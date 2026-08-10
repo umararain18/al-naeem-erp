@@ -6,7 +6,7 @@ import { hasPermission } from "@/lib/permissions";
 import { BalanceType, PartyType } from "@prisma/client";
 
 const updatePartySchema = z.object({
-  partyName: z.string().min(2, "Party name is required").optional(),
+  partyName: z.string().min(2).optional(),
   contactPerson: z.string().optional(),
   phone: z.string().optional(),
   whatsapp: z.string().optional(),
@@ -22,12 +22,12 @@ const updatePartySchema = z.object({
         "VENDOR",
       ])
     )
-    .min(1, "At least one party type is required")
+    .min(1)
     .optional(),
 
   openingBalance: z
     .number()
-    .min(0, "Opening balance cannot be negative")
+    .min(0)
     .optional(),
 
   openingBalanceType: z
@@ -36,10 +36,11 @@ const updatePartySchema = z.object({
     .optional(),
 
   isActive: z.boolean().optional(),
+
   notes: z.string().optional(),
 });
 
-// GET /api/parties/[id]
+// GET PARTY
 export async function GET(
   _request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -49,14 +50,20 @@ export async function GET(
 
     if (!currentUser) {
       return NextResponse.json(
-        { success: false, message: "Unauthorized" },
+        {
+          success: false,
+          message: "Unauthorized",
+        },
         { status: 401 }
       );
     }
 
     if (!hasPermission(currentUser, "parties.view")) {
       return NextResponse.json(
-        { success: false, message: "Forbidden" },
+        {
+          success: false,
+          message: "Forbidden",
+        },
         { status: 403 }
       );
     }
@@ -69,7 +76,10 @@ export async function GET(
 
     if (!party) {
       return NextResponse.json(
-        { success: false, message: "Party not found" },
+        {
+          success: false,
+          message: "Party not found",
+        },
         { status: 404 }
       );
     }
@@ -82,13 +92,16 @@ export async function GET(
     console.error("Get party error:", error);
 
     return NextResponse.json(
-      { success: false, message: "Something went wrong" },
+      {
+        success: false,
+        message: "Something went wrong",
+      },
       { status: 500 }
     );
   }
 }
 
-// PATCH /api/parties/[id]
+// UPDATE PARTY
 export async function PATCH(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -98,7 +111,10 @@ export async function PATCH(
 
     if (!currentUser) {
       return NextResponse.json(
-        { success: false, message: "Unauthorized" },
+        {
+          success: false,
+          message: "Unauthorized",
+        },
         { status: 401 }
       );
     }
@@ -107,7 +123,8 @@ export async function PATCH(
       return NextResponse.json(
         {
           success: false,
-          message: "You do not have permission to edit parties",
+          message:
+            "You do not have permission to edit parties",
         },
         { status: 403 }
       );
@@ -121,7 +138,10 @@ export async function PATCH(
 
     if (!existingParty) {
       return NextResponse.json(
-        { success: false, message: "Party not found" },
+        {
+          success: false,
+          message: "Party not found",
+        },
         { status: 404 }
       );
     }
@@ -145,13 +165,15 @@ export async function PATCH(
 
     const updatedParty = await prisma.party.update({
       where: { id },
+
       data: {
         ...(data.partyName !== undefined && {
           partyName: data.partyName,
         }),
 
         ...(data.contactPerson !== undefined && {
-          contactPerson: data.contactPerson || null,
+          contactPerson:
+            data.contactPerson || null,
         }),
 
         ...(data.phone !== undefined && {
@@ -171,17 +193,20 @@ export async function PATCH(
         }),
 
         ...(data.partyTypes !== undefined && {
-          partyTypes: data.partyTypes as PartyType[],
+          partyTypes:
+            data.partyTypes as PartyType[],
         }),
 
         ...(data.openingBalance !== undefined && {
-          openingBalance: data.openingBalance,
+          openingBalance:
+            data.openingBalance,
         }),
 
         ...(data.openingBalanceType !== undefined && {
-          openingBalanceType: data.openingBalanceType
-            ? (data.openingBalanceType as BalanceType)
-            : null,
+          openingBalanceType:
+            data.openingBalanceType
+              ? (data.openingBalanceType as BalanceType)
+              : null,
         }),
 
         ...(data.isActive !== undefined && {
@@ -203,13 +228,16 @@ export async function PATCH(
     console.error("Update party error:", error);
 
     return NextResponse.json(
-      { success: false, message: "Something went wrong" },
+      {
+        success: false,
+        message: "Something went wrong",
+      },
       { status: 500 }
     );
   }
 }
 
-// DELETE /api/parties/[id]
+// DELETE PARTY
 export async function DELETE(
   _request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -219,7 +247,10 @@ export async function DELETE(
 
     if (!currentUser) {
       return NextResponse.json(
-        { success: false, message: "Unauthorized" },
+        {
+          success: false,
+          message: "Unauthorized",
+        },
         { status: 401 }
       );
     }
@@ -228,7 +259,8 @@ export async function DELETE(
       return NextResponse.json(
         {
           success: false,
-          message: "You do not have permission to delete parties",
+          message:
+            "You do not have permission to delete parties",
         },
         { status: 403 }
       );
@@ -242,7 +274,10 @@ export async function DELETE(
 
     if (!existingParty) {
       return NextResponse.json(
-        { success: false, message: "Party not found" },
+        {
+          success: false,
+          message: "Party not found",
+        },
         { status: 404 }
       );
     }
@@ -259,7 +294,11 @@ export async function DELETE(
     console.error("Delete party error:", error);
 
     return NextResponse.json(
-      { success: false, message: "Something went wrong" },
+      {
+        success: false,
+        message:
+          "Unable to delete party. It may have related records.",
+      },
       { status: 500 }
     );
   }
