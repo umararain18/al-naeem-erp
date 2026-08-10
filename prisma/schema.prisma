@@ -8,21 +8,51 @@ datasource db {
 }
 
 model User {
-  id         String   @id @default(cuid())
-  fullName   String
-  username   String   @unique
-  password   String
-  phone      String?
-  role       Role
-  isActive   Boolean  @default(true)
-  lastLogin  DateTime?
+  id        String    @id @default(cuid())
+  fullName  String
+  username  String    @unique
+  password  String
+  phone     String?
+  role      Role
+  isActive  Boolean   @default(true)
+  lastLogin DateTime?
 
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Party {
+  id                 String       @id @default(cuid())
+  partyName          String
+  contactPerson      String?
+  phone              String?
+  whatsapp           String?
+  cnicNtn            String?
+  address            String?
+  partyTypes         PartyType[]
+  openingBalance     Decimal      @default(0) @db.Decimal(15, 2)
+  openingBalanceType BalanceType?
+  isActive           Boolean      @default(true)
+  notes              String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 enum Role {
   SUPER_ADMIN
   MANAGER
   VIEWER
+}
+
+enum PartyType {
+  TRANSPORTER
+  CLEARING_AGENT
+  CUSTOMER
+  VENDOR
+}
+
+enum BalanceType {
+  DEBIT
+  CREDIT
 }
