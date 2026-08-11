@@ -17,8 +17,9 @@ model User {
   isActive  Boolean   @default(true)
   lastLogin DateTime?
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  journalEntries JournalEntry[]
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
 }
 
 model Party {
@@ -35,8 +36,96 @@ model Party {
   isActive           Boolean      @default(true)
   notes              String?
 
+  // One party = one account
+  account Account?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+model Account {
+  id          String  @id @default(cuid())
+  accountName String
+  accountCode String? @unique
+
+  accountType AccountType
+  category    AccountCategory
+
+  description String?
+
+  isSystem Boolean @default(false)
+  isActive Boolean @default(true)
+
+  // Parent / child Chart of Accounts
+  parentId String?
+  parent   Account?  @relation("AccountHierarchy", fields: [parentId], references: [id], onDelete: Restrict)
+  children Account[] @relation("AccountHierarchy")
+
+  // One party = one account
+  partyId String? @unique
+  party   Party?  @relation(fields: [partyId], references: [id], onDelete: SetNull)
+
+  // Internal ledger
+  ledgerEntries JournalLine[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([accountType])
+  @@index([category])
+  @@index([parentId])
+}
+
+model JournalEntry {
+  id String @id @default(cuid())
+
+  entryDate DateTime @default(now())
+
+  referenceType String?
+  referenceId   String?
+
+  description String?
+
+  createdById String?
+  createdBy   User?   @relation(fields: [createdById], references: [id], onDelete: SetNull)
+
+  lines JournalLine[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([entryDate])
+  @@index([referenceType])
+  @@index([referenceId])
+  @@index([createdById])
+}
+
+model JournalLine {
+  id String @id @default(cuid())
+
+  journalEntryId String
+  journalEntry   JournalEntry @relation(fields: [journalEntryId], references: [id], onDelete: Cascade)
+
+  accountId String
+  account   Account @relation(fields: [accountId], references: [id], onDelete: Restrict)
+
+  description String?
+
+  // Daily Posting / source document information
+  sourceType   String?
+  sourceId     String?
+  sourceNumber String?
+
+  debit  Decimal @default(0) @db.Decimal(15, 2)
+  credit Decimal @default(0) @db.Decimal(15, 2)
+
+  createdAt DateTime @default(now())
+
+  @@index([journalEntryId])
+  @@index([accountId])
+  @@index([sourceType])
+  @@index([sourceId])
+  @@index([sourceNumber])
 }
 
 enum Role {
@@ -50,9 +139,55 @@ enum PartyType {
   CLEARING_AGENT
   CUSTOMER
   VENDOR
+  BOTH
 }
 
 enum BalanceType {
   DEBIT
   CREDIT
+}
+
+enum AccountType {
+  ASSET
+  LIABILITY
+  EQUITY
+  INCOME
+  EXPENSE
+
+  // Party accounts use one account
+  // and their balance determines Receivable/Payable
+  PARTY
+}
+
+enum AccountCategory {
+  CASH
+  BANK
+  RECEIVABLE
+  PAYABLE
+  OTHER_ASSET
+
+  TRANSPORTER_PAYABLE
+  DELIVERY_POINT_PAYABLE
+  VENDOR_PAYABLE
+  OTHER_LIABILITY
+
+  OWNER_CAPITAL
+  OWNER_DRAWING
+  OTHER_EQUITY
+
+  BOOKING_INCOME
+  DELIVERY_INCOME
+  CARRIER_INCOME
+  OTHER_INCOME
+
+  FUEL
+  OFFICE_RENT
+  SALARY
+  ELECTRICITY
+  TEA_REFRESHMENT
+  REPAIR_MAINTENANCE
+  OTHER_EXPENSE
+
+  // Dynamic party account
+  PARTY
 }
