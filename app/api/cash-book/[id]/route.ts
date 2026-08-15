@@ -331,3 +331,175 @@ export async function PATCH(
     );
   }
 }
+export async function DELETE(
+  request: NextRequest,
+  context: {
+    params: Promise<{ id: string }>;
+  }
+) {
+  try {
+    // ============================================================
+    // AUTHENTICATION
+    // ============================================================
+
+    const currentUser = await getCurrentUser();
+
+    if (!currentUser) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: "Unauthorized",
+        },
+        { status: 401 }
+      );
+    }
+
+    // ============================================================
+    // ROLE CHECK
+    //
+    // SUPER_ADMIN + MANAGER can move transactions to Bin.
+    // VIEWER cannot delete.
+    // ============================================================
+
+    if (
+      currentUser.role !== "SUPER_ADMIN" &&
+      currentUser.role !== "MANAGER"
+    ) {
+      return NextResponse.json(
+        {
+          success: false,
+          message:
+            "You do not have permission to move transactions to Bin.",
+        },
+        { status: 403 }
+      );
+    }
+
+    // ============================================================
+    // GET JOURNAL LINE ID
+    // ============================================================
+
+    const { id } = await context.params;
+
+    if (!id) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: "Transaction ID is required",
+        },
+        { status: 400 }
+      );
+    }
+
+    // ============================================================
+    // FIND TRANSACTION
+    // ============================================================
+
+    const currentLine =
+      await prisma.journalLine.findUnique({
+        where: {
+          id,
+        },
+
+        include: {
+          journalEntry: {
+            include: {
+              lines: true,
+            },
+          },
+
+          account: true,
+        },
+      });
+
+    if (!currentLine) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: "Transaction not found",
+        },
+        { status: 404 }
+      );
+    }
+
+    // ============================================================
+    // SAFETY CHECK
+    // ============================================================
+
+    if (
+      currentLine.account.category !== "CASH" &&
+      currentLine.account.category !== "BANK"
+    ) {
+      return NextResponse.json(
+        {
+          success: false,
+          message:
+            "This transaction does not belong to a Cash/Bank account.",
+        },
+        { status: 400 }
+      );
+    }
+
+    // ============================================================
+    // ALREADY IN BIN
+    // ============================================================
+
+    if (currentLine.journalEntry.isDeleted) {
+      return NextResponse.json(
+        {
+          success: false,
+          message:
+            "This transaction is already in Bin.",
+        },
+        { status: 400 }
+      );
+    }
+
+    // ============================================================
+    // SOFT DELETE
+    //
+    // DO NOT DELETE JOURNAL ENTRY.
+    // DO NOT DELETE JOURNAL LINES.
+    //
+    // Only mark the JournalEntry as deleted.
+    // ============================================================
+
+    const deletedEntry =
+      await prisma.journalEntry.update({
+        where: {
+          id: currentLine.journalEntryId,
+        },
+
+        data: {
+          isDeleted: true,
+          deletedAt: new Date(),
+          deletedById: currentUser.userId,
+        },
+      });
+
+    // ============================================================
+    // SUCCESS
+    // ============================================================
+
+    return NextResponse.json({
+      success: true,
+      message:
+        "Transaction moved to Bin successfully.",
+      journalEntryId: deletedEntry.id,
+    });
+  } catch (error) {
+    console.error(
+      "Cash Book soft delete error:",
+      error
+    );
+
+    return NextResponse.json(
+      {
+        success: false,
+        message:
+          "Unable to move transaction to Bin.",
+      },
+      { status: 500 }
+    );
+  }
+}

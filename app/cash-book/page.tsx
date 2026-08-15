@@ -323,6 +323,51 @@ export default function CashBookPage() {
       );
     }
   }
+  async function handleDelete(entry: CashBookEntry) {
+  const confirmed = window.confirm(
+    "Move this transaction to Bin?\n\nThe transaction will not be permanently deleted."
+  );
+
+  if (!confirmed) {
+    return;
+  }
+
+  try {
+    setError("");
+
+    const response = await fetch(
+      `/api/cash-book/${entry.id}`,
+      {
+        method: "DELETE",
+      }
+    );
+
+    const data = await response.json();
+
+    if (!response.ok || !data.success) {
+      throw new Error(
+        data.message ||
+          "Unable to move transaction to Bin."
+      );
+    }
+
+    if (selectedAccountId) {
+      await loadCashBook(
+        selectedAccountId,
+        fromDate,
+        toDate
+      );
+    }
+  } catch (err) {
+    console.error(err);
+
+    setError(
+      err instanceof Error
+        ? err.message
+        : "Unable to move transaction to Bin."
+    );
+  }
+}
 
   /*
    * Expand / collapse date.
@@ -831,11 +876,15 @@ export default function CashBookPage() {
 </button>
 
                                         <button
-                                          type="button"
-                                          className="rounded-md border border-red-200 px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50"
-                                        >
-                                          Delete
-                                        </button>
+  type="button"
+  onClick={() => {
+  console.log("DELETE CLICKED", entry);
+  handleDelete(entry);
+}}
+  className="rounded-md border border-red-200 px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50"
+>
+  Delete
+</button>
 
                                       </div>
 

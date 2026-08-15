@@ -214,16 +214,20 @@ export async function GET(request: NextRequest) {
     const journalLines =
       await prisma.journalLine.findMany({
         where: {
-          accountId: selectedAccount.id,
+  accountId: selectedAccount.id,
 
-          ...(Object.keys(dateFilter).length > 0
-            ? {
-                journalEntry: {
-                  entryDate: dateFilter,
-                },
-              }
-            : {}),
-        },
+  journalEntry: {
+    is: {
+      isDeleted: false,
+
+      ...(Object.keys(dateFilter).length > 0
+        ? {
+            entryDate: dateFilter,
+          }
+        : {}),
+    },
+  },
+},
 
         include: {
           journalEntry: {

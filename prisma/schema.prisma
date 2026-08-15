@@ -88,7 +88,10 @@ model JournalEntry {
 
   createdById String?
   createdBy   User?   @relation(fields: [createdById], references: [id], onDelete: SetNull)
-
+  // Soft Delete / Bin
+  isDeleted   Boolean  @default(false)
+  deletedAt   DateTime?
+  deletedById String?
   lines JournalLine[]
 
   createdAt DateTime @default(now())
@@ -98,6 +101,8 @@ model JournalEntry {
   @@index([referenceType])
   @@index([referenceId])
   @@index([createdById])
+    @@index([isDeleted])
+  @@index([deletedById])
 }
 
 model JournalLine {
