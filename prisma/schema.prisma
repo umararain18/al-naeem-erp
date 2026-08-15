@@ -17,7 +17,8 @@ model User {
   isActive  Boolean   @default(true)
   lastLogin DateTime?
 
-  journalEntries JournalEntry[]
+  createdJournalEntries JournalEntry[] @relation("JournalEntryCreatedBy")
+  deletedJournalEntries JournalEntry[] @relation("JournalEntryDeletedBy")
   createdAt      DateTime       @default(now())
   updatedAt      DateTime       @updatedAt
 }
@@ -87,11 +88,12 @@ model JournalEntry {
   description String?
 
   createdById String?
-  createdBy   User?   @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  createdBy   User?   @relation("JournalEntryCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
   // Soft Delete / Bin
   isDeleted   Boolean  @default(false)
   deletedAt   DateTime?
   deletedById String?
+  deletedBy   User?   @relation("JournalEntryDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
   lines JournalLine[]
 
   createdAt DateTime @default(now())
@@ -101,7 +103,8 @@ model JournalEntry {
   @@index([referenceType])
   @@index([referenceId])
   @@index([createdById])
-    @@index([isDeleted])
+  @@index([isDeleted])
+  @@index([isDeleted, deletedAt])
   @@index([deletedById])
 }
 

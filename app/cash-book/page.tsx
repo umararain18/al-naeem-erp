@@ -24,6 +24,9 @@ type CashBookEntry = {
   journalEntryId: string;
   referenceType: string | null;
   referenceId: string | null;
+  canEdit: boolean;
+  canMoveToBin: boolean;
+  isEditableStructure: boolean;
 };
 
 type CashBookDay = {
@@ -47,6 +50,10 @@ type CashBookResponse = {
     closingBalance: number;
   };
   days: CashBookDay[];
+  capabilities?: {
+    canEdit: boolean;
+    canMoveToBin: boolean;
+  };
 };
 
 function formatMoney(amount: number) {
@@ -103,6 +110,11 @@ export default function CashBookPage() {
   const [editEntry, setEditEntry] =
   useState<CashBookEntry | null>(null);
 
+  const [capabilities, setCapabilities] = useState({
+    canEdit: false,
+    canMoveToBin: false,
+  });
+
   const [loadingAccounts, setLoadingAccounts] =
     useState(false);
 
@@ -142,6 +154,10 @@ export default function CashBookPage() {
       }
 
       setAccounts(data.accounts || []);
+      setCapabilities(data.capabilities || {
+        canEdit: false,
+        canMoveToBin: false,
+      });
     } catch (err) {
       console.error(err);
 
@@ -212,6 +228,10 @@ export default function CashBookPage() {
       }
 
       setDays(data.days || []);
+      setCapabilities(data.capabilities || {
+        canEdit: false,
+        canMoveToBin: false,
+      });
 
       setSummary(
         data.summary || {
@@ -325,7 +345,7 @@ export default function CashBookPage() {
   }
   async function handleDelete(entry: CashBookEntry) {
   const confirmed = window.confirm(
-    "Move this transaction to Bin?\n\nThe transaction will not be permanently deleted."
+    "Move this complete Journal Entry to Bin?\n\nAll of its journal lines will be excluded from normal accounting. This is not permanent deletion."
   );
 
   if (!confirmed) {
@@ -864,6 +884,7 @@ export default function CashBookPage() {
   View
 </button>
 
+                                        {entry.canEdit ? (
                                         <button
   type="button"
   onClick={() => {
@@ -872,9 +893,15 @@ export default function CashBookPage() {
   }}
   className="rounded-md border border-blue-200 px-3 py-1.5 text-xs font-medium text-blue-600 hover:bg-blue-50"
 >
-  Edit
-</button>
+                                          Edit
+                                        </button>
+                                        ) : capabilities.canEdit && !entry.isEditableStructure ? (
+                                          <span className="px-1 py-1.5 text-xs text-gray-500">
+                                            Multi-line entries cannot be edited here.
+                                          </span>
+                                        ) : null}
 
+                                        {entry.canMoveToBin && (
                                         <button
   type="button"
   onClick={() => {
@@ -883,8 +910,9 @@ export default function CashBookPage() {
 }}
   className="rounded-md border border-red-200 px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50"
 >
-  Delete
-</button>
+                                          Move to Bin
+                                        </button>
+                                        )}
 
                                       </div>
 

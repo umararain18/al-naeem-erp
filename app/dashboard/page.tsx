@@ -1,5 +1,7 @@
 import { getCurrentUser } from "@/lib/auth";
+import { hasPermission } from "@/lib/permissions";
 import { redirect } from "next/navigation";
+import Link from "next/link";
 import LogoutButton from "@/components/LogoutButton";
 
 export default async function DashboardPage() {
@@ -19,6 +21,15 @@ export default async function DashboardPage() {
           </div>
 
           <div className="flex items-center gap-4">
+            {hasPermission(user, "accountingTransactions.binView") && (
+              <Link
+                href="/accounting-transaction-bin"
+                className="rounded-lg border px-4 py-2 text-sm hover:bg-gray-50"
+              >
+                Bin
+              </Link>
+            )}
+
             <div className="text-sm text-gray-600">
               Welcome, {user.username}
             </div>

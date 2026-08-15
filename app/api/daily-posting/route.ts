@@ -101,6 +101,7 @@ export async function GET(request: NextRequest) {
 
     const where: {
       referenceType: string;
+      isDeleted: boolean;
       referenceId?: string;
       entryDate?: {
         gte: Date;
@@ -108,6 +109,7 @@ export async function GET(request: NextRequest) {
       };
     } = {
       referenceType: "DAILY_POSTING",
+      isDeleted: false,
     };
 
     if (accountId) {
@@ -429,6 +431,11 @@ export async function POST(request: NextRequest) {
           where: {
             sourceType: line.sourceType,
             sourceId: line.sourceId,
+            journalEntry: {
+              is: {
+                isDeleted: false,
+              },
+            },
           },
 
           include: {
@@ -605,6 +612,8 @@ export async function POST(request: NextRequest) {
                 description:
                   data.remarks ||
                   `Daily Posting - ${mainAccount.accountName}`,
+
+                createdById: currentUser.userId,
 
                 lines: {
                   create: journalLines,

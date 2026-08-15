@@ -120,6 +120,13 @@ export async function GET(request: NextRequest) {
         accounts,
         selectedAccount: null,
         days: [],
+        capabilities: {
+          canEdit: hasPermission(currentUser, "accounts.edit"),
+          canMoveToBin: hasPermission(
+            currentUser,
+            "accountingTransactions.bin"
+          ),
+        },
       });
     }
 
@@ -237,6 +244,11 @@ export async function GET(request: NextRequest) {
               description: true,
               referenceType: true,
               referenceId: true,
+              _count: {
+                select: {
+                  lines: true,
+                },
+              },
             },
           },
 
@@ -303,6 +315,18 @@ export async function GET(request: NextRequest) {
 
         referenceId:
           line.journalEntry.referenceId,
+
+        canEdit:
+          hasPermission(currentUser, "accounts.edit") &&
+          line.journalEntry._count.lines === 2,
+
+        isEditableStructure:
+          line.journalEntry._count.lines === 2,
+
+        canMoveToBin: hasPermission(
+          currentUser,
+          "accountingTransactions.bin"
+        ),
       })
     );
 
@@ -438,6 +462,13 @@ const days =
       },
 
       days,
+      capabilities: {
+        canEdit: hasPermission(currentUser, "accounts.edit"),
+        canMoveToBin: hasPermission(
+          currentUser,
+          "accountingTransactions.bin"
+        ),
+      },
     });
   } catch (error) {
     console.error(

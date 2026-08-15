@@ -91,6 +91,11 @@ export async function GET(
         where: {
           accountId:
             party.account.id,
+          journalEntry: {
+            is: {
+              isDeleted: false,
+            },
+          },
         },
 
         include: {

@@ -159,6 +159,17 @@ export async function PATCH(
       );
     }
 
+    if (currentLine.journalEntry.isDeleted) {
+      return NextResponse.json(
+        {
+          success: false,
+          message:
+            "Binned transactions cannot be edited. Restore the transaction first.",
+        },
+        { status: 400 }
+      );
+    }
+
     // ============================================================
     // SAFETY CHECK
     //
@@ -355,16 +366,10 @@ export async function DELETE(
     }
 
     // ============================================================
-    // ROLE CHECK
-    //
-    // SUPER_ADMIN + MANAGER can move transactions to Bin.
-    // VIEWER cannot delete.
+    // PERMISSION
     // ============================================================
 
-    if (
-      currentUser.role !== "SUPER_ADMIN" &&
-      currentUser.role !== "MANAGER"
-    ) {
+    if (!hasPermission(currentUser, "accountingTransactions.bin")) {
       return NextResponse.json(
         {
           success: false,

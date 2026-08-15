@@ -1,15 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-
-type Account = {
-  id: string;
-  accountName: string;
-  accountCode: string | null;
-  accountType: string;
-  category: string;
-  isActive: boolean;
-};
+import { useEffect, useState } from "react";
 
 type TransactionEntry = {
   id: string;
@@ -37,13 +28,6 @@ export default function TransactionEditModal({
   onClose,
   onSaved,
 }: TransactionEditModalProps) {
-  const [accounts, setAccounts] = useState<Account[]>([]);
-
-  const [accountId, setAccountId] = useState("");
-  const [accountSearch, setAccountSearch] = useState("");
-  const [showAccountSearch, setShowAccountSearch] =
-    useState(false);
-
   const [date, setDate] = useState("");
   const [document, setDocument] = useState("");
   const [documentNo, setDocumentNo] = useState("");
@@ -52,52 +36,8 @@ export default function TransactionEditModal({
   const [credit, setCredit] = useState("0");
 
   const [saving, setSaving] = useState(false);
-  const [loadingAccounts, setLoadingAccounts] =
-    useState(false);
-
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
-
-  /*
-   * Load accounts
-   */
-  async function loadAccounts() {
-    try {
-      setLoadingAccounts(true);
-
-      const response = await fetch("/api/accounts", {
-        method: "GET",
-        cache: "no-store",
-      });
-
-      const data = await response.json();
-
-      if (!response.ok || !data.success) {
-        throw new Error(
-          data.message || "Unable to load accounts"
-        );
-      }
-
-      const cashBankAccounts = (
-        data.accounts || []
-      ).filter(
-        (account: Account) =>
-          account.isActive &&
-          (account.category === "CASH" ||
-            account.category === "BANK")
-      );
-
-      setAccounts(cashBankAccounts);
-    } catch (err) {
-      setError(
-        err instanceof Error
-          ? err.message
-          : "Unable to load accounts"
-      );
-    } finally {
-      setLoadingAccounts(false);
-    }
-  }
 
   /*
    * Set values whenever a different transaction is selected
@@ -115,62 +55,9 @@ setDate(entry.date || "");
     setDebit(String(entry.debit ?? 0));
     setCredit(String(entry.credit ?? 0));
 
-    setAccountSearch(entry.account || "");
-
     setError("");
     setMessage("");
-    setShowAccountSearch(false);
-
-    void loadAccounts();
   }, [entry]);
-
-  /*
-   * Find current account from account name
-   */
-  useEffect(() => {
-    if (!entry || accounts.length === 0) {
-      return;
-    }
-
-    const currentAccount = accounts.find(
-      (account) =>
-        account.accountName.toLowerCase() ===
-        entry.account.toLowerCase()
-    );
-
-    if (currentAccount) {
-        // eslint-disable-next-line react-hooks/set-state-in-effect
-      setAccountId(currentAccount.id);
-      setAccountSearch(currentAccount.accountName);
-    }
-  }, [accounts, entry]);
-
-  /*
-   * Search accounts
-   */
-  const filteredAccounts = useMemo(() => {
-    const search =
-      accountSearch.trim().toLowerCase();
-
-    if (!search) {
-      return accounts;
-    }
-
-    return accounts.filter((account) =>
-      account.accountName
-        .toLowerCase()
-        .includes(search)
-    );
-  }, [accounts, accountSearch]);
-
-  /*
-   * Select account
-   */
-  function handleAccountSelect(account: Account) {
-    setAccountId(account.id);
-    setAccountSearch(account.accountName);
-    setShowAccountSearch(false);
-  }
 
   /*
    * Save transaction
@@ -186,11 +73,6 @@ setDate(entry.date || "");
 
     if (!date) {
       setError("Date is required.");
-      return;
-    }
-
-    if (!accountId) {
-      setError("Please select a Cash or Bank account.");
       return;
     }
 
@@ -226,7 +108,6 @@ setDate(entry.date || "");
           },
           body: JSON.stringify({
             date,
-            accountId,
             document,
             documentNo,
             description,
@@ -338,67 +219,16 @@ setDate(entry.date || "");
             />
           </div>
 
-          {/* Account Search */}
-          <div className="relative">
+          <div>
             <label className="mb-1 block text-xs font-medium text-gray-600">
               Cash / Bank Account
             </label>
-
-            <input
-              type="text"
-              value={accountSearch}
-              onChange={(e) => {
-                setAccountSearch(e.target.value);
-                setAccountId("");
-                setShowAccountSearch(true);
-              }}
-              onFocus={() =>
-                setShowAccountSearch(true)
-              }
-              placeholder="Search Cash or Bank account..."
-              className="w-full rounded-lg border px-3 py-2 text-sm outline-none focus:border-blue-500"
-            />
-
-            {showAccountSearch && (
-              <div className="absolute left-0 right-0 z-20 mt-1 max-h-52 overflow-y-auto rounded-lg border bg-white shadow-lg">
-
-                {loadingAccounts && (
-                  <div className="px-4 py-3 text-sm text-gray-500">
-                    Loading accounts...
-                  </div>
-                )}
-
-                {!loadingAccounts &&
-                  filteredAccounts.length === 0 && (
-                    <div className="px-4 py-3 text-sm text-gray-500">
-                      No Cash/Bank account found.
-                    </div>
-                  )}
-
-                {!loadingAccounts &&
-                  filteredAccounts.map((account) => (
-                    <button
-                      key={account.id}
-                      type="button"
-                      onMouseDown={(e) =>
-                        e.preventDefault()
-                      }
-                      onClick={() =>
-                        handleAccountSelect(account)
-                      }
-                      className="flex w-full items-center justify-between px-4 py-3 text-left text-sm hover:bg-gray-50"
-                    >
-                      <span className="font-medium text-gray-900">
-                        {account.accountName}
-                      </span>
-
-                      <span className="text-xs text-gray-500">
-                        {account.category}
-                      </span>
-                    </button>
-                  ))}
-              </div>
-            )}
+            <p className="rounded-lg border bg-gray-50 px-3 py-2 text-sm text-gray-700">
+              {entry.account}
+            </p>
+            <p className="mt-1 text-xs text-gray-500">
+              Account reassignment is not supported when editing a posted transaction.
+            </p>
           </div>
 
           {/* Document */}
