@@ -10,9 +10,14 @@ export type Permission =
   | "parties.edit"
   | "parties.delete"
   | "bilty.view"
+      | "bilty.bin"
+  | "bilty.binView"
+  | "bilty.restore"
+  | "bilty.permanentlyDelete"
   | "bilty.create"
   | "bilty.edit"
   | "bilty.delete"
+    
   | "challan.view"
   | "challan.create"
   | "challan.edit"
@@ -41,6 +46,11 @@ const permissions: Record<AuthUser["role"], Permission[]> = {
     "bilty.create",
     "bilty.edit",
     "bilty.delete",
+        "bilty.bin",
+    "bilty.binView",
+    "bilty.restore",
+    "bilty.permanentlyDelete",
+    
 
     "parties.view",
     "parties.create",
@@ -75,6 +85,10 @@ const permissions: Record<AuthUser["role"], Permission[]> = {
     "bilty.view",
     "bilty.create",
     "bilty.edit",
+        "bilty.bin",
+    "bilty.binView",
+    "bilty.restore",
+    
     "parties.view",
     "parties.create",
     "parties.edit",

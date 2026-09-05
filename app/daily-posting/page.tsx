@@ -23,6 +23,21 @@ type PostingLine = {
   sourceType: string;
   sourceId: string;
   sourceNumber: string;
+  // Client-side only - not sent to the server. Tracks the party
+  // auto-resolved from the selected document ("" = none), purely
+  // so the UI can show "Resolved Party: X" / explain why Counter
+  // Account is empty. The server independently re-resolves at
+  // submit time regardless of this value.
+  resolvedPartyLabel: string;
+};
+
+type DocumentSearchResult = {
+  type: "CHALLAN" | "BILTY";
+  id: string;
+  number: string;
+  subtitle: string;
+  detail: string;
+  resolvedParty: { accountId: string; partyName: string } | null;
 };
 
 type SearchOption = {
@@ -120,6 +135,157 @@ function SearchableSelect({
   );
 }
 
+function DocumentSearchSelect({
+  sourceType,
+  sourceId,
+  sourceNumber,
+  onSelect,
+  onClear,
+}: {
+  sourceType: string;
+  sourceId: string;
+  sourceNumber: string;
+  onSelect: (result: DocumentSearchResult) => void;
+  onClear: () => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [results, setResults] = useState<DocumentSearchResult[]>([]);
+
+  useEffect(() => {
+    if (!sourceId) {
+      setQuery("");
+    }
+  }, [sourceId]);
+
+  useEffect(() => {
+    if (!open) return;
+
+    const search = query.trim();
+
+    if (!search) {
+      setResults([]);
+      return;
+    }
+
+    const handle = window.setTimeout(async () => {
+      try {
+        setLoading(true);
+
+        const response = await fetch(
+          `/api/daily-posting/search-documents?q=${encodeURIComponent(search)}`
+        );
+
+        const data = await response.json();
+
+        if (response.ok && data.success) {
+          setResults(data.results || []);
+        }
+      } catch {
+        // silent
+      } finally {
+        setLoading(false);
+      }
+    }, 300);
+
+    return () => window.clearTimeout(handle);
+  }, [query, open]);
+
+  const displayValue = sourceId
+    ? `${sourceType} ${sourceNumber}`
+    : query;
+
+  return (
+    <div className="relative w-56">
+      <input
+        type="text"
+        value={displayValue}
+        placeholder="Search Challan/Bilty no..."
+        onFocus={() => {
+          setOpen(true);
+          if (sourceId) setQuery("");
+        }}
+        onChange={(event) => {
+          setQuery(event.target.value);
+          setOpen(true);
+          if (sourceId) onClear();
+        }}
+        onBlur={() => {
+          window.setTimeout(() => setOpen(false), 150);
+        }}
+        className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
+      />
+
+      {sourceId && (
+        <button
+          type="button"
+          onMouseDown={(event) => {
+            event.preventDefault();
+            onClear();
+            setQuery("");
+          }}
+          className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-gray-400 hover:text-red-500"
+        >
+          ✕
+        </button>
+      )}
+
+      {open && !sourceId && (
+        <div className="absolute left-0 top-full z-50 mt-1 max-h-72 w-80 overflow-y-auto rounded-lg border border-gray-200 bg-white shadow-xl">
+          {loading && (
+            <div className="px-3 py-3 text-sm text-gray-500">Searching...</div>
+          )}
+
+          {!loading && query.trim() && results.length === 0 && (
+            <div className="px-3 py-3 text-sm text-gray-500">
+              No Challan or Bilty found.
+            </div>
+          )}
+
+          {!loading && !query.trim() && (
+            <div className="px-3 py-3 text-sm text-gray-500">
+              Type a Challan or Bilty number to search.
+            </div>
+          )}
+
+          {results.map((result) => (
+            <button
+              key={`${result.type}-${result.id}`}
+              type="button"
+              onMouseDown={(event) => {
+                event.preventDefault();
+                onSelect(result);
+                setOpen(false);
+              }}
+              className="block w-full border-b border-gray-100 px-3 py-2 text-left text-sm last:border-b-0 hover:bg-blue-50"
+            >
+              <div className="flex items-center gap-2">
+                <span
+                  className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
+                    result.type === "CHALLAN"
+                      ? "bg-purple-100 text-purple-700"
+                      : "bg-teal-100 text-teal-700"
+                  }`}
+                >
+                  {result.type}
+                </span>
+                <span className="font-medium text-gray-900">
+                  {result.number}
+                </span>
+              </div>
+              <div className="mt-0.5 text-xs text-gray-500">
+                {result.subtitle}
+              </div>
+              <div className="text-xs text-gray-400">{result.detail}</div>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 const sourceOptions = [
   { value: "DIRECT", label: "Direct Account" },
   { value: "PARTY", label: "Party" },
@@ -139,6 +305,7 @@ function createLine(): PostingLine {
     sourceType: "DIRECT",
     sourceId: "",
     sourceNumber: "",
+    resolvedPartyLabel: "",
   };
 }
 
@@ -160,6 +327,16 @@ export default function DailyPostingPage() {
 
   const [duplicateData, setDuplicateData] = useState<any[]>([]);
   const [showDuplicateWarning, setShowDuplicateWarning] = useState(false);
+
+  // One token per distinct posting attempt - reused across a retry
+  // of the SAME attempt (e.g. confirming the duplicate-document
+  // warning), regenerated only once that attempt actually succeeds,
+  // so an accidental resubmission (double-click, network retry,
+  // duplicate tab) of an already-posted entry safely no-ops on the
+  // server instead of posting twice. See app/api/daily-posting/route.ts.
+  const [submissionKey, setSubmissionKey] = useState(() =>
+    crypto.randomUUID()
+  );
 
   useEffect(() => {
     loadAccounts();
@@ -300,7 +477,14 @@ export default function DailyPostingPage() {
     }
 
     for (const [index, line] of lines.entries()) {
-      if (!line.counterAccountId) {
+      // A Challan/Bilty-linked entry may leave Counter Account
+      // empty - the server resolves the responsible party from the
+      // document itself. Every other entry still requires it.
+      if (
+        line.sourceType !== "CHALLAN" &&
+        line.sourceType !== "BILTY" &&
+        !line.counterAccountId
+      ) {
         setError(
           `Please select counter account in entry ${
             index + 1
@@ -348,8 +532,9 @@ export default function DailyPostingPage() {
         accountId,
         remarks: remarks.trim() || undefined,
         confirmDuplicate,
+        idempotencyKey: submissionKey,
         lines: lines.map((line) => ({
-          counterAccountId: line.counterAccountId,
+          counterAccountId: line.counterAccountId || undefined,
           description: line.description.trim(),
           amount: Number(line.amount),
           direction: line.direction,
@@ -397,6 +582,9 @@ export default function DailyPostingPage() {
 
       setLines([createLine()]);
       setRemarks("");
+      // This attempt is done - the next Post is a new, separate
+      // posting and must get its own idempotency key.
+      setSubmissionKey(crypto.randomUUID());
     } catch (err) {
       setError(
         err instanceof Error
@@ -556,16 +744,35 @@ export default function DailyPostingPage() {
                       <SearchableSelect
                         value={line.counterAccountId}
                         options={counterAccountOptions}
-                        placeholder="Search account..."
-                        onChange={(value) =>
-                          updateLine(
-                            line.id,
-                            "counterAccountId",
-                            value
-                          )
+                        placeholder={
+                          line.sourceType === "CHALLAN" || line.sourceType === "BILTY"
+                            ? "Optional - auto-resolved from document"
+                            : "Search account..."
                         }
+                        onChange={(value) => {
+                          updateLine(line.id, "counterAccountId", value);
+                          // A manual change supersedes the earlier
+                          // auto-resolution label.
+                          updateLine(line.id, "resolvedPartyLabel", "");
+                        }}
                         className="w-72"
                       />
+                      {(line.sourceType === "CHALLAN" || line.sourceType === "BILTY") &&
+                        line.sourceId &&
+                        line.resolvedPartyLabel && (
+                          <p className="mt-1 text-xs text-green-600">
+                            Resolved Party: {line.resolvedPartyLabel}
+                          </p>
+                        )}
+                      {(line.sourceType === "CHALLAN" || line.sourceType === "BILTY") &&
+                        line.sourceId &&
+                        !line.resolvedPartyLabel &&
+                        !line.counterAccountId && (
+                          <p className="mt-1 text-xs text-amber-600">
+                            No party could be auto-resolved - please select a
+                            Counter Account.
+                          </p>
+                        )}
                     </td>
 
                     <td className="px-4 py-4">
@@ -575,35 +782,65 @@ export default function DailyPostingPage() {
                         placeholder="Search document..."
                         onChange={(value) => {
                           updateLine(line.id, "sourceType", value);
-
-                          if (value === "DIRECT") {
-                            updateLine(line.id, "sourceId", "");
-                            updateLine(line.id, "sourceNumber", "");
-                          }
+                          updateLine(line.id, "sourceId", "");
+                          updateLine(line.id, "sourceNumber", "");
                         }}
                         className="w-48"
                       />
                     </td>
 
                     <td className="px-4 py-4">
-                      <input
-                        type="text"
-                        value={line.sourceNumber}
-                        onChange={(e) =>
-                          updateLine(
-                            line.id,
-                            "sourceNumber",
-                            e.target.value
-                          )
-                        }
-                        placeholder={
-                          line.sourceType === "DIRECT"
-                            ? "Not required"
-                            : "e.g. 4252"
-                        }
-                        disabled={line.sourceType === "DIRECT"}
-                        className="w-36 rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none disabled:bg-gray-100 focus:border-blue-500"
-                      />
+                      {line.sourceType === "CHALLAN" ||
+                      line.sourceType === "BILTY" ? (
+                        <DocumentSearchSelect
+                          sourceType={line.sourceType}
+                          sourceId={line.sourceId}
+                          sourceNumber={line.sourceNumber}
+                          onSelect={(result) => {
+                            updateLine(line.id, "sourceType", result.type);
+                            updateLine(line.id, "sourceId", result.id);
+                            updateLine(line.id, "sourceNumber", result.number);
+                            // Auto-resolve the responsible party from the
+                            // document so the user does not have to search
+                            // for the same party again. Still fully
+                            // editable/clearable afterward.
+                            updateLine(
+                              line.id,
+                              "counterAccountId",
+                              result.resolvedParty?.accountId || ""
+                            );
+                            updateLine(
+                              line.id,
+                              "resolvedPartyLabel",
+                              result.resolvedParty?.partyName || ""
+                            );
+                          }}
+                          onClear={() => {
+                            updateLine(line.id, "sourceId", "");
+                            updateLine(line.id, "sourceNumber", "");
+                            updateLine(line.id, "resolvedPartyLabel", "");
+                          }}
+                        />
+                      ) : (
+                        <input
+                          type="text"
+                          value={line.sourceNumber}
+                          onChange={(e) =>
+                            updateLine(
+                              line.id,
+                              "sourceNumber",
+                              e.target.value
+                            )
+                          }
+                          placeholder={
+                            line.sourceType === "DIRECT"
+                              ? "Not required"
+                              : "e.g. 4252"
+                          }
+                          disabled={line.sourceType === "DIRECT"}
+                          className="w-36 rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none disabled:bg-gray-100 focus:border-blue-500"
+                        />
+                      )}
                     </td>
 
                     <td className="px-4 py-4">

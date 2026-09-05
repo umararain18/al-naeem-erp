@@ -46,6 +46,31 @@ export async function GET(
 
     const { id } = await params;
 
+    const { searchParams } = new URL(_request.url);
+    const from = searchParams.get("from");
+    const to = searchParams.get("to");
+
+    // ---------------------------------------------
+    // DATE FILTER
+    // ---------------------------------------------
+
+    const dateFilter: { gte?: Date; lt?: Date } = {};
+
+    if (from) {
+      const start = new Date(`${from}T00:00:00`);
+      if (!Number.isNaN(start.getTime())) {
+        dateFilter.gte = start;
+      }
+    }
+
+    if (to) {
+      const end = new Date(`${to}T00:00:00`);
+      end.setDate(end.getDate() + 1);
+      if (!Number.isNaN(end.getTime())) {
+        dateFilter.lt = end;
+      }
+    }
+
     // ---------------------------------------------
     // FIND PARTY + ITS ONE ACCOUNT
     // ---------------------------------------------
@@ -94,6 +119,9 @@ export async function GET(
           journalEntry: {
             is: {
               isDeleted: false,
+              ...(Object.keys(dateFilter).length > 0
+                ? { entryDate: dateFilter }
+                : {}),
             },
           },
         },
@@ -160,6 +188,9 @@ export async function GET(
             entry.journalEntry
               .entryDate,
 
+          journalEntryId:
+            entry.journalEntryId,
+
           referenceType:
             entry.journalEntry
               .referenceType,
@@ -167,6 +198,22 @@ export async function GET(
           referenceId:
             entry.journalEntry
               .referenceId,
+
+          // Per-line source (JournalLine.sourceType/sourceId/
+          // sourceNumber) - already part of the existing accounting
+          // architecture, just not previously exposed here. This is
+          // the MOST specific source available: e.g. a SETTLEMENT
+          // JournalEntry is Challan-level (referenceId = challanId)
+          // but each of its lines is additionally tagged to the
+          // exact Bilty it belongs to.
+          sourceType:
+            entry.sourceType,
+
+          sourceId:
+            entry.sourceId,
+
+          sourceNumber:
+            entry.sourceNumber,
 
           description:
             entry.description ||
@@ -191,7 +238,7 @@ export async function GET(
     // TOTALS
     // ---------------------------------------------
 
-    const totalDebit =
+    const periodDebit =
       entries.reduce(
         (sum, entry) =>
           sum +
@@ -199,7 +246,7 @@ export async function GET(
         0
       );
 
-    const totalCredit =
+    const periodCredit =
       entries.reduce(
         (sum, entry) =>
           sum +
@@ -208,19 +255,62 @@ export async function GET(
       );
 
     const netBalance =
-      totalDebit -
-      totalCredit;
+      periodDebit -
+      periodCredit;
+
+    // ---------------------------------------------
+    // OPENING BALANCE
+    // ---------------------------------------------
+
+    let openingBalance = 0;
+
+    if (Object.keys(dateFilter).length > 0 && from) {
+      const openingEntries =
+        await prisma.journalLine.findMany({
+          where: {
+            accountId:
+              party.account.id,
+            journalEntry: {
+              is: {
+                isDeleted: false,
+                entryDate: {
+                  lt: new Date(
+                    `${from}T00:00:00`
+                  ),
+                },
+              },
+            },
+          },
+
+          select: {
+            debit: true,
+            credit: true,
+          },
+        });
+
+      openingBalance =
+        openingEntries.reduce(
+          (sum, entry) =>
+            sum +
+            Number(entry.debit) -
+            Number(entry.credit),
+          0
+        );
+    }
+
+    const closingBalance =
+      openingBalance + netBalance;
 
     let balanceType:
       | "RECEIVABLE"
       | "PAYABLE"
       | "SETTLED";
 
-    if (netBalance > 0) {
+    if (closingBalance > 0) {
       balanceType =
         "RECEIVABLE";
     } else if (
-      netBalance < 0
+      closingBalance < 0
     ) {
       balanceType =
         "PAYABLE";
@@ -245,13 +335,16 @@ export async function GET(
           party.account.accountName,
       },
 
+      filters: {
+        from: from || null,
+        to: to || null,
+      },
+
       summary: {
-        totalDebit,
-        totalCredit,
-
-        netBalance:
-          Math.abs(netBalance),
-
+        openingBalance,
+        periodDebit,
+        periodCredit,
+        closingBalance,
         balanceType,
       },
 

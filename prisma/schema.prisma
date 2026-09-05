@@ -8,132 +8,318 @@ datasource db {
 }
 
 model User {
-  id        String    @id @default(cuid())
-  fullName  String
-  username  String    @unique
-  password  String
-  phone     String?
-  role      Role
-  isActive  Boolean   @default(true)
-  lastLogin DateTime?
-
+  id                    String         @id @default(cuid())
+  fullName              String
+  username              String         @unique
+  password              String
+  role                  Role
+  isActive              Boolean        @default(true)
+  createdAt             DateTime       @default(now())
+  updatedAt             DateTime       @updatedAt
+  lastLogin             DateTime?
+  phone                 String?
   createdJournalEntries JournalEntry[] @relation("JournalEntryCreatedBy")
   deletedJournalEntries JournalEntry[] @relation("JournalEntryDeletedBy")
-  createdAt      DateTime       @default(now())
-  updatedAt      DateTime       @updatedAt
+  createdBilties        Bilty[]        @relation("BiltyCreatedBy")
+  updatedBilties        Bilty[]        @relation("BiltyUpdatedBy")
+  deletedBilties        Bilty[]        @relation("BiltyDeletedBy")
+  createdChallans       Challan[]      @relation("ChallanCreatedBy")
+  updatedChallans       Challan[]      @relation("ChallanUpdatedBy")
+  deletedChallans       Challan[]      @relation("ChallanDeletedBy")
+  settledChallans       Challan[]      @relation("ChallanSettledBy")
+  createdSettlementPayments SettlementPayment[] @relation("SettlementPaymentCreatedBy")
 }
 
 model Party {
-  id                 String       @id @default(cuid())
-  partyName          String
-  contactPerson      String?
-  phone              String?
-  whatsapp           String?
-  cnicNtn            String?
-  address            String?
-  partyTypes         PartyType[]
-  openingBalance     Decimal      @default(0) @db.Decimal(15, 2)
-  openingBalanceType BalanceType?
-  isActive           Boolean      @default(true)
-  notes              String?
-
-  // One party = one account
-  account Account?
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id                   String       @id @default(cuid())
+  partyName            String
+  contactPerson        String?
+  phone                String?
+  whatsapp             String?
+  cnicNtn              String?
+  address              String?
+  openingBalance       Decimal      @default(0) @db.Decimal(15, 2)
+  openingBalanceType   BalanceType?
+  isActive             Boolean      @default(true)
+  notes                String?
+  createdAt            DateTime     @default(now())
+  updatedAt            DateTime     @updatedAt
+  partyTypes           PartyType[]
+  account              Account?
+  consignorBilties     Bilty[]      @relation("BiltyConsignorParty")
+  consigneeBilties     Bilty[]      @relation("BiltyConsigneeParty")
+  clearingAgentBilties Bilty[]      @relation("BiltyClearingAgentParty")
+  paidResponsibleBilties Bilty[]    @relation("BiltyPaidResponsibleParty")
+  agentBilties         Bilty[]      @relation("BiltyAgentParty")
+  transporterChallans  Challan[]    @relation("ChallanTransporterParty")
 }
 
 model Account {
-  id          String  @id @default(cuid())
-  accountName String
-  accountCode String? @unique
-
-  accountType AccountType
-  category    AccountCategory
-
-  description String?
-
-  isSystem Boolean @default(false)
-  isActive Boolean @default(true)
-
-  // Parent / child Chart of Accounts
-  parentId String?
-  parent   Account?  @relation("AccountHierarchy", fields: [parentId], references: [id], onDelete: Restrict)
-  children Account[] @relation("AccountHierarchy")
-
-  // One party = one account
-  partyId String? @unique
-  party   Party?  @relation(fields: [partyId], references: [id], onDelete: SetNull)
-
-  // Internal ledger
+  id            String          @id @default(cuid())
+  accountName   String
+  accountCode   String?         @unique
+  accountType   AccountType
+  category      AccountCategory
+  description   String?
+  isSystem      Boolean         @default(false)
+  isActive      Boolean         @default(true)
+  parentId      String?
+  partyId       String?         @unique
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+  parent        Account?        @relation("AccountHierarchy", fields: [parentId], references: [id], onDelete: Restrict)
+  children      Account[]       @relation("AccountHierarchy")
+  party         Party?          @relation(fields: [partyId], references: [id])
   ledgerEntries JournalLine[]
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  settlementPayments SettlementPayment[]
 
   @@index([accountType])
   @@index([category])
   @@index([parentId])
 }
 
-model JournalEntry {
-  id String @id @default(cuid())
+model Location {
+  id       String  @id @default(cuid())
+  name     String  @unique
+  isActive Boolean @default(true)
 
-  entryDate DateTime @default(now())
-
-  referenceType String?
-  referenceId   String?
-
-  description String?
-
-  createdById String?
-  createdBy   User?   @relation("JournalEntryCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
-  // Soft Delete / Bin
-  isDeleted   Boolean  @default(false)
-  deletedAt   DateTime?
-  deletedById String?
-  deletedBy   User?   @relation("JournalEntryDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
-  lines JournalLine[]
+  fromBilties Bilty[] @relation("BiltyFromLocation")
+  toBilties   Bilty[] @relation("BiltyToLocation")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+}
+
+model Bilty {
+  id      String   @id @default(cuid())
+  biltyNo String   @unique
+  date    DateTime
+
+  // Locations
+  fromLocationId String
+  fromLocation   Location @relation("BiltyFromLocation", fields: [fromLocationId], references: [id], onDelete: Restrict)
+
+  toLocationId String
+  toLocation   Location @relation("BiltyToLocation", fields: [toLocationId], references: [id], onDelete: Restrict)
+
+  // Consignor
+  consignorPartyId String?
+  consignorParty   Party?  @relation("BiltyConsignorParty", fields: [consignorPartyId], references: [id], onDelete: SetNull)
+  consignorName    String
+  consignorPhone   String?
+
+  // Consignee
+  consigneePartyId String?
+  consigneeParty   Party?  @relation("BiltyConsigneeParty", fields: [consigneePartyId], references: [id], onDelete: SetNull)
+  consigneeName    String
+  consigneePhone   String?
+
+  // Vehicle
+  vehicleType        String?
+  vehicleModel       String?
+  vehicleColor       String?
+  engineNumber       String?
+  chassisNumber      String?
+  registrationNumber String?
+
+  // Clearing Agent / Delivery Point
+  clearingAgentPartyId String?
+  clearingAgentParty   Party?  @relation("BiltyClearingAgentParty", fields: [clearingAgentPartyId], references: [id], onDelete: SetNull)
+  clearingAgentName    String?
+
+  // Freight
+  rent      Decimal @default(0) @db.Decimal(15, 2)
+  insurance Decimal @default(0) @db.Decimal(15, 2)
+  expense   Decimal @default(0) @db.Decimal(15, 2)
+  total     Decimal @default(0) @db.Decimal(15, 2)
+  advance   Decimal @default(0) @db.Decimal(15, 2)
+  toPay     Decimal @default(0) @db.Decimal(15, 2)
+
+  // Paid-amount ("advance") responsibility - which Party is
+  // considered responsible for the Paid portion actually reaching
+  // ANC. Explicit only when BOTH consignorParty and consigneeParty
+  // have a valid account (never guessed); left null when only one
+  // exists (auto-resolved on read from whichever exists) or when
+  // neither exists (Paid remains recognized on the Bilty with no
+  // Party attribution - never fabricated). See
+  // lib/document-party-resolution.ts's resolveBiltyPaidResponsibleParty().
+  paidResponsiblePartyId String?
+  paidResponsibleParty   Party?  @relation("BiltyPaidResponsibleParty", fields: [paidResponsiblePartyId], references: [id], onDelete: SetNull)
+
+  // Agent Commission
+  agentPartyId     String?
+  agentParty       Party?  @relation("BiltyAgentParty", fields: [agentPartyId], references: [id], onDelete: SetNull)
+  agentCommission  Decimal @default(0) @db.Decimal(15, 2)
+  agentDescription String?
+
+  notes  String?
+  status BiltyStatus @default(PENDING)
+
+  // Bin
+  isDeleted   Boolean   @default(false)
+  deletedAt   DateTime?
+  deletedById String?
+  deletedBy   User?     @relation("BiltyDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+
+  // Audit
+  createdById String?
+  createdBy   User?   @relation("BiltyCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  updatedById String?
+  updatedBy   User?   @relation("BiltyUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+  challanBilties ChallanBilty[]
+  settlementPayments SettlementPayment[]
+
+  @@index([date])
+  @@index([status])
+  @@index([isDeleted, deletedAt])
+  @@index([fromLocationId])
+  @@index([toLocationId])
+}
+
+model JournalEntry {
+  id            String        @id @default(cuid())
+  entryDate     DateTime      @default(now())
+  referenceType String?
+  referenceId   String?
+  description   String?
+  createdById   String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  deletedAt     DateTime?
+  deletedById   String?
+  isDeleted     Boolean       @default(false)
+  createdBy     User?         @relation("JournalEntryCreatedBy", fields: [createdById], references: [id])
+  deletedBy     User?         @relation("JournalEntryDeletedBy", fields: [deletedById], references: [id])
+  lines         JournalLine[]
+  settledChallans Challan[]  @relation("ChallanSettlement")
+  settlementPayment SettlementPayment?
 
   @@index([entryDate])
   @@index([referenceType])
   @@index([referenceId])
   @@index([createdById])
   @@index([isDeleted])
-  @@index([isDeleted, deletedAt])
   @@index([deletedById])
 }
 
 model JournalLine {
-  id String @id @default(cuid())
-
+  id             String       @id @default(cuid())
   journalEntryId String
+  accountId      String
+  description    String?
+  debit          Decimal      @default(0) @db.Decimal(15, 2)
+  credit         Decimal      @default(0) @db.Decimal(15, 2)
+  createdAt      DateTime     @default(now())
+  sourceId       String?
+  sourceNumber   String?
+  sourceType     String?
+  account        Account      @relation(fields: [accountId], references: [id])
   journalEntry   JournalEntry @relation(fields: [journalEntryId], references: [id], onDelete: Cascade)
-
-  accountId String
-  account   Account @relation(fields: [accountId], references: [id], onDelete: Restrict)
-
-  description String?
-
-  // Daily Posting / source document information
-  sourceType   String?
-  sourceId     String?
-  sourceNumber String?
-
-  debit  Decimal @default(0) @db.Decimal(15, 2)
-  credit Decimal @default(0) @db.Decimal(15, 2)
-
-  createdAt DateTime @default(now())
+  paymentAllocations PaymentAllocation[]
 
   @@index([journalEntryId])
   @@index([accountId])
   @@index([sourceType])
   @@index([sourceId])
   @@index([sourceNumber])
+}
+
+// ============================================================
+// PAYMENT ALLOCATION (Party Ledger 2.0, Step 2A)
+//
+// Strictly additive reporting/reconciliation layer over the
+// EXISTING accounting model - never a second accounting system.
+//
+// A "payment" is never a new record: it is the Party-side
+// JournalLine of an already-posted Daily Posting Cash/Bank <->
+// Party movement (see lib/payment-allocation.ts for the exact
+// qualifying shape). This table only records how much of that
+// EXISTING, unmodified line's amount is considered applied to
+// which outstanding Bilty/Challan - it never creates, reverses, or
+// duplicates a JournalEntry/JournalLine, never touches
+// debit/credit/sourceId on the original line, and is invisible to
+// every existing P&L/Trial Balance/Receivable/Payable calculation.
+//
+// One journalLineId can have MANY rows (one payment split across
+// several documents); one (targetSourceType, targetSourceId) can
+// also appear in MANY rows (several payments applied to the same
+// document over time) - deliberately NOT unique together.
+// ============================================================
+model PaymentAllocation {
+  id               String      @id @default(cuid())
+  journalLineId    String
+  journalLine      JournalLine @relation(fields: [journalLineId], references: [id], onDelete: Cascade)
+  // "BILTY" | "CHALLAN" - the same sourceType vocabulary
+  // JournalLine already uses; not modeled as an enum here for the
+  // same reason JournalLine.sourceType isn't (see that field).
+  targetSourceType String
+  targetSourceId   String
+  allocatedAmount  Decimal     @db.Decimal(15, 2)
+  createdAt        DateTime    @default(now())
+  createdById      String?
+
+  @@index([journalLineId])
+  @@index([targetSourceType, targetSourceId])
+}
+
+// ============================================================
+// SETTLEMENT PAYMENT (multi-payer / multi-collector engine)
+//
+// Strictly additive over the existing Settlement/reclassification
+// architecture (lib/settlement-accounting.ts, lib/settlement-
+// correction.ts) - never a second accounting system. Each row
+// represents exactly ONE simultaneous, independently-identified
+// (payer, amount) reclassification against one Bilty's Collection
+// (Remaining To-Pay) or one Challan's Carrier Rent - replacing the
+// old single-payer-per-component ceiling WITHOUT touching how a
+// still-single-payer document is recognized/booked (that existing
+// path, lib/settlement-accounting.ts's buildSettlementEntries, is
+// untouched and keeps working exactly as before).
+//
+// Every row's accounting effect lives entirely in real, balanced
+// JournalEntry/JournalLine records - this table is a pure lookup/
+// index over that ledger (exactly like PaymentAllocation above),
+// never a second source of truth for the amount itself. A row's own
+// id is the ONLY thing used to find every JournalEntry that belongs
+// to it (JournalLine.sourceType = "SETTLEMENT_PAYMENT", sourceId =
+// this row's id) - never description text, never "latest JournalLine
+// wins". See lib/settlement-payments.ts.
+//
+// component is "COLLECTION" (Bilty-level, biltyId required) or
+// "CARRIER_RENT" (Challan-level, biltyId null) - the same string
+// vocabulary lib/settlement-accounting.ts's SettlementComponent type
+// already uses, not modeled as a Prisma enum for the same reason
+// JournalLine.sourceType / PaymentAllocation.targetSourceType aren't.
+// ============================================================
+model SettlementPayment {
+  id             String       @id @default(cuid())
+  // Nullable: "PAID" (Bilty Paid-amount responsibility, see
+  // lib/bilty-paid-verification.ts) is resolved independently of any
+  // Challan/Settlement and may exist before a Bilty ever joins a
+  // Challan. "COLLECTION" and "CARRIER_RENT" rows always set this -
+  // both remain Settlement-gated exactly as before.
+  challanId      String?
+  challan        Challan?     @relation(fields: [challanId], references: [id], onDelete: Cascade)
+  biltyId        String?
+  bilty          Bilty?       @relation(fields: [biltyId], references: [id], onDelete: Cascade)
+  component      String
+  payerAccountId String
+  payerAccount   Account      @relation(fields: [payerAccountId], references: [id], onDelete: Restrict)
+  amount         Decimal      @db.Decimal(15, 2)
+  journalEntryId String       @unique
+  journalEntry   JournalEntry @relation(fields: [journalEntryId], references: [id], onDelete: Restrict)
+  createdById    String?
+  createdBy      User?        @relation("SettlementPaymentCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@index([challanId, component])
+  @@index([biltyId, component])
+  @@index([payerAccountId])
 }
 
 enum Role {
@@ -143,11 +329,11 @@ enum Role {
 }
 
 enum PartyType {
-  TRANSPORTER
-  CLEARING_AGENT
   CUSTOMER
   VENDOR
   BOTH
+  TRANSPORTER
+  CLEARING_AGENT
 }
 
 enum BalanceType {
@@ -161,9 +347,6 @@ enum AccountType {
   EQUITY
   INCOME
   EXPENSE
-
-  // Party accounts use one account
-  // and their balance determines Receivable/Payable
   PARTY
 }
 
@@ -173,21 +356,18 @@ enum AccountCategory {
   RECEIVABLE
   PAYABLE
   OTHER_ASSET
-
   TRANSPORTER_PAYABLE
   DELIVERY_POINT_PAYABLE
   VENDOR_PAYABLE
   OTHER_LIABILITY
-
   OWNER_CAPITAL
   OWNER_DRAWING
   OTHER_EQUITY
-
   BOOKING_INCOME
   DELIVERY_INCOME
   CARRIER_INCOME
   OTHER_INCOME
-
+  CARRIER_RENT
   FUEL
   OFFICE_RENT
   SALARY
@@ -195,7 +375,87 @@ enum AccountCategory {
   TEA_REFRESHMENT
   REPAIR_MAINTENANCE
   OTHER_EXPENSE
-
-  // Dynamic party account
   PARTY
+}
+
+enum BiltyStatus {
+  PENDING
+  IN_TRANSIT
+  DELIVERED
+  CANCELLED
+}
+
+enum ChallanStatus {
+  IN_TRANSIT
+  DELIVERED
+  CANCELLED
+}
+
+model Challan {
+  id          String        @id @default(cuid())
+  challanNo   String        @unique
+  loadingDate DateTime
+  status      ChallanStatus @default(IN_TRANSIT)
+
+  // Transporter / Driver
+  transporterPartyId String?
+  transporterParty   Party?  @relation("ChallanTransporterParty", fields: [transporterPartyId], references: [id], onDelete: SetNull)
+  driverName         String?
+  driverPhone        String?
+  carrierNumber      String?
+
+  // Financial
+  carrierRent        Decimal  @default(0) @db.Decimal(15, 2)
+  remarks            String?
+
+  // Settlement
+  isSettled               Boolean   @default(false)
+  settledAt               DateTime?
+  settledById             String?
+  settledBy               User?     @relation("ChallanSettledBy", fields: [settledById], references: [id], onDelete: SetNull)
+  settlementNotes         String?
+  settlementJournalEntryId String?
+  settlementJournalEntry  JournalEntry? @relation("ChallanSettlement", fields: [settlementJournalEntryId], references: [id], onDelete: SetNull)
+
+  clearingAgentPaysDriver Boolean   @default(false)
+  commissionRecoveryFrom  String?
+  outstandingReceivable   Decimal   @default(0) @db.Decimal(15, 2)
+  outstandingPayable      Decimal   @default(0) @db.Decimal(15, 2)
+  isFinanciallyCleared    Boolean   @default(false)
+
+  // Bin
+  isDeleted   Boolean   @default(false)
+  deletedAt   DateTime?
+  deletedById String?
+  deletedBy   User?     @relation("ChallanDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+
+  // Audit
+  createdById String?
+  createdBy   User?   @relation("ChallanCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?
+  updatedBy   User?   @relation("ChallanUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  bilties ChallanBilty[]
+  settlementPayments SettlementPayment[]
+
+  @@index([loadingDate])
+  @@index([status])
+  @@index([isDeleted, deletedAt])
+  @@index([challanNo])
+}
+
+model ChallanBilty {
+  id        String   @id @default(cuid())
+  challanId String
+  biltyId   String
+  challan   Challan  @relation(fields: [challanId], references: [id], onDelete: Cascade)
+  bilty     Bilty    @relation(fields: [biltyId], references: [id], onDelete: Cascade)
+  addedAt   DateTime @default(now())
+
+  @@unique([challanId, biltyId])
+  @@index([biltyId])
 }

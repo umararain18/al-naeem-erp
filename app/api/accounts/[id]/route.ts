@@ -52,6 +52,7 @@ const updateAccountSchema = z.object({
       "TEA_REFRESHMENT",
       "REPAIR_MAINTENANCE",
       "OTHER_EXPENSE",
+      "CARRIER_RENT",
     ])
     .optional(),
 
@@ -119,6 +120,7 @@ const allowedCategories: Record<
     AccountCategory.TEA_REFRESHMENT,
     AccountCategory.REPAIR_MAINTENANCE,
     AccountCategory.OTHER_EXPENSE,
+    AccountCategory.CARRIER_RENT,
   ],
 
   PARTY: [

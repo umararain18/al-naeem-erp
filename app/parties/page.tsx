@@ -1,6 +1,7 @@
 "use client";
 
 import { FormEvent, useEffect, useState } from "react";
+import Link from "next/link";
 
 type PartyType =
   | "TRANSPORTER"
@@ -445,12 +446,6 @@ export default function PartiesPage() {
     } finally {
       setActionLoading(null);
     }
-  }
-
-  function openLedger(party: Party) {
-    alert(
-      `Ledger for "${party.partyName}" will be connected after the Accounts/Ledger module is completed.`
-    );
   }
 
   function formatPartyTypes(
@@ -924,17 +919,12 @@ export default function PartiesPage() {
                                 Delete
                               </button>
 
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  openLedger(
-                                    party
-                                  )
-                                }
+                              <Link
+                                href={`/parties/${party.id}/ledger`}
                                 className="border rounded-lg px-3 py-1 text-sm hover:bg-gray-50"
                               >
                                 Ledger
-                              </button>
+                              </Link>
 
                             </div>
 

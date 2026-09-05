@@ -26,6 +26,10 @@ type CashBookEntry = {
   referenceId: string | null;
   canEdit: boolean;
   canMoveToBin: boolean;
+  // Set only when canMoveToBin is false purely due to the age/
+  // settled-document policy (not a plain permission gate) - lets a
+  // Manager see WHY the action is unavailable for this specific row.
+  binProtectedReason: string | null;
   isEditableStructure: boolean;
 };
 
@@ -158,6 +162,8 @@ export default function CashBookPage() {
         canEdit: false,
         canMoveToBin: false,
       });
+
+      return data.accounts || [];
     } catch (err) {
       console.error(err);
 
@@ -166,6 +172,8 @@ export default function CashBookPage() {
           ? err.message
           : "Unable to load accounts"
       );
+
+      return [];
     } finally {
       setLoadingAccounts(false);
     }
@@ -267,12 +275,37 @@ export default function CashBookPage() {
 
   useEffect(() => {
   const timer = window.setTimeout(() => {
-    void loadAccounts();
+    void (async () => {
+      const loadedAccounts = await loadAccounts();
+
+      // Drill-down from elsewhere (e.g. Dashboard Cash/Bank) may
+      // deep-link straight to an account, optionally preserving a
+      // date range - preselect it instead of showing the picker.
+      // Read directly from the browser URL (not next/navigation's
+      // useSearchParams) since this only needs to run once on
+      // mount and avoids that hook's Suspense-boundary requirement.
+      const urlParams = new URLSearchParams(window.location.search);
+      const urlAccountId = urlParams.get("accountId");
+      if (!urlAccountId) return;
+
+      const match = loadedAccounts.find((a) => a.id === urlAccountId);
+      if (!match) return;
+
+      const urlFrom = urlParams.get("from") || "";
+      const urlTo = urlParams.get("to") || "";
+
+      setSelectedAccountId(match.id);
+      setSelectedAccountName(match.accountName);
+      setFromDate(urlFrom);
+      setToDate(urlTo);
+      loadCashBook(match.id, urlFrom, urlTo);
+    })();
   }, 0);
 
   return () => {
     window.clearTimeout(timer);
   };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
 }, []);
 
   /*
@@ -901,7 +934,7 @@ export default function CashBookPage() {
                                           </span>
                                         ) : null}
 
-                                        {entry.canMoveToBin && (
+                                        {entry.canMoveToBin ? (
                                         <button
   type="button"
   onClick={() => {
@@ -912,7 +945,11 @@ export default function CashBookPage() {
 >
                                           Move to Bin
                                         </button>
-                                        )}
+                                        ) : capabilities.canMoveToBin && entry.binProtectedReason ? (
+                                          <span className="px-1 py-1.5 text-xs text-gray-500" title={entry.binProtectedReason}>
+                                            {entry.binProtectedReason}
+                                          </span>
+                                        ) : null}
 
                                       </div>
 

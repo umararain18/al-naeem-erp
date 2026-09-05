@@ -2,6 +2,12 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
+import {
+  BIN_REASON_TOO_OLD,
+  BIN_REASON_SETTLED_DOCUMENT,
+  isOlderThanBinThreshold,
+  isLinkedToSettledDocument,
+} from "@/lib/cash-bank-bin-policy";
 
 function isValidDate(value: string) {
   const date = new Date(`${value}T00:00:00`);
@@ -458,6 +464,37 @@ export async function DELETE(
         },
         { status: 400 }
       );
+    }
+
+    // ============================================================
+    // AGE / SETTLED-DOCUMENT POLICY (operational safety only)
+    //
+    // SUPER_ADMIN is unrestricted here - unchanged. A MANAGER may
+    // only bin a RECENT transaction that is not tied to an
+    // already-settled Challan/Bilty. This is enforced here
+    // regardless of what the frontend shows or hides, so a direct
+    // API call cannot bypass it.
+    // ============================================================
+
+    if (currentUser.role !== "SUPER_ADMIN") {
+      if (isOlderThanBinThreshold(currentLine.journalEntry.entryDate)) {
+        return NextResponse.json(
+          { success: false, message: BIN_REASON_TOO_OLD },
+          { status: 403 }
+        );
+      }
+
+      const linkedToSettled = await isLinkedToSettledDocument(
+        prisma,
+        currentLine.journalEntry.lines
+      );
+
+      if (linkedToSettled) {
+        return NextResponse.json(
+          { success: false, message: BIN_REASON_SETTLED_DOCUMENT },
+          { status: 403 }
+        );
+      }
     }
 
     // ============================================================

@@ -2,6 +2,13 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
+import {
+  BIN_REASON_TOO_OLD,
+  BIN_REASON_SETTLED_DOCUMENT,
+  isOlderThanBinThreshold,
+  findSettledChallanIds,
+  findSettledBiltyIds,
+} from "@/lib/cash-bank-bin-policy";
 
 function startOfDay(date: string) {
   return new Date(`${date}T00:00:00`);
@@ -276,6 +283,55 @@ export async function GET(request: NextRequest) {
       });
 
     // ============================================================
+    // BIN ELIGIBILITY (operational safety only - see
+    // lib/cash-bank-bin-policy.ts). SUPER_ADMIN is unrestricted;
+    // for everyone else, batch-resolve which Challan/Bilty sources
+    // referenced by this page's lines are already settled, once,
+    // instead of a query per line.
+    // ============================================================
+
+    const isSuperAdmin = currentUser.role === "SUPER_ADMIN";
+    const hasBinPermission = hasPermission(currentUser, "accountingTransactions.bin");
+
+    let settledChallanIds = new Set<string>();
+    let settledBiltyIds = new Set<string>();
+
+    if (hasBinPermission && !isSuperAdmin) {
+      const challanIds = new Set<string>();
+      const biltyIds = new Set<string>();
+      for (const line of journalLines) {
+        if (line.sourceType === "CHALLAN" && line.sourceId) challanIds.add(line.sourceId);
+        if (line.sourceType === "BILTY" && line.sourceId) biltyIds.add(line.sourceId);
+      }
+      [settledChallanIds, settledBiltyIds] = await Promise.all([
+        findSettledChallanIds(prisma, [...challanIds]),
+        findSettledBiltyIds(prisma, [...biltyIds]),
+      ]);
+    }
+
+    function binEligibility(line: (typeof journalLines)[number]): {
+      canMoveToBin: boolean;
+      binProtectedReason: string | null;
+    } {
+      if (!hasBinPermission) return { canMoveToBin: false, binProtectedReason: null };
+      if (isSuperAdmin) return { canMoveToBin: true, binProtectedReason: null };
+
+      if (isOlderThanBinThreshold(line.journalEntry.entryDate)) {
+        return { canMoveToBin: false, binProtectedReason: BIN_REASON_TOO_OLD };
+      }
+
+      const linkedToSettled =
+        (line.sourceType === "CHALLAN" && !!line.sourceId && settledChallanIds.has(line.sourceId)) ||
+        (line.sourceType === "BILTY" && !!line.sourceId && settledBiltyIds.has(line.sourceId));
+
+      if (linkedToSettled) {
+        return { canMoveToBin: false, binProtectedReason: BIN_REASON_SETTLED_DOCUMENT };
+      }
+
+      return { canMoveToBin: true, binProtectedReason: null };
+    }
+
+    // ============================================================
     // CONVERT DECIMAL VALUES
     // ============================================================
 
@@ -323,10 +379,7 @@ export async function GET(request: NextRequest) {
         isEditableStructure:
           line.journalEntry._count.lines === 2,
 
-        canMoveToBin: hasPermission(
-          currentUser,
-          "accountingTransactions.bin"
-        ),
+        ...binEligibility(line),
       })
     );
 

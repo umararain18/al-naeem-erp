@@ -36,6 +36,9 @@ yarn-error.log*
 # vercel
 .vercel
 
+# local dev auth artifacts (contains a real session cookie - never commit)
+cookies.txt
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts

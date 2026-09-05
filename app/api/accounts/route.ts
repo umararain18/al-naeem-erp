@@ -112,6 +112,7 @@ function isCategoryValidForType(
       AccountCategory.TEA_REFRESHMENT,
       AccountCategory.REPAIR_MAINTENANCE,
       AccountCategory.OTHER_EXPENSE,
+      AccountCategory.CARRIER_RENT,
     ],
 
     PARTY: [
