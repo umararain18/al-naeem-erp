@@ -66,6 +66,7 @@ const REFERENCE_LABELS: Record<string, string> = {
   SETTLEMENT_CORRECTION: "Settlement Correction",
   DAILY_POSTING: "Daily Posting",
   OPENING_BALANCE: "Opening Balance",
+  MANUAL_JOURNAL: "Manual Journal Entry",
 };
 
 function friendlyReferenceLabel(referenceType: string | null) {
@@ -102,6 +103,13 @@ function resolveLedgerDestination(entry: LedgerEntry): { href: string; label: st
     entry.referenceId
   ) {
     return { href: `/challan/${entry.referenceId}`, label: refLabel };
+  }
+
+  // Manual Journal Entry (Step 15) - referenceId holds the
+  // human-friendly Manual Journal Number ("MJ-00001"), not a
+  // document id - show it directly rather than the raw referenceType.
+  if (entry.referenceType === "MANUAL_JOURNAL" && entry.referenceId) {
+    return { href: `/accounting-transactions/${entry.journalEntryId}`, label: `Manual Journal ${entry.referenceId}` };
   }
 
   return { href: `/accounting-transactions/${entry.journalEntryId}`, label: refLabel };

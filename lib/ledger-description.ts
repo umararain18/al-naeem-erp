@@ -615,6 +615,15 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
       reference = "Opening Balance";
       referenceHref = null;
       description = line.lineDescription || line.entryDescription || "Opening Balance";
+    } else if (line.referenceType === "MANUAL_JOURNAL") {
+      // Manual Journal Entry (Step 15) - never document-linked (v1),
+      // so this is always a Direct-Entry-style row. referenceId holds
+      // the human-friendly, sequential Manual Journal Number (e.g.
+      // "MJ-00001"), NOT a document id - see
+      // app/api/journal-entries/route.ts for how it is assigned.
+      reference = line.referenceId ? `Manual Journal ${line.referenceId}` : "Manual Journal Entry";
+      referenceHref = `/accounting-transactions/${line.journalEntryId}`;
+      description = line.lineDescription || line.entryDescription || "—";
     } else if (line.referenceType && SIMPLE_REFERENCE_LABELS[line.referenceType]) {
       reference = SIMPLE_REFERENCE_LABELS[line.referenceType];
       referenceHref = `/accounting-transactions/${line.journalEntryId}`;

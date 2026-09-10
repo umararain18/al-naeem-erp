@@ -56,7 +56,17 @@ export interface BiltyPaidVerificationState {
   isInconsistent: boolean;
 }
 
-export async function getBiltyPaidVerification(tx: Tx, biltyId: string): Promise<BiltyPaidVerificationState> {
+export async function getBiltyPaidVerification(
+  tx: Tx,
+  biltyId: string,
+  // When set, EXCLUDES this one JournalEntry's own Bilty-tagged lines from
+  // the "already verified" sum - used only when EDITING an existing Daily
+  // Posting receipt against the SAME Bilty, so the row's own prior amount
+  // is not double-counted against itself before the new amount is checked
+  // (see assertPaidVerificationNotExceeded below). Never set by Create,
+  // which has no existing row to exclude - its behavior is unchanged.
+  excludeJournalEntryId?: string
+): Promise<BiltyPaidVerificationState> {
   const bilty = await tx.bilty.findUnique({ where: { id: biltyId }, select: { advance: true } });
   const paidAmount = bilty ? round2(Number(bilty.advance)) : 0;
 
@@ -90,6 +100,7 @@ export async function getBiltyPaidVerification(tx: Tx, biltyId: string): Promise
             "PAID_RESPONSIBILITY_REASSIGNMENT",
           ],
         },
+        ...(excludeJournalEntryId ? { id: { not: excludeJournalEntryId } } : {}),
       },
       account: { category: "PARTY" },
     },
@@ -106,7 +117,11 @@ export async function getBiltyPaidVerification(tx: Tx, biltyId: string): Promise
         accountId: { in: [...relevantAccountIds] },
         sourceType: "BILTY",
         sourceId: biltyId,
-        journalEntry: { referenceType: "DAILY_POSTING", isDeleted: false },
+        journalEntry: {
+          referenceType: "DAILY_POSTING",
+          isDeleted: false,
+          ...(excludeJournalEntryId ? { id: { not: excludeJournalEntryId } } : {}),
+        },
       },
       select: { debit: true, credit: true },
     });
@@ -148,7 +163,10 @@ export async function assertPaidVerificationNotExceeded(
   biltyId: string,
   counterAccountId: string,
   amount: number,
-  direction: "DEBIT" | "CREDIT"
+  direction: "DEBIT" | "CREDIT",
+  // See getBiltyPaidVerification() above - only ever set when EDITING an
+  // existing Daily Posting receipt, to exclude its own prior contribution.
+  excludeJournalEntryId?: string
 ): Promise<void> {
   // direction here is the MAIN account's own direction (per Daily
   // Posting's existing convention) - DEBIT means the main account
@@ -157,7 +175,7 @@ export async function assertPaidVerificationNotExceeded(
   // verify a Paid amount.
   if (direction !== "DEBIT") return;
 
-  const state = await getBiltyPaidVerification(tx, biltyId);
+  const state = await getBiltyPaidVerification(tx, biltyId, excludeJournalEntryId);
   if (!state.responsiblePartyAccountId || state.responsiblePartyAccountId !== counterAccountId) return;
 
   if (state.isInconsistent) {

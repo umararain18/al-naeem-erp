@@ -1,7 +1,8 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { DocumentSearchSelect } from "../daily-posting/DocumentSearchSelect";
+import { DocumentSearchSelect, type DocumentSearchResult } from "../daily-posting/DocumentSearchSelect";
+import { SearchableSelect, sourceOptions } from "../daily-posting/SearchableSelect";
 
 type TransactionEntry = {
   id: string;
@@ -38,6 +39,11 @@ export default function TransactionEditModal({
   const [date, setDate] = useState("");
   const [document, setDocument] = useState("");
   const [documentNo, setDocumentNo] = useState("");
+  // Only meaningful for a BILTY/CHALLAN Daily Posting line - the real
+  // Bilty/Challan id backing document/documentNo. Cleared whenever the
+  // user picks a different Document Type or a different document, and
+  // re-set by DocumentSearchSelect's onSelect below.
+  const [sourceId, setSourceId] = useState("");
   const [description, setDescription] = useState("");
   const [debit, setDebit] = useState("0");
   const [credit, setCredit] = useState("0");
@@ -58,6 +64,7 @@ export default function TransactionEditModal({
 setDate(entry.date || "");
     setDocument(entry.document || "");
     setDocumentNo(entry.documentNo || "");
+    setSourceId(entry.sourceId || "");
     setDescription(entry.description || "");
     setDebit(String(entry.debit ?? 0));
     setCredit(String(entry.credit ?? 0));
@@ -117,6 +124,7 @@ setDate(entry.date || "");
             date,
             document,
             documentNo,
+            sourceId,
             description,
             debit: debitAmount,
             credit: creditAmount,
@@ -168,16 +176,18 @@ setDate(entry.date || "");
 
   // Only a Daily Posting transaction (app/daily-posting/register/page.tsx)
   // reaches this modal with a document-aware source (BILTY/CHALLAN linked
-  // to a real record) or a DIRECT entry with no document at all. Every
-  // other Cash Book row (referenceType e.g. SETTLEMENT, or none) keeps
-  // today's exact free-text Document/Document No. fields below, fully
-  // unchanged. See lib/document-party-resolution.ts's sibling concern:
-  // the linked Bilty/Challan's responsible party must never be silently
-  // changed - locking the field here is the safe way to guarantee that,
-  // since PATCH /api/cash-book/{id} has no mechanism to re-resolve a
-  // reassigned document's counter account.
+  // to a real record) or a DIRECT/PARTY/PHONCH/BILL entry. Every other
+  // Cash Book row (referenceType e.g. SETTLEMENT, or none) keeps today's
+  // exact free-text Document/Document No. fields below, fully unchanged.
+  // For a Daily Posting row, Document/Document No. are now fully
+  // editable using the SAME components and validation as the Daily
+  // Posting Create form (see lib/daily-posting-validation.ts and
+  // PATCH /api/cash-book/[id]/route.ts's isDailyPosting branch, which
+  // re-resolves and re-validates the Counter Account exactly like a
+  // brand-new posting whenever the document actually changes).
   const isDailyPosting = entry.referenceType === "DAILY_POSTING";
   const isSearchableDocument = isDailyPosting && (document === "BILTY" || document === "CHALLAN");
+  const isDirectDocument = isDailyPosting && document === "DIRECT";
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
@@ -260,9 +270,20 @@ setDate(entry.date || "");
               </label>
 
               {isDailyPosting ? (
-                <p className="rounded-lg border bg-gray-50 px-3 py-2 text-sm text-gray-700">
-                  {document}
-                </p>
+                <SearchableSelect
+                  value={document}
+                  options={sourceOptions}
+                  placeholder="Search document..."
+                  onChange={(value) => {
+                    setDocument(value);
+                    // A different Document Type has no relationship to
+                    // whatever was previously selected - clear the
+                    // number/id so the user must pick again, exactly
+                    // like Create's own Document Type change handler.
+                    setDocumentNo("");
+                    setSourceId("");
+                  }}
+                />
               ) : (
                 <input
                   type="text"
@@ -283,16 +304,26 @@ setDate(entry.date || "");
               {isSearchableDocument ? (
                 <DocumentSearchSelect
                   sourceType={document}
-                  sourceId={entry.sourceId || ""}
+                  sourceId={sourceId}
                   sourceNumber={documentNo}
-                  onSelect={() => {}}
-                  onClear={() => {}}
-                  readOnly
+                  onSelect={(result: DocumentSearchResult) => {
+                    setDocument(result.type);
+                    setDocumentNo(result.number);
+                    setSourceId(result.id);
+                  }}
+                  onClear={() => {
+                    setDocumentNo("");
+                    setSourceId("");
+                  }}
                 />
-              ) : isDailyPosting ? (
-                <p className="rounded-lg border bg-gray-50 px-3 py-2 text-sm text-gray-700">
-                  {documentNo || "Not required"}
-                </p>
+              ) : isDirectDocument ? (
+                <input
+                  type="text"
+                  value=""
+                  disabled
+                  placeholder="Not required"
+                  className="w-full rounded-lg border px-3 py-2 text-sm outline-none disabled:bg-gray-100"
+                />
               ) : (
                 <input
                   type="text"
@@ -300,6 +331,7 @@ setDate(entry.date || "");
                   onChange={(e) =>
                     setDocumentNo(e.target.value)
                   }
+                  placeholder={isDailyPosting ? "e.g. 4252" : undefined}
                   className="w-full rounded-lg border px-3 py-2 text-sm outline-none focus:border-blue-500"
                 />
               )}
@@ -309,7 +341,7 @@ setDate(entry.date || "");
 
           {isDailyPosting && (
             <p className="-mt-3 text-xs text-gray-500">
-              The linked document cannot be reassigned when editing a posted Daily Posting transaction.
+              Changing the document re-validates this transaction using the same rules as a new Daily Posting entry (e.g. the Paid-amount verification ceiling).
             </p>
           )}
 

@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
@@ -8,6 +9,16 @@ import {
   isOlderThanBinThreshold,
   isLinkedToSettledDocument,
 } from "@/lib/cash-bank-bin-policy";
+import {
+  DAILY_POSTING_SOURCE_TYPES,
+  DailyPostingValidationError,
+  resolveDailyPostingLine,
+  type DailyPostingSourceType,
+} from "@/lib/daily-posting-validation";
+import {
+  assertPaidVerificationNotExceeded,
+  BiltyPaidVerificationError,
+} from "@/lib/bilty-paid-verification";
 
 function isValidDate(value: string) {
   const date = new Date(`${value}T00:00:00`);
@@ -77,6 +88,13 @@ export async function PATCH(
       date,
       document,
       documentNo,
+      // Only meaningful for a BILTY/CHALLAN Daily Posting line - the real
+      // database id of the document the user selected via
+      // DocumentSearchSelect (never trusted blindly; re-verified below by
+      // resolveDailyPostingLine -> verifyDailyPostingDocument, exactly
+      // like a brand-new Daily Posting submission). Absent/ignored for
+      // every other row.
+      sourceId: requestedSourceId,
       description,
       debit,
       credit,
@@ -227,23 +245,20 @@ export async function PATCH(
     const counterLine = counterLines[0];
 
     // ============================================================
-    // DOCUMENT LOCK (Daily Posting only)
+    // DAILY POSTING: FULL BUSINESS VALIDATION, SAME AS CREATE
     //
     // A Daily Posting transaction's Document/Document No. identify a
-    // real, already-validated Bilty/Challan (or DIRECT, meaning no
-    // document) - see app/daily-posting/register/page.tsx and
-    // TransactionEditModal.tsx, where this field is rendered read-only
-    // for exactly this reason. That is a UI-only guard; this server
-    // route is the actual authority, so it must refuse the change here
-    // too, regardless of what any client (UI, direct API call, retry)
-    // sends - the client-supplied document/documentNo are simply
-    // IGNORED for a Daily Posting line, and the line's own existing
-    // sourceType/sourceNumber are always kept as-is. This prevents the
-    // linked document from ever being silently reassigned or
-    // corrupted (e.g. into an arbitrary, non-existent document
-    // number) through this endpoint. Every other Cash Book row
-    // (referenceType e.g. SETTLEMENT, or none) is completely
-    // unaffected - its existing free-text behavior below is unchanged.
+    // real Bilty/Challan (or DIRECT, meaning no document). Editing it
+    // is treated as EXACTLY the same business operation as posting a
+    // brand-new Daily Posting line (see lib/daily-posting-validation.ts,
+    // extracted from POST /api/daily-posting's own per-line logic) -
+    // the only difference is that this ONE existing JournalEntry is
+    // replaced in place rather than a new one being created, and its
+    // OWN prior contribution is excluded before re-checking guards like
+    // the Paid-verification ceiling (lib/bilty-paid-verification.ts).
+    // Every other Cash Book row (referenceType e.g. SETTLEMENT, or
+    // none) is completely unaffected - its existing free-text
+    // document/documentNo behavior below is unchanged.
     // ============================================================
 
     const isDailyPosting = currentLine.journalEntry.referenceType === "DAILY_POSTING";
@@ -262,8 +277,176 @@ export async function PATCH(
     const counterCredit =
       newDebit;
 
+    if (isDailyPosting) {
+      const requestedSourceType =
+        typeof document === "string" && document.trim()
+          ? document.trim()
+          : currentLine.sourceType || "DIRECT";
+
+      if (!DAILY_POSTING_SOURCE_TYPES.includes(requestedSourceType as DailyPostingSourceType)) {
+        return NextResponse.json(
+          { success: false, message: "Invalid document type" },
+          { status: 400 }
+        );
+      }
+
+      if (requestedSourceType === "CHALLAN" && !hasPermission(currentUser, "challan.view")) {
+        return NextResponse.json({ success: false, message: "Forbidden" }, { status: 403 });
+      }
+      if (requestedSourceType === "BILTY" && !hasPermission(currentUser, "bilty.view")) {
+        return NextResponse.json({ success: false, message: "Forbidden" }, { status: 403 });
+      }
+
+      try {
+        const updatedEntry = await prisma.$transaction(
+          async (tx) => {
+            const finalSourceType: DailyPostingSourceType = requestedSourceType as DailyPostingSourceType;
+            let finalSourceId: string | null = currentLine.sourceId;
+            let finalSourceNumber: string | null = currentLine.sourceNumber;
+            let finalCounterAccountId = counterLine.accountId;
+
+            if (finalSourceType === "DIRECT") {
+              finalSourceId = null;
+              finalSourceNumber = null;
+              // Counter account reassignment is not supported here -
+              // same restriction already applied to the Main account.
+            } else if (finalSourceType === "CHALLAN" || finalSourceType === "BILTY") {
+              const requestedId =
+                typeof requestedSourceId === "string" && requestedSourceId.trim()
+                  ? requestedSourceId.trim()
+                  : undefined;
+
+              const effectiveSourceId =
+                requestedId ||
+                (finalSourceType === currentLine.sourceType ? currentLine.sourceId || undefined : undefined);
+
+              if (!effectiveSourceId) {
+                throw new DailyPostingValidationError("Source ID is required for document-linked entries");
+              }
+
+              // Same document (same type + same id) as before this edit?
+              // Only then is the EXISTING Counter Account re-validated as
+              // a manually-supplied one (never silently re-resolved away
+              // from a party that was already fine). A genuinely changed
+              // document has no existing Counter Account to fall back to
+              // and must auto-resolve, exactly like a brand-new posting
+              // with none supplied.
+              const documentUnchanged =
+                finalSourceType === currentLine.sourceType && effectiveSourceId === currentLine.sourceId;
+
+              const resolved = await resolveDailyPostingLine({
+                tx,
+                mainAccountId: currentLine.accountId,
+                mainCategory: currentLine.account.category,
+                sourceType: finalSourceType,
+                sourceId: effectiveSourceId,
+                sourceNumber: typeof documentNo === "string" ? documentNo.trim() : undefined,
+                counterAccountId: documentUnchanged ? counterLine.accountId : undefined,
+              });
+
+              finalSourceId = resolved.sourceId;
+              finalSourceNumber = resolved.sourceNumber;
+              finalCounterAccountId = resolved.counterAccountId;
+            } else {
+              // PARTY / PHONCH / BILL / ACCOUNT - free text, exactly like
+              // Create's own lack of search-based validation for these
+              // types. Counter account is not reassigned.
+              finalSourceId = null;
+              finalSourceNumber =
+                typeof documentNo === "string" ? documentNo.trim() || null : currentLine.sourceNumber;
+            }
+
+            // PAID VERIFICATION CEILING - the entry's OWN prior
+            // contribution is excluded (see
+            // lib/bilty-paid-verification.ts's excludeJournalEntryId),
+            // so only the NEW amount is checked against the Bilty's
+            // truly remaining unverified Paid amount - never additive
+            // against the old value being replaced.
+            if (finalSourceType === "BILTY" && finalSourceId) {
+              const mainDirection: "DEBIT" | "CREDIT" = newDebit > 0 ? "DEBIT" : "CREDIT";
+              const mainAmount = newDebit > 0 ? newDebit : newCredit;
+              await assertPaidVerificationNotExceeded(
+                tx,
+                finalSourceId,
+                finalCounterAccountId,
+                mainAmount,
+                mainDirection,
+                currentLine.journalEntryId
+              );
+            }
+
+            const updatedJournalEntry = await tx.journalEntry.update({
+              where: { id: currentLine.journalEntryId },
+              data: {
+                entryDate: new Date(`${date}T00:00:00`),
+                description: description?.trim() || currentLine.journalEntry.description,
+              },
+            });
+
+            await tx.journalLine.update({
+              where: { id: currentLine.id },
+              data: {
+                description: description?.trim() || null,
+                debit: newDebit,
+                credit: newCredit,
+                sourceType: finalSourceType,
+                sourceId: finalSourceId,
+                sourceNumber: finalSourceNumber,
+              },
+            });
+
+            await tx.journalLine.update({
+              where: { id: counterLine.id },
+              data: {
+                accountId: finalCounterAccountId,
+                description: description?.trim() || null,
+                debit: counterDebit,
+                credit: counterCredit,
+                sourceType: finalSourceType,
+                sourceId: finalSourceId,
+                sourceNumber: finalSourceNumber,
+              },
+            });
+
+            return updatedJournalEntry;
+          },
+          { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+        );
+
+        return NextResponse.json({
+          success: true,
+          message: "Transaction updated successfully",
+          journalEntryId: updatedEntry.id,
+        });
+      } catch (error) {
+        if (error instanceof DailyPostingValidationError) {
+          return NextResponse.json(
+            { success: false, message: error.message },
+            { status: error.status }
+          );
+        }
+        if (error instanceof BiltyPaidVerificationError) {
+          return NextResponse.json(
+            { success: false, code: error.code, message: error.message },
+            { status: 400 }
+          );
+        }
+        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2034") {
+          return NextResponse.json(
+            {
+              success: false,
+              message: "Another Daily Posting change for the same Bilty/Challan happened at the same time. Please retry.",
+            },
+            { status: 409 }
+          );
+        }
+        throw error;
+      }
+    }
+
     // ============================================================
-    // UPDATE BOTH SIDES ATOMICALLY
+    // UPDATE BOTH SIDES ATOMICALLY (non-Daily-Posting rows only -
+    // unchanged free-text Document/Document No. behavior)
     // ============================================================
 
     const updatedEntry =
@@ -300,16 +483,14 @@ export async function PATCH(
 
               credit: newCredit,
 
-              sourceType: isDailyPosting
-                ? currentLine.sourceType
-                : typeof document === "string" &&
-                    document.trim()
+              sourceType:
+                typeof document === "string" &&
+                document.trim()
                   ? document.trim()
                   : currentLine.sourceType,
 
-              sourceNumber: isDailyPosting
-                ? currentLine.sourceNumber
-                : typeof documentNo === "string"
+              sourceNumber:
+                typeof documentNo === "string"
                   ? documentNo.trim() || null
                   : currentLine.sourceNumber,
             },
@@ -329,16 +510,14 @@ export async function PATCH(
 
               credit: counterCredit,
 
-              sourceType: isDailyPosting
-                ? counterLine.sourceType
-                : typeof document === "string" &&
-                    document.trim()
+              sourceType:
+                typeof document === "string" &&
+                document.trim()
                   ? document.trim()
                   : counterLine.sourceType,
 
-              sourceNumber: isDailyPosting
-                ? counterLine.sourceNumber
-                : typeof documentNo === "string"
+              sourceNumber:
+                typeof documentNo === "string"
                   ? documentNo.trim() || null
                   : counterLine.sourceNumber,
             },
