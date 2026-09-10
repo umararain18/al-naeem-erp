@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { DocumentSearchSelect } from "../daily-posting/DocumentSearchSelect";
 
 type TransactionEntry = {
   id: string;
@@ -15,6 +16,12 @@ type TransactionEntry = {
   journalEntryId: string;
   referenceType: string | null;
   referenceId: string | null;
+  // Only present for a Daily Posting transaction (see
+  // app/daily-posting/register/page.tsx) - the authoritative Bilty/
+  // Challan id behind `document`/`documentNo`, used ONLY to render the
+  // already-linked document as a recognized, read-only selection below.
+  // Absent for plain Cash Book rows, which are unaffected by this field.
+  sourceId?: string | null;
 };
 
 type TransactionEditModalProps = {
@@ -159,6 +166,19 @@ setDate(entry.date || "");
     return null;
   }
 
+  // Only a Daily Posting transaction (app/daily-posting/register/page.tsx)
+  // reaches this modal with a document-aware source (BILTY/CHALLAN linked
+  // to a real record) or a DIRECT entry with no document at all. Every
+  // other Cash Book row (referenceType e.g. SETTLEMENT, or none) keeps
+  // today's exact free-text Document/Document No. fields below, fully
+  // unchanged. See lib/document-party-resolution.ts's sibling concern:
+  // the linked Bilty/Challan's responsible party must never be silently
+  // changed - locking the field here is the safe way to guarantee that,
+  // since PATCH /api/cash-book/{id} has no mechanism to re-resolve a
+  // reassigned document's counter account.
+  const isDailyPosting = entry.referenceType === "DAILY_POSTING";
+  const isSearchableDocument = isDailyPosting && (document === "BILTY" || document === "CHALLAN");
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
       <div className="w-full max-w-xl rounded-xl bg-white shadow-xl">
@@ -239,14 +259,20 @@ setDate(entry.date || "");
                 Document
               </label>
 
-              <input
-                type="text"
-                value={document}
-                onChange={(e) =>
-                  setDocument(e.target.value)
-                }
-                className="w-full rounded-lg border px-3 py-2 text-sm outline-none focus:border-blue-500"
-              />
+              {isDailyPosting ? (
+                <p className="rounded-lg border bg-gray-50 px-3 py-2 text-sm text-gray-700">
+                  {document}
+                </p>
+              ) : (
+                <input
+                  type="text"
+                  value={document}
+                  onChange={(e) =>
+                    setDocument(e.target.value)
+                  }
+                  className="w-full rounded-lg border px-3 py-2 text-sm outline-none focus:border-blue-500"
+                />
+              )}
             </div>
 
             <div>
@@ -254,17 +280,38 @@ setDate(entry.date || "");
                 Document No.
               </label>
 
-              <input
-                type="text"
-                value={documentNo}
-                onChange={(e) =>
-                  setDocumentNo(e.target.value)
-                }
-                className="w-full rounded-lg border px-3 py-2 text-sm outline-none focus:border-blue-500"
-              />
+              {isSearchableDocument ? (
+                <DocumentSearchSelect
+                  sourceType={document}
+                  sourceId={entry.sourceId || ""}
+                  sourceNumber={documentNo}
+                  onSelect={() => {}}
+                  onClear={() => {}}
+                  readOnly
+                />
+              ) : isDailyPosting ? (
+                <p className="rounded-lg border bg-gray-50 px-3 py-2 text-sm text-gray-700">
+                  {documentNo || "Not required"}
+                </p>
+              ) : (
+                <input
+                  type="text"
+                  value={documentNo}
+                  onChange={(e) =>
+                    setDocumentNo(e.target.value)
+                  }
+                  className="w-full rounded-lg border px-3 py-2 text-sm outline-none focus:border-blue-500"
+                />
+              )}
             </div>
 
           </div>
+
+          {isDailyPosting && (
+            <p className="-mt-3 text-xs text-gray-500">
+              The linked document cannot be reassigned when editing a posted Daily Posting transaction.
+            </p>
+          )}
 
           {/* Description */}
           <div>

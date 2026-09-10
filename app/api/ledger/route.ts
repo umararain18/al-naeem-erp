@@ -171,6 +171,13 @@ export async function GET(request: NextRequest) {
     const totalDebit = normalizedEntries.reduce((sum, entry) => sum + entry.debit, 0);
     const totalCredit = normalizedEntries.reduce((sum, entry) => sum + entry.credit, 0);
 
+    // Normal ERP screen: newest -> oldest. The running balance above
+    // is calculated chronologically (oldest -> newest) since each
+    // row's balance depends on every prior one - only the FINISHED
+    // array is reversed for display; each entry's own `balance`
+    // value is unaffected by this reversal.
+    const displayEntries = [...normalizedEntries].reverse();
+
     let openingBalance = 0;
 
     if (Object.keys(dateFilter).length > 0 && from) {
@@ -208,7 +215,7 @@ export async function GET(request: NextRequest) {
         category: selectedAccount.category,
         party: selectedAccount.party,
       },
-      entries: normalizedEntries,
+      entries: displayEntries,
       summary: {
         openingBalance,
         totalDebit,

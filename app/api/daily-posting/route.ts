@@ -186,9 +186,10 @@ export async function GET(request: NextRequest) {
         },
       },
 
-      orderBy: {
-        entryDate: "desc",
-      },
+      orderBy: [
+        { entryDate: "desc" },
+        { createdAt: "desc" },
+      ],
     });
 
     return NextResponse.json({

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";import TransactionViewModal from "./TransactionViewModal"; import TransactionEditModal from "./TransactionEditModal";
+import { useEffect, useMemo, useState } from "react";import { useRouter } from "next/navigation"; import TransactionViewModal from "./TransactionViewModal"; import TransactionEditModal from "./TransactionEditModal";
 
 type Account = {
   id: string;
@@ -78,6 +78,8 @@ function formatDate(date: string) {
 }
 
 export default function CashBookPage() {
+  const router = useRouter();
+
   const [accounts, setAccounts] = useState<Account[]>([]);
 
   const [selectedAccountId, setSelectedAccountId] =
@@ -376,6 +378,18 @@ export default function CashBookPage() {
       );
     }
   }
+  /*
+   * Daily Posting rows get their View/Edit/Move-to-Bin actions
+   * routed to the dedicated Daily Posting date register instead of
+   * the generic Cash Book modals/Bin call - see Step 12. Every OTHER
+   * referenceType (SETTLEMENT, etc.) keeps today's exact existing
+   * behavior below, unchanged.
+   */
+  function openDailyPostingRegister(entry: CashBookEntry) {
+    const params = new URLSearchParams({ date: entry.date, highlight: entry.journalEntryId });
+    router.push(`/daily-posting/register?${params.toString()}`);
+  }
+
   async function handleDelete(entry: CashBookEntry) {
   const confirmed = window.confirm(
     "Move this complete Journal Entry to Bin?\n\nAll of its journal lines will be excluded from normal accounting. This is not permanent deletion."
@@ -909,7 +923,10 @@ export default function CashBookPage() {
                                         <button
   type="button"
   onClick={() => {
-    console.log("VIEW CLICKED", entry);
+    if (entry.referenceType === "DAILY_POSTING") {
+      openDailyPostingRegister(entry);
+      return;
+    }
     setSelectedEntry(entry);
   }}
   className="rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-gray-50"
@@ -921,7 +938,10 @@ export default function CashBookPage() {
                                         <button
   type="button"
   onClick={() => {
-    console.log("EDIT CLICKED", entry);
+    if (entry.referenceType === "DAILY_POSTING") {
+      openDailyPostingRegister(entry);
+      return;
+    }
     setEditEntry(entry);
   }}
   className="rounded-md border border-blue-200 px-3 py-1.5 text-xs font-medium text-blue-600 hover:bg-blue-50"
@@ -938,7 +958,10 @@ export default function CashBookPage() {
                                         <button
   type="button"
   onClick={() => {
-  console.log("DELETE CLICKED", entry);
+  if (entry.referenceType === "DAILY_POSTING") {
+    openDailyPostingRegister(entry);
+    return;
+  }
   handleDelete(entry);
 }}
   className="rounded-md border border-red-200 px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50"

@@ -97,7 +97,10 @@ export async function GET(request: NextRequest) {
           orderBy: { addedAt: "asc" },
         },
       },
-      orderBy: { loadingDate: "desc" },
+      orderBy: [
+        { loadingDate: "desc" },
+        { createdAt: "desc" },
+      ],
     });
 
     const financialsMap = await computeChallanFinancialsBatch(

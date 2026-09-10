@@ -67,7 +67,10 @@ export async function GET(
           },
         },
       },
-      orderBy: { journalEntry: { entryDate: "desc" } },
+      orderBy: [
+        { journalEntry: { entryDate: "desc" } },
+        { createdAt: "desc" },
+      ],
     });
 
     const journalLineIds = lines.map((l) => l.id);

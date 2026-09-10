@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { DocumentSearchSelect } from "./DocumentSearchSelect";
 
 type Account = {
   id: string;
@@ -29,15 +31,6 @@ type PostingLine = {
   // Account is empty. The server independently re-resolves at
   // submit time regardless of this value.
   resolvedPartyLabel: string;
-};
-
-type DocumentSearchResult = {
-  type: "CHALLAN" | "BILTY";
-  id: string;
-  number: string;
-  subtitle: string;
-  detail: string;
-  resolvedParty: { accountId: string; partyName: string } | null;
 };
 
 type SearchOption = {
@@ -135,157 +128,6 @@ function SearchableSelect({
   );
 }
 
-function DocumentSearchSelect({
-  sourceType,
-  sourceId,
-  sourceNumber,
-  onSelect,
-  onClear,
-}: {
-  sourceType: string;
-  sourceId: string;
-  sourceNumber: string;
-  onSelect: (result: DocumentSearchResult) => void;
-  onClear: () => void;
-}) {
-  const [query, setQuery] = useState("");
-  const [open, setOpen] = useState(false);
-  const [loading, setLoading] = useState(false);
-  const [results, setResults] = useState<DocumentSearchResult[]>([]);
-
-  useEffect(() => {
-    if (!sourceId) {
-      setQuery("");
-    }
-  }, [sourceId]);
-
-  useEffect(() => {
-    if (!open) return;
-
-    const search = query.trim();
-
-    if (!search) {
-      setResults([]);
-      return;
-    }
-
-    const handle = window.setTimeout(async () => {
-      try {
-        setLoading(true);
-
-        const response = await fetch(
-          `/api/daily-posting/search-documents?q=${encodeURIComponent(search)}`
-        );
-
-        const data = await response.json();
-
-        if (response.ok && data.success) {
-          setResults(data.results || []);
-        }
-      } catch {
-        // silent
-      } finally {
-        setLoading(false);
-      }
-    }, 300);
-
-    return () => window.clearTimeout(handle);
-  }, [query, open]);
-
-  const displayValue = sourceId
-    ? `${sourceType} ${sourceNumber}`
-    : query;
-
-  return (
-    <div className="relative w-56">
-      <input
-        type="text"
-        value={displayValue}
-        placeholder="Search Challan/Bilty no..."
-        onFocus={() => {
-          setOpen(true);
-          if (sourceId) setQuery("");
-        }}
-        onChange={(event) => {
-          setQuery(event.target.value);
-          setOpen(true);
-          if (sourceId) onClear();
-        }}
-        onBlur={() => {
-          window.setTimeout(() => setOpen(false), 150);
-        }}
-        className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
-      />
-
-      {sourceId && (
-        <button
-          type="button"
-          onMouseDown={(event) => {
-            event.preventDefault();
-            onClear();
-            setQuery("");
-          }}
-          className="absolute right-2 top-1/2 -translate-y-1/2 text-xs text-gray-400 hover:text-red-500"
-        >
-          ✕
-        </button>
-      )}
-
-      {open && !sourceId && (
-        <div className="absolute left-0 top-full z-50 mt-1 max-h-72 w-80 overflow-y-auto rounded-lg border border-gray-200 bg-white shadow-xl">
-          {loading && (
-            <div className="px-3 py-3 text-sm text-gray-500">Searching...</div>
-          )}
-
-          {!loading && query.trim() && results.length === 0 && (
-            <div className="px-3 py-3 text-sm text-gray-500">
-              No Challan or Bilty found.
-            </div>
-          )}
-
-          {!loading && !query.trim() && (
-            <div className="px-3 py-3 text-sm text-gray-500">
-              Type a Challan or Bilty number to search.
-            </div>
-          )}
-
-          {results.map((result) => (
-            <button
-              key={`${result.type}-${result.id}`}
-              type="button"
-              onMouseDown={(event) => {
-                event.preventDefault();
-                onSelect(result);
-                setOpen(false);
-              }}
-              className="block w-full border-b border-gray-100 px-3 py-2 text-left text-sm last:border-b-0 hover:bg-blue-50"
-            >
-              <div className="flex items-center gap-2">
-                <span
-                  className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
-                    result.type === "CHALLAN"
-                      ? "bg-purple-100 text-purple-700"
-                      : "bg-teal-100 text-teal-700"
-                  }`}
-                >
-                  {result.type}
-                </span>
-                <span className="font-medium text-gray-900">
-                  {result.number}
-                </span>
-              </div>
-              <div className="mt-0.5 text-xs text-gray-500">
-                {result.subtitle}
-              </div>
-              <div className="text-xs text-gray-400">{result.detail}</div>
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
 const sourceOptions = [
   { value: "DIRECT", label: "Direct Account" },
   { value: "PARTY", label: "Party" },
@@ -340,6 +182,21 @@ export default function DailyPostingPage() {
 
   useEffect(() => {
     loadAccounts();
+  }, []);
+
+  // Arriving from the Daily Posting register's "+ Add Entry" button
+  // (?date=YYYY-MM-DD) starts the form on that same date instead of
+  // today - a pure convenience default, never required. Read
+  // directly from the URL (not next/navigation's useSearchParams),
+  // matching the same one-time-on-mount pattern already used by
+  // app/cash-book/page.tsx, to avoid that hook's Suspense-boundary
+  // requirement.
+  useEffect(() => {
+    const urlDate = new URLSearchParams(window.location.search).get("date");
+    if (urlDate && /^\d{4}-\d{2}-\d{2}$/.test(urlDate)) {
+      setPostingDate(urlDate);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function loadAccounts() {
@@ -607,15 +464,21 @@ export default function DailyPostingPage() {
     <div className="min-h-screen bg-gray-50 p-6">
       <div className="mx-auto max-w-7xl">
         {/* HEADER */}
-        <div className="mb-6">
-          <h1 className="text-2xl font-bold text-gray-900">
-            Daily Posting
-          </h1>
+        <div className="mb-6 flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+          <div>
+            <h1 className="text-2xl font-bold text-gray-900">
+              Daily Posting
+            </h1>
 
-          <p className="mt-1 text-sm text-gray-500">
-            Post daily income, expenses, receipts and
-            payments from one screen.
-          </p>
+            <p className="mt-1 text-sm text-gray-500">
+              Post daily income, expenses, receipts and
+              payments from one screen.
+            </p>
+          </div>
+
+          <Link href="/daily-posting/register" className="rounded-lg border px-4 py-2 text-sm hover:bg-gray-50 whitespace-nowrap">
+            View Daily Register
+          </Link>
         </div>
 
         {/* SUCCESS */}

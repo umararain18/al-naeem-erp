@@ -227,6 +227,28 @@ export async function PATCH(
     const counterLine = counterLines[0];
 
     // ============================================================
+    // DOCUMENT LOCK (Daily Posting only)
+    //
+    // A Daily Posting transaction's Document/Document No. identify a
+    // real, already-validated Bilty/Challan (or DIRECT, meaning no
+    // document) - see app/daily-posting/register/page.tsx and
+    // TransactionEditModal.tsx, where this field is rendered read-only
+    // for exactly this reason. That is a UI-only guard; this server
+    // route is the actual authority, so it must refuse the change here
+    // too, regardless of what any client (UI, direct API call, retry)
+    // sends - the client-supplied document/documentNo are simply
+    // IGNORED for a Daily Posting line, and the line's own existing
+    // sourceType/sourceNumber are always kept as-is. This prevents the
+    // linked document from ever being silently reassigned or
+    // corrupted (e.g. into an arbitrary, non-existent document
+    // number) through this endpoint. Every other Cash Book row
+    // (referenceType e.g. SETTLEMENT, or none) is completely
+    // unaffected - its existing free-text behavior below is unchanged.
+    // ============================================================
+
+    const isDailyPosting = currentLine.journalEntry.referenceType === "DAILY_POSTING";
+
+    // ============================================================
     // NEW VALUES
     // ============================================================
 
@@ -278,14 +300,16 @@ export async function PATCH(
 
               credit: newCredit,
 
-              sourceType:
-                typeof document === "string" &&
-                document.trim()
+              sourceType: isDailyPosting
+                ? currentLine.sourceType
+                : typeof document === "string" &&
+                    document.trim()
                   ? document.trim()
                   : currentLine.sourceType,
 
-              sourceNumber:
-                typeof documentNo === "string"
+              sourceNumber: isDailyPosting
+                ? currentLine.sourceNumber
+                : typeof documentNo === "string"
                   ? documentNo.trim() || null
                   : currentLine.sourceNumber,
             },
@@ -305,14 +329,16 @@ export async function PATCH(
 
               credit: counterCredit,
 
-              sourceType:
-                typeof document === "string" &&
-                document.trim()
+              sourceType: isDailyPosting
+                ? counterLine.sourceType
+                : typeof document === "string" &&
+                    document.trim()
                   ? document.trim()
                   : counterLine.sourceType,
 
-              sourceNumber:
-                typeof documentNo === "string"
+              sourceNumber: isDailyPosting
+                ? counterLine.sourceNumber
+                : typeof documentNo === "string"
                   ? documentNo.trim() || null
                   : counterLine.sourceNumber,
             },

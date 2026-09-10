@@ -66,7 +66,12 @@ export async function GET(
       totalPaid: state.totalPaid,
       remainingDue: state.remainingDue,
       distinctPayerAccountIds: state.distinctPayerAccountIds,
-      rows: state.rows,
+      // Settlement History display: newest -> oldest, like every
+      // other normal ERP list screen. getComponentPaymentState()
+      // itself (lib/settlement-payments.ts, untouched) returns rows
+      // oldest-first for its own internal/calculation use - this
+      // reverses only the array handed back to the client.
+      rows: [...state.rows].reverse(),
     });
   } catch (error) {
     if (error instanceof SettlementPaymentError) {

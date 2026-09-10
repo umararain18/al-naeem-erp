@@ -28,6 +28,7 @@ type Challan = {
   id: string;
   challanNo: string;
   loadingDate: string;
+  createdAt: string;
   status: ChallanStatus;
   transporterParty: { id: string; partyName: string } | null;
   driverName: string | null;
@@ -274,6 +275,8 @@ function clearingAgentSummary(challan: Challan): string {
 // Numeric-aware Challan No. comparator: "4002" sorts before
 // "40010" (unlike plain string comparison). Non-numeric challan
 // numbers sort after numeric ones, alphabetically among themselves.
+// Used only as a deterministic TIEBREAKER below, never as the
+// primary sort key.
 function compareChallanNo(a: Challan, b: Challan): number {
   const aNum = /^\d+$/.test(a.challanNo.trim());
   const bNum = /^\d+$/.test(b.challanNo.trim());
@@ -283,6 +286,17 @@ function compareChallanNo(a: Challan, b: Challan): number {
   }
   if (aNum !== bNum) return aNum ? -1 : 1;
   return a.challanNo.localeCompare(b.challanNo);
+}
+
+// Normal ERP list ordering: newest -> oldest by loadingDate, then
+// createdAt, then Challan No. as a final deterministic tiebreaker -
+// never left to unspecified/database-default order.
+function compareChallanNewestFirst(a: Challan, b: Challan): number {
+  const dateDiff = new Date(b.loadingDate).getTime() - new Date(a.loadingDate).getTime();
+  if (dateDiff !== 0) return dateDiff;
+  const createdDiff = new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+  if (createdDiff !== 0) return createdDiff;
+  return -compareChallanNo(a, b);
 }
 
 // Combines a payer breakdown that may span several Bilties (the
@@ -473,7 +487,7 @@ export default function ChallanPage() {
       );
     });
 
-    return [...filtered].sort(compareChallanNo);
+    return [...filtered].sort(compareChallanNewestFirst);
   }, [challans, search, statusFilter, financialFilter, dateFrom, dateTo]);
 
   const summary = useMemo(() => {

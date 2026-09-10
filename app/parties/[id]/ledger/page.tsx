@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { t, loadStoredLang, storeLang, type Lang } from "@/lib/i18n/party-ledger";
 import { notoNastaliqUrdu } from "@/lib/fonts";
@@ -12,20 +12,27 @@ import StatementView from "./StatementView";
 
 type PartyType = "TRANSPORTER" | "CLEARING_AGENT" | "CUSTOMER" | "VENDOR";
 
+type LedgerHistoryItem = {
+  date: string;
+  referenceType: string | null;
+  description: string;
+  debit: number;
+  credit: number;
+};
+
 type LedgerEntry = {
   id: string;
   date: string;
-  journalEntryId: string;
-  referenceType: string | null;
-  referenceId: string | null;
-  sourceType: string | null;
-  sourceId: string | null;
-  sourceNumber: string | null;
+  reference: string;
+  referenceHref: string | null;
   description: string;
   debit: number;
   credit: number;
   balance: number;
   balanceType: "RECEIVABLE" | "PAYABLE" | "SETTLED";
+  isGrouped: boolean;
+  isRemoved: boolean;
+  history: LedgerHistoryItem[];
 };
 
 type Party = {
@@ -75,59 +82,237 @@ function formatDate(value: string) {
   }).format(new Date(value));
 }
 
-// ============================================================
-// LEDGER ROW -> SOURCE DESTINATION (unchanged from the existing,
-// already-tested drill-down logic - see Test 1 regression)
-// ============================================================
-
-const REFERENCE_LABELS: Record<string, string> = {
-  BILTY_BOOKING: "Bilty Booking",
-  BILTY_BOOKING_CORRECTION: "Bilty Correction",
-  CHALLAN_DISPATCH: "Challan Dispatch",
-  CHALLAN_DISPATCH_CORRECTION: "Challan Correction",
-  SETTLEMENT: "Settlement",
-  SETTLEMENT_CORRECTION: "Settlement Correction",
-  DAILY_POSTING: "Daily Posting",
-  OPENING_BALANCE: "Opening Balance",
-};
-
-function friendlyReferenceLabel(referenceType: string | null) {
-  if (!referenceType) return "Direct Entry";
-  return REFERENCE_LABELS[referenceType] || referenceType;
-}
-
-function resolveLedgerDestination(entry: LedgerEntry): { href: string; label: string } {
-  const refLabel = friendlyReferenceLabel(entry.referenceType);
-
-  if (entry.sourceType === "CHALLAN" && entry.sourceId) {
-    return { href: `/challan/${entry.sourceId}`, label: `${refLabel} - Challan ${entry.sourceNumber || entry.sourceId}` };
-  }
-  if (entry.sourceType === "BILTY" && entry.sourceId) {
-    return { href: `/bilty/${entry.sourceId}`, label: `${refLabel} - Bilty ${entry.sourceNumber || entry.sourceId}` };
-  }
-
-  if (
-    (entry.referenceType === "BILTY_BOOKING" || entry.referenceType === "BILTY_BOOKING_CORRECTION") &&
-    entry.referenceId
-  ) {
-    return { href: `/bilty/${entry.referenceId}`, label: refLabel };
-  }
-  if (
-    (entry.referenceType === "CHALLAN_DISPATCH" ||
-      entry.referenceType === "CHALLAN_DISPATCH_CORRECTION" ||
-      entry.referenceType === "SETTLEMENT" ||
-      entry.referenceType === "SETTLEMENT_CORRECTION") &&
-    entry.referenceId
-  ) {
-    return { href: `/challan/${entry.referenceId}`, label: refLabel };
-  }
-
-  return { href: `/accounting-transactions/${entry.journalEntryId}`, label: refLabel };
-}
-
 type ViewKey = "ledger" | "summary" | "documents" | "outstanding" | "payments" | "reconciliation" | "statement";
 
 const VIEW_KEYS: ViewKey[] = ["ledger", "summary", "documents", "outstanding", "payments", "reconciliation", "statement"];
+
+type TxType = "ALL" | "BILTY" | "CHALLAN" | "OTHER";
+
+function txType(entry: LedgerEntry): Exclude<TxType, "ALL"> {
+  if (entry.reference.startsWith("Bilty")) return "BILTY";
+  if (entry.reference.startsWith("Challan")) return "CHALLAN";
+  return "OTHER";
+}
+
+function LedgerTable({
+  partyId,
+  ledger,
+  lang,
+  from,
+  to,
+  setFrom,
+  setTo,
+}: {
+  partyId: string;
+  ledger: LedgerEntry[];
+  lang: Lang;
+  from: string;
+  to: string;
+  setFrom: (v: string) => void;
+  setTo: (v: string) => void;
+}) {
+  const [search, setSearch] = useState("");
+  const [typeFilter, setTypeFilter] = useState<TxType>("ALL");
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+
+  function toggleExpanded(id: string) {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return ledger.filter((entry) => {
+      if (typeFilter !== "ALL" && txType(entry) !== typeFilter) return false;
+      if (!q) return true;
+      return entry.reference.toLowerCase().includes(q) || entry.description.toLowerCase().includes(q);
+    });
+  }, [ledger, search, typeFilter]);
+
+  const exportQuery = new URLSearchParams({ ...(from ? { from } : {}), ...(to ? { to } : {}) }).toString();
+
+  return (
+    <>
+      {/* Filters */}
+      <div className="bg-white rounded-xl shadow-sm p-4 mb-6">
+        <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search reference or description..."
+            className="border rounded-lg px-3 py-2 text-sm md:col-span-2"
+          />
+          <select
+            value={typeFilter}
+            onChange={(e) => setTypeFilter(e.target.value as TxType)}
+            className="border rounded-lg px-3 py-2 text-sm"
+          >
+            <option value="ALL">All Types</option>
+            <option value="BILTY">Bilty</option>
+            <option value="CHALLAN">Challan</option>
+            <option value="OTHER">Other</option>
+          </select>
+          <input
+            type="date"
+            value={from}
+            onChange={(e) => setFrom(e.target.value)}
+            className="border rounded-lg px-3 py-2 text-sm"
+            placeholder="From"
+          />
+          <input
+            type="date"
+            value={to}
+            onChange={(e) => setTo(e.target.value)}
+            className="border rounded-lg px-3 py-2 text-sm"
+            placeholder="To"
+          />
+        </div>
+        <div className="flex justify-end mt-3 gap-2">
+          <a
+            href={`/api/parties/${partyId}/ledger/pdf?${exportQuery}`}
+            target="_blank"
+            rel="noreferrer"
+            className="border rounded-lg px-4 py-2 text-sm hover:bg-gray-50 bg-blue-600 text-white border-blue-600"
+          >
+            Export PDF
+          </a>
+          <a
+            href={`/api/parties/${partyId}/ledger/excel?${exportQuery}`}
+            className="border rounded-lg px-4 py-2 text-sm hover:bg-gray-50"
+          >
+            Export Excel
+          </a>
+          <button
+            type="button"
+            onClick={() => {
+              setSearch("");
+              setTypeFilter("ALL");
+              setFrom("");
+              setTo("");
+            }}
+            className="border rounded-lg px-4 py-2 text-sm hover:bg-gray-50"
+          >
+            {t("reset", lang)}
+          </button>
+        </div>
+      </div>
+
+      {/* Ledger Table */}
+      <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+        {filtered.length === 0 ? (
+          <div className="p-10 text-center text-gray-500">{t("noData", lang)}</div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="bg-gray-50 text-left text-xs uppercase text-gray-500">
+                <tr>
+                  <th className="px-4 py-3">{t("date", lang)}</th>
+                  <th className="px-4 py-3">{t("source", lang)}</th>
+                  <th className="px-4 py-3">{t("description", lang)}</th>
+                  <th className="px-4 py-3 text-right">{t("debit", lang)}</th>
+                  <th className="px-4 py-3 text-right">{t("credit", lang)}</th>
+                  <th className="px-4 py-3 text-right">{t("balance", lang)}</th>
+                  <th className="px-4 py-3"></th>
+                </tr>
+              </thead>
+              <tbody className="divide-y">
+                {filtered.map((entry) => {
+                  const isExpanded = expanded.has(entry.id);
+                  const hasHistory = entry.history.length > 1 || entry.isRemoved;
+
+                  return (
+                    <Fragment key={entry.id}>
+                      <tr className="hover:bg-gray-50">
+                        <td className="px-4 py-3">{formatDate(entry.date)}</td>
+                        <td className="px-4 py-3">
+                          {entry.referenceHref ? (
+                            <Link href={entry.referenceHref} className="text-blue-600 hover:underline" title="View source document">
+                              {entry.reference}
+                            </Link>
+                          ) : (
+                            entry.reference
+                          )}
+                        </td>
+                        <td className="px-4 py-3">
+                          {entry.description || "—"}
+                          {entry.isRemoved && (
+                            <span className="ml-2 text-xs text-gray-400 italic">(removed)</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-right">{entry.debit > 0 ? formatCurrency(entry.debit) : "—"}</td>
+                        <td className="px-4 py-3 text-right">{entry.credit > 0 ? formatCurrency(entry.credit) : "—"}</td>
+                        <td className="px-4 py-3 text-right">
+                          <span
+                            className={
+                              entry.balanceType === "RECEIVABLE"
+                                ? "text-green-600"
+                                : entry.balanceType === "PAYABLE"
+                                  ? "text-red-600"
+                                  : ""
+                            }
+                          >
+                            {formatCurrency(entry.balance)}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 text-right">
+                          {hasHistory && (
+                            <button
+                              type="button"
+                              onClick={() => toggleExpanded(entry.id)}
+                              className="text-xs border rounded-lg px-2 py-1 hover:bg-gray-50 text-gray-600"
+                            >
+                              {isExpanded ? "Hide history" : "View history"}
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                      {isExpanded && hasHistory && (
+                        <tr className="bg-gray-50">
+                          <td colSpan={7} className="px-4 py-3">
+                            <div className="text-xs text-gray-500 mb-2">
+                              Revision history ({entry.history.length} {entry.history.length === 1 ? "entry" : "entries"}):
+                            </div>
+                            <table className="w-full text-xs border rounded-lg overflow-hidden">
+                              <thead className="bg-white text-gray-500">
+                                <tr>
+                                  <th className="px-3 py-2 text-left">{t("date", lang)}</th>
+                                  <th className="px-3 py-2 text-left">Type</th>
+                                  <th className="px-3 py-2 text-left">{t("description", lang)}</th>
+                                  <th className="px-3 py-2 text-right">{t("debit", lang)}</th>
+                                  <th className="px-3 py-2 text-right">{t("credit", lang)}</th>
+                                </tr>
+                              </thead>
+                              <tbody className="divide-y bg-white">
+                                {entry.history.map((h, i) => (
+                                  <tr key={i}>
+                                    <td className="px-3 py-2">{formatDate(h.date)}</td>
+                                    <td className="px-3 py-2 text-gray-500">{h.referenceType || "Direct Entry"}</td>
+                                    <td className="px-3 py-2">{h.description}</td>
+                                    <td className="px-3 py-2 text-right">{h.debit > 0 ? formatCurrency(h.debit) : "—"}</td>
+                                    <td className="px-3 py-2 text-right">{h.credit > 0 ? formatCurrency(h.credit) : "—"}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
 
 export default function PartyLedgerPage({
   params,
@@ -354,93 +539,7 @@ export default function PartyLedgerPage({
         </div>
 
         {view === "ledger" && (
-          <>
-            {/* Filters */}
-            <div className="bg-white rounded-xl shadow-sm p-4 mb-6">
-              <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
-                <input
-                  type="date"
-                  value={from}
-                  onChange={(e) => setFrom(e.target.value)}
-                  className="border rounded-lg px-3 py-2 text-sm"
-                  placeholder="From"
-                />
-                <input
-                  type="date"
-                  value={to}
-                  onChange={(e) => setTo(e.target.value)}
-                  className="border rounded-lg px-3 py-2 text-sm"
-                  placeholder="To"
-                />
-                <div className="md:col-span-2 flex justify-end gap-2">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setFrom("");
-                      setTo("");
-                    }}
-                    className="border rounded-lg px-4 py-2 text-sm hover:bg-gray-50"
-                  >
-                    {t("reset", lang)}
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            {/* Ledger Table */}
-            <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-              {ledger.length === 0 ? (
-                <div className="p-10 text-center text-gray-500">{t("noData", lang)}</div>
-              ) : (
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm">
-                    <thead className="bg-gray-50 text-left text-xs uppercase text-gray-500">
-                      <tr>
-                        <th className="px-4 py-3">{t("date", lang)}</th>
-                        <th className="px-4 py-3">{t("source", lang)}</th>
-                        <th className="px-4 py-3">{t("description", lang)}</th>
-                        <th className="px-4 py-3 text-right">{t("debit", lang)}</th>
-                        <th className="px-4 py-3 text-right">{t("credit", lang)}</th>
-                        <th className="px-4 py-3 text-right">{t("balance", lang)}</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y">
-                      {ledger.map((entry) => {
-                        const destination = resolveLedgerDestination(entry);
-
-                        return (
-                          <tr key={entry.id} className="hover:bg-gray-50">
-                            <td className="px-4 py-3">{formatDate(entry.date)}</td>
-                            <td className="px-4 py-3">
-                              <Link
-                                href={destination.href}
-                                className="text-blue-600 hover:underline"
-                                title="View source document"
-                              >
-                                {destination.label}
-                              </Link>
-                            </td>
-                            <td className="px-4 py-3">{entry.description || "—"}</td>
-                            <td className="px-4 py-3 text-right">
-                              {entry.debit > 0 ? formatCurrency(entry.debit) : "—"}
-                            </td>
-                            <td className="px-4 py-3 text-right">
-                              {entry.credit > 0 ? formatCurrency(entry.credit) : "—"}
-                            </td>
-                            <td className="px-4 py-3 text-right">
-                              <span className={entry.balanceType === "RECEIVABLE" ? "text-green-600" : entry.balanceType === "PAYABLE" ? "text-red-600" : ""}>
-                                {formatCurrency(entry.balance)}
-                              </span>
-                            </td>
-                          </tr>
-                        );
-                      })}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </div>
-          </>
+          <LedgerTable partyId={partyId} ledger={ledger} lang={lang} from={from} to={to} setFrom={setFrom} setTo={setTo} />
         )}
 
         {view === "summary" && <SummaryView partyId={partyId} lang={lang} />}

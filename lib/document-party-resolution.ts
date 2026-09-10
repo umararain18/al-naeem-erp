@@ -40,6 +40,7 @@ async function resolveBiltyParty(biltyId: string): Promise<ResolvedDocumentParty
   const bilty = await prisma.bilty.findUnique({
     where: { id: biltyId },
     select: {
+      toPay: true,
       clearingAgentParty: {
         select: {
           partyName: true,
@@ -132,7 +133,21 @@ async function resolveBiltyParty(biltyId: string): Promise<ResolvedDocumentParty
   // fallback must not manufacture one merely because the field is
   // populated (this previously caused a false ambiguity against a
   // real, established Paid attribution - see the Step 2 hotfix audit).
-  if (!collectionResult && activeChallan && bilty.clearingAgentParty?.account?.id && bilty.clearingAgentParty.account.isActive) {
+  //
+  // ALSO requires Bilty.toPay > 0 - a fully (or now fully) Paid
+  // Bilty has nothing left to collect, so the Clearing Agent is not
+  // a real Collection destination for it either, regardless of the
+  // Challan being active. Without this check, a Paid Bilty on an
+  // active Challan manufactured a false Collection destination that
+  // collided with the genuinely-resolved Paid-responsible party
+  // below and forced an unnecessary manual Counter Account selection.
+  if (
+    !collectionResult &&
+    activeChallan &&
+    Number(bilty.toPay) > 0 &&
+    bilty.clearingAgentParty?.account?.id &&
+    bilty.clearingAgentParty.account.isActive
+  ) {
     collectionResult = {
       accountId: bilty.clearingAgentParty.account.id,
       partyName: bilty.clearingAgentParty.partyName,
