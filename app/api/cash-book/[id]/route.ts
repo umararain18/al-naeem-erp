@@ -263,6 +263,20 @@ export async function PATCH(
 
     const isDailyPosting = currentLine.journalEntry.referenceType === "DAILY_POSTING";
 
+    // Manual Journal is v1 "never document-linked" (see
+    // lib/manual-journal-validation.ts / app/api/journal-entries/route.ts -
+    // its lines are created with sourceType/sourceId/sourceNumber all
+    // null, always). The generic branch below otherwise lets the
+    // free-text `document`/`documentNo` fields overwrite a line's
+    // sourceType/sourceNumber with no validation - fine for the
+    // referenceTypes that already have their own free-text document
+    // convention (e.g. SETTLEMENT), but it must NOT apply to a Manual
+    // Journal line, or Cash Book editing could silently put an
+    // arbitrary document type/number onto it. sourceId is never
+    // touched by the generic branch already, so only sourceType/
+    // sourceNumber need gating here.
+    const isManualJournal = currentLine.journalEntry.referenceType === "MANUAL_JOURNAL";
+
     // ============================================================
     // NEW VALUES
     // ============================================================
@@ -484,13 +498,14 @@ export async function PATCH(
               credit: newCredit,
 
               sourceType:
+                !isManualJournal &&
                 typeof document === "string" &&
                 document.trim()
                   ? document.trim()
                   : currentLine.sourceType,
 
               sourceNumber:
-                typeof documentNo === "string"
+                !isManualJournal && typeof documentNo === "string"
                   ? documentNo.trim() || null
                   : currentLine.sourceNumber,
             },
@@ -511,13 +526,14 @@ export async function PATCH(
               credit: counterCredit,
 
               sourceType:
+                !isManualJournal &&
                 typeof document === "string" &&
                 document.trim()
                   ? document.trim()
                   : counterLine.sourceType,
 
               sourceNumber:
-                typeof documentNo === "string"
+                !isManualJournal && typeof documentNo === "string"
                   ? documentNo.trim() || null
                   : counterLine.sourceNumber,
             },
