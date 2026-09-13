@@ -64,6 +64,16 @@ const REFERENCE_LABELS: Record<string, string> = {
   CHALLAN_DISPATCH_CORRECTION: "Challan Correction",
   SETTLEMENT: "Settlement",
   SETTLEMENT_CORRECTION: "Settlement Correction",
+  // Live multi-payer Final Settlement mechanism (lib/settlement-payments.ts) -
+  // previously missing here, so any of these fell through to the raw
+  // referenceType string below (REFERENCE_LABELS[x] || x).
+  SETTLEMENT_PAYMENT: "Settlement Payment",
+  SETTLEMENT_PAYMENT_CORRECTION: "Settlement Payment Correction",
+  SETTLEMENT_PAYMENT_REVERSAL: "Settlement Payment Reversal",
+  PAID_RESPONSIBILITY_REASSIGNMENT: "Paid Responsibility",
+  COLLECTION_MULTI_PAYER_TRANSITION: "Collection Transition",
+  CARRIER_RENT_MULTI_PAYER_TRANSITION: "Carrier Rent Transition",
+  PHONCH: "Phonch",
   DAILY_POSTING: "Daily Posting",
   OPENING_BALANCE: "Opening Balance",
   MANUAL_JOURNAL: "Manual Journal Entry",

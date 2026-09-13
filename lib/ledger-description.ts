@@ -108,7 +108,31 @@ const SIMPLE_REFERENCE_LABELS: Record<string, string> = {
   CHALLAN_DISPATCH_CORRECTION: "Challan Correction",
   OPENING_BALANCE: "Opening Balance",
   PAID_RESPONSIBILITY_REASSIGNMENT: "Paid Responsibility",
+  // Live multi-payer Final Settlement mechanism (lib/settlement-payments.ts)
+  // and the old single-payer mechanism (lib/settlement-accounting.ts /
+  // lib/settlement-correction.ts) - previously fell through to the raw
+  // referenceType string below when the combined net wasn't provably
+  // zero (see extractHousekeepingNoise() above), which is a real,
+  // everyday occurrence for any party involved in a Final Settlement.
+  SETTLEMENT: "Settlement",
+  SETTLEMENT_CORRECTION: "Settlement Correction",
+  SETTLEMENT_PAYMENT: "Settlement Payment",
+  SETTLEMENT_PAYMENT_CORRECTION: "Settlement Payment Correction",
+  SETTLEMENT_PAYMENT_REVERSAL: "Settlement Payment Reversal",
+  COLLECTION_MULTI_PAYER_TRANSITION: "Collection Transition",
+  CARRIER_RENT_MULTI_PAYER_TRANSITION: "Carrier Rent Transition",
 };
+
+/** Business-readable label for a raw JournalEntry.referenceType -
+ * never the raw enum value itself. Used both for the main Source/
+ * Reference column's fallback (line 638-ish below) and for each
+ * row's own Revision History "Type" column (toHistoryItem()),
+ * so a technical value like "SETTLEMENT_PAYMENT_CORRECTION" is never
+ * shown to a normal user in either place. */
+function friendlyReferenceTypeLabel(referenceType: string | null): string {
+  if (!referenceType) return "Direct Entry";
+  return SIMPLE_REFERENCE_LABELS[referenceType] || referenceType;
+}
 
 /**
  * "Received"/"Paid" wording, oriented the same way the existing
@@ -314,7 +338,7 @@ function extractHousekeepingNoise(lines: RawLedgerLine[]): { remaining: RawLedge
 function toHistoryItem(line: RawLedgerLine): DisplayHistoryItem {
   return {
     date: line.entryDate.toISOString(),
-    referenceType: line.referenceType,
+    referenceType: friendlyReferenceTypeLabel(line.referenceType),
     description: line.lineDescription || line.entryDescription || "—",
     debit: line.debit,
     credit: line.credit,
