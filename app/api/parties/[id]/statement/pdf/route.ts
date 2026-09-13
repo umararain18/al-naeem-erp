@@ -4,6 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { getPartyDocumentStates } from "@/lib/payment-allocation";
+import { getPartyLedgerData } from "@/lib/ledger-description";
 
 // ============================================================
 // GET /api/parties/[id]/statement/pdf?from=&to=
@@ -55,35 +56,17 @@ export async function GET(
       return NextResponse.json({ success: false, message: "Party not found" }, { status: 404 });
     }
 
-    // Same ledger summary the on-screen Ledger/Statement views use -
-    // never recomputed here.
-    const dateFilter: { gte?: Date; lt?: Date } = {};
-    if (from) dateFilter.gte = new Date(`${from}T00:00:00`);
-    if (to) {
-      const end = new Date(`${to}T00:00:00`);
-      end.setDate(end.getDate() + 1);
-      dateFilter.lt = end;
-    }
-
-    const entries = await prisma.journalLine.findMany({
-      where: {
-        accountId: party.account.id,
-        journalEntry: { is: { isDeleted: false, ...(Object.keys(dateFilter).length ? { entryDate: dateFilter } : {}) } },
-      },
-      select: { debit: true, credit: true },
-    });
-    const periodDebit = entries.reduce((s, e) => s + Number(e.debit), 0);
-    const periodCredit = entries.reduce((s, e) => s + Number(e.credit), 0);
-
-    let openingBalance = 0;
-    if (from) {
-      const openingLines = await prisma.journalLine.findMany({
-        where: { accountId: party.account.id, journalEntry: { is: { isDeleted: false, entryDate: { lt: new Date(`${from}T00:00:00`) } } } },
-        select: { debit: true, credit: true },
-      });
-      openingBalance = openingLines.reduce((s, l) => s + Number(l.debit) - Number(l.credit), 0);
-    }
-    const closingBalance = openingBalance + periodDebit - periodCredit;
+    // Authoritative Party Ledger summary - the exact same
+    // getPartyLedgerData() the browser Party Ledger screen and the
+    // Party Ledger PDF/Excel exports already use (lib/ledger-description.ts),
+    // never a second, independently maintained recomputation. Only
+    // `summary` is used here - the per-line `ledger` rows are not,
+    // since this Statement's "Transaction Details" section below is a
+    // document-level (Bilty) summary via getPartyDocumentStates(), a
+    // genuinely different, Statement-specific view that
+    // getPartyLedgerData() does not produce.
+    const { summary } = await getPartyLedgerData(partyId, { from, to, order: "asc" });
+    const { openingBalance, periodDebit, periodCredit, closingBalance } = summary;
 
     // Same document set the Summary/Statement view already shows -
     // via the same lib/payment-allocation.ts helper.
