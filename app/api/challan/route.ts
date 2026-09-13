@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
+import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
@@ -8,6 +9,23 @@ import { computeChallanFinancialsBatch } from "@/lib/challan-financials";
 import { getGrossCarrierRentPayableAccountId } from "@/lib/gross-accounts";
 import { getChallanResponsiblePartiesBatch } from "@/lib/document-party-resolution";
 import { computeChallanSettlementSummaryBatch } from "@/lib/challan-settlement-summary";
+import { SettlementPaymentError } from "@/lib/settlement-payments";
+
+// Re-check status codes for the in-transaction Bilty-availability
+// re-validation below (POST) - kept separate from the pre-transaction
+// check's own inline NextResponse statuses since these fire from
+// inside the Serializable transaction and must be mapped after it
+// resolves. See the comment at that re-check for why it exists.
+function biltyRecheckStatus(code: string): number {
+  switch (code) {
+    case "BILTIES_NOT_FOUND":
+      return 404;
+    case "BILTY_ALREADY_ASSIGNED":
+      return 409;
+    default:
+      return 400;
+  }
+}
 
 const createChallanSchema = z.object({
   challanNo: z
@@ -282,7 +300,57 @@ export async function POST(request: NextRequest) {
       carrierRentExpenseAccountId = carrierRentAccount.id;
     }
 
-    const challan = await prisma.$transaction(async (tx) => {
+    let challan;
+    try {
+      challan = await prisma.$transaction(async (tx) => {
+      // Re-check every Bilty's availability INSIDE this SERIALIZABLE
+      // transaction, on the same snapshot the writes below will use.
+      // The pre-check above (lines ~201-249) only protects against a
+      // Bilty that was already unavailable at the time of THAT read -
+      // it cannot protect against a second, truly concurrent
+      // POST /api/challan request racing this one for the SAME Bilty.
+      // Under SERIALIZABLE, if both transactions read here before
+      // either commits, Postgres aborts one with a serialization
+      // failure (caught below as P2034 -> 409); if one has already
+      // committed by the time this one reads, this explicit re-check
+      // catches it directly instead of silently double-dispatching
+      // the same Bilty onto two active Challans.
+      const freshBilties = await tx.bilty.findMany({
+        where: { id: { in: data.biltyIds } },
+        include: {
+          challanBilties: {
+            include: {
+              challan: true,
+            },
+          },
+        },
+      });
+
+      if (freshBilties.length !== data.biltyIds.length) {
+        throw new SettlementPaymentError("BILTIES_NOT_FOUND", "One or more bilties not found");
+      }
+
+      for (const bilty of freshBilties) {
+        if (bilty.isDeleted) {
+          throw new SettlementPaymentError("BILTY_DELETED", `Bilty ${bilty.biltyNo} is deleted`);
+        }
+
+        if (bilty.status !== "PENDING") {
+          throw new SettlementPaymentError("BILTY_NOT_PENDING", `Bilty ${bilty.biltyNo} is not pending`);
+        }
+
+        const activeChallan = bilty.challanBilties.find(
+          (cb) => cb.challan && !cb.challan.isDeleted
+        );
+
+        if (activeChallan) {
+          throw new SettlementPaymentError(
+            "BILTY_ALREADY_ASSIGNED",
+            `Bilty ${bilty.biltyNo} is already assigned to challan ${activeChallan.challan.challanNo}`
+          );
+        }
+      }
+
       const createdChallan = await tx.challan.create({
         data: {
           challanNo: data.challanNo,
@@ -360,7 +428,22 @@ export async function POST(request: NextRequest) {
       }
 
       return createdChallan;
-    });
+      }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
+    } catch (txError) {
+      if (txError instanceof SettlementPaymentError) {
+        return NextResponse.json(
+          { success: false, message: txError.message },
+          { status: biltyRecheckStatus(txError.code) }
+        );
+      }
+      if (txError instanceof Prisma.PrismaClientKnownRequestError && txError.code === "P2034") {
+        return NextResponse.json(
+          { success: false, message: "This Challan could not be created due to a concurrent change. Please retry." },
+          { status: 409 }
+        );
+      }
+      throw txError;
+    }
 
     return NextResponse.json({
       success: true,
