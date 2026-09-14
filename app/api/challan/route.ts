@@ -154,6 +154,14 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({
       success: true,
       items,
+      // Matches the exact permission DELETE /api/challan/[id] (the
+      // Bin action) already enforces - lets the list page hide the
+      // Delete button for a role the backend would reject anyway,
+      // the same capabilities-flag pattern app/api/employees/route.ts
+      // already uses.
+      capabilities: {
+        canBin: hasPermission(currentUser, "challan.bin"),
+      },
     });
   } catch (error) {
     console.error("List challans error:", error);

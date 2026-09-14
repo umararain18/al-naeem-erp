@@ -22,6 +22,9 @@ export type Permission =
   | "challan.create"
   | "challan.edit"
   | "challan.delete"
+  | "challan.bin"
+  | "challan.restore"
+  | "challan.permanentlyDelete"
   | "accounts.view"
   | "accounts.create"
   | "accounts.edit"
@@ -63,6 +66,9 @@ const permissions: Record<AuthUser["role"], Permission[]> = {
     "challan.create",
     "challan.edit",
     "challan.delete",
+    "challan.bin",
+    "challan.restore",
+    "challan.permanentlyDelete",
 
     "accounts.view",
     "accounts.create",
@@ -101,6 +107,8 @@ const permissions: Record<AuthUser["role"], Permission[]> = {
     "challan.view",
     "challan.create",
     "challan.edit",
+    "challan.bin",
+    "challan.restore",
 
     "accounts.view",
     "accounts.create",

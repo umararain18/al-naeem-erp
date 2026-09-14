@@ -401,6 +401,7 @@ function SettlementDetails({ challan }: { challan: Challan }) {
 
 export default function ChallanPage() {
   const [challans, setChallans] = useState<Challan[]>([]);
+  const [capabilities, setCapabilities] = useState({ canBin: false });
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
@@ -515,6 +516,7 @@ export default function ChallanPage() {
         return;
       }
       setChallans(data.items || []);
+      setCapabilities(data.capabilities || { canBin: false });
     } catch {
       setError("Unable to connect to the server");
     } finally {
@@ -1170,14 +1172,16 @@ export default function ChallanPage() {
                                   Settle
                                 </Link>
                               )}
-                              <button
-                                type="button"
-                                disabled={actionLoading === challan.id}
-                                onClick={() => deleteChallan(challan)}
-                                className="border border-red-300 text-red-600 rounded-lg px-3 py-1 text-xs hover:bg-red-50 disabled:opacity-50"
-                              >
-                                Delete
-                              </button>
+                              {capabilities.canBin && (
+                                <button
+                                  type="button"
+                                  disabled={actionLoading === challan.id}
+                                  onClick={() => deleteChallan(challan)}
+                                  className="border border-red-300 text-red-600 rounded-lg px-3 py-1 text-xs hover:bg-red-50 disabled:opacity-50"
+                                >
+                                  Delete
+                                </button>
+                              )}
                             </div>
                           </td>
                         </tr>
