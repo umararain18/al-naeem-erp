@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { usePathname } from "next/navigation";
 import Link from "next/link";
+import { hasPermission as checkPermission, type Permission } from "@/lib/permissions";
 import {
   LayoutDashboard,
   FileText,
@@ -179,45 +180,23 @@ const navigation: { section: string; items: NavItem[] }[] = [
   },
 ];
 
+// Delegates to the single authoritative role->permission map in
+// lib/permissions.ts (previously a second, hand-maintained copy of
+// the exact same data lived here - the two had already drifted from
+// each other's edits: this map hardcoded "challan.bin"/"challan.binView"/
+// "challan.restore"/"challan.permanentlyDelete" as loosely-typed
+// strings even though lib/permissions.ts's own Permission union did
+// not yet define them, a drift TypeScript could not catch here since
+// this map was Record<string, string[]>, not Permission[]). Nav-item
+// visibility is UI convenience only; the real enforcement is the
+// same lib/permissions.ts hasPermission() every API route already
+// calls, unaffected by this. userId is never threaded down to this
+// component (see app/layout.tsx's <AppSidebar user={...}> call) and
+// is never read by hasPermission() - only user.role is.
 function hasPermission(user: User | null, permission?: string): boolean {
   if (!permission) return true;
   if (!user) return false;
-  
-  const permissions: Record<string, string[]> = {
-    SUPER_ADMIN: [
-      "users.view", "users.create", "users.edit", "users.delete",
-      "bilty.view", "bilty.create", "bilty.edit", "bilty.delete", "bilty.bin", "bilty.binView", "bilty.restore", "bilty.permanentlyDelete",
-      "parties.view", "parties.create", "parties.edit", "parties.delete",
-      "challan.view", "challan.create", "challan.edit", "challan.delete", "challan.bin", "challan.binView", "challan.restore", "challan.permanentlyDelete",
-      "accounts.view", "accounts.create", "accounts.edit", "accounts.delete",
-      "reports.view", "reports.export",
-      "settings.view", "settings.edit",
-      "accountingTransactions.view", "accountingTransactions.bin", "accountingTransactions.binView", "accountingTransactions.restore", "accountingTransactions.permanentlyDelete",
-      "bin.view",
-    ],
-    MANAGER: [
-      "users.view",
-      "bilty.view", "bilty.create", "bilty.edit", "bilty.bin", "bilty.binView", "bilty.restore",
-      "parties.view", "parties.create", "parties.edit",
-      "challan.view", "challan.create", "challan.edit", "challan.bin", "challan.binView", "challan.restore",
-      "accounts.view", "accounts.create", "accounts.edit",
-      "reports.view", "reports.export",
-      "settings.view",
-      "accountingTransactions.view", "accountingTransactions.bin", "accountingTransactions.binView", "accountingTransactions.restore",
-      "bin.view",
-    ],
-    VIEWER: [
-      "bilty.view",
-      "challan.view",
-      "accounts.view",
-      "parties.view",
-      "accountingTransactions.view",
-      "reports.view",
-      "reports.export",
-    ],
-  };
-
-  return permissions[user.role]?.includes(permission) ?? false;
+  return checkPermission({ userId: "", username: user.username, role: user.role }, permission as Permission);
 }
 
 export default function AppSidebar({ user }: { user: User | null }) {
