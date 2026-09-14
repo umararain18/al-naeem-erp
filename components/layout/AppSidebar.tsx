@@ -21,6 +21,7 @@ import {
   Menu,
   X,
   ChevronLeft,
+  Briefcase,
 } from "lucide-react";
 
 type User = {
@@ -123,6 +124,13 @@ const navigation: { section: string; items: NavItem[] }[] = [
         icon: FileSpreadsheet,
         permission: "accounts.view",
         match: (pathname) => pathname === "/journal-entries" || pathname.startsWith("/journal-entries/"),
+      },
+      {
+        label: "Employees & Payroll",
+        href: "/employees",
+        icon: Briefcase,
+        permission: "employees.view",
+        match: (pathname) => pathname === "/employees" || pathname.startsWith("/employees/"),
       },
     ],
   },

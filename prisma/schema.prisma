@@ -28,6 +28,10 @@ model User {
   deletedChallans       Challan[]      @relation("ChallanDeletedBy")
   settledChallans       Challan[]      @relation("ChallanSettledBy")
   createdSettlementPayments SettlementPayment[] @relation("SettlementPaymentCreatedBy")
+  createdEmployees          Employee[]          @relation("EmployeeCreatedBy")
+  deletedEmployees          Employee[]          @relation("EmployeeDeletedBy")
+  createdPayslips           Payslip[]           @relation("PayslipCreatedBy")
+  deletedPayslips           Payslip[]           @relation("PayslipDeletedBy")
 }
 
 model Party {
@@ -54,6 +58,81 @@ model Party {
   transporterChallans  Challan[]    @relation("ChallanTransporterParty")
 }
 
+// ============================================================
+// EMPLOYEES & PAYROLL (Step 16)
+//
+// Deliberately NOT a Party - Employee is its own first-class
+// accounting relationship (per the approved design), with its own
+// 1:1 Account (category EMPLOYEE_PAYABLE, mirroring exactly how
+// Party gets its own 1:1 Account via Account.partyId). This keeps
+// Employees fully out of Receivable/Payable (which iterate
+// Party.findMany() only) while still fully participating in
+// General Ledger/Trial Balance/P&L/Cash Book, all of which are
+// already source- and relation-agnostic (sum by accountId/
+// accountType only).
+//
+// Payslip intentionally has NO separate "payment" table and NO
+// direct JournalEntry foreign key - actual payments are ordinary
+// JournalEntry/JournalLine rows tagged JournalLine.sourceType =
+// "PAYSLIP", sourceId = this Payslip's id (the exact same
+// convention already used for Bilty/Challan), so "paid amount" is
+// always DERIVED from the real ledger, never a second, independently
+// stored balance that could drift from it.
+// ============================================================
+
+model Employee {
+  id            String    @id @default(cuid())
+  employeeCode  String    @unique
+  name          String
+  designation   String?
+  phone         String?
+  joiningDate   DateTime?
+  monthlySalary Decimal   @default(0) @db.Decimal(15, 2)
+  isActive      Boolean   @default(true)
+  notes         String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  createdById   String?
+  deletedAt     DateTime?
+  deletedById   String?
+  isDeleted     Boolean   @default(false)
+
+  createdBy User?     @relation("EmployeeCreatedBy", fields: [createdById], references: [id])
+  deletedBy User?     @relation("EmployeeDeletedBy", fields: [deletedById], references: [id])
+  account   Account?
+  payslips  Payslip[]
+
+  @@index([isActive])
+  @@index([isDeleted])
+}
+
+model Payslip {
+  id           String    @id @default(cuid())
+  payslipNo    String    @unique
+  employeeId   String
+  payrollMonth String
+  payDate      DateTime
+  grossPay     Decimal   @db.Decimal(15, 2)
+  deduction    Decimal   @default(0) @db.Decimal(15, 2)
+  netPay       Decimal   @db.Decimal(15, 2)
+  contribution Decimal   @default(0) @db.Decimal(15, 2)
+  notes        String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  createdById  String?
+  deletedAt    DateTime?
+  deletedById  String?
+  isDeleted    Boolean   @default(false)
+
+  employee  Employee @relation(fields: [employeeId], references: [id])
+  createdBy User?    @relation("PayslipCreatedBy", fields: [createdById], references: [id])
+  deletedBy User?    @relation("PayslipDeletedBy", fields: [deletedById], references: [id])
+
+  @@unique([employeeId, payrollMonth])
+  @@index([payrollMonth])
+  @@index([employeeId])
+}
+
 model Account {
   id            String          @id @default(cuid())
   accountName   String
@@ -65,11 +144,13 @@ model Account {
   isActive      Boolean         @default(true)
   parentId      String?
   partyId       String?         @unique
+  employeeId    String?         @unique
   createdAt     DateTime        @default(now())
   updatedAt     DateTime        @updatedAt
   parent        Account?        @relation("AccountHierarchy", fields: [parentId], references: [id], onDelete: Restrict)
   children      Account[]       @relation("AccountHierarchy")
   party         Party?          @relation(fields: [partyId], references: [id])
+  employee      Employee?       @relation(fields: [employeeId], references: [id])
   ledgerEntries JournalLine[]
   settlementPayments SettlementPayment[]
 
@@ -359,6 +440,7 @@ enum AccountCategory {
   TRANSPORTER_PAYABLE
   DELIVERY_POINT_PAYABLE
   VENDOR_PAYABLE
+  EMPLOYEE_PAYABLE
   OTHER_LIABILITY
   OWNER_CAPITAL
   OWNER_DRAWING

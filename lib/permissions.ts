@@ -38,7 +38,10 @@ export type Permission =
   | "accountingTransactions.binView"
   | "accountingTransactions.restore"
   | "accountingTransactions.permanentlyDelete"
-  | "bin.view";
+  | "bin.view"
+  | "employees.view"
+  | "employees.create"
+  | "employees.edit";
 
 const permissions: Record<AuthUser["role"], Permission[]> = {
   SUPER_ADMIN: [
@@ -88,6 +91,10 @@ const permissions: Record<AuthUser["role"], Permission[]> = {
     "accountingTransactions.permanentlyDelete",
 
     "bin.view",
+
+    "employees.view",
+    "employees.create",
+    "employees.edit",
   ],
 
   MANAGER: [
@@ -125,6 +132,10 @@ const permissions: Record<AuthUser["role"], Permission[]> = {
     "accountingTransactions.restore",
 
     "bin.view",
+
+    "employees.view",
+    "employees.create",
+    "employees.edit",
   ],
 
   VIEWER: [
