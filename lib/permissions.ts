@@ -41,7 +41,14 @@ export type Permission =
   | "bin.view"
   | "employees.view"
   | "employees.create"
-  | "employees.edit";
+  | "employees.edit"
+  | "phonch.view"
+  | "phonch.create"
+  | "phonch.edit"
+  | "phonch.bin"
+  | "phonch.binView"
+  | "phonch.restore"
+  | "phonch.permanentlyDelete";
 
 const permissions: Record<AuthUser["role"], Permission[]> = {
   SUPER_ADMIN: [
@@ -95,6 +102,14 @@ const permissions: Record<AuthUser["role"], Permission[]> = {
     "employees.view",
     "employees.create",
     "employees.edit",
+
+    "phonch.view",
+    "phonch.create",
+    "phonch.edit",
+    "phonch.bin",
+    "phonch.binView",
+    "phonch.restore",
+    "phonch.permanentlyDelete",
   ],
 
   MANAGER: [
@@ -136,6 +151,13 @@ const permissions: Record<AuthUser["role"], Permission[]> = {
     "employees.view",
     "employees.create",
     "employees.edit",
+
+    "phonch.view",
+    "phonch.create",
+    "phonch.edit",
+    "phonch.bin",
+    "phonch.binView",
+    "phonch.restore",
   ],
 
   VIEWER: [
@@ -148,6 +170,8 @@ const permissions: Record<AuthUser["role"], Permission[]> = {
 
     "reports.view",
     "reports.export",
+
+    "phonch.view",
   ],
 };
 

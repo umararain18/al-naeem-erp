@@ -186,7 +186,7 @@ setDate(entry.date || "");
   // re-resolves and re-validates the Counter Account exactly like a
   // brand-new posting whenever the document actually changes).
   const isDailyPosting = entry.referenceType === "DAILY_POSTING";
-  const isSearchableDocument = isDailyPosting && (document === "BILTY" || document === "CHALLAN");
+  const isSearchableDocument = isDailyPosting && (document === "BILTY" || document === "CHALLAN" || document === "PHONCH");
   const isDirectDocument = isDailyPosting && document === "DIRECT";
 
   return (

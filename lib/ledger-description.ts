@@ -639,6 +639,17 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
       reference = "Opening Balance";
       referenceHref = null;
       description = line.lineDescription || line.entryDescription || "Opening Balance";
+    } else if (line.referenceType === "PHONCH" && line.referenceId) {
+      // Showroom Phonch / Delivery - the description is fully
+      // pre-composed at creation time (lib/phonch-accounting.ts's
+      // buildPhonchLedgerDescription()) and stored directly as this
+      // line's/entry's own description, exactly like Manual Journal's
+      // narration - no live Bilty/Challan lookup is needed here since
+      // a Phonch's Bilty No./Challan No. are plain manual reference
+      // text, not real relations (see the Phonch schema doc comment).
+      reference = "Phonch";
+      referenceHref = `/phonch/${line.referenceId}`;
+      description = line.lineDescription || line.entryDescription || "—";
     } else if (line.referenceType === "MANUAL_JOURNAL") {
       // Manual Journal Entry (Step 15) - never document-linked (v1),
       // so this is always a Direct-Entry-style row. referenceId holds

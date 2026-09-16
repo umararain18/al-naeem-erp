@@ -231,12 +231,13 @@ export default function DailyPostingPage() {
     }
 
     for (const [index, line] of lines.entries()) {
-      // A Challan/Bilty-linked entry may leave Counter Account
+      // A Challan/Bilty/Phonch-linked entry may leave Counter Account
       // empty - the server resolves the responsible party from the
       // document itself. Every other entry still requires it.
       if (
         line.sourceType !== "CHALLAN" &&
         line.sourceType !== "BILTY" &&
+        line.sourceType !== "PHONCH" &&
         !line.counterAccountId
       ) {
         setError(
@@ -505,7 +506,7 @@ export default function DailyPostingPage() {
                         value={line.counterAccountId}
                         options={counterAccountOptions}
                         placeholder={
-                          line.sourceType === "CHALLAN" || line.sourceType === "BILTY"
+                          line.sourceType === "CHALLAN" || line.sourceType === "BILTY" || line.sourceType === "PHONCH"
                             ? "Optional - auto-resolved from document"
                             : "Search account..."
                         }
@@ -517,14 +518,14 @@ export default function DailyPostingPage() {
                         }}
                         className="w-72"
                       />
-                      {(line.sourceType === "CHALLAN" || line.sourceType === "BILTY") &&
+                      {(line.sourceType === "CHALLAN" || line.sourceType === "BILTY" || line.sourceType === "PHONCH") &&
                         line.sourceId &&
                         line.resolvedPartyLabel && (
                           <p className="mt-1 text-xs text-green-600">
                             Resolved Party: {line.resolvedPartyLabel}
                           </p>
                         )}
-                      {(line.sourceType === "CHALLAN" || line.sourceType === "BILTY") &&
+                      {(line.sourceType === "CHALLAN" || line.sourceType === "BILTY" || line.sourceType === "PHONCH") &&
                         line.sourceId &&
                         !line.resolvedPartyLabel &&
                         !line.counterAccountId && (
@@ -551,7 +552,8 @@ export default function DailyPostingPage() {
 
                     <td className="px-4 py-4">
                       {line.sourceType === "CHALLAN" ||
-                      line.sourceType === "BILTY" ? (
+                      line.sourceType === "BILTY" ||
+                      line.sourceType === "PHONCH" ? (
                         <DocumentSearchSelect
                           sourceType={line.sourceType}
                           sourceId={line.sourceId}

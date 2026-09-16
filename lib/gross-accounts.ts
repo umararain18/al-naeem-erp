@@ -30,9 +30,10 @@ async function getOrCreateSystemAccount(
   tx: Tx,
   accountCode: string,
   accountName: string,
-  accountType: "ASSET" | "LIABILITY",
-  category: "RECEIVABLE" | "TRANSPORTER_PAYABLE" | "OTHER_LIABILITY",
-  description: string
+  accountType: "ASSET" | "LIABILITY" | "INCOME",
+  category: "RECEIVABLE" | "TRANSPORTER_PAYABLE" | "OTHER_LIABILITY" | "DELIVERY_INCOME" | "OTHER_INCOME",
+  description: string,
+  parentId?: string
 ): Promise<string> {
   const existing = await tx.account.findFirst({
     where: { accountCode, isSystem: true },
@@ -50,6 +51,7 @@ async function getOrCreateSystemAccount(
       description,
       isSystem: true,
       isActive: true,
+      ...(parentId ? { parentId } : {}),
     },
     select: { id: true },
   });
@@ -87,5 +89,48 @@ export async function getGrossCommissionPayableAccountId(tx: Tx): Promise<string
     "LIABILITY",
     "OTHER_LIABILITY",
     "System clearing account: full Booking Agent Commission expense is recognized here at Bilty booking time, before Settlement determines the actual responsible party."
+  );
+}
+
+// ============================================================
+// SHOWROOM PHONCH / DELIVERY income accounts
+//
+// Not clearing/suspense accounts (Phonch never reclassifies later,
+// unlike the three above) - these are the actual, final income
+// accounts the Phonch's Transporter Debit is matched against at
+// creation time. "Showroom Delivery Income" is deliberately a child
+// of the existing "Delivery Income" account (business decision:
+// Delivery Charges and Other Expense recovery both post here);
+// Claim recovery is kept on its own separate account. Resolved by
+// accountCode, exactly like the gross accounts above, so this never
+// collides with the parent "Delivery Income" account even though
+// they share the same category.
+// ============================================================
+
+export async function getShowroomDeliveryIncomeAccountId(tx: Tx): Promise<string> {
+  const parent = await tx.account.findFirst({
+    where: { category: "DELIVERY_INCOME", parentId: null },
+    select: { id: true },
+  });
+
+  return getOrCreateSystemAccount(
+    tx,
+    "SHOWROOM-DELIVERY-INCOME",
+    "Showroom Delivery Income",
+    "INCOME",
+    "DELIVERY_INCOME",
+    "Showroom Phonch Delivery Charges and Other Expense recovery income - sub-account of Delivery Income.",
+    parent?.id
+  );
+}
+
+export async function getClaimRecoveryAccountId(tx: Tx): Promise<string> {
+  return getOrCreateSystemAccount(
+    tx,
+    "CLAIM-RECOVERY",
+    "Claim Recovery",
+    "INCOME",
+    "OTHER_INCOME",
+    "Showroom Phonch vehicle damage/claim recovery income, charged to the responsible Transporter."
   );
 }

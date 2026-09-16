@@ -16,7 +16,7 @@ import { resolveDocumentPartyAccount } from "@/lib/document-party-resolution";
 // ============================================================
 
 type DocumentSearchResult = {
-  type: "CHALLAN" | "BILTY";
+  type: "CHALLAN" | "BILTY" | "PHONCH";
   id: string;
   number: string;
   subtitle: string;
@@ -51,6 +51,7 @@ export async function GET(request: NextRequest) {
 
     const canViewChallans = hasPermission(currentUser, "challan.view");
     const canViewBilties = hasPermission(currentUser, "bilty.view");
+    const canViewPhonch = hasPermission(currentUser, "phonch.view");
 
     const results: DocumentSearchResult[] = [];
 
@@ -143,6 +144,37 @@ export async function GET(request: NextRequest) {
           detail: parentChallan
             ? `Customer: ${customer} • Challan: ${parentChallan.challanNo}`
             : `Customer: ${customer}`,
+          resolvedParty,
+        });
+      }
+    }
+
+    if (canViewPhonch) {
+      const phonches = await prisma.phonch.findMany({
+        where: {
+          isDeleted: false,
+          phonchNo: { contains: q, mode: "insensitive" },
+        },
+        select: {
+          id: true,
+          phonchNo: true,
+          carrierNumber: true,
+          transporterParty: { select: { partyName: true } },
+          _count: { select: { vehicles: true } },
+        },
+        orderBy: { date: "desc" },
+        take: 8,
+      });
+
+      for (const phonch of phonches) {
+        const resolvedParty = await resolveDocumentPartyAccount("PHONCH", phonch.id);
+
+        results.push({
+          type: "PHONCH",
+          id: phonch.id,
+          number: phonch.phonchNo,
+          subtitle: `Transporter: ${phonch.transporterParty.partyName}`,
+          detail: `${phonch._count.vehicles} Vehicle(s)${phonch.carrierNumber ? ` • Carrier: ${phonch.carrierNumber}` : ""}`,
           resolvedParty,
         });
       }

@@ -10,7 +10,7 @@
 import { useEffect, useState } from "react";
 
 export type DocumentSearchResult = {
-  type: "CHALLAN" | "BILTY";
+  type: "CHALLAN" | "BILTY" | "PHONCH";
   id: string;
   number: string;
   subtitle: string;

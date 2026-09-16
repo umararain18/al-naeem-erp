@@ -6,6 +6,7 @@ import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { getBiltyLegitimatePartyAccountIds, resolveDocumentPartyAccount } from "@/lib/document-party-resolution";
 import { assertPaidVerificationNotExceeded, BiltyPaidVerificationError } from "@/lib/bilty-paid-verification";
+import { assertPhonchReceiptNotExceeded, PhonchAccountingError } from "@/lib/phonch-accounting";
 
 const lineSchema = z.object({
   // Required for non-document-linked entries; optional for a
@@ -347,11 +348,13 @@ export async function POST(request: NextRequest) {
       }
 
       // Counter account remains REQUIRED for every entry that is
-      // not linked to a Challan/Bilty - only those can auto-resolve
-      // the responsible party from the document itself (see below).
+      // not linked to a Challan/Bilty/Phonch - only those can auto-
+      // resolve the responsible party from the document itself (see
+      // below).
       if (
         line.sourceType !== "CHALLAN" &&
         line.sourceType !== "BILTY" &&
+        line.sourceType !== "PHONCH" &&
         !line.counterAccountId
       ) {
         return NextResponse.json(
@@ -389,6 +392,9 @@ export async function POST(request: NextRequest) {
     const biltyLineEntries = indexedLines.filter(
       ({ line }) => line.sourceType === "BILTY"
     );
+    const phonchLineEntries = indexedLines.filter(
+      ({ line }) => line.sourceType === "PHONCH"
+    );
 
     if (challanLineEntries.length > 0 && !hasPermission(currentUser, "challan.view")) {
       return NextResponse.json(
@@ -404,11 +410,21 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    if (phonchLineEntries.length > 0 && !hasPermission(currentUser, "phonch.view")) {
+      return NextResponse.json(
+        { success: false, message: "Forbidden" },
+        { status: 403 }
+      );
+    }
+
     const challanIds = Array.from(
       new Set(challanLineEntries.map(({ line }) => line.sourceId!))
     );
     const biltyIds = Array.from(
       new Set(biltyLineEntries.map(({ line }) => line.sourceId!))
+    );
+    const phonchIds = Array.from(
+      new Set(phonchLineEntries.map(({ line }) => line.sourceId!))
     );
 
     const linkedChallans = challanIds.length > 0
@@ -425,8 +441,16 @@ export async function POST(request: NextRequest) {
         })
       : [];
 
+    const linkedPhonches = phonchIds.length > 0
+      ? await prisma.phonch.findMany({
+          where: { id: { in: phonchIds }, isDeleted: false },
+          select: { id: true, phonchNo: true },
+        })
+      : [];
+
     const challanNoById = new Map(linkedChallans.map((c) => [c.id, c.challanNo]));
     const biltyNoById = new Map(linkedBilties.map((b) => [b.id, b.biltyNo]));
+    const phonchNoById = new Map(linkedPhonches.map((p) => [p.id, p.phonchNo]));
 
     for (const { line, index } of challanLineEntries) {
       if (!challanNoById.has(line.sourceId!)) {
@@ -446,6 +470,18 @@ export async function POST(request: NextRequest) {
           {
             success: false,
             message: `Selected Bilty was not found in entry ${index + 1}`,
+          },
+          { status: 400 }
+        );
+      }
+    }
+
+    for (const { line, index } of phonchLineEntries) {
+      if (!phonchNoById.has(line.sourceId!)) {
+        return NextResponse.json(
+          {
+            success: false,
+            message: `Selected Phonch was not found in entry ${index + 1}`,
           },
           { status: 400 }
         );
@@ -474,10 +510,10 @@ export async function POST(request: NextRequest) {
         continue;
       }
 
-      // VALIDATE LINES (above) already guarantees only CHALLAN/BILTY
-      // lines can reach here without a counterAccountId.
+      // VALIDATE LINES (above) already guarantees only CHALLAN/BILTY/
+      // PHONCH lines can reach here without a counterAccountId.
       const resolved = await resolveDocumentPartyAccount(
-        line.sourceType as "CHALLAN" | "BILTY",
+        line.sourceType as "CHALLAN" | "BILTY" | "PHONCH",
         line.sourceId!
       );
 
@@ -635,7 +671,7 @@ export async function POST(request: NextRequest) {
 
     const preparedChallanBiltyLines = preparedLines
       .map((line, index) => ({ line, index }))
-      .filter(({ line }) => line.sourceType === "CHALLAN" || line.sourceType === "BILTY");
+      .filter(({ line }) => line.sourceType === "CHALLAN" || line.sourceType === "BILTY" || line.sourceType === "PHONCH");
 
     for (const { line, index } of preparedChallanBiltyLines) {
       const mainCat = mainAccount ? categoryMap[mainAccount.id] : "";
@@ -649,7 +685,7 @@ export async function POST(request: NextRequest) {
         return NextResponse.json(
           {
             success: false,
-            message: `Entry ${index + 1}: Challan/Bilty-linked posting must move money only between a PARTY account and a CASH/BANK account.`,
+            message: `Entry ${index + 1}: Challan/Bilty/Phonch-linked posting must move money only between a PARTY account and a CASH/BANK account.`,
           },
           { status: 400 }
         );
@@ -669,6 +705,12 @@ export async function POST(request: NextRequest) {
         return {
           ...line,
           sourceNumber: biltyNoById.get(line.sourceId!) || line.sourceNumber,
+        };
+      }
+      if (line.sourceType === "PHONCH") {
+        return {
+          ...line,
+          sourceNumber: phonchNoById.get(line.sourceId!) || line.sourceNumber,
         };
       }
       return line;
@@ -693,6 +735,7 @@ export async function POST(request: NextRequest) {
         line.sourceType !== "DIRECT" &&
         line.sourceType !== "CHALLAN" &&
         line.sourceType !== "BILTY" &&
+        line.sourceType !== "PHONCH" &&
         line.sourceId
     );
 
@@ -954,8 +997,12 @@ export async function POST(request: NextRequest) {
         // concurrent Daily Posting for the same Bilty, which is why
         // this transaction is now SERIALIZABLE.
         for (const line of resolvedLines) {
-          if (line.sourceType !== "BILTY" || !line.sourceId) continue;
-          await assertPaidVerificationNotExceeded(tx, line.sourceId, line.counterAccountId, line.amount, line.direction);
+          if (line.sourceType === "BILTY" && line.sourceId) {
+            await assertPaidVerificationNotExceeded(tx, line.sourceId, line.counterAccountId, line.amount, line.direction);
+          }
+          if (line.sourceType === "PHONCH" && line.sourceId) {
+            await assertPhonchReceiptNotExceeded(tx, line.sourceId, line.counterAccountId, line.amount, line.direction);
+          }
         }
 
         const created = [];
@@ -987,6 +1034,13 @@ export async function POST(request: NextRequest) {
       }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
     } catch (error) {
       if (error instanceof BiltyPaidVerificationError) {
+        return NextResponse.json(
+          { success: false, code: error.code, message: error.message },
+          { status: 400 }
+        );
+      }
+
+      if (error instanceof PhonchAccountingError) {
         return NextResponse.json(
           { success: false, code: error.code, message: error.message },
           { status: 400 }

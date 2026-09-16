@@ -19,6 +19,10 @@ import {
   assertPaidVerificationNotExceeded,
   BiltyPaidVerificationError,
 } from "@/lib/bilty-paid-verification";
+import {
+  assertPhonchReceiptNotExceeded,
+  PhonchAccountingError,
+} from "@/lib/phonch-accounting";
 
 function isValidDate(value: string) {
   const date = new Date(`${value}T00:00:00`);
@@ -389,6 +393,22 @@ export async function PATCH(
               );
             }
 
+            // Same ceiling, applied to a Phonch's Total Amount instead
+            // of a Bilty's Paid amount - see lib/phonch-accounting.ts's
+            // assertPhonchReceiptNotExceeded().
+            if (finalSourceType === "PHONCH" && finalSourceId) {
+              const mainDirection: "DEBIT" | "CREDIT" = newDebit > 0 ? "DEBIT" : "CREDIT";
+              const mainAmount = newDebit > 0 ? newDebit : newCredit;
+              await assertPhonchReceiptNotExceeded(
+                tx,
+                finalSourceId,
+                finalCounterAccountId,
+                mainAmount,
+                mainDirection,
+                currentLine.journalEntryId
+              );
+            }
+
             const updatedJournalEntry = await tx.journalEntry.update({
               where: { id: currentLine.journalEntryId },
               data: {
@@ -440,6 +460,12 @@ export async function PATCH(
           );
         }
         if (error instanceof BiltyPaidVerificationError) {
+          return NextResponse.json(
+            { success: false, code: error.code, message: error.message },
+            { status: 400 }
+          );
+        }
+        if (error instanceof PhonchAccountingError) {
           return NextResponse.json(
             { success: false, code: error.code, message: error.message },
             { status: 400 }

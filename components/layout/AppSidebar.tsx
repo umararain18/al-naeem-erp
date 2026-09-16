@@ -22,6 +22,7 @@ import {
   X,
   ChevronLeft,
   Briefcase,
+  Truck,
 } from "lucide-react";
 
 type User = {
@@ -65,6 +66,13 @@ const navigation: { section: string; items: NavItem[] }[] = [
         icon: ClipboardList,
         permission: "challan.view",
         match: (pathname) => pathname === "/challan" || pathname.startsWith("/challan/"),
+      },
+      {
+        label: "Phonch / Delivery",
+        href: "/phonch",
+        icon: Truck,
+        permission: "phonch.view",
+        match: (pathname) => pathname === "/phonch" || pathname.startsWith("/phonch/"),
       },
       {
         label: "Location Master",

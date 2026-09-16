@@ -66,6 +66,7 @@ export function validateDailyPostingLineShape(input: {
   if (
     input.sourceType !== "CHALLAN" &&
     input.sourceType !== "BILTY" &&
+    input.sourceType !== "PHONCH" &&
     !input.counterAccountId
   ) {
     throw new DailyPostingValidationError("Counter account is required");
@@ -79,7 +80,7 @@ export function validateDailyPostingLineShape(input: {
 // ------------------------------------------------------------
 export async function verifyDailyPostingDocument(
   tx: Tx,
-  sourceType: "CHALLAN" | "BILTY",
+  sourceType: "CHALLAN" | "BILTY" | "PHONCH",
   sourceId: string
 ): Promise<{ canonicalNumber: string }> {
   if (sourceType === "CHALLAN") {
@@ -91,6 +92,17 @@ export async function verifyDailyPostingDocument(
       throw new DailyPostingValidationError("Selected Challan was not found");
     }
     return { canonicalNumber: challan.challanNo };
+  }
+
+  if (sourceType === "PHONCH") {
+    const phonch = await tx.phonch.findFirst({
+      where: { id: sourceId, isDeleted: false },
+      select: { phonchNo: true },
+    });
+    if (!phonch) {
+      throw new DailyPostingValidationError("Selected Phonch was not found");
+    }
+    return { canonicalNumber: phonch.phonchNo };
   }
 
   const bilty = await tx.bilty.findFirst({
@@ -118,10 +130,10 @@ export async function resolveCounterAccountForDailyPostingLine(
     return { counterAccountId: manualCounterAccountId, wasManuallySupplied: true };
   }
 
-  // validateDailyPostingLineShape already guarantees only CHALLAN/BILTY
-  // lines can reach here without a counterAccountId.
+  // validateDailyPostingLineShape already guarantees only CHALLAN/BILTY/
+  // PHONCH lines can reach here without a counterAccountId.
   const resolved = await resolveDocumentPartyAccount(
-    sourceType as "CHALLAN" | "BILTY",
+    sourceType as "CHALLAN" | "BILTY" | "PHONCH",
     sourceId!
   );
 
@@ -200,7 +212,7 @@ export function assertPartyCashBankRestriction(
   mainCategory: string,
   counterCategory: string
 ): void {
-  if (sourceType !== "CHALLAN" && sourceType !== "BILTY") return;
+  if (sourceType !== "CHALLAN" && sourceType !== "BILTY" && sourceType !== "PHONCH") return;
 
   const isCashBank = (cat: string) => cat === "CASH" || cat === "BANK";
   const valid =
@@ -251,7 +263,7 @@ export async function resolveDailyPostingLine(
   validateDailyPostingLineShape({ sourceType, sourceId, sourceNumber, counterAccountId });
 
   let canonicalNumber: string | null = sourceNumber || null;
-  if ((sourceType === "CHALLAN" || sourceType === "BILTY") && sourceId) {
+  if ((sourceType === "CHALLAN" || sourceType === "BILTY" || sourceType === "PHONCH") && sourceId) {
     const doc = await verifyDailyPostingDocument(tx, sourceType, sourceId);
     canonicalNumber = doc.canonicalNumber;
   }
@@ -278,7 +290,7 @@ export async function resolveDailyPostingLine(
     counterAccountId: resolvedCounterId,
     counterAccount,
     sourceType,
-    sourceId: (sourceType === "CHALLAN" || sourceType === "BILTY") ? sourceId || null : null,
+    sourceId: (sourceType === "CHALLAN" || sourceType === "BILTY" || sourceType === "PHONCH") ? sourceId || null : null,
     sourceNumber: canonicalNumber,
   };
 }

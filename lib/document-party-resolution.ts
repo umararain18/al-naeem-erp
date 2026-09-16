@@ -273,11 +273,33 @@ async function resolveChallanParty(challanId: string): Promise<ResolvedDocumentP
 }
 
 export async function resolveDocumentPartyAccount(
-  sourceType: "CHALLAN" | "BILTY",
+  sourceType: "CHALLAN" | "BILTY" | "PHONCH",
   sourceId: string
 ): Promise<ResolvedDocumentParty | null> {
   if (sourceType === "BILTY") return resolveBiltyParty(sourceId);
+  if (sourceType === "PHONCH") return resolvePhonchParty(sourceId);
   return resolveChallanParty(sourceId);
+}
+
+// ============================================================
+// PHONCH -> TRANSPORTER (unambiguous - a Phonch has exactly one,
+// always-required Transporter field, unlike Bilty/Challan's
+// multi-party fallback chains above).
+// ============================================================
+
+async function resolvePhonchParty(phonchId: string): Promise<ResolvedDocumentParty | null> {
+  const phonch = await prisma.phonch.findUnique({
+    where: { id: phonchId },
+    select: {
+      transporterParty: {
+        select: { partyName: true, account: { select: { id: true, isActive: true } } },
+      },
+    },
+  });
+
+  if (!phonch || !phonch.transporterParty.account || !phonch.transporterParty.account.isActive) return null;
+
+  return { accountId: phonch.transporterParty.account.id, partyName: phonch.transporterParty.partyName };
 }
 
 // ============================================================
