@@ -4,7 +4,6 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
-import { ChallanStatus } from "@prisma/client";
 import { computeChallanFinancialsBatch } from "@/lib/challan-financials";
 import { getGrossCarrierRentPayableAccountId } from "@/lib/gross-accounts";
 import { getChallanResponsiblePartiesBatch } from "@/lib/document-party-resolution";
@@ -72,7 +71,7 @@ const createChallanSchema = z.object({
     .min(1, "At least one bilty is required"),
 });
 
-export async function GET(request: NextRequest) {
+export async function GET() {
   try {
     const currentUser = await getCurrentUser();
 
@@ -261,7 +260,7 @@ export async function POST(request: NextRequest) {
       }
 
       const activeChallan = bilty.challanBilties.find(
-        (cb: any) => cb.challan && !cb.challan.isDeleted
+        (cb) => cb.challan && !cb.challan.isDeleted
       );
 
       if (activeChallan) {

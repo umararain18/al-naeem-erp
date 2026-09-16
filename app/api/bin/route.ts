@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
@@ -132,7 +133,7 @@ export async function GET(request: NextRequest) {
 
     // Challans
     if (type === "ALL" || type === "CHALLAN") {
-      const challanWhere: any = {
+      const challanWhere: Prisma.ChallanWhereInput = {
         isDeleted: true,
         ...(Object.keys(deletedAt).length > 0 ? { deletedAt } : {}),
       };
@@ -176,7 +177,7 @@ export async function GET(request: NextRequest) {
 
     // Journal Entries
     if (type === "ALL" || type === "JOURNAL_ENTRY" || type === "DAILY_POSTING") {
-      const journalWhere: any = {
+      const journalWhere: Prisma.JournalEntryWhereInput = {
         isDeleted: true,
         ...(Object.keys(deletedAt).length > 0 ? { deletedAt } : {}),
       };

@@ -1,7 +1,6 @@
 import { prisma } from "@/lib/prisma";
 import { getBiltyPaidVerification } from "@/lib/bilty-paid-verification";
 import {
-  findSettledPartyAccountId,
   getSettledPartyAccountIdsBatch,
   getComponentNetAmount,
   SETTLEMENT_NET_REFERENCE_TYPES,

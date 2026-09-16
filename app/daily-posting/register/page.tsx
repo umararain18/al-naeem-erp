@@ -246,7 +246,6 @@ export default function DailyPostingRegisterPage() {
     const urlDate = params.get("date");
     setDate(urlDate && /^\d{4}-\d{2}-\d{2}$/.test(urlDate) ? urlDate : todayYMD());
     setHighlightId(params.get("highlight"));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function load(forDate: string) {
@@ -331,7 +330,6 @@ export default function DailyPostingRegisterPage() {
 
   useEffect(() => {
     if (date) void load(date);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [date]);
 
   function goToDate(newDate: string, keepHighlight: boolean) {

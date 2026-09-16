@@ -132,10 +132,6 @@ function toNumber(value) {
   return Number(value);
 }
 
-function round2(num) {
-  return Math.round(num * 100) / 100;
-}
-
 // ============================================================
 // MAIN AUDIT EXECUTION
 // ============================================================
@@ -216,8 +212,6 @@ async function main() {
     // ============================================================
     logSection('PHASE 2: CREATE TEST RECORDS');
 
-    var testParty = null;
-    var testLocation = null;
     var testBilty = null;
     var testChallan = null;
     var testTransporterParty = null;
@@ -369,8 +363,6 @@ async function main() {
         });
         info('Created test locations', fromLocation.name + ' -> ' + toLocation.name);
       }
-
-      testLocation = fromLocation;
 
       // Create test bilty
       var biltyNo = 'AUDIT-BILTY-' + Date.now();
@@ -610,8 +602,6 @@ async function main() {
     // ============================================================
     logSection('PHASE 5: CANCEL CHALLAN AND VERIFY BILTY RETURNS TO PENDING');
 
-    var cancelledChallanId = null;
-
     try {
       // Cancel the challan
       await prisma.$transaction(async function(tx) {
@@ -638,8 +628,6 @@ async function main() {
           });
         }
       });
-
-      cancelledChallanId = testChallan.id;
 
       // Verify challan status
       var cancelledChallan = await prisma.challan.findUnique({
@@ -1677,7 +1665,7 @@ async function main() {
 
   try {
     var { execSync } = require('child_process');
-    var tscCheck = execSync('npx tsc --noEmit', { encoding: 'utf-8', cwd: __dirname });
+    execSync('npx tsc --noEmit', { encoding: 'utf-8', cwd: __dirname });
     pass('TypeScript check', 'No errors');
   } catch (e) {
     // tsc returns non-zero exit code on errors

@@ -41,6 +41,16 @@ type PartyOption = {
   accountActive: boolean;
 };
 
+// The raw shape GET /api/parties returns per party (Prisma Party +
+// its included account, narrowed to only the fields this file reads
+// when deriving PartyOption below).
+type RawPartyRecord = {
+  id: string;
+  partyName: string;
+  partyTypes: string[];
+  account: { id: string; isActive: boolean; category: string } | null;
+};
+
 type LiveRow = {
   id: string;
   payerAccountId: string;
@@ -497,7 +507,14 @@ function LiveSettlementSection({
         componentTotal: data.componentTotal,
         totalPaid: data.totalPaid,
         remainingDue: data.remainingDue,
-        rows: data.rows.map((r: any) => ({ id: r.id, payerAccountId: r.payerAccountId, amount: r.amount, isDraft: false })),
+        // Traced to lib/settlement-payments.ts's SettlementPaymentRow -
+        // only the 3 fields this screen actually reads from each row.
+        rows: data.rows.map((r: { id: string; payerAccountId: string; amount: number }) => ({
+          id: r.id,
+          payerAccountId: r.payerAccountId,
+          amount: r.amount,
+          isDraft: false,
+        })),
       });
     } catch {
       setError("Unable to connect to the server");
@@ -710,10 +727,20 @@ function BiltySettlementBlock({
   const isFullyVerified = paidAmount > 0 && unverified <= 0.009;
 
   const responsibleLabel = paidVerification?.responsiblePartyName || null;
-  const responsiblePartyId = useMemo(() => {
+  // Plain derived value, not memoized: this is a read-only display
+  // link only (never feeds any settlement/payment calculation - see
+  // this file's own header comment), and the lookup is a cheap
+  // .find() over the small per-Challan `parties` list, so there is no
+  // meaningful cost to recomputing it every render. Avoiding useMemo
+  // here sidesteps React Compiler's preserve-manual-memoization bail-
+  // out (it inferred a coarser `paidVerification`-object dependency
+  // than the narrower `.responsiblePartyAccountId` field the manual
+  // array specified) without changing behavior in any way - the exact
+  // same expression, evaluated fresh each render instead of cached.
+  const responsiblePartyId = (() => {
     if (!paidVerification?.responsiblePartyAccountId) return null;
     return parties.find((p) => p.accountId === paidVerification.responsiblePartyAccountId)?.partyId || null;
-  }, [parties, paidVerification?.responsiblePartyAccountId]);
+  })();
 
   const toPay = Number(bilty.toPay || 0);
 
@@ -867,7 +894,7 @@ export default function FinalSettlementOperations({
         const data = await response.json();
         if (!response.ok || !data.success) return;
         setParties(
-          (data.parties || []).map((p: any) => ({
+          (data.parties || []).map((p: RawPartyRecord) => ({
             partyId: p.id,
             partyName: p.partyName,
             partyTypes: p.partyTypes || [],

@@ -22,6 +22,19 @@ type Transporter = {
   partyName: string;
 };
 
+// The raw shape GET /api/parties returns per party, narrowed to only
+// the fields this file reads.
+type RawPartyRecord = {
+  id: string;
+  partyName: string;
+  partyTypes?: string[];
+};
+
+// GET /api/bilty returns every Bilty scalar field (no `select`
+// narrowing it), so beyond this file's own local `Bilty` display
+// type, `status`/`isDeleted` are also always present on each row.
+type RawBiltySearchResult = Bilty & { status: string; isDeleted: boolean };
+
 type ChallanStatus = "IN_TRANSIT" | "DELIVERED" | "CANCELLED";
 
 type Challan = {
@@ -532,7 +545,7 @@ export default function ChallanPage() {
       if (!response.ok || !data.success) {
         return;
       }
-      const transporterList = (data.parties || []).filter((party: any) =>
+      const transporterList = (data.parties || []).filter((party: RawPartyRecord) =>
         party.partyTypes?.includes("TRANSPORTER")
       );
       setTransporters(transporterList);
@@ -566,7 +579,7 @@ export default function ChallanPage() {
         return;
       }
       const pendingBilties = (data.bilties || []).filter(
-        (b: any) => b.status === "PENDING" && !b.isDeleted
+        (b: RawBiltySearchResult) => b.status === "PENDING" && !b.isDeleted
       );
       setAllBilties(pendingBilties);
     } catch {
@@ -729,12 +742,6 @@ export default function ChallanPage() {
       setActionLoading(null);
     }
   }
-
-  const statusColors: Record<ChallanStatus, string> = {
-    IN_TRANSIT: "text-blue-600",
-    DELIVERED: "text-green-600",
-    CANCELLED: "text-red-600",
-  };
 
   return (
     <main className="min-h-screen bg-gray-50">

@@ -1,5 +1,4 @@
 import type { Prisma, PrismaClient } from "@prisma/client";
-import { prisma } from "@/lib/prisma";
 import { resolveBiltyPaidResponsibleParty } from "@/lib/document-party-resolution";
 
 // ============================================================

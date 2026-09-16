@@ -85,10 +85,6 @@ function formatCurrency(value: number | undefined | null) {
   return `Rs. ${safeValue.toLocaleString()}`;
 }
 
-function formatDate(dateString: string) {
-  return new Date(dateString).toLocaleDateString();
-}
-
 function getStatusColor(status: string) {
   switch (status) {
     case "PENDING":

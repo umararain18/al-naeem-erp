@@ -1,18 +1,8 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { accumulateBalances, netExpense, netIncome } from "@/lib/pnl";
-
-function startOfDay(date: string) {
-  return new Date(`${date}T00:00:00`);
-}
-
-function endOfDay(date: string) {
-  const end = startOfDay(date);
-  end.setDate(end.getDate() + 1);
-  return end;
-}
 
 function getCurrentMonthRange() {
   const now = new Date();
@@ -23,7 +13,7 @@ function getCurrentMonthRange() {
   return { start, end };
 }
 
-export async function GET(request: NextRequest) {
+export async function GET() {
   try {
     const currentUser = await getCurrentUser();
 
@@ -39,7 +29,7 @@ export async function GET(request: NextRequest) {
     const canViewChallanStats = hasPermission(currentUser, "challan.view");
     const canViewAccountingActivity = hasPermission(currentUser, "accounts.view");
 
-    const data: any = {
+    const data: Record<string, unknown> = {
       success: true,
       capabilities: {
         canViewFinancials,
@@ -127,12 +117,6 @@ export async function GET(request: NextRequest) {
       });
 
       const incomeExpenseIds = incomeExpenseAccounts.map((a) => a.id);
-      const incomeAccountIds = incomeExpenseAccounts
-        .filter((a) => a.accountType === "INCOME")
-        .map((a) => a.id);
-      const expenseAccountIds = incomeExpenseAccounts
-        .filter((a) => a.accountType === "EXPENSE")
-        .map((a) => a.id);
 
       const monthlyLines = await prisma.journalLine.findMany({
         where: {

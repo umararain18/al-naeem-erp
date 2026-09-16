@@ -328,7 +328,7 @@ export async function POST(
       }
     }
 
-    let createdAllocations: { component: string; biltyId: string | null; payerAccountId: string; amount: number }[] = [];
+    const createdAllocations: { component: string; biltyId: string | null; payerAccountId: string; amount: number }[] = [];
 
     try {
       const updatedChallan = await prisma.$transaction(

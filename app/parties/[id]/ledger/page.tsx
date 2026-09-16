@@ -418,7 +418,7 @@ export default function PartyLedgerPage({
     );
   }
 
-  const { party, account, summary, ledger, filters } = data;
+  const { party, account, summary, ledger } = data;
   const dir: "ltr" | "rtl" = lang === "ur" ? "rtl" : "ltr";
 
   const tabs: { key: ViewKey; label: string }[] = [

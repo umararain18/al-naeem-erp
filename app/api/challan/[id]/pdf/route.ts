@@ -130,7 +130,7 @@ export async function GET(
       margin: { left: 14, right: 14 },
     });
 
-    const finalY = (doc as any).lastAutoTable?.finalY || y + 40;
+    const finalY = (doc as unknown as { lastAutoTable?: { finalY: number } }).lastAutoTable?.finalY || y + 40;
 
     let summaryY = finalY + 8;
     if (summaryY > 270) {

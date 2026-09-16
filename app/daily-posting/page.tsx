@@ -17,6 +17,16 @@ type Account = {
   } | null;
 };
 
+// Traced to app/api/daily-posting/route.ts's `duplicateWarnings` array
+// (the 409 response's `duplicates` field) - narrowed to only the
+// fields this page actually displays.
+type DuplicateWarning = {
+  sourceType: string;
+  sourceId: string;
+  sourceNumber: string | null;
+  amount: string;
+};
+
 type PostingLine = {
   id: string;
   counterAccountId: string;
@@ -64,7 +74,7 @@ export default function DailyPostingPage() {
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
 
-  const [duplicateData, setDuplicateData] = useState<any[]>([]);
+  const [duplicateData, setDuplicateData] = useState<DuplicateWarning[]>([]);
   const [showDuplicateWarning, setShowDuplicateWarning] = useState(false);
 
   // One token per distinct posting attempt - reused across a retry
@@ -76,25 +86,6 @@ export default function DailyPostingPage() {
   const [submissionKey, setSubmissionKey] = useState(() =>
     crypto.randomUUID()
   );
-
-  useEffect(() => {
-    loadAccounts();
-  }, []);
-
-  // Arriving from the Daily Posting register's "+ Add Entry" button
-  // (?date=YYYY-MM-DD) starts the form on that same date instead of
-  // today - a pure convenience default, never required. Read
-  // directly from the URL (not next/navigation's useSearchParams),
-  // matching the same one-time-on-mount pattern already used by
-  // app/cash-book/page.tsx, to avoid that hook's Suspense-boundary
-  // requirement.
-  useEffect(() => {
-    const urlDate = new URLSearchParams(window.location.search).get("date");
-    if (urlDate && /^\d{4}-\d{2}-\d{2}$/.test(urlDate)) {
-      setPostingDate(urlDate);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
 
   async function loadAccounts() {
     try {
@@ -120,6 +111,24 @@ export default function DailyPostingPage() {
       setLoadingAccounts(false);
     }
   }
+
+  useEffect(() => {
+    loadAccounts();
+  }, []);
+
+  // Arriving from the Daily Posting register's "+ Add Entry" button
+  // (?date=YYYY-MM-DD) starts the form on that same date instead of
+  // today - a pure convenience default, never required. Read
+  // directly from the URL (not next/navigation's useSearchParams),
+  // matching the same one-time-on-mount pattern already used by
+  // app/cash-book/page.tsx, to avoid that hook's Suspense-boundary
+  // requirement.
+  useEffect(() => {
+    const urlDate = new URLSearchParams(window.location.search).get("date");
+    if (urlDate && /^\d{4}-\d{2}-\d{2}$/.test(urlDate)) {
+      setPostingDate(urlDate);
+    }
+  }, []);
 
   function updateLine(
     id: string,

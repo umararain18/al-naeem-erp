@@ -101,7 +101,6 @@ export async function GET(
 
     const leftX = 14;
     const rightX = pageWidth / 2 + 4;
-    const rightWidth = pageWidth - rightX - 14;
 
     const leftItems = [
       ["Party", bilty.consignorParty?.partyName || "—"],

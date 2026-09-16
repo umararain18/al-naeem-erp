@@ -119,7 +119,7 @@ export default function StatementView({
         {lang === "ur" ? (
           <div className="flex items-center gap-2">
             <span className="text-xs text-gray-500 max-w-[220px] text-right">
-              اردو PDF کے لیے پرنٹ کریں اور "Save as PDF" منتخب کریں
+              اردو PDF کے لیے پرنٹ کریں اور &quot;Save as PDF&quot; منتخب کریں
             </span>
             <button type="button" onClick={() => window.print()} className="border rounded-lg px-4 py-2 text-sm hover:bg-gray-50 bg-blue-600 text-white border-blue-600">
               {t("print", lang)}

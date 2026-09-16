@@ -302,7 +302,6 @@ export default function BiltyPage() {
     if (consignorAccountValid) return "CONSIGNOR_ONLY";
     if (consigneeAccountValid) return "CONSIGNEE_ONLY";
     return "NONE";
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [advance, consignorAccountValid, consigneeAccountValid]);
 
   const clearingAgentOptions = useMemo(

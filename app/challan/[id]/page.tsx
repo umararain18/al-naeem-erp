@@ -12,6 +12,20 @@ type PartyRef = {
   account?: { id: string; accountName: string } | null;
 } | null;
 
+// The raw shape GET /api/parties returns per party (Prisma Party +
+// its included account), narrowed to only the fields this file reads.
+type RawPartyRecord = {
+  id: string;
+  partyName: string;
+  partyTypes?: string[];
+  account: { id: string; isActive: boolean; category: string; accountCode: string | null } | null;
+};
+
+// GET /api/bilty returns every Bilty scalar field (no `select`
+// narrowing it), so beyond this file's own local `Bilty` display
+// type, `status`/`isDeleted` are also always present on each row.
+type RawBiltySearchResult = Bilty & { status: string; isDeleted: boolean };
+
 export type Bilty = {
   id: string;
   biltyNo: string;
@@ -531,7 +545,7 @@ export default function ChallanDetailPage({
       const data = await response.json();
       if (!response.ok || !data.success) return;
       setTransporters(
-        (data.parties || []).filter((p: any) => p.partyTypes?.includes("TRANSPORTER"))
+        (data.parties || []).filter((p: RawPartyRecord) => p.partyTypes?.includes("TRANSPORTER"))
       );
     } catch {
       // silent
@@ -544,11 +558,11 @@ export default function ChallanDetailPage({
       const data = await response.json();
       if (!response.ok || !data.success) return;
       const options: PartyAccountOption[] = (data.parties || [])
-        .filter((p: any) => p.account && p.account.isActive && p.account.category === "PARTY")
-        .map((p: any) => ({
-          accountId: p.account.id,
+        .filter((p: RawPartyRecord) => p.account && p.account.isActive && p.account.category === "PARTY")
+        .map((p: RawPartyRecord) => ({
+          accountId: p.account!.id,
           partyName: p.partyName,
-          accountCode: p.account.accountCode || null,
+          accountCode: p.account!.accountCode || null,
         }));
       setPartyAccountOptions(options);
     } catch {
@@ -592,7 +606,7 @@ export default function ChallanDetailPage({
       const alreadyLinked = new Set((challan?.bilties || []).map((cb) => cb.bilty.id));
       const alreadyQueued = new Set(biltiesToAdd.map((b) => b.id));
       const results = (data.bilties || []).filter(
-        (b: any) =>
+        (b: RawBiltySearchResult) =>
           b.status === "PENDING" &&
           !b.isDeleted &&
           !alreadyLinked.has(b.id) &&

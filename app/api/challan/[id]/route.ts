@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
-import { ChallanStatus, Prisma } from "@prisma/client";
+import { Prisma } from "@prisma/client";
 import { computeChallanFinancialsBatch } from "@/lib/challan-financials";
 import {
   applySettlementCorrection,
@@ -442,7 +442,10 @@ export async function PATCH(
       }
     }
 
-    const updateData: any = {};
+    // Unchecked (not the plain ChallanUpdateInput) - this object is
+    // built up with raw foreign-key scalars (transporterPartyId
+    // below), not nested relation `connect` syntax.
+    const updateData: Prisma.ChallanUncheckedUpdateInput = {};
 
     if (body.loadingDate) {
       const loadingDate = new Date(`${body.loadingDate}T00:00:00`);
