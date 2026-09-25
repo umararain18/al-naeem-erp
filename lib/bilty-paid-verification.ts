@@ -1,5 +1,6 @@
 import type { Prisma, PrismaClient } from "@prisma/client";
 import { resolveBiltyPaidResponsibleParty } from "@/lib/document-party-resolution";
+import { getGrossBiltyReceivableAccountId, getUnclaimedGrossBiltyReceivableAmount } from "@/lib/gross-accounts";
 
 // ============================================================
 // BILTY PAID -> VERIFIED ANC RECEIPT (derived, no new stored state)
@@ -132,6 +133,35 @@ export async function getBiltyPaidVerification(
     );
   }
 
+  // A receipt posted directly to Gross Bilty Receivable (never a
+  // PARTY account, so never included in relevantAccountIds above) is
+  // just as real a verification as one posted to a Paid-responsible
+  // Party - see resolveUnclaimedGrossBiltyReceivable() in
+  // lib/document-party-resolution.ts, which is what makes that
+  // destination eligible in the first place. Scoped to the exact same
+  // account/sourceType/sourceId/referenceType/isDeleted shape as the
+  // Party-account query above, so it can never double-count a line
+  // already counted there (the two account sets are disjoint - Gross
+  // is never a PARTY-category account).
+  const grossAccountId = await getGrossBiltyReceivableAccountId(tx);
+  const grossLines = await tx.journalLine.findMany({
+    where: {
+      accountId: grossAccountId,
+      sourceType: "BILTY",
+      sourceId: biltyId,
+      journalEntry: {
+        referenceType: "DAILY_POSTING",
+        isDeleted: false,
+        ...(excludeJournalEntryId ? { id: { not: excludeJournalEntryId } } : {}),
+      },
+    },
+    select: { debit: true, credit: true },
+  });
+  const grossVerifiedAmount = round2(
+    Math.max(0, grossLines.reduce((s, l) => s + Number(l.credit) - Number(l.debit), 0))
+  );
+  verifiedReceivedAmount = round2(verifiedReceivedAmount + grossVerifiedAmount);
+
   const isInconsistent = verifiedReceivedAmount > paidAmount + EPS;
   const unverifiedAmount = isInconsistent ? 0 : Math.max(0, round2(paidAmount - verifiedReceivedAmount));
 
@@ -173,6 +203,26 @@ export async function assertPaidVerificationNotExceeded(
   // (the Party) - i.e. a receipt from them. Only that shape can ever
   // verify a Paid amount.
   if (direction !== "DEBIT") return;
+
+  // Gross Bilty Receivable is not a Party account, so it can never
+  // match state.responsiblePartyAccountId below - it needs its own
+  // cap, mirroring resolveUnclaimedGrossBiltyReceivable()'s own
+  // eligibility calculation exactly (lib/gross-accounts.ts), so the
+  // two can never disagree about how much is genuinely claimable.
+  // Never Bilty.advance alone (that ignores what is already posted)
+  // and never Bilty.total (that would also admit the To-Pay portion,
+  // which is Settlement's business alone).
+  const grossAccountId = await getGrossBiltyReceivableAccountId(tx);
+  if (counterAccountId === grossAccountId) {
+    const unclaimed = await getUnclaimedGrossBiltyReceivableAmount(tx, biltyId, excludeJournalEntryId);
+    if (round2(amount) > unclaimed + EPS) {
+      throw new BiltyPaidVerificationError(
+        "GROSS_RECEIVABLE_OVER_RECEIPT",
+        `This receipt of ${round2(amount)} would exceed this Bilty's genuinely unclaimed Paid-side Gross Bilty Receivable balance (${unclaimed}).`
+      );
+    }
+    return;
+  }
 
   const state = await getBiltyPaidVerification(tx, biltyId, excludeJournalEntryId);
   if (!state.responsiblePartyAccountId || state.responsiblePartyAccountId !== counterAccountId) return;

@@ -23,6 +23,7 @@ import {
   ChevronLeft,
   Briefcase,
   Truck,
+  HandCoins,
 } from "lucide-react";
 
 type User = {
@@ -73,6 +74,13 @@ const navigation: { section: string; items: NavItem[] }[] = [
         icon: Truck,
         permission: "phonch.view",
         match: (pathname) => pathname === "/phonch" || pathname.startsWith("/phonch/"),
+      },
+      {
+        label: "Private Phonch",
+        href: "/private-phonch",
+        icon: HandCoins,
+        permission: "privatePhonch.view",
+        match: (pathname) => pathname === "/private-phonch" || pathname.startsWith("/private-phonch/"),
       },
       {
         label: "Location Master",

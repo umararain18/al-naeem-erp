@@ -3,6 +3,7 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
+import { payrollMonthLabel } from "@/lib/payroll-accounting";
 
 function startOfDay(value: string) {
   return new Date(`${value}T00:00:00`);
@@ -15,7 +16,7 @@ function endOfDay(value: string) {
 }
 
 type BinItem = {
-  type: "BILTY" | "CHALLAN" | "JOURNAL_ENTRY" | "DAILY_POSTING";
+  type: "BILTY" | "CHALLAN" | "PAYSLIP" | "JOURNAL_ENTRY" | "DAILY_POSTING";
   id: string;
   reference: string;
   title: string;
@@ -86,6 +87,11 @@ export async function GET(request: NextRequest) {
     const challanCanPermanentlyDelete = hasPermission(currentUser, "challan.permanentlyDelete");
     const journalCanRestore = hasPermission(currentUser, "accountingTransactions.restore");
     const journalCanPermanentlyDelete = hasPermission(currentUser, "accountingTransactions.permanentlyDelete");
+    // Matches the exact permission app/api/payslips/[id]/restore/route.ts
+    // itself requires - no separate payslip-permanent-delete capability
+    // exists (app/api/payslips/[id]/route.ts's DELETE only ever soft-
+    // deletes, mirroring Employee's own bin-only design).
+    const payslipCanRestore = hasPermission(currentUser, "accountingTransactions.restore");
 
     const items: BinItem[] = [];
 
@@ -175,10 +181,62 @@ export async function GET(request: NextRequest) {
       }
     }
 
+    // Payslips - a dedicated bin item, NOT surfaced via the generic
+    // Journal Entries bucket below (which explicitly excludes
+    // PAYROLL_SALARY). Restoring a Payslip must go through
+    // POST /api/payslips/[id]/restore, the only place that keeps
+    // Payslip.isDeleted and its PAYROLL_SALARY JournalEntry.isDeleted
+    // in sync - the generic accounting-transactions restore route
+    // only ever touches the JournalEntry side.
+    if (type === "ALL" || type === "PAYSLIP") {
+      const payslipWhere: Prisma.PayslipWhereInput = {
+        isDeleted: true,
+        ...(Object.keys(deletedAt).length > 0 ? { deletedAt } : {}),
+      };
+
+      if (search) {
+        payslipWhere.OR = [
+          { payslipNo: { contains: search, mode: "insensitive" } },
+          { employee: { name: { contains: search, mode: "insensitive" } } },
+          { employee: { employeeCode: { contains: search, mode: "insensitive" } } },
+        ];
+      }
+
+      const payslips = await prisma.payslip.findMany({
+        where: payslipWhere,
+        include: {
+          employee: { select: { id: true, name: true, employeeCode: true } },
+          deletedBy: { select: { id: true, fullName: true, username: true } },
+        },
+        orderBy: [{ deletedAt: "desc" }, { payDate: "desc" }],
+      });
+
+      for (const payslip of payslips) {
+        items.push({
+          type: "PAYSLIP",
+          id: payslip.id,
+          reference: payslip.payslipNo,
+          title: `${payslip.employee.name} (${payslip.employee.employeeCode}) - ${payrollMonthLabel(payslip.payrollMonth)}`,
+          deletedAt: payslip.deletedAt ? new Date(payslip.deletedAt).toISOString() : "",
+          deletedBy: payslip.deletedBy,
+          moduleUrl: `/employees`,
+          capabilities: {
+            canRestore: payslipCanRestore,
+            // No payslip-permanent-delete capability exists (see
+            // payslipCanRestore's comment above) - never true.
+            canPermanentlyDelete: false,
+          },
+        });
+      }
+    }
+
     // Journal Entries
     if (type === "ALL" || type === "JOURNAL_ENTRY" || type === "DAILY_POSTING") {
       const journalWhere: Prisma.JournalEntryWhereInput = {
         isDeleted: true,
+        // Surfaced through the dedicated Payslip bin item above instead
+        // (see comment there for why this exclusion is required).
+        referenceType: { not: "PAYROLL_SALARY" },
         ...(Object.keys(deletedAt).length > 0 ? { deletedAt } : {}),
       };
 
@@ -236,6 +294,7 @@ export async function GET(request: NextRequest) {
         canPermanentlyDeleteBilty: biltyCanPermanentlyDelete,
         canRestoreChallan: challanCanRestore,
         canPermanentlyDeleteChallan: challanCanPermanentlyDelete,
+        canRestorePayslip: payslipCanRestore,
         canRestoreJournalEntry: journalCanRestore,
         canPermanentlyDeleteJournalEntry: journalCanPermanentlyDelete,
       },

@@ -2,7 +2,10 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { SearchableSelect } from "../daily-posting/SearchableSelect";
+import { presetRange } from "@/components/LedgerFilters";
 import type { EmployeeLedgerData, PayslipPaymentState } from "@/lib/payroll-accounting";
+
+type EmployeeLedgerResponse = EmployeeLedgerData & { resultCount?: number | null };
 
 // ============================================================
 // EMPLOYEES & PAYROLL - ONE unified workspace (Step 16)
@@ -657,7 +660,7 @@ function EmployeeLedgerTab({
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
   const [search, setSearch] = useState("");
-  const [data, setData] = useState<EmployeeLedgerData | null>(null);
+  const [data, setData] = useState<EmployeeLedgerResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
@@ -687,8 +690,10 @@ function EmployeeLedgerTab({
     // refreshToken dependency: if a payslip/payment is recorded while
     // this employee's ledger is the visible tab, reconcile immediately
     // (GET only) without requiring a tab switch or browser refresh.
+    // from/to/search now auto-reload too - same live-filtering feel as
+    // General Ledger/Party Ledger, no separate Search button needed.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [employeeId, refreshToken]);
+  }, [employeeId, refreshToken, from, to, search]);
 
   const employeeOptions = useMemo(
     () => employees.map((e) => ({ value: e.id, label: e.name, secondary: e.employeeCode })),
@@ -725,11 +730,20 @@ function EmployeeLedgerTab({
             type="text"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search description..."
+            placeholder="Search transactions..."
             className="w-64 rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
           />
-          <button type="button" onClick={() => load(employeeId)} disabled={!employeeId} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700 disabled:opacity-50">
-            Search
+          <button
+            type="button"
+            onClick={() => {
+              setFrom("");
+              setTo("");
+              setSearch("");
+            }}
+            disabled={!employeeId}
+            className="rounded-lg border px-4 py-2 text-sm hover:bg-gray-50 disabled:opacity-50"
+          >
+            Reset
           </button>
           <div className="ml-auto flex gap-2">
             <button type="button" onClick={() => handleExport("pdf")} disabled={!employeeId} className="rounded-lg border px-4 py-2 text-sm hover:bg-gray-50 disabled:opacity-50">
@@ -740,6 +754,32 @@ function EmployeeLedgerTab({
             </button>
           </div>
         </div>
+        <div className="mt-3 flex flex-wrap gap-2">
+          {(["TODAY", "YESTERDAY", "THIS_WEEK", "THIS_MONTH", "LAST_MONTH", "THIS_YEAR", "ALL_TIME"] as const).map((key) => (
+            <button
+              key={key}
+              type="button"
+              onClick={() => {
+                const range = presetRange(key);
+                setFrom(range.from);
+                setTo(range.to);
+              }}
+              className="text-xs rounded-lg border px-3 py-1.5 hover:bg-gray-50 text-gray-600"
+            >
+              {key
+                .split("_")
+                .map((w) => w[0] + w.slice(1).toLowerCase())
+                .join(" ")}
+            </button>
+          ))}
+        </div>
+        {search.trim() && data && (
+          <p className="mt-2 text-xs text-gray-500">
+            {data.entries.length === 0
+              ? "No transactions found"
+              : `${data.entries.length} transaction${data.entries.length === 1 ? "" : "s"} found`}
+          </p>
+        )}
       </div>
 
       {error && <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>}

@@ -4,9 +4,17 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
-import { getBiltyLegitimatePartyAccountIds, resolveDocumentPartyAccount } from "@/lib/document-party-resolution";
+import { getGrossBiltyReceivableAccountId } from "@/lib/gross-accounts";
+import {
+  getBiltyLegitimatePartyAccountIds,
+  getChallanEligiblePartyAccountIds,
+  getPhonchEligiblePartyAccountIds,
+  getPrivatePhonchEligiblePartyAccountIds,
+  resolveDocumentPartyAccount,
+} from "@/lib/document-party-resolution";
 import { assertPaidVerificationNotExceeded, BiltyPaidVerificationError } from "@/lib/bilty-paid-verification";
 import { assertPhonchReceiptNotExceeded, PhonchAccountingError } from "@/lib/phonch-accounting";
+import { assertPrivatePhonchPaymentNotExceeded, PrivatePhonchAccountingError } from "@/lib/private-phonch-accounting";
 
 const lineSchema = z.object({
   // Required for non-document-linked entries; optional for a
@@ -40,6 +48,7 @@ const lineSchema = z.object({
     .enum([
       "CHALLAN",
       "PHONCH",
+      "PRIVATE_PHONCH",
       "BILTY",
       "BILL",
       "PARTY",
@@ -348,13 +357,14 @@ export async function POST(request: NextRequest) {
       }
 
       // Counter account remains REQUIRED for every entry that is
-      // not linked to a Challan/Bilty/Phonch - only those can auto-
-      // resolve the responsible party from the document itself (see
-      // below).
+      // not linked to a Challan/Bilty/Phonch/Private Phonch - only
+      // those can auto-resolve the responsible party from the
+      // document itself (see below).
       if (
         line.sourceType !== "CHALLAN" &&
         line.sourceType !== "BILTY" &&
         line.sourceType !== "PHONCH" &&
+        line.sourceType !== "PRIVATE_PHONCH" &&
         !line.counterAccountId
       ) {
         return NextResponse.json(
@@ -395,6 +405,9 @@ export async function POST(request: NextRequest) {
     const phonchLineEntries = indexedLines.filter(
       ({ line }) => line.sourceType === "PHONCH"
     );
+    const privatePhonchLineEntries = indexedLines.filter(
+      ({ line }) => line.sourceType === "PRIVATE_PHONCH"
+    );
 
     if (challanLineEntries.length > 0 && !hasPermission(currentUser, "challan.view")) {
       return NextResponse.json(
@@ -417,6 +430,13 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    if (privatePhonchLineEntries.length > 0 && !hasPermission(currentUser, "privatePhonch.view")) {
+      return NextResponse.json(
+        { success: false, message: "Forbidden" },
+        { status: 403 }
+      );
+    }
+
     const challanIds = Array.from(
       new Set(challanLineEntries.map(({ line }) => line.sourceId!))
     );
@@ -425,6 +445,9 @@ export async function POST(request: NextRequest) {
     );
     const phonchIds = Array.from(
       new Set(phonchLineEntries.map(({ line }) => line.sourceId!))
+    );
+    const privatePhonchIds = Array.from(
+      new Set(privatePhonchLineEntries.map(({ line }) => line.sourceId!))
     );
 
     const linkedChallans = challanIds.length > 0
@@ -448,9 +471,17 @@ export async function POST(request: NextRequest) {
         })
       : [];
 
+    const linkedPrivatePhonches = privatePhonchIds.length > 0
+      ? await prisma.privatePhonch.findMany({
+          where: { id: { in: privatePhonchIds }, isDeleted: false },
+          select: { id: true, phonchNo: true },
+        })
+      : [];
+
     const challanNoById = new Map(linkedChallans.map((c) => [c.id, c.challanNo]));
     const biltyNoById = new Map(linkedBilties.map((b) => [b.id, b.biltyNo]));
     const phonchNoById = new Map(linkedPhonches.map((p) => [p.id, p.phonchNo]));
+    const privatePhonchNoById = new Map(linkedPrivatePhonches.map((p) => [p.id, p.phonchNo]));
 
     for (const { line, index } of challanLineEntries) {
       if (!challanNoById.has(line.sourceId!)) {
@@ -488,6 +519,18 @@ export async function POST(request: NextRequest) {
       }
     }
 
+    for (const { line, index } of privatePhonchLineEntries) {
+      if (!privatePhonchNoById.has(line.sourceId!)) {
+        return NextResponse.json(
+          {
+            success: false,
+            message: `Selected Private Phonch was not found in entry ${index + 1}`,
+          },
+          { status: 400 }
+        );
+      }
+    }
+
     // ========================================================
     // AUTO-RESOLVE COUNTER ACCOUNT FROM THE DOCUMENT
     //
@@ -511,10 +554,12 @@ export async function POST(request: NextRequest) {
       }
 
       // VALIDATE LINES (above) already guarantees only CHALLAN/BILTY/
-      // PHONCH lines can reach here without a counterAccountId.
+      // PHONCH/PRIVATE_PHONCH lines can reach here without a
+      // counterAccountId.
       const resolved = await resolveDocumentPartyAccount(
-        line.sourceType as "CHALLAN" | "BILTY" | "PHONCH",
-        line.sourceId!
+        line.sourceType as "CHALLAN" | "BILTY" | "PHONCH" | "PRIVATE_PHONCH",
+        line.sourceId!,
+        line.direction
       );
 
       if (!resolved) {
@@ -561,7 +606,7 @@ export async function POST(request: NextRequest) {
     for (const { line, index } of preparedLines.map((line, index) => ({ line, index }))) {
       if (line.sourceType !== "BILTY" || !line.wasManuallySupplied || !line.sourceId) continue;
 
-      const legitimateAccountIds = await getBiltyLegitimatePartyAccountIds(line.sourceId);
+      const legitimateAccountIds = await getBiltyLegitimatePartyAccountIds(line.sourceId, line.direction);
       // A manually-supplied Counter Account must always match SOMETHING
       // legitimate for this Bilty - never accepted merely because
       // nothing else is known yet. An empty set (nothing established,
@@ -578,6 +623,102 @@ export async function POST(request: NextRequest) {
               legitimateAccountIds.size > 0
                 ? `Entry ${index + 1}: The selected Counter Account does not match this Bilty's established responsible Party. Select the correct Party, or leave Counter Account blank to auto-resolve.`
                 : `Entry ${index + 1}: This Bilty has no established or identifiable responsible Party (no valid Consignor/Consignee/Clearing Agent account, no Collection or Paid responsibility). Please verify the Bilty's parties before posting against it.`,
+          },
+          { status: 400 }
+        );
+      }
+    }
+
+    // ========================================================
+    // HARD REJECT: manually-supplied Counter Account mismatching an
+    // eligible Receivable/Payable party for a Challan-linked line.
+    //
+    // Per the LOCKED rule (lib/document-party-resolution.ts's
+    // resolveChallanParty()): a manually-supplied Counter Account for
+    // a Challan line must be one of the parties with an outstanding
+    // Receivable (RECEIPT/DEBIT) or Payable (PAYMENT/CREDIT) against
+    // that Challan - never a Transporter/Clearing Agent account
+    // merely because it exists on the document. A Challan with no
+    // eligible party for this direction yet (empty set) is
+    // unaffected, exactly as before this feature existed.
+    // ========================================================
+
+    for (const { line, index } of preparedLines.map((line, index) => ({ line, index }))) {
+      if (line.sourceType !== "CHALLAN" || !line.wasManuallySupplied || !line.sourceId) continue;
+
+      const eligibleAccountIds = await getChallanEligiblePartyAccountIds(line.sourceId, line.direction);
+
+      if (eligibleAccountIds.size > 0 && !eligibleAccountIds.has(line.counterAccountId)) {
+        return NextResponse.json(
+          {
+            success: false,
+            message: `Entry ${index + 1}: The selected Counter Account is not an outstanding ${
+              line.direction === "DEBIT" ? "Receivable" : "Payable"
+            } party for this Challan. Select one of the eligible parties, or leave Counter Account blank to auto-resolve.`,
+          },
+          { status: 400 }
+        );
+      }
+    }
+
+    // ========================================================
+    // HARD REJECT: manually-supplied Counter Account mismatching an
+    // eligible payable/deposit party for a Private Phonch-linked
+    // line. Per the LOCKED rule (lib/document-party-resolution.ts's
+    // resolvePrivatePhonchParty()): a manually-supplied Counter
+    // Account for a Private Phonch line must be one of the parties
+    // with an outstanding Carrier/CA Payable (CREDIT/PAYMENT) or, for
+    // a Clearing Agent deposit (DEBIT/RECEIPT), one of the Clearing
+    // Agents actually named on this Private Phonch - never an
+    // unrelated Party merely because it was typed in manually. A
+    // Private Phonch with no eligible party for this direction yet
+    // (empty set) is unaffected.
+    // ========================================================
+
+    for (const { line, index } of preparedLines.map((line, index) => ({ line, index }))) {
+      if (line.sourceType !== "PRIVATE_PHONCH" || !line.wasManuallySupplied || !line.sourceId) continue;
+
+      const eligibleAccountIds = await getPrivatePhonchEligiblePartyAccountIds(line.sourceId, line.direction);
+
+      if (eligibleAccountIds.size > 0 && !eligibleAccountIds.has(line.counterAccountId)) {
+        return NextResponse.json(
+          {
+            success: false,
+            message: `Entry ${index + 1}: The selected Counter Account is not an outstanding ${
+              line.direction === "DEBIT" ? "deposit-eligible Clearing Agent" : "payable"
+            } party for this Private Phonch. Select one of the eligible parties, or leave Counter Account blank to auto-resolve.`,
+          },
+          { status: 400 }
+        );
+      }
+    }
+
+    // ========================================================
+    // HARD REJECT: manually-supplied Counter Account mismatching a
+    // Showroom Phonch's own Transporter. Per the LOCKED rule
+    // (lib/document-party-resolution.ts's resolvePhonchParty(), reused
+    // by getPhonchEligiblePartyAccountIds()): a Phonch has exactly one
+    // legitimate counterparty, its own Transporter - never an
+    // unrelated Party merely because it was typed in manually. Unlike
+    // Challan/Private Phonch's "empty set is unaffected" fallback
+    // (which exists for their own more flexible multi-party models), a
+    // Phonch's Transporter is a required field at creation, so an
+    // empty set here (no active Transporter account) means there is no
+    // safe destination at all and every manually-supplied account is
+    // rejected - the same strict behavior as Bilty's own equivalent
+    // guard above.
+    // ========================================================
+
+    for (const { line, index } of preparedLines.map((line, index) => ({ line, index }))) {
+      if (line.sourceType !== "PHONCH" || !line.wasManuallySupplied || !line.sourceId) continue;
+
+      const eligibleAccountIds = await getPhonchEligiblePartyAccountIds(line.sourceId);
+
+      if (!eligibleAccountIds.has(line.counterAccountId)) {
+        return NextResponse.json(
+          {
+            success: false,
+            message: `Entry ${index + 1}: The selected Counter Account is not this Phonch's own Transporter. Select the correct Transporter, or leave Counter Account blank to auto-resolve.`,
           },
           { status: 400 }
         );
@@ -669,9 +810,22 @@ export async function POST(request: NextRequest) {
 
     const isCashBank = (cat: string) => cat === "CASH" || cat === "BANK";
 
+    // Narrow exception: BILTY + RECEIPT + the exact existing Gross
+    // Bilty Receivable system account is the ONLY non-PARTY
+    // destination this restriction ever admits - see
+    // resolveUnclaimedGrossBiltyReceivable() in lib/document-party-
+    // resolution.ts. Fetched once, outside the loop below.
+    const grossBiltyReceivableId = await getGrossBiltyReceivableAccountId(prisma);
+
     const preparedChallanBiltyLines = preparedLines
       .map((line, index) => ({ line, index }))
-      .filter(({ line }) => line.sourceType === "CHALLAN" || line.sourceType === "BILTY" || line.sourceType === "PHONCH");
+      .filter(
+        ({ line }) =>
+          line.sourceType === "CHALLAN" ||
+          line.sourceType === "BILTY" ||
+          line.sourceType === "PHONCH" ||
+          line.sourceType === "PRIVATE_PHONCH"
+      );
 
     for (const { line, index } of preparedChallanBiltyLines) {
       const mainCat = mainAccount ? categoryMap[mainAccount.id] : "";
@@ -679,13 +833,17 @@ export async function POST(request: NextRequest) {
 
       const valid =
         (mainCat === "PARTY" && isCashBank(counterCat)) ||
-        (counterCat === "PARTY" && isCashBank(mainCat));
+        (counterCat === "PARTY" && isCashBank(mainCat)) ||
+        (line.sourceType === "BILTY" &&
+          line.direction === "DEBIT" &&
+          isCashBank(mainCat) &&
+          line.counterAccountId === grossBiltyReceivableId);
 
       if (!valid) {
         return NextResponse.json(
           {
             success: false,
-            message: `Entry ${index + 1}: Challan/Bilty/Phonch-linked posting must move money only between a PARTY account and a CASH/BANK account.`,
+            message: `Entry ${index + 1}: Challan/Bilty/Phonch/Private Phonch-linked posting must move money only between a PARTY account and a CASH/BANK account.`,
           },
           { status: 400 }
         );
@@ -713,6 +871,12 @@ export async function POST(request: NextRequest) {
           sourceNumber: phonchNoById.get(line.sourceId!) || line.sourceNumber,
         };
       }
+      if (line.sourceType === "PRIVATE_PHONCH") {
+        return {
+          ...line,
+          sourceNumber: privatePhonchNoById.get(line.sourceId!) || line.sourceNumber,
+        };
+      }
       return line;
     });
 
@@ -736,6 +900,7 @@ export async function POST(request: NextRequest) {
         line.sourceType !== "CHALLAN" &&
         line.sourceType !== "BILTY" &&
         line.sourceType !== "PHONCH" &&
+        line.sourceType !== "PRIVATE_PHONCH" &&
         line.sourceId
     );
 
@@ -1003,6 +1168,9 @@ export async function POST(request: NextRequest) {
           if (line.sourceType === "PHONCH" && line.sourceId) {
             await assertPhonchReceiptNotExceeded(tx, line.sourceId, line.counterAccountId, line.amount, line.direction);
           }
+          if (line.sourceType === "PRIVATE_PHONCH" && line.sourceId) {
+            await assertPrivatePhonchPaymentNotExceeded(tx, line.sourceId, line.counterAccountId, line.amount, line.direction);
+          }
         }
 
         const created = [];
@@ -1041,6 +1209,13 @@ export async function POST(request: NextRequest) {
       }
 
       if (error instanceof PhonchAccountingError) {
+        return NextResponse.json(
+          { success: false, code: error.code, message: error.message },
+          { status: 400 }
+        );
+      }
+
+      if (error instanceof PrivatePhonchAccountingError) {
         return NextResponse.json(
           { success: false, code: error.code, message: error.message },
           { status: 400 }

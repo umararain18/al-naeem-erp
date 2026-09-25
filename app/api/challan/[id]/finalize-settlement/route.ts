@@ -210,12 +210,17 @@ export async function POST(
       const clearingAgentAccountId = bilty.clearingAgentParty?.account?.isActive
         ? bilty.clearingAgentParty.account.id
         : null;
-      const amount = Number(bilty.total);
+      // Per the LOCKED rule, Paid is not a Collection amount - only
+      // the genuinely outstanding To-Pay portion is reclassified to a
+      // Collection-responsible party. A fully-Paid Bilty (toPay = 0)
+      // needs no Collection party at all. See
+      // lib/settlement-accounting.ts's BiltySettlementInput.collectionAmount.
+      const collectionAmount = Number(bilty.toPay);
       const commissionAmount = Number(bilty.agentCommission);
 
       let collectionResponsibility: CollectionResponsibility;
       let collectionPartyAccountId: string | null = null;
-      if (amount > 0) {
+      if (collectionAmount > 0) {
         if (clearingAgentAccountId) {
           collectionResponsibility = "CLEARING_AGENT";
           collectionPartyAccountId = clearingAgentAccountId;
@@ -255,6 +260,7 @@ export async function POST(
         biltyId: bilty.id,
         biltyNo: bilty.biltyNo,
         amount: bilty.total,
+        collectionAmount: bilty.toPay,
         collectionResponsibility,
         collectionPartyAccountId,
         agentCommission: bilty.agentCommission,

@@ -70,6 +70,14 @@ export async function GET(request: NextRequest) {
     const accountSearch =
       searchParams.get("accountSearch");
 
+    // Transaction search (distinct from accountSearch above, which
+    // filters the Cash/Bank ACCOUNT picker) - narrows which lines are
+    // DISPLAYED only, never the opening/closing balance. See its use
+    // below, after the opening balance is computed from the FULL
+    // pre-`from` history.
+    const transactionSearch =
+      (searchParams.get("q") || searchParams.get("transactionSearch"))?.trim().toLowerCase() || "";
+
     // ============================================================
     // LOAD CASH + BANK ACCOUNTS
     //
@@ -403,6 +411,26 @@ export async function GET(request: NextRequest) {
     }
 
     // ============================================================
+    // OPENING BALANCE - all qualifying activity BEFORE `from`, the
+    // same aggregate pattern General/Party/Employee Ledger already
+    // use (never calculated from only the displayed/matching rows).
+    // No `from` selected (or "All Time") -> 0, same as before.
+    // ============================================================
+
+    let openingBalance = 0;
+
+    if (from) {
+      const openingLines = await prisma.journalLine.findMany({
+        where: {
+          accountId: selectedAccount.id,
+          journalEntry: { is: { isDeleted: false, entryDate: { lt: startOfDay(from) } } },
+        },
+        select: { debit: true, credit: true },
+      });
+      openingBalance = openingLines.reduce((sum, l) => sum + Number(l.debit) - Number(l.credit), 0);
+    }
+
+    // ============================================================
     // CALCULATE RUNNING BALANCE
     //
     // For CASH/BANK:
@@ -411,13 +439,9 @@ export async function GET(request: NextRequest) {
     // Credit = money going out
     //
     // Balance = Opening + Debit - Credit
-    //
-    // Current opening balance is 0 here.
-    // We will connect real account opening balance
-    // once that field is finalized in Account.
     // ============================================================
 
-    let runningBalance = 0;
+    let runningBalance = openingBalance;
 
     const chronologicalDays = Array.from(
       grouped.entries()
@@ -467,8 +491,9 @@ export async function GET(request: NextRequest) {
 const chronologicalDaysResult =
   chronologicalDays;
 
-// Calculate summary BEFORE reversing
-// the array for UI display.
+// Calculate summary BEFORE reversing/filtering
+// the array for UI display - never affected by
+// transaction search, matching every other ledger.
 
 const totalDebit =
   chronologicalDaysResult.reduce(
@@ -484,11 +509,6 @@ const totalCredit =
     0
   );
 
-const openingBalance =
-  chronologicalDaysResult.length > 0
-    ? chronologicalDaysResult[0].openingBalance
-    : 0;
-
 const closingBalance =
   chronologicalDaysResult.length > 0
     ? chronologicalDaysResult[
@@ -496,10 +516,40 @@ const closingBalance =
       ].closingBalance
     : openingBalance;
 
-// Only reverse for display.
-// Calculations remain chronological.
-const days =
-  [...chronologicalDaysResult].reverse();
+// ============================================================
+// TRANSACTION SEARCH - narrows which entries are DISPLAYED
+// within each day only; each entry's own `balance` (computed
+// above from the complete, unfiltered period) is never
+// recomputed. Matches Bilty No/Challan No (documentNo, already
+// the canonical number - see app/api/daily-posting/route.ts),
+// description, and account name. A day with no matching entries
+// is dropped entirely; a day with at least one match keeps only
+// its matching entries, still under that same day.
+// ============================================================
+
+function matchesSearch(entry: (typeof chronologicalDaysResult)[number]["entries"][number]): boolean {
+  if (!transactionSearch) return true;
+  return (
+    entry.documentNo.toLowerCase().includes(transactionSearch) ||
+    entry.description.toLowerCase().includes(transactionSearch) ||
+    entry.account.toLowerCase().includes(transactionSearch) ||
+    entry.document.toLowerCase().includes(transactionSearch)
+  );
+}
+
+// Newest date group first, and newest transaction first WITHIN
+// each day (the per-day `entries` above are chronological asc,
+// needed for the balance calculation - reversed here, display
+// only, same "calculate forward, reverse for display" rule as
+// every other ledger).
+const days = [...chronologicalDaysResult]
+  .reverse()
+  .map((day) => ({ ...day, entries: [...day.entries].reverse().filter(matchesSearch) }))
+  .filter((day) => day.entries.length > 0 || !transactionSearch);
+
+const resultCount = transactionSearch
+  ? days.reduce((sum, day) => sum + day.entries.length, 0)
+  : null;
     return NextResponse.json({
       success: true,
 
@@ -515,6 +565,8 @@ const days =
       },
 
       days,
+      resultCount,
+      filters: { from: from || null, to: to || null, search: transactionSearch || null },
       capabilities: {
         canEdit: hasPermission(currentUser, "accounts.edit"),
         canMoveToBin: hasPermission(

@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 
-type ItemType = "BILTY" | "CHALLAN" | "JOURNAL_ENTRY" | "DAILY_POSTING";
+type ItemType = "BILTY" | "CHALLAN" | "PAYSLIP" | "JOURNAL_ENTRY" | "DAILY_POSTING";
 
 type BinItem = {
   type: ItemType;
@@ -24,6 +24,7 @@ type Capabilities = {
   canPermanentlyDeleteBilty: boolean;
   canRestoreChallan: boolean;
   canPermanentlyDeleteChallan: boolean;
+  canRestorePayslip: boolean;
   canRestoreJournalEntry: boolean;
   canPermanentlyDeleteJournalEntry: boolean;
 };
@@ -45,6 +46,7 @@ export default function BinPage() {
     canPermanentlyDeleteBilty: false,
     canRestoreChallan: false,
     canPermanentlyDeleteChallan: false,
+    canRestorePayslip: false,
     canRestoreJournalEntry: false,
     canPermanentlyDeleteJournalEntry: false,
   });
@@ -86,6 +88,7 @@ export default function BinPage() {
         canPermanentlyDeleteBilty: false,
         canRestoreChallan: false,
         canPermanentlyDeleteChallan: false,
+        canRestorePayslip: false,
         canRestoreJournalEntry: false,
         canPermanentlyDeleteJournalEntry: false,
       });
@@ -117,6 +120,12 @@ export default function BinPage() {
         restoreUrl = `/api/bilty/${item.id}/restore`;
       } else if (item.type === "CHALLAN") {
         restoreUrl = `/api/challan/${item.id}/restore`;
+      } else if (item.type === "PAYSLIP") {
+        // Reuses the existing dedicated endpoint, which keeps
+        // Payslip.isDeleted and its PAYROLL_SALARY JournalEntry in
+        // sync - the generic accounting-transactions route below has
+        // no awareness of the Payslip side.
+        restoreUrl = `/api/payslips/${item.id}/restore`;
       } else {
         restoreUrl = `/api/accounting-transactions/${item.id}/restore`;
       }
@@ -172,6 +181,8 @@ export default function BinPage() {
         return "Bilty";
       case "CHALLAN":
         return "Challan";
+      case "PAYSLIP":
+        return "Payslip";
       case "DAILY_POSTING":
         return "Daily Posting";
       case "JOURNAL_ENTRY":
@@ -182,12 +193,16 @@ export default function BinPage() {
   const canRestore = (item: BinItem) => {
     if (item.type === "BILTY") return capabilities.canRestoreBilty;
     if (item.type === "CHALLAN") return capabilities.canRestoreChallan;
+    if (item.type === "PAYSLIP") return capabilities.canRestorePayslip;
     return capabilities.canRestoreJournalEntry;
   };
 
   const canPermanentlyDelete = (item: BinItem) => {
     if (item.type === "BILTY") return capabilities.canPermanentlyDeleteBilty;
     if (item.type === "CHALLAN") return capabilities.canPermanentlyDeleteChallan;
+    // No payslip-permanent-delete capability exists - see the API
+    // route's own comment.
+    if (item.type === "PAYSLIP") return false;
     return capabilities.canPermanentlyDeleteJournalEntry;
   };
 
@@ -222,6 +237,7 @@ export default function BinPage() {
             <option value="ALL">All</option>
             <option value="BILTY">Bilty</option>
             <option value="CHALLAN">Challan</option>
+            <option value="PAYSLIP">Payslip</option>
             <option value="DAILY_POSTING">Daily Posting</option>
             <option value="JOURNAL_ENTRY">Journal Entries</option>
           </select>

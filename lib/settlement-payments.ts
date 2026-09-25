@@ -321,20 +321,73 @@ async function getBookingIncomeAccountId(tx: Tx): Promise<string> {
 }
 
 /**
- * The Collection floor depends on whether a PAID row now exists for
- * this Bilty: with none, Bilty.advance stays (for now) with whoever
- * the OLD mechanism attributed Collection to (the pre-PAID-
- * accounting stopgap); once a PAID row exists, the Paid slice has
- * its own separate claim, so the OLD Collection party must retain
- * NO claim over it (floor = 0).
+ * Keeps the OLD (single-payer) Collection default's ledger
+ * attribution in sync with the CURRENT sum of active new-engine
+ * COLLECTION SettlementPayment rows for this Bilty - the Collection
+ * analogue of syncCarrierRentFloorForChallan() below, and the
+ * current-architecture replacement for the old resolveCollectionFloor()
+ * (which assumed the OLD default bundled Bilty.total = Paid + To-Pay,
+ * and so tried to protect Bilty.advance inside it). Under the current
+ * architecture the OLD default already only ever attributes
+ * Bilty.toPay (see BiltySettlementInput.collectionAmount in
+ * lib/settlement-accounting.ts) - there is no Paid slice left inside
+ * it to protect, so the target floor is simply:
+ *
+ *   max(0, toPay - sum(active COLLECTION rows))
+ *
+ * Called AFTER a COLLECTION row is created/updated/deleted (mirroring
+ * syncCarrierRentFloorForChallan()'s own post-write timing), so
+ * "active rows" always reflects the just-written state - a brand new
+ * COLLECTION row for the Bilty's full toPay therefore immediately
+ * releases the OLD default's matching claim back to Gross in the SAME
+ * transaction, instead of leaving both live at once (see the Bilty
+ * #105 forensic report: this ordering, not the floor formula alone,
+ * is what previously left the OLD default's 2,000 and a new 2,000
+ * allocation both attributed to the same party simultaneously).
+ *
+ * A no-op for a Bilty with no settled Challan yet, or whose OLD
+ * default never attributed a Collection party to begin with.
  */
-async function resolveCollectionFloor(tx: Tx, biltyId: string, biltyAdvance: number): Promise<number> {
-  if (biltyAdvance <= 0) return 0;
-  const paidRow = await tx.settlementPayment.findFirst({
-    where: { component: "PAID", biltyId },
-    select: { id: true },
+async function syncCollectionFloorForNewEngineRows(
+  tx: Tx,
+  biltyId: string,
+  createdById: string | null
+): Promise<void> {
+  const link = await tx.challanBilty.findFirst({
+    where: { biltyId, challan: { isDeleted: false, status: { not: "CANCELLED" } } },
+    select: {
+      challan: { select: { id: true, challanNo: true, isSettled: true, settlementJournalEntryId: true } },
+      bilty: { select: { id: true, biltyNo: true, toPay: true, advance: true } },
+    },
   });
-  return paidRow ? 0 : Math.max(0, biltyAdvance);
+  if (!link || !link.challan.isSettled || !link.challan.settlementJournalEntryId) return;
+
+  const grossAccountId = await getGrossBiltyReceivableAccountId(tx);
+  const toPay = round2(Number(link.bilty.toPay));
+
+  const activeRows = await getActiveSettlementPayments(tx, "COLLECTION", {
+    challanId: link.challan.id,
+    biltyId: link.bilty.id,
+  });
+  const activeTotal = round2(activeRows.reduce((s, r) => s + r.amount, 0));
+  const explicitFloor = Math.max(0, round2(toPay - activeTotal));
+
+  const collectionContext: ComponentContext = {
+    challanId: link.challan.id,
+    challanNo: link.challan.challanNo,
+    settlementJournalEntryId: link.challan.settlementJournalEntryId,
+    biltyId: link.bilty.id,
+    biltyNo: link.bilty.biltyNo,
+    biltyAdvance: round2(Number(link.bilty.advance)),
+    // Not used by ensureOldAttributionWithinFloor() - this context is
+    // built solely to trigger the OLD mechanism's release/restore, not
+    // to validate/create an actual COLLECTION row.
+    componentTotal: 0,
+    grossAccountId,
+    documentLabel: `Bilty ${link.bilty.biltyNo} To-Pay`,
+  };
+
+  await ensureOldAttributionWithinFloor(tx, "COLLECTION", collectionContext, createdById, explicitFloor);
 }
 
 /**
@@ -434,11 +487,11 @@ async function syncCollectionFloorForBilty(
  * authoritative "how much Collection is actually outstanding" figure
  * the rest of the multi-payer engine already uses everywhere else).
  *
- * This is a DIFFERENT floor concept from resolveCollectionFloor()
- * (which protects the Paid slice from an ONGOING new-engine
- * COLLECTION row, keyed off PAID-row presence/absence) - here the
- * floor is simply the Bilty's own toPay, independent of whether a
- * PAID row exists at all:
+ * This is a DIFFERENT floor concept from syncCollectionFloorForNewEngineRows()
+ * above (which reconciles the default against ONGOING new-engine
+ * COLLECTION rows, keyed off their live total) - here the floor is
+ * simply the Bilty's own toPay, independent of any new-engine
+ * COLLECTION activity:
  *   - Genuinely To-Pay (toPay === total): floor === the default
  *     itself - a no-op, nothing was ever wrongly attributed.
  *   - Partially Paid (0 < toPay < total): only the amount ABOVE
@@ -497,19 +550,20 @@ export async function reconcileCollectionAttributionAtSettlement(
  * fallback, or whatever a pre-existing historical Challan already
  * established) in sync with the CURRENT sum of active CARRIER_RENT
  * SettlementPayment rows, in EITHER direction - the Carrier Rent
- * analogue of syncCollectionFloorForBilty(), but self-referential:
- * CARRIER_RENT's own new-engine activity determines CARRIER_RENT's
- * own floor directly (there is no separate cross-component trigger
- * the way PAID drives COLLECTION's floor - Carrier Rent has exactly
- * one component, and its default party IS the residual claimant for
+ * analogue of syncCollectionFloorForNewEngineRows() above, but
+ * self-referential: CARRIER_RENT's own new-engine activity determines
+ * CARRIER_RENT's own floor directly (there is no separate
+ * cross-component trigger the way PAID separately drives
+ * syncCollectionFloorForBilty() - Carrier Rent has exactly one
+ * component, and its default party IS the residual claimant for
  * whatever this component itself has not yet explicitly attributed
  * to a payer).
  *
- * Unlike resolveCollectionFloor() (a fixed, one-time floor keyed off
- * Bilty.advance/PAID existence), Carrier Rent's floor must track the
- * LIVE remaining balance so a PARTIAL payment by one payer leaves
- * the unpaid remainder attributed to the default party rather than
- * releasing the default's entire original claim on the first row:
+ * Like syncCollectionFloorForNewEngineRows(), Carrier Rent's floor
+ * must track the LIVE remaining balance so a PARTIAL payment by one
+ * payer leaves the unpaid remainder attributed to the default party
+ * rather than releasing the default's entire original claim on the
+ * first row:
  *
  *   floor = max(0, Challan.carrierRent - sum(ALL active CARRIER_RENT rows))
  *
@@ -603,12 +657,12 @@ async function ensureOldAttributionWithinFloor(
     oldPartyAccountId
   );
 
-  const floor =
-    explicitFloor !== undefined
-      ? explicitFloor
-      : component === "COLLECTION"
-        ? await resolveCollectionFloor(tx, context.biltyId as string, context.biltyAdvance || 0)
-        : 0;
+  // Every current caller for both components now passes an explicit
+  // floor (COLLECTION: syncCollectionFloorForNewEngineRows() /
+  // reconcileCollectionAttributionAtSettlement() / syncCollectionFloorForBilty();
+  // CARRIER_RENT: syncCarrierRentFloorForChallan()) - this default
+  // exists only as a defensive fallback, never expected to be reached.
+  const floor = explicitFloor !== undefined ? explicitFloor : 0;
   // COLLECTION's old net is a DEBIT (positive); CARRIER_RENT's old
   // net is a CREDIT (negative, per getComponentNetAmount's own
   // debit-minus-credit convention) - normalize to a positive
@@ -665,11 +719,20 @@ async function ensureOldAttributionWithinFloor(
   const lines = isRestore
     ? buildLines(component, adjustAmount, oldPartyAccountId, context.grossAccountId)
     : buildReverseLines(component, adjustAmount, oldPartyAccountId, context.grossAccountId);
+  // Generic wording, deliberately not narrative-specific to any ONE
+  // caller's own reason for the floor (a PAID row's own amount, a
+  // fixed toPay, or toPay-minus-active-new-engine-rows - see
+  // syncCollectionFloorForBilty(), reconcileCollectionAttributionAtSettlement(),
+  // and syncCollectionFloorForNewEngineRows() above, all of which call
+  // this with their own, different floor) - previously said "Paid
+  // amount ... remains/now separately established" unconditionally,
+  // which was only ever accurate for syncCollectionFloorForBilty()'s
+  // own PAID-row-triggered calls and misdescribed the other two.
   const description =
     component === "COLLECTION"
       ? isRestore
-        ? `Collection Multi-Collector Transition - ${context.documentLabel} - restoring ${adjustAmount} from Gross (Paid attribution no longer separately claims this slice)`
-        : `Collection Multi-Collector Transition - ${context.documentLabel} - releasing ${adjustAmount} back to Gross${floor > 0 ? ` (Paid amount ${floor} remains with the original party)` : " (Paid amount now separately established)"}`
+        ? `Collection Multi-Collector Transition - ${context.documentLabel} - restoring ${adjustAmount} from Gross`
+        : `Collection Multi-Collector Transition - ${context.documentLabel} - releasing ${adjustAmount} back to Gross${floor > 0 ? ` (${floor} of the original attribution remains with this party)` : ""}`
       : isRestore
         ? `Carrier Rent Multi-Payer Transition - ${context.documentLabel} - restoring ${adjustAmount} from Gross`
         : `Carrier Rent Multi-Payer Transition - ${context.documentLabel} - releasing ${adjustAmount} back to Gross`;
@@ -1044,19 +1107,6 @@ export async function createSettlementPayment(
     const context = await resolveComponentContext(tx, component, { challanId, biltyId });
     await assertValidPayerAccount(tx, payerAccountId);
 
-    // Release whatever the OLD single-payer mechanism still
-    // attributes above this component's floor BEFORE validating the
-    // new row against componentTotal, so the two mechanisms never
-    // simultaneously double-claim the same Gross balance. CARRIER_RENT
-    // is handled AFTER row creation instead (see the
-    // syncCarrierRentFloorForChallan() call below) - its floor depends
-    // on the live sum of active rows INCLUDING the one being created
-    // here, which does not exist yet at this point. Never applies to
-    // PAID, which has no old mechanism to transition from.
-    if (component === "COLLECTION") {
-      await ensureOldAttributionWithinFloor(tx, component, context, createdById);
-    }
-
     const existingRows = await getActiveSettlementPayments(tx, component, {
       challanId: context.challanId,
       biltyId: context.biltyId,
@@ -1156,6 +1206,18 @@ export async function createSettlementPayment(
     // syncCarrierRentFloorForChallan() for the full reasoning.
     if (component === "CARRIER_RENT") {
       await syncCarrierRentFloorForChallan(tx, context.challanId as string, createdById);
+    }
+
+    // Keep the OLD single-payer Collection default in sync with the
+    // live sum of active COLLECTION rows (now including the one just
+    // created) - see syncCollectionFloorForNewEngineRows() for the
+    // full reasoning. Run AFTER creation (not before, like the old
+    // resolveCollectionFloor()-based check used to) so a brand new row
+    // covering this Bilty's full toPay immediately releases the OLD
+    // default's matching claim in the same transaction, instead of
+    // leaving both live at once.
+    if (component === "COLLECTION") {
+      await syncCollectionFloorForNewEngineRows(tx, context.biltyId as string, createdById);
     }
 
     return {
@@ -1324,6 +1386,13 @@ export async function updateSettlementPaymentAmount(
       await syncCarrierRentFloorForChallan(tx, context.challanId as string, existing.createdById);
     }
 
+    // Re-sync the OLD Collection default to this row's NEW amount -
+    // an increase releases more from the default, a decrease restores
+    // the difference back to it. See syncCollectionFloorForNewEngineRows().
+    if (component === "COLLECTION") {
+      await syncCollectionFloorForNewEngineRows(tx, context.biltyId as string, existing.createdById);
+    }
+
     return {
       row: toRow(updated),
       componentTotal: context.componentTotal,
@@ -1462,6 +1531,13 @@ export async function deleteSettlementPayment(
     // no-op once the target floor is already reached.
     if (component === "CARRIER_RENT") {
       await syncCarrierRentFloorForChallan(tx, context.challanId as string, existing.createdById);
+    }
+
+    // Restore the OLD Collection default now that this row is gone -
+    // the other half of the double-booking fix, in reverse. See
+    // syncCollectionFloorForNewEngineRows().
+    if (component === "COLLECTION") {
+      await syncCollectionFloorForNewEngineRows(tx, existing.biltyId as string, existing.createdById);
     }
 
     const otherRows = await tx.settlementPayment.findMany({

@@ -1,7 +1,9 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { SearchableSelect, type SearchOption } from "@/app/daily-posting/SearchableSelect";
+import { LedgerFilters } from "@/components/LedgerFilters";
 
 type Account = {
   id: string;
@@ -12,19 +14,31 @@ type Account = {
   party: { id: string; partyName: string } | null;
 };
 
-type LedgerEntry = {
-  id: string;
-  journalEntryId: string;
+type LedgerHistoryItem = {
   date: string;
   referenceType: string | null;
-  referenceId: string | null;
-  sourceType: string | null;
-  sourceId: string | null;
-  sourceNumber: string | null;
+  description: string;
+  debit: number;
+  credit: number;
+};
+
+// Matches lib/ledger-description.ts's FinalLedgerRow - the same
+// business-readable, duplicate-collapsing row shape Party Ledger
+// already uses, now shared by General Ledger for ANY account (see
+// getAccountLedgerData()).
+type LedgerEntry = {
+  id: string;
+  date: string;
+  reference: string;
+  referenceHref: string | null;
   description: string;
   debit: number;
   credit: number;
   balance: number;
+  balanceType: "RECEIVABLE" | "PAYABLE" | "SETTLED";
+  isGrouped: boolean;
+  isRemoved: boolean;
+  history: LedgerHistoryItem[];
 };
 
 type Summary = {
@@ -32,6 +46,7 @@ type Summary = {
   totalDebit: number;
   totalCredit: number;
   closingBalance: number;
+  balanceType?: "RECEIVABLE" | "PAYABLE" | "SETTLED";
 };
 
 type LedgerResponse = {
@@ -44,7 +59,7 @@ type LedgerResponse = {
 };
 
 function formatCurrency(value: number) {
-  return `Rs. ${value.toLocaleString()}`;
+  return `Rs. ${Math.round(value).toLocaleString()}`;
 }
 
 function formatDate(value: string) {
@@ -57,78 +72,11 @@ function formatDate(value: string) {
   }).format(new Date(value));
 }
 
-const REFERENCE_LABELS: Record<string, string> = {
-  BILTY_BOOKING: "Bilty Booking",
-  BILTY_BOOKING_CORRECTION: "Bilty Correction",
-  CHALLAN_DISPATCH: "Challan Dispatch",
-  CHALLAN_DISPATCH_CORRECTION: "Challan Correction",
-  SETTLEMENT: "Settlement",
-  SETTLEMENT_CORRECTION: "Settlement Correction",
-  // Live multi-payer Final Settlement mechanism (lib/settlement-payments.ts) -
-  // previously missing here, so any of these fell through to the raw
-  // referenceType string below (REFERENCE_LABELS[x] || x).
-  SETTLEMENT_PAYMENT: "Settlement Payment",
-  SETTLEMENT_PAYMENT_CORRECTION: "Settlement Payment Correction",
-  SETTLEMENT_PAYMENT_REVERSAL: "Settlement Payment Reversal",
-  PAID_RESPONSIBILITY_REASSIGNMENT: "Paid Responsibility",
-  COLLECTION_MULTI_PAYER_TRANSITION: "Collection Transition",
-  CARRIER_RENT_MULTI_PAYER_TRANSITION: "Carrier Rent Transition",
-  PHONCH: "Phonch",
-  DAILY_POSTING: "Daily Posting",
-  OPENING_BALANCE: "Opening Balance",
-  MANUAL_JOURNAL: "Manual Journal Entry",
-};
-
-function friendlyReferenceLabel(referenceType: string | null) {
-  if (!referenceType) return "Direct Entry";
-  return REFERENCE_LABELS[referenceType] || referenceType;
-}
-
-// Reuses the existing accounting architecture only (JournalLine's
-// own sourceType/sourceId, then the JournalEntry's referenceType/
-// referenceId, then the generic Journal Entry viewer as a last
-// resort) - see app/parties/[id]/ledger/page.tsx for the identical
-// pattern used on the Party Ledger.
-function resolveLedgerDestination(entry: LedgerEntry): { href: string; label: string } {
-  const refLabel = friendlyReferenceLabel(entry.referenceType);
-
-  if (entry.sourceType === "CHALLAN" && entry.sourceId) {
-    return { href: `/challan/${entry.sourceId}`, label: `${refLabel} - Challan ${entry.sourceNumber || entry.sourceId}` };
-  }
-  if (entry.sourceType === "BILTY" && entry.sourceId) {
-    return { href: `/bilty/${entry.sourceId}`, label: `${refLabel} - Bilty ${entry.sourceNumber || entry.sourceId}` };
-  }
-
-  if (
-    (entry.referenceType === "BILTY_BOOKING" || entry.referenceType === "BILTY_BOOKING_CORRECTION") &&
-    entry.referenceId
-  ) {
-    return { href: `/bilty/${entry.referenceId}`, label: refLabel };
-  }
-  if (
-    (entry.referenceType === "CHALLAN_DISPATCH" ||
-      entry.referenceType === "CHALLAN_DISPATCH_CORRECTION" ||
-      entry.referenceType === "SETTLEMENT" ||
-      entry.referenceType === "SETTLEMENT_CORRECTION") &&
-    entry.referenceId
-  ) {
-    return { href: `/challan/${entry.referenceId}`, label: refLabel };
-  }
-
-  // Manual Journal Entry (Step 15) - referenceId holds the
-  // human-friendly Manual Journal Number ("MJ-00001"), not a
-  // document id - show it directly rather than the raw referenceType.
-  if (entry.referenceType === "MANUAL_JOURNAL" && entry.referenceId) {
-    return { href: `/accounting-transactions/${entry.journalEntryId}`, label: `Manual Journal ${entry.referenceId}` };
-  }
-
-  return { href: `/accounting-transactions/${entry.journalEntryId}`, label: refLabel };
-}
-
 export default function LedgerPage() {
   const [data, setData] = useState<LedgerResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
   // A drill-down link (e.g. a P&L account row) may deep-link
   // straight to an account via ?accountId=.
@@ -140,15 +88,35 @@ export default function LedgerPage() {
   const [to, setTo] = useState("");
   const [search, setSearch] = useState("");
 
+  // Every active account is fetched ONCE (no accountId/date params) so
+  // the account picker can filter instantly client-side - the same
+  // dataset the dropdown always loaded, just no longer re-fetched from
+  // the server on every keystroke.
+  const [accounts, setAccounts] = useState<Account[]>([]);
+
+  useEffect(() => {
+    async function loadAccounts() {
+      try {
+        const response = await fetch(`/api/ledger`);
+        const result = await response.json();
+        if (response.ok && result.success) setAccounts(result.accounts || []);
+      } catch {
+        // silent - the ledger fetch below will surface the real error state
+      }
+    }
+    loadAccounts();
+  }, []);
+
   useEffect(() => {
     async function load() {
       try {
         setError("");
+        setLoading(true);
         const query = new URLSearchParams();
         if (accountId) query.set("accountId", accountId);
         if (from) query.set("from", from);
         if (to) query.set("to", to);
-        if (search) query.set("search", search);
+        if (search.trim()) query.set("q", search.trim());
 
         const response = await fetch(`/api/ledger?${query.toString()}`);
         const result = await response.json();
@@ -159,6 +127,7 @@ export default function LedgerPage() {
         }
 
         setData(result);
+        setExpanded(new Set());
       } catch {
         setError("Unable to connect to the server");
       } finally {
@@ -169,6 +138,25 @@ export default function LedgerPage() {
     load();
   }, [accountId, from, to, search]);
 
+  const accountOptions: SearchOption[] = useMemo(
+    () =>
+      accounts.map((a) => ({
+        value: a.id,
+        label: `${a.accountCode ? `[${a.accountCode}] ` : ""}${a.accountName}`,
+        secondary: a.party ? `Party: ${a.party.partyName}` : `${a.accountType} · ${a.category}`,
+      })),
+    [accounts]
+  );
+
+  function toggleExpanded(id: string) {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
   const selectedAccount = data?.selectedAccount || null;
   const entries = data?.entries || [];
   const summary = data?.summary || null;
@@ -178,59 +166,40 @@ export default function LedgerPage() {
       <div className="max-w-7xl mx-auto p-6">
         <div className="mb-6">
           <h1 className="text-2xl font-bold">General Ledger</h1>
-          <p className="text-gray-600">Account-wise transaction history.</p>
+          <p className="text-gray-600">Search any account and view its ledger for any period.</p>
         </div>
 
-        {/* Filters */}
-        <div className="bg-white rounded-xl shadow-sm p-4 mb-6">
-          <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
-            <select
-              value={accountId}
-              onChange={(e) => setAccountId(e.target.value)}
-              className="border rounded-lg px-3 py-2 text-sm"
-            >
-              <option value="">Select Account</option>
-              {data?.accounts.map((account) => (
-                <option key={account.id} value={account.id}>
-                  {account.accountCode ? `[${account.accountCode}] ` : ""}
-                  {account.accountName}
-                  {account.party ? ` (${account.party.partyName})` : ""}
-                </option>
-              ))}
-            </select>
-            <input
-              type="date"
-              value={from}
-              onChange={(e) => setFrom(e.target.value)}
-              className="border rounded-lg px-3 py-2 text-sm"
-            />
-            <input
-              type="date"
-              value={to}
-              onChange={(e) => setTo(e.target.value)}
-              className="border rounded-lg px-3 py-2 text-sm"
-            />
-            <input
-              type="text"
-              placeholder="Search accounts..."
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              className="border rounded-lg px-3 py-2 text-sm"
-            />
-            <button
-              type="button"
-              onClick={() => {
-                setAccountId("");
-                setFrom("");
-                setTo("");
-                setSearch("");
-              }}
-              className="border rounded-lg px-4 py-2 text-sm hover:bg-gray-50"
-            >
-              Reset
-            </button>
-          </div>
-        </div>
+        <LedgerFilters
+          search={search}
+          onSearchChange={setSearch}
+          from={from}
+          to={to}
+          onFromChange={setFrom}
+          onToChange={setTo}
+          onReset={() => {
+            setAccountId("");
+            setFrom("");
+            setTo("");
+            setSearch("");
+          }}
+          resultLabel={
+            data
+              ? entries.length === 0
+                ? "No transactions found"
+                : `${entries.length} transaction${entries.length === 1 ? "" : "s"} found`
+              : null
+          }
+          extra={
+            <div className="mb-3">
+              <SearchableSelect
+                value={accountId}
+                options={accountOptions}
+                placeholder="Search account name or code..."
+                onChange={setAccountId}
+              />
+            </div>
+          }
+        />
 
         {error && <p className="text-sm text-red-600 mb-4">{error}</p>}
 
@@ -302,31 +271,91 @@ export default function LedgerPage() {
                     <th className="px-4 py-3 text-right">Debit</th>
                     <th className="px-4 py-3 text-right">Credit</th>
                     <th className="px-4 py-3 text-right">Balance</th>
+                    <th className="px-4 py-3"></th>
                   </tr>
                 </thead>
                 <tbody className="divide-y">
                   {entries.map((entry) => {
-                    const destination = resolveLedgerDestination(entry);
+                    const isExpanded = expanded.has(entry.id);
+                    const hasHistory = entry.history.length > 1 || entry.isRemoved;
 
                     return (
-                      <tr key={entry.id} className="hover:bg-gray-50">
-                        <td className="px-4 py-3">{formatDate(entry.date)}</td>
-                        <td className="px-4 py-3">
-                          <Link href={destination.href} className="text-blue-600 hover:underline" title="View source document">
-                            {destination.label}
-                          </Link>
-                        </td>
-                        <td className="px-4 py-3">{entry.description || "—"}</td>
-                        <td className="px-4 py-3 text-right">
-                          {entry.debit > 0 ? formatCurrency(entry.debit) : "—"}
-                        </td>
-                        <td className="px-4 py-3 text-right">
-                          {entry.credit > 0 ? formatCurrency(entry.credit) : "—"}
-                        </td>
-                        <td className="px-4 py-3 text-right">
-                          {formatCurrency(entry.balance)}
-                        </td>
-                      </tr>
+                      <Fragment key={entry.id}>
+                        <tr className="hover:bg-gray-50">
+                          <td className="px-4 py-3">{formatDate(entry.date)}</td>
+                          <td className="px-4 py-3">
+                            {entry.referenceHref ? (
+                              <Link href={entry.referenceHref} className="text-blue-600 hover:underline" title="View source document">
+                                {entry.reference}
+                              </Link>
+                            ) : (
+                              entry.reference
+                            )}
+                          </td>
+                          <td className="px-4 py-3">
+                            {entry.description || "—"}
+                            {entry.isRemoved && <span className="ml-2 text-xs text-gray-400 italic">(removed)</span>}
+                          </td>
+                          <td className="px-4 py-3 text-right">{entry.debit > 0 ? formatCurrency(entry.debit) : "—"}</td>
+                          <td className="px-4 py-3 text-right">{entry.credit > 0 ? formatCurrency(entry.credit) : "—"}</td>
+                          <td className="px-4 py-3 text-right">
+                            <span
+                              className={
+                                entry.balanceType === "RECEIVABLE"
+                                  ? "text-green-600"
+                                  : entry.balanceType === "PAYABLE"
+                                    ? "text-red-600"
+                                    : ""
+                              }
+                            >
+                              {formatCurrency(entry.balance)}
+                            </span>
+                          </td>
+                          <td className="px-4 py-3 text-right">
+                            {hasHistory && (
+                              <button
+                                type="button"
+                                onClick={() => toggleExpanded(entry.id)}
+                                className="text-xs border rounded-lg px-2 py-1 hover:bg-gray-50 text-gray-600"
+                              >
+                                {isExpanded ? "Hide details" : "View details"}
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                        {isExpanded && hasHistory && (
+                          <tr className="bg-gray-50">
+                            <td colSpan={7} className="px-4 py-3">
+                              <div className="text-xs text-gray-500 mb-2">
+                                Underlying accounting entries ({entry.history.length}{" "}
+                                {entry.history.length === 1 ? "entry" : "entries"}):
+                              </div>
+                              <table className="w-full text-xs border rounded-lg overflow-hidden">
+                                <thead className="bg-white text-gray-500">
+                                  <tr>
+                                    <th className="px-3 py-2 text-left">Date</th>
+                                    <th className="px-3 py-2 text-left">Type</th>
+                                    <th className="px-3 py-2 text-left">Description</th>
+                                    <th className="px-3 py-2 text-right">Debit</th>
+                                    <th className="px-3 py-2 text-right">Credit</th>
+                                  </tr>
+                                </thead>
+                                <tbody className="divide-y bg-white">
+                                  {entry.history.map((h, i) => (
+                                    <tr key={i}>
+                                      <td className="px-3 py-2">{formatDate(h.date)}</td>
+                                      <td className="px-3 py-2 text-gray-500">{h.referenceType || "Direct Entry"}</td>
+                                      <td className="px-3 py-2">{h.description}</td>
+                                      <td className="px-3 py-2 text-right">{h.debit > 0 ? formatCurrency(h.debit) : "—"}</td>
+                                      <td className="px-3 py-2 text-right">{h.credit > 0 ? formatCurrency(h.credit) : "—"}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </td>
+                          </tr>
+                        )}
+                      </Fragment>
                     );
                   })}
                 </tbody>

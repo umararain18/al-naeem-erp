@@ -350,6 +350,34 @@ export async function getPhonchPaymentState(
   };
 }
 
+// ------------------------------------------------------------
+// EDIT-TIME "NOT BELOW ALREADY RECEIVED" CHECK - a financial edit is
+// allowed after partial receipt, as long as the EDITED Total Amount is
+// still >= what has already actually been received via Daily Posting.
+// Reuses getPhonchPaymentState() above (the one authoritative reader
+// of Daily Posting lines for this Phonch) rather than a second,
+// separately-computed balance - the `totalAmount` argument passed to
+// it here is irrelevant to the returned receivedAmount (which is
+// derived purely from JournalLines), so the CURRENT (pre-edit) total
+// is passed through for semantic clarity only.
+// ------------------------------------------------------------
+
+export async function assertPhonchEditNotBelowSettled(
+  tx: Tx,
+  phonchId: string,
+  transporterAccountId: string | null,
+  currentTotalAmount: number,
+  newTotalAmount: number
+): Promise<void> {
+  if (!transporterAccountId) return;
+  const state = await getPhonchPaymentState(tx, phonchId, transporterAccountId, currentTotalAmount);
+  if (round2(newTotalAmount) < state.receivedAmount - EPS) {
+    throw new PhonchValidationError(
+      `Amount cannot be less than the amount already received: ${formatRs(state.receivedAmount)}.`
+    );
+  }
+}
+
 /**
  * Validates that a NEW Daily Posting receipt of `amount` credited
  * against `phonchId`'s Transporter would not verify more than the

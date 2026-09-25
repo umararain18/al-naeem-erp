@@ -121,6 +121,8 @@ const SIMPLE_REFERENCE_LABELS: Record<string, string> = {
   SETTLEMENT_PAYMENT_REVERSAL: "Settlement Payment Reversal",
   COLLECTION_MULTI_PAYER_TRANSITION: "Collection Transition",
   CARRIER_RENT_MULTI_PAYER_TRANSITION: "Carrier Rent Transition",
+  PAYROLL_SALARY: "Salary",
+  PAYROLL_PAYMENT: "Salary Payment",
 };
 
 /** Business-readable label for a raw JournalEntry.referenceType -
@@ -733,8 +735,32 @@ export interface FinalLedgerRow {
   history: DisplayHistoryItem[];
 }
 
-export interface PartyLedgerData {
-  party: { id: string; partyName: string; partyTypes: string[] };
+export interface AccountLedgerOptions {
+  from?: string | null;
+  to?: string | null;
+  /**
+   * Display order for the returned `ledger` array ONLY.
+   *
+   * "asc" (chronological, oldest -> newest) - the client-facing
+   * Party Summary / Account Statement (PDF/Excel export): a formal
+   * statement always reads Opening Balance -> oldest -> newest ->
+   * Totals -> Closing Balance.
+   *
+   * "desc" (newest -> oldest) - the normal browser ledger screen,
+   * matching every other normal ERP list/ledger screen.
+   *
+   * The running balance is ALWAYS computed chronologically first,
+   * regardless of this option - each row's own `balance` field is
+   * the true balance as of that transaction, and is completely
+   * unaffected by which order the finished array is handed back
+   * in. This option only decides the ORDER of the finished rows,
+   * exactly like the task's own "calculate forward, only reverse
+   * for display" instruction.
+   */
+  order?: "asc" | "desc";
+}
+
+export interface AccountLedgerData {
   account: { id: string; accountName: string };
   filters: { from: string | null; to: string | null };
   summary: {
@@ -747,42 +773,41 @@ export interface PartyLedgerData {
   ledger: FinalLedgerRow[];
 }
 
+export interface PartyLedgerData extends AccountLedgerData {
+  party: { id: string; partyName: string; partyTypes: string[] };
+}
+
 function classifyBalance(value: number): "RECEIVABLE" | "PAYABLE" | "SETTLED" {
   if (value > 0.009) return "RECEIVABLE";
   if (value < -0.009) return "PAYABLE";
   return "SETTLED";
 }
 
-export async function getPartyLedgerData(
-  partyId: string,
-  options: {
-    from?: string | null;
-    to?: string | null;
-    /**
-     * Display order for the returned `ledger` array ONLY.
-     *
-     * "asc" (chronological, oldest -> newest) - the client-facing
-     * Party Summary / Account Statement (PDF/Excel export): a formal
-     * statement always reads Opening Balance -> oldest -> newest ->
-     * Totals -> Closing Balance.
-     *
-     * "desc" (newest -> oldest) - the normal browser Party Ledger
-     * screen, matching every other normal ERP list/ledger screen.
-     *
-     * The running balance is ALWAYS computed chronologically first,
-     * regardless of this option - each row's own `balance` field is
-     * the true balance as of that transaction, and is completely
-     * unaffected by which order the finished array is handed back
-     * in. This option only decides the ORDER of the finished rows,
-     * exactly like the task's own "calculate forward, only reverse
-     * for display" instruction.
-     */
-    order?: "asc" | "desc";
-  }
-): Promise<PartyLedgerData> {
+// ============================================================
+// ACCOUNT-GENERIC CORE (used by General Ledger for ANY account -
+// system/Gross accounts, Cash/Bank, Party, or any user-created
+// account - and reused BELOW by getPartyLedgerData() so the Party
+// Ledger screen/PDF/Excel trio keeps running through the exact same
+// code it always has, byte-for-byte, just via this shared function
+// instead of a private copy of it). buildUserFacingLedgerRows() was
+// already account-agnostic - only the surrounding opening-balance/
+// running-balance/party-lookup logic was previously duplicated
+// per-caller; this is the single extraction of that logic, not a
+// new calculation.
+// ============================================================
+
+export async function getAccountLedgerData(
+  accountId: string,
+  options: AccountLedgerOptions
+): Promise<AccountLedgerData> {
   const from = options.from || null;
   const to = options.to || null;
   const order = options.order || "asc";
+
+  const account = await prisma.account.findUnique({ where: { id: accountId }, select: { id: true, accountName: true } });
+  if (!account) {
+    throw new PartyLedgerLookupError("NO_ACCOUNT", "Account not found.");
+  }
 
   const dateFilter: { gte?: Date; lt?: Date } = {};
   if (from) {
@@ -795,17 +820,9 @@ export async function getPartyLedgerData(
     if (!Number.isNaN(end.getTime())) dateFilter.lt = end;
   }
 
-  const party = await prisma.party.findUnique({ where: { id: partyId }, include: { account: true } });
-  if (!party) {
-    throw new PartyLedgerLookupError("PARTY_NOT_FOUND", "Party not found");
-  }
-  if (!party.account) {
-    throw new PartyLedgerLookupError("NO_ACCOUNT", "This party does not have an account yet.");
-  }
-
   const entries = await prisma.journalLine.findMany({
     where: {
-      accountId: party.account.id,
+      accountId: account.id,
       journalEntry: { is: { isDeleted: false, ...(Object.keys(dateFilter).length > 0 ? { entryDate: dateFilter } : {}) } },
     },
     include: {
@@ -822,7 +839,7 @@ export async function getPartyLedgerData(
   if (from) {
     const openingEntries = await prisma.journalLine.findMany({
       where: {
-        accountId: party.account.id,
+        accountId: account.id,
         journalEntry: { is: { isDeleted: false, entryDate: { lt: new Date(`${from}T00:00:00`) } } },
       },
       select: { debit: true, credit: true },
@@ -848,7 +865,7 @@ export async function getPartyLedgerData(
     credit: Number(entry.credit),
   }));
 
-  const displayRows = await buildUserFacingLedgerRows(party.account.id, rawLines);
+  const displayRows = await buildUserFacingLedgerRows(account.id, rawLines);
 
   let displayRunningBalance = openingBalance;
   const ledger: FinalLedgerRow[] = displayRows.map((row) => {
@@ -877,8 +894,7 @@ export async function getPartyLedgerData(
   const orderedLedger = order === "desc" ? [...ledger].reverse() : ledger;
 
   return {
-    party: { id: party.id, partyName: party.partyName, partyTypes: party.partyTypes },
-    account: { id: party.account.id, accountName: party.account.accountName },
+    account: { id: account.id, accountName: account.accountName },
     filters: { from, to },
     summary: {
       openingBalance,
@@ -888,5 +904,56 @@ export async function getPartyLedgerData(
       balanceType: classifyBalance(closingBalance),
     },
     ledger: orderedLedger,
+  };
+}
+
+// ============================================================
+// TRANSACTION SEARCH (shared by every ledger screen)
+//
+// Filters an already-built, already-business-described ledger row
+// list - never the raw JournalLine table, and never re-queries the
+// database. Matches against the row's own composed `reference` +
+// `description` (which already embeds Bilty No/Challan No/Carrier
+// No/Transporter/Party name wherever buildUserFacingLedgerRows()
+// resolved that context - see biltyDescription()/challanDescription()
+// above) plus every underlying raw entry in `history`, so a search
+// term still finds a row even when it was collapsed/consolidated
+// from several technical JournalEntries.
+//
+// Deliberately does NOT touch summary.openingBalance/periodDebit/
+// periodCredit/closingBalance, and does NOT recompute any row's own
+// `balance` - a search only narrows which rows are DISPLAYED; the
+// account's real opening/closing/running balance stays exactly what
+// it was for the full (unfiltered) selected date range, per the
+// explicit "search must not distort the accounting balance" rule.
+// ============================================================
+export function filterLedgerRowsBySearch<T extends { reference: string; description: string; history: DisplayHistoryItem[] }>(
+  rows: T[],
+  search: string | null | undefined
+): T[] {
+  const q = (search || "").trim().toLowerCase();
+  if (!q) return rows;
+
+  return rows.filter((row) => {
+    if (row.reference.toLowerCase().includes(q)) return true;
+    if (row.description.toLowerCase().includes(q)) return true;
+    return row.history.some((h) => h.description.toLowerCase().includes(q));
+  });
+}
+
+export async function getPartyLedgerData(partyId: string, options: AccountLedgerOptions): Promise<PartyLedgerData> {
+  const party = await prisma.party.findUnique({ where: { id: partyId }, include: { account: true } });
+  if (!party) {
+    throw new PartyLedgerLookupError("PARTY_NOT_FOUND", "Party not found");
+  }
+  if (!party.account) {
+    throw new PartyLedgerLookupError("NO_ACCOUNT", "This party does not have an account yet.");
+  }
+
+  const data = await getAccountLedgerData(party.account.id, options);
+
+  return {
+    party: { id: party.id, partyName: party.partyName, partyTypes: party.partyTypes },
+    ...data,
   };
 }

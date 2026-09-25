@@ -7,6 +7,7 @@ import {
   resolvePhonchInput,
   buildPhonchLedgerDescription,
   getPhonchPaymentState,
+  assertPhonchEditNotBelowSettled,
   PhonchValidationError,
   type PhonchInput,
 } from "@/lib/phonch-accounting";
@@ -111,23 +112,11 @@ export async function PATCH(
       return NextResponse.json({ success: false, message: "Binned Phonch cannot be edited. Restore it first." }, { status: 400 });
     }
 
-    // Edit is blocked once ANY Daily Posting receipt has been
-    // recorded against this Phonch - exactly the same protection
-    // Payslip already applies to its own financial fields once
-    // paidAmount > 0 (app/api/payslips/[id]/route.ts).
-    if (current.transporterParty.account) {
-      const currentTotal = current.vehicles.reduce(
-        (s, v) => s + Number(v.deliveryCharges) + Number(v.otherExpenseAmount) + Number(v.claimAmount),
-        0
-      );
-      const state = await getPhonchPaymentState(prisma, id, current.transporterParty.account.id, currentTotal);
-      if (state.receivedAmount > 0.009) {
-        return NextResponse.json(
-          { success: false, message: "This Phonch has recorded Daily Posting receipts and cannot be edited. Reverse the receipt(s) first." },
-          { status: 400 }
-        );
-      }
-    }
+    const currentTransporterAccountId = current.transporterParty.account?.id || null;
+    const currentTotal = current.vehicles.reduce(
+      (s, v) => s + Number(v.deliveryCharges) + Number(v.otherExpenseAmount) + Number(v.claimAmount),
+      0
+    );
 
     if (resolved.phonchNo !== current.phonchNo) {
       const dup = await prisma.phonch.findFirst({
@@ -161,23 +150,30 @@ export async function PATCH(
             }
           }
 
-          // Re-check no receipt slipped in between the pre-check above
-          // and this transaction opening (Serializable re-check,
-          // same pattern as the Challan creation race fix).
-          const existingReceipt = await tx.journalLine.findFirst({
-            where: {
-              sourceType: "PHONCH",
-              sourceId: id,
-              journalEntry: { referenceType: "DAILY_POSTING", isDeleted: false },
-            },
-            select: { id: true },
-          });
-          if (existingReceipt) {
-            throw new PhonchValidationError(
-              "This Phonch received a Daily Posting receipt just now and can no longer be edited. Please refresh.",
-              409
-            );
+          // Changing the Transporter PARTY itself while the CURRENT
+          // Transporter already has a received amount is rejected -
+          // reassigning would misattribute (or orphan) that Daily
+          // Posting history onto a different party's account. An
+          // amount-only edit to the SAME Transporter is validated
+          // below instead.
+          if (currentTransporterAccountId && resolved.transporterPartyId !== current.transporterPartyId) {
+            const currentState = await getPhonchPaymentState(tx, id, currentTransporterAccountId, currentTotal);
+            if (currentState.receivedAmount > 0.009) {
+              throw new PhonchValidationError(
+                "Cannot change the Transporter - a Daily Posting receipt has already been recorded against the current Transporter."
+              );
+            }
           }
+
+          // Financial edit is allowed after partial receipt, as long as
+          // the NEW Total Amount is still >= what has already been
+          // received via Daily Posting - read live, inside this
+          // Serializable transaction, so a concurrent Daily Posting can
+          // never be missed (replaces the old blanket "any receipt
+          // exists" edit lock entirely). Non-financial fields (Vehicle,
+          // Chassis, Engine, Bilty No., Challan No.) are never gated by
+          // this check.
+          await assertPhonchEditNotBelowSettled(tx, id, currentTransporterAccountId, currentTotal, resolved.totalAmount);
 
           await tx.phonch.update({
             where: { id },

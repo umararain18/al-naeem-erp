@@ -20,6 +20,7 @@ export const sourceOptions: SearchOption[] = [
   { value: "PARTY", label: "Party" },
   { value: "CHALLAN", label: "CN - Challan" },
   { value: "PHONCH", label: "PN - Phonch" },
+  { value: "PRIVATE_PHONCH", label: "PP - Private Phonch" },
   { value: "BILTY", label: "BL - Bilty" },
   { value: "BILL", label: "BI - Bill" },
 ];

@@ -2,7 +2,11 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
-import { resolveDocumentPartyAccount } from "@/lib/document-party-resolution";
+import {
+  getChallanEligibleParties,
+  getPrivatePhonchEligibleParties,
+  resolveDocumentPartyAccount,
+} from "@/lib/document-party-resolution";
 
 // ============================================================
 // GET /api/daily-posting/search-documents?q=4001
@@ -16,12 +20,19 @@ import { resolveDocumentPartyAccount } from "@/lib/document-party-resolution";
 // ============================================================
 
 type DocumentSearchResult = {
-  type: "CHALLAN" | "BILTY" | "PHONCH";
+  type: "CHALLAN" | "BILTY" | "PHONCH" | "PRIVATE_PHONCH";
   id: string;
   number: string;
   subtitle: string;
   detail: string;
   resolvedParty: { accountId: string; partyName: string } | null;
+  // CHALLAN and PRIVATE_PHONCH only, and only once `direction` is
+  // known: every party with an outstanding eligible position for
+  // that direction, per the LOCKED rule - so the UI can offer an
+  // explicit selector when there is more than one (resolvedParty
+  // above is already the auto-selected single case). Undefined for
+  // BILTY/PHONCH and when direction is unknown.
+  eligibleParties?: { accountId: string; partyName: string; amount: number }[];
 };
 
 export async function GET(request: NextRequest) {
@@ -44,6 +55,13 @@ export async function GET(request: NextRequest) {
 
     const { searchParams } = new URL(request.url);
     const q = (searchParams.get("q") || "").trim();
+    // The line's DEBIT/CREDIT direction, forwarded so a CHALLAN
+    // result's resolvedParty reflects the LOCKED Receivable/Payable
+    // rule (see resolveChallanParty() in lib/document-party-resolution.ts).
+    // Absent/invalid = undefined, exactly as if not yet chosen.
+    const directionParam = searchParams.get("direction");
+    const direction: "DEBIT" | "CREDIT" | undefined =
+      directionParam === "DEBIT" || directionParam === "CREDIT" ? directionParam : undefined;
 
     if (!q) {
       return NextResponse.json({ success: true, results: [] });
@@ -52,6 +70,7 @@ export async function GET(request: NextRequest) {
     const canViewChallans = hasPermission(currentUser, "challan.view");
     const canViewBilties = hasPermission(currentUser, "bilty.view");
     const canViewPhonch = hasPermission(currentUser, "phonch.view");
+    const canViewPrivatePhonch = hasPermission(currentUser, "privatePhonch.view");
 
     const results: DocumentSearchResult[] = [];
 
@@ -90,7 +109,18 @@ export async function GET(request: NextRequest) {
           : "No bilties linked";
 
         const transporter = challan.transporterParty?.partyName || "—";
-        const resolvedParty = await resolveDocumentPartyAccount("CHALLAN", challan.id);
+        const resolvedParty = await resolveDocumentPartyAccount("CHALLAN", challan.id, direction);
+
+        // Informational only (never itself the resolution decision -
+        // that stays resolveDocumentPartyAccount()'s alone, above) so
+        // the UI can offer an explicit selector when more than one
+        // party is eligible for the current direction. Reads the SAME
+        // source resolveDocumentPartyAccount() itself consults, so
+        // this list can never disagree with the actual resolution.
+        let eligibleParties: DocumentSearchResult["eligibleParties"];
+        if (direction) {
+          eligibleParties = await getChallanEligibleParties(challan.id, direction);
+        }
 
         results.push({
           type: "CHALLAN",
@@ -99,6 +129,7 @@ export async function GET(request: NextRequest) {
           subtitle: route,
           detail: `Transporter: ${transporter} • ${challan._count.bilties} Bilty(ies)`,
           resolvedParty,
+          eligibleParties,
         });
       }
     }
@@ -134,7 +165,7 @@ export async function GET(request: NextRequest) {
         const parentChallan = bilty.challanBilties.find(
           (cb) => cb.challan && !cb.challan.isDeleted
         )?.challan;
-        const resolvedParty = await resolveDocumentPartyAccount("BILTY", bilty.id);
+        const resolvedParty = await resolveDocumentPartyAccount("BILTY", bilty.id, direction);
 
         results.push({
           type: "BILTY",
@@ -176,6 +207,47 @@ export async function GET(request: NextRequest) {
           subtitle: `Transporter: ${phonch.transporterParty.partyName}`,
           detail: `${phonch._count.vehicles} Vehicle(s)${phonch.carrierNumber ? ` • Carrier: ${phonch.carrierNumber}` : ""}`,
           resolvedParty,
+        });
+      }
+    }
+
+    if (canViewPrivatePhonch) {
+      const privatePhonches = await prisma.privatePhonch.findMany({
+        where: {
+          isDeleted: false,
+          phonchNo: { contains: q, mode: "insensitive" },
+        },
+        select: {
+          id: true,
+          phonchNo: true,
+          transporterParty: { select: { partyName: true } },
+          _count: { select: { vehicles: true } },
+        },
+        orderBy: { date: "desc" },
+        take: 8,
+      });
+
+      for (const privatePhonch of privatePhonches) {
+        const resolvedParty = await resolveDocumentPartyAccount("PRIVATE_PHONCH", privatePhonch.id, direction);
+
+        // Same informational-only role as CHALLAN's own eligibleParties
+        // above - lets the UI offer an explicit selector when more
+        // than one payable/deposit party is eligible for the current
+        // direction (see getPrivatePhonchEligibleParties()'s own doc
+        // comment in lib/document-party-resolution.ts).
+        let eligibleParties: DocumentSearchResult["eligibleParties"];
+        if (direction) {
+          eligibleParties = await getPrivatePhonchEligibleParties(privatePhonch.id, direction);
+        }
+
+        results.push({
+          type: "PRIVATE_PHONCH",
+          id: privatePhonch.id,
+          number: privatePhonch.phonchNo,
+          subtitle: `Transporter: ${privatePhonch.transporterParty.partyName}`,
+          detail: `${privatePhonch._count.vehicles} Vehicle(s)`,
+          resolvedParty,
+          eligibleParties,
         });
       }
     }

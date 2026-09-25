@@ -27,6 +27,13 @@ type DuplicateWarning = {
   amount: string;
 };
 
+// A CHALLAN's party with an outstanding Receivable (RECEIPT) or
+// Payable (PAYMENT) position for the line's current direction - see
+// app/api/daily-posting/search-documents/route.ts. Populated only
+// when there is more than one, so the user can explicitly choose
+// instead of the system guessing.
+type EligibleParty = { accountId: string; partyName: string; amount: number };
+
 type PostingLine = {
   id: string;
   counterAccountId: string;
@@ -42,6 +49,11 @@ type PostingLine = {
   // Account is empty. The server independently re-resolves at
   // submit time regardless of this value.
   resolvedPartyLabel: string;
+  // Client-side only - not sent to the server. The CHALLAN's
+  // Receivable/Payable parties for the line's current direction,
+  // whatever the count - used only to offer an explicit selector
+  // when there is more than one (see setLineEligibleParties()).
+  eligibleParties: EligibleParty[];
 };
 
 function createLine(): PostingLine {
@@ -55,6 +67,7 @@ function createLine(): PostingLine {
     sourceId: "",
     sourceNumber: "",
     resolvedPartyLabel: "",
+    eligibleParties: [],
   };
 }
 
@@ -143,6 +156,17 @@ export default function DailyPostingPage() {
               [field]: value,
             }
           : line
+      )
+    );
+  }
+
+  // Separate from updateLine() above purely because eligibleParties
+  // is an array, not the string type that setter is declared for -
+  // same setLines()/map() shape, narrowly typed for this one field.
+  function setLineEligibleParties(id: string, eligibleParties: EligibleParty[]) {
+    setLines((current) =>
+      current.map((line) =>
+        line.id === id ? { ...line, eligibleParties } : line
       )
     );
   }
@@ -240,13 +264,15 @@ export default function DailyPostingPage() {
     }
 
     for (const [index, line] of lines.entries()) {
-      // A Challan/Bilty/Phonch-linked entry may leave Counter Account
-      // empty - the server resolves the responsible party from the
-      // document itself. Every other entry still requires it.
+      // A Challan/Bilty/Phonch/Private Phonch-linked entry may leave
+      // Counter Account empty - the server resolves the responsible
+      // party from the document itself. Every other entry still
+      // requires it.
       if (
         line.sourceType !== "CHALLAN" &&
         line.sourceType !== "BILTY" &&
         line.sourceType !== "PHONCH" &&
+        line.sourceType !== "PRIVATE_PHONCH" &&
         !line.counterAccountId
       ) {
         setError(
@@ -511,38 +537,105 @@ export default function DailyPostingPage() {
                     </td>
 
                     <td className="px-4 py-4">
-                      <SearchableSelect
-                        value={line.counterAccountId}
-                        options={counterAccountOptions}
-                        placeholder={
-                          line.sourceType === "CHALLAN" || line.sourceType === "BILTY" || line.sourceType === "PHONCH"
-                            ? "Optional - auto-resolved from document"
-                            : "Search account..."
-                        }
-                        onChange={(value) => {
-                          updateLine(line.id, "counterAccountId", value);
-                          // A manual change supersedes the earlier
-                          // auto-resolution label.
-                          updateLine(line.id, "resolvedPartyLabel", "");
-                        }}
-                        className="w-72"
-                      />
-                      {(line.sourceType === "CHALLAN" || line.sourceType === "BILTY" || line.sourceType === "PHONCH") &&
-                        line.sourceId &&
-                        line.resolvedPartyLabel && (
-                          <p className="mt-1 text-xs text-green-600">
-                            Resolved Party: {line.resolvedPartyLabel}
-                          </p>
-                        )}
-                      {(line.sourceType === "CHALLAN" || line.sourceType === "BILTY" || line.sourceType === "PHONCH") &&
-                        line.sourceId &&
-                        !line.resolvedPartyLabel &&
-                        !line.counterAccountId && (
-                          <p className="mt-1 text-xs text-amber-600">
-                            No party could be auto-resolved - please select a
-                            Counter Account.
-                          </p>
-                        )}
+                      {(() => {
+                        // A Challan or Private Phonch with MORE than one
+                        // eligible Receivable/Payable (Challan) or payable/
+                        // deposit (Private Phonch) party must never be
+                        // auto-selected - per the LOCKED rule in
+                        // lib/document-party-resolution.ts's
+                        // resolveChallanParty()/resolvePrivatePhonchParty().
+                        // Reuses this SAME Counter Account field/component,
+                        // just narrowed to the eligible parties only, so the
+                        // user has an obvious existing-pattern way to choose -
+                        // never a Transporter/Clearing Agent shown merely
+                        // because it exists on the document.
+                        const isAmbiguousChallan =
+                          (line.sourceType === "CHALLAN" || line.sourceType === "PRIVATE_PHONCH") &&
+                          line.eligibleParties.length > 1 &&
+                          !line.counterAccountId;
+
+                        const eligibleLabel =
+                          line.sourceType === "PRIVATE_PHONCH"
+                            ? line.direction === "DEBIT"
+                              ? "Deposit"
+                              : "Payable"
+                            : line.direction === "DEBIT"
+                            ? "Receivable"
+                            : "Payable";
+
+                        const options = isAmbiguousChallan
+                          ? line.eligibleParties.map((party) => ({
+                              value: party.accountId,
+                              label: party.partyName,
+                              secondary: `${eligibleLabel} Rs. ${party.amount.toLocaleString()}`,
+                            }))
+                          : counterAccountOptions;
+
+                        const placeholder = isAmbiguousChallan
+                          ? `Select ${eligibleLabel} Party`
+                          : line.sourceType === "CHALLAN" ||
+                            line.sourceType === "BILTY" ||
+                            line.sourceType === "PHONCH" ||
+                            line.sourceType === "PRIVATE_PHONCH"
+                          ? "Optional - auto-resolved from document"
+                          : "Search account...";
+
+                        return (
+                          <>
+                            <SearchableSelect
+                              value={line.counterAccountId}
+                              options={options}
+                              placeholder={placeholder}
+                              onChange={(value) => {
+                                updateLine(line.id, "counterAccountId", value);
+                                // Picking from the eligible-party selector IS
+                                // a resolution (just an explicit one instead
+                                // of automatic) - label it the same way. Any
+                                // other manual change supersedes the earlier
+                                // auto-resolution label.
+                                const eligibleMatch = line.eligibleParties.find(
+                                  (party) => party.accountId === value
+                                );
+                                updateLine(
+                                  line.id,
+                                  "resolvedPartyLabel",
+                                  eligibleMatch ? eligibleMatch.partyName : ""
+                                );
+                              }}
+                              className="w-72"
+                            />
+                            {(line.sourceType === "CHALLAN" ||
+                              line.sourceType === "BILTY" ||
+                              line.sourceType === "PHONCH" ||
+                              line.sourceType === "PRIVATE_PHONCH") &&
+                              line.sourceId &&
+                              line.resolvedPartyLabel && (
+                                <p className="mt-1 text-xs text-green-600">
+                                  Resolved Party: {line.resolvedPartyLabel}
+                                </p>
+                              )}
+                            {isAmbiguousChallan && (
+                              <p className="mt-1 text-xs text-blue-600">
+                                Multiple eligible {eligibleLabel} parties found - select
+                                the correct one above.
+                              </p>
+                            )}
+                            {(line.sourceType === "CHALLAN" ||
+                              line.sourceType === "BILTY" ||
+                              line.sourceType === "PHONCH" ||
+                              line.sourceType === "PRIVATE_PHONCH") &&
+                              line.sourceId &&
+                              !line.resolvedPartyLabel &&
+                              !line.counterAccountId &&
+                              !isAmbiguousChallan && (
+                                <p className="mt-1 text-xs text-amber-600">
+                                  No party could be auto-resolved - please select a
+                                  Counter Account.
+                                </p>
+                              )}
+                          </>
+                        );
+                      })()}
                     </td>
 
                     <td className="px-4 py-4">
@@ -554,6 +647,7 @@ export default function DailyPostingPage() {
                           updateLine(line.id, "sourceType", value);
                           updateLine(line.id, "sourceId", "");
                           updateLine(line.id, "sourceNumber", "");
+                          setLineEligibleParties(line.id, []);
                         }}
                         className="w-48"
                       />
@@ -562,11 +656,13 @@ export default function DailyPostingPage() {
                     <td className="px-4 py-4">
                       {line.sourceType === "CHALLAN" ||
                       line.sourceType === "BILTY" ||
-                      line.sourceType === "PHONCH" ? (
+                      line.sourceType === "PHONCH" ||
+                      line.sourceType === "PRIVATE_PHONCH" ? (
                         <DocumentSearchSelect
                           sourceType={line.sourceType}
                           sourceId={line.sourceId}
                           sourceNumber={line.sourceNumber}
+                          direction={line.direction}
                           onSelect={(result) => {
                             updateLine(line.id, "sourceType", result.type);
                             updateLine(line.id, "sourceId", result.id);
@@ -585,11 +681,18 @@ export default function DailyPostingPage() {
                               "resolvedPartyLabel",
                               result.resolvedParty?.partyName || ""
                             );
+                            // Multiple eligible Receivable/Payable parties
+                            // (CHALLAN) or payable/deposit parties (PRIVATE_
+                            // PHONCH) - never auto-selected above, offered as
+                            // an explicit selector instead. See the Counter
+                            // Account cell.
+                            setLineEligibleParties(line.id, result.eligibleParties || []);
                           }}
                           onClear={() => {
                             updateLine(line.id, "sourceId", "");
                             updateLine(line.id, "sourceNumber", "");
                             updateLine(line.id, "resolvedPartyLabel", "");
+                            setLineEligibleParties(line.id, []);
                           }}
                         />
                       ) : (

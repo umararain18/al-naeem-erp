@@ -1,5 +1,11 @@
 import type { Prisma, PrismaClient } from "@prisma/client";
-import { getBiltyLegitimatePartyAccountIds, resolveDocumentPartyAccount } from "@/lib/document-party-resolution";
+import {
+  getBiltyLegitimatePartyAccountIds,
+  getChallanEligiblePartyAccountIds,
+  getPrivatePhonchEligiblePartyAccountIds,
+  resolveDocumentPartyAccount,
+} from "@/lib/document-party-resolution";
+import { getGrossBiltyReceivableAccountId } from "@/lib/gross-accounts";
 
 // ============================================================
 // SHARED DAILY POSTING LINE VALIDATION
@@ -20,6 +26,7 @@ type Tx = PrismaClient | Prisma.TransactionClient;
 export type DailyPostingSourceType =
   | "CHALLAN"
   | "PHONCH"
+  | "PRIVATE_PHONCH"
   | "BILTY"
   | "BILL"
   | "PARTY"
@@ -29,6 +36,7 @@ export type DailyPostingSourceType =
 export const DAILY_POSTING_SOURCE_TYPES: DailyPostingSourceType[] = [
   "CHALLAN",
   "PHONCH",
+  "PRIVATE_PHONCH",
   "BILTY",
   "BILL",
   "PARTY",
@@ -67,6 +75,7 @@ export function validateDailyPostingLineShape(input: {
     input.sourceType !== "CHALLAN" &&
     input.sourceType !== "BILTY" &&
     input.sourceType !== "PHONCH" &&
+    input.sourceType !== "PRIVATE_PHONCH" &&
     !input.counterAccountId
   ) {
     throw new DailyPostingValidationError("Counter account is required");
@@ -80,7 +89,7 @@ export function validateDailyPostingLineShape(input: {
 // ------------------------------------------------------------
 export async function verifyDailyPostingDocument(
   tx: Tx,
-  sourceType: "CHALLAN" | "BILTY" | "PHONCH",
+  sourceType: "CHALLAN" | "BILTY" | "PHONCH" | "PRIVATE_PHONCH",
   sourceId: string
 ): Promise<{ canonicalNumber: string }> {
   if (sourceType === "CHALLAN") {
@@ -105,6 +114,17 @@ export async function verifyDailyPostingDocument(
     return { canonicalNumber: phonch.phonchNo };
   }
 
+  if (sourceType === "PRIVATE_PHONCH") {
+    const privatePhonch = await tx.privatePhonch.findFirst({
+      where: { id: sourceId, isDeleted: false },
+      select: { phonchNo: true },
+    });
+    if (!privatePhonch) {
+      throw new DailyPostingValidationError("Selected Private Phonch was not found");
+    }
+    return { canonicalNumber: privatePhonch.phonchNo };
+  }
+
   const bilty = await tx.bilty.findFirst({
     where: { id: sourceId, isDeleted: false },
     select: { biltyNo: true },
@@ -124,17 +144,21 @@ export async function resolveCounterAccountForDailyPostingLine(
   sourceType: DailyPostingSourceType,
   sourceId: string | undefined,
   manualCounterAccountId: string | undefined,
-  sourceNumberForMessage: string | undefined
+  sourceNumberForMessage: string | undefined,
+  // Only consulted for CHALLAN - see resolveChallanParty() in
+  // lib/document-party-resolution.ts.
+  direction?: "DEBIT" | "CREDIT"
 ): Promise<{ counterAccountId: string; wasManuallySupplied: boolean }> {
   if (manualCounterAccountId) {
     return { counterAccountId: manualCounterAccountId, wasManuallySupplied: true };
   }
 
   // validateDailyPostingLineShape already guarantees only CHALLAN/BILTY/
-  // PHONCH lines can reach here without a counterAccountId.
+  // PHONCH/PRIVATE_PHONCH lines can reach here without a counterAccountId.
   const resolved = await resolveDocumentPartyAccount(
-    sourceType as "CHALLAN" | "BILTY" | "PHONCH",
-    sourceId!
+    sourceType as "CHALLAN" | "BILTY" | "PHONCH" | "PRIVATE_PHONCH",
+    sourceId!,
+    direction
   );
 
   if (!resolved) {
@@ -150,25 +174,92 @@ export async function resolveCounterAccountForDailyPostingLine(
 // STEP 4 - hard-reject a manually-supplied Counter Account that
 // mismatches this Bilty's established responsible Party. Mirrors
 // "HARD REJECT: manually-supplied Counter Account mismatching...".
-// A no-op for CHALLAN (Create has no equivalent mismatch guard for
-// CHALLAN lines - not invented here either) and for auto-resolved
-// lines (wasManuallySupplied === false).
+// A no-op for CHALLAN (see assertCounterAccountLegitimateForChallan()
+// below, its own separate guard) and for auto-resolved lines
+// (wasManuallySupplied === false).
 // ------------------------------------------------------------
 export async function assertCounterAccountLegitimateForBilty(
   sourceType: DailyPostingSourceType,
   sourceId: string | undefined,
   counterAccountId: string,
-  wasManuallySupplied: boolean
+  wasManuallySupplied: boolean,
+  // Only consulted for the Gross Bilty Receivable exception - see
+  // getBiltyLegitimatePartyAccountIds().
+  direction?: "DEBIT" | "CREDIT"
 ): Promise<void> {
   if (sourceType !== "BILTY" || !wasManuallySupplied || !sourceId) return;
 
-  const legitimateAccountIds = await getBiltyLegitimatePartyAccountIds(sourceId);
+  const legitimateAccountIds = await getBiltyLegitimatePartyAccountIds(sourceId, direction);
 
   if (!legitimateAccountIds.has(counterAccountId)) {
     throw new DailyPostingValidationError(
       legitimateAccountIds.size > 0
         ? "The selected Counter Account does not match this Bilty's established responsible Party. Select the correct Party, or leave Counter Account blank to auto-resolve."
         : "This Bilty has no established or identifiable responsible Party (no valid Consignor/Consignee/Clearing Agent account, no Collection or Paid responsibility). Please verify the Bilty's parties before posting against it."
+    );
+  }
+}
+
+// ------------------------------------------------------------
+// STEP 4b - hard-reject a manually-supplied Counter Account that
+// mismatches this Challan's eligible Receivable/Payable parties for
+// the given direction, per the LOCKED rule in lib/document-party-
+// resolution.ts's resolveChallanParty(). A random Transporter/
+// Clearing Agent account must never be accepted merely because it
+// exists on the Challan - it must be an actual outstanding
+// Receivable (RECEIPT/DEBIT) or Payable (PAYMENT/CREDIT) party. A
+// no-op for non-CHALLAN sources, auto-resolved lines
+// (wasManuallySupplied === false), and a Challan with no eligible
+// party for this direction yet (empty set - preserves the existing,
+// pre-this-feature manual-entry behavior for that case).
+// ------------------------------------------------------------
+export async function assertCounterAccountLegitimateForChallan(
+  sourceType: DailyPostingSourceType,
+  sourceId: string | undefined,
+  counterAccountId: string,
+  wasManuallySupplied: boolean,
+  direction: "DEBIT" | "CREDIT" | undefined
+): Promise<void> {
+  if (sourceType !== "CHALLAN" || !wasManuallySupplied || !sourceId || !direction) return;
+
+  const eligibleAccountIds = await getChallanEligiblePartyAccountIds(sourceId, direction);
+
+  if (eligibleAccountIds.size > 0 && !eligibleAccountIds.has(counterAccountId)) {
+    throw new DailyPostingValidationError(
+      `The selected Counter Account is not an outstanding ${
+        direction === "DEBIT" ? "Receivable" : "Payable"
+      } party for this Challan. Select one of the eligible parties, or leave Counter Account blank to auto-resolve.`
+    );
+  }
+}
+
+// ------------------------------------------------------------
+// STEP 4c - hard-reject a manually-supplied Counter Account that
+// mismatches this Private Phonch's eligible payable/deposit parties
+// for the given direction, per the LOCKED rule in lib/document-party-
+// resolution.ts's resolvePrivatePhonchParty(). A no-op for non-
+// PRIVATE_PHONCH sources, auto-resolved lines (wasManuallySupplied
+// === false), and a Private Phonch with no eligible party for this
+// direction yet (empty set - preserves the pre-this-feature manual-
+// entry behavior for that case). Mirrors
+// assertCounterAccountLegitimateForChallan() exactly.
+// ------------------------------------------------------------
+export async function assertCounterAccountLegitimateForPrivatePhonch(
+  sourceType: DailyPostingSourceType,
+  sourceId: string | undefined,
+  counterAccountId: string,
+  wasManuallySupplied: boolean,
+  direction: "DEBIT" | "CREDIT" | undefined
+): Promise<void> {
+  if (sourceType !== "PRIVATE_PHONCH" || !wasManuallySupplied || !sourceId || !direction) return;
+
+  const eligibleAccountIds = await getPrivatePhonchEligiblePartyAccountIds(sourceId, direction);
+
+  if (eligibleAccountIds.size > 0 && !eligibleAccountIds.has(counterAccountId)) {
+    throw new DailyPostingValidationError(
+      `The selected Counter Account is not an outstanding ${
+        direction === "DEBIT" ? "deposit-eligible Clearing Agent" : "payable"
+      } party for this Private Phonch. Select one of the eligible parties, or leave Counter Account blank to auto-resolve.`
     );
   }
 }
@@ -207,23 +298,41 @@ export async function assertCounterAccountValidAndActive(
 // a PARTY account and a CASH/BANK account. Mirrors "PARTY <-> CASH/
 // BANK RESTRICTION".
 // ------------------------------------------------------------
-export function assertPartyCashBankRestriction(
+export async function assertPartyCashBankRestriction(
+  tx: Tx,
   sourceType: DailyPostingSourceType,
   mainCategory: string,
-  counterCategory: string
-): void {
-  if (sourceType !== "CHALLAN" && sourceType !== "BILTY" && sourceType !== "PHONCH") return;
+  counterCategory: string,
+  // Only consulted for the narrow Gross Bilty Receivable exception
+  // below - the exact account id and the line's direction.
+  counterAccountId?: string,
+  direction?: "DEBIT" | "CREDIT"
+): Promise<void> {
+  if (sourceType !== "CHALLAN" && sourceType !== "BILTY" && sourceType !== "PHONCH" && sourceType !== "PRIVATE_PHONCH") return;
 
   const isCashBank = (cat: string) => cat === "CASH" || cat === "BANK";
   const valid =
     (mainCategory === "PARTY" && isCashBank(counterCategory)) ||
     (counterCategory === "PARTY" && isCashBank(mainCategory));
 
-  if (!valid) {
-    throw new DailyPostingValidationError(
-      "Challan/Bilty-linked posting must move money only between a PARTY account and a CASH/BANK account."
-    );
+  if (valid) return;
+
+  // Narrow exception: BILTY + RECEIPT + the exact existing Gross
+  // Bilty Receivable system account (Main must be CASH/BANK) is the
+  // ONLY non-PARTY destination this restriction ever admits - see
+  // resolveUnclaimedGrossBiltyReceivable() in
+  // lib/document-party-resolution.ts. Eligibility for this SPECIFIC
+  // Bilty was already proven by the legitimacy guard above (Step 4) -
+  // this only re-checks that the resolved account IS that exact
+  // system account, never any other RECEIVABLE/ASSET account.
+  if (sourceType === "BILTY" && direction === "DEBIT" && isCashBank(mainCategory) && counterAccountId) {
+    const grossBiltyReceivableId = await getGrossBiltyReceivableAccountId(tx);
+    if (counterAccountId === grossBiltyReceivableId) return;
   }
+
+  throw new DailyPostingValidationError(
+    "Challan/Bilty-linked posting must move money only between a PARTY account and a CASH/BANK account."
+  );
 }
 
 // ------------------------------------------------------------
@@ -245,6 +354,10 @@ export interface ResolveDailyPostingLineParams {
   // exactly like Create validates one) - undefined = auto-resolve from
   // the document, exactly like Create does when none is supplied.
   counterAccountId?: string;
+  // The line's DEBIT/CREDIT direction against the Main account - only
+  // consulted for a CHALLAN source (see resolveChallanParty() in
+  // lib/document-party-resolution.ts).
+  direction?: "DEBIT" | "CREDIT";
 }
 
 export interface ResolvedDailyPostingLine {
@@ -258,12 +371,12 @@ export interface ResolvedDailyPostingLine {
 export async function resolveDailyPostingLine(
   params: ResolveDailyPostingLineParams
 ): Promise<ResolvedDailyPostingLine> {
-  const { tx, mainAccountId, mainCategory, sourceType, sourceId, sourceNumber, counterAccountId } = params;
+  const { tx, mainAccountId, mainCategory, sourceType, sourceId, sourceNumber, counterAccountId, direction } = params;
 
   validateDailyPostingLineShape({ sourceType, sourceId, sourceNumber, counterAccountId });
 
   let canonicalNumber: string | null = sourceNumber || null;
-  if ((sourceType === "CHALLAN" || sourceType === "BILTY" || sourceType === "PHONCH") && sourceId) {
+  if ((sourceType === "CHALLAN" || sourceType === "BILTY" || sourceType === "PHONCH" || sourceType === "PRIVATE_PHONCH") && sourceId) {
     const doc = await verifyDailyPostingDocument(tx, sourceType, sourceId);
     canonicalNumber = doc.canonicalNumber;
   }
@@ -273,24 +386,30 @@ export async function resolveDailyPostingLine(
       sourceType,
       sourceId,
       counterAccountId,
-      canonicalNumber || undefined
+      canonicalNumber || undefined,
+      direction
     );
 
   if (resolvedCounterId === mainAccountId) {
     throw new DailyPostingValidationError("Main account cannot be its own counter account");
   }
 
-  await assertCounterAccountLegitimateForBilty(sourceType, sourceId, resolvedCounterId, wasManuallySupplied);
+  await assertCounterAccountLegitimateForBilty(sourceType, sourceId, resolvedCounterId, wasManuallySupplied, direction);
+  await assertCounterAccountLegitimateForChallan(sourceType, sourceId, resolvedCounterId, wasManuallySupplied, direction);
+  await assertCounterAccountLegitimateForPrivatePhonch(sourceType, sourceId, resolvedCounterId, wasManuallySupplied, direction);
 
   const counterAccount = await assertCounterAccountValidAndActive(tx, resolvedCounterId, mainAccountId);
 
-  assertPartyCashBankRestriction(sourceType, mainCategory, counterAccount.category);
+  await assertPartyCashBankRestriction(tx, sourceType, mainCategory, counterAccount.category, resolvedCounterId, direction);
 
   return {
     counterAccountId: resolvedCounterId,
     counterAccount,
     sourceType,
-    sourceId: (sourceType === "CHALLAN" || sourceType === "BILTY" || sourceType === "PHONCH") ? sourceId || null : null,
+    sourceId:
+      (sourceType === "CHALLAN" || sourceType === "BILTY" || sourceType === "PHONCH" || sourceType === "PRIVATE_PHONCH")
+        ? sourceId || null
+        : null,
     sourceNumber: canonicalNumber,
   };
 }

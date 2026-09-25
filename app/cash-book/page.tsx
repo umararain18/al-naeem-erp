@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";import { useRouter } from "next/navigation"; import TransactionViewModal from "./TransactionViewModal"; import TransactionEditModal from "./TransactionEditModal";
+import { presetRange } from "@/components/LedgerFilters";
 
 type Account = {
   id: string;
@@ -54,6 +55,7 @@ type CashBookResponse = {
     closingBalance: number;
   };
   days: CashBookDay[];
+  resultCount?: number | null;
   capabilities?: {
     canEdit: boolean;
     canMoveToBin: boolean;
@@ -96,6 +98,12 @@ export default function CashBookPage() {
 
   const [toDate, setToDate] =
     useState("");
+
+  const [transactionSearch, setTransactionSearch] =
+    useState("");
+
+  const [resultCount, setResultCount] =
+    useState<number | null>(null);
 
   const [openDates, setOpenDates] =
     useState<string[]>([]);
@@ -188,7 +196,8 @@ export default function CashBookPage() {
   async function loadCashBook(
     accountId: string,
     from = fromDate,
-    to = toDate
+    to = toDate,
+    search = transactionSearch
   ) {
     if (!accountId) {
       setDays([]);
@@ -199,6 +208,8 @@ export default function CashBookPage() {
         totalCredit: 0,
         closingBalance: 0,
       });
+
+      setResultCount(null);
 
       return;
     }
@@ -217,6 +228,10 @@ export default function CashBookPage() {
 
       if (to) {
         params.set("to", to);
+      }
+
+      if (search.trim()) {
+        params.set("q", search.trim());
       }
 
       const response = await fetch(
@@ -238,6 +253,7 @@ export default function CashBookPage() {
       }
 
       setDays(data.days || []);
+      setResultCount(data.resultCount ?? null);
       setCapabilities(data.capabilities || {
         canEdit: false,
         canMoveToBin: false,
@@ -263,6 +279,7 @@ export default function CashBookPage() {
       );
 
       setDays([]);
+      setResultCount(null);
 
       setSummary({
         openingBalance: 0,
@@ -368,14 +385,29 @@ export default function CashBookPage() {
   function handleReset() {
     setFromDate("");
     setToDate("");
+    setTransactionSearch("");
     setError("");
 
     if (selectedAccountId) {
       loadCashBook(
         selectedAccountId,
         "",
+        "",
         ""
       );
+    }
+  }
+
+  /*
+   * Date preset - sets From/To and reloads immediately, same as
+   * every other ledger's preset buttons.
+   */
+  function handlePreset(from: string, to: string) {
+    setFromDate(from);
+    setToDate(to);
+
+    if (selectedAccountId) {
+      loadCashBook(selectedAccountId, from, to);
     }
   }
   /*
@@ -584,6 +616,44 @@ export default function CashBookPage() {
             </div>
 
           </div>
+
+          <div className="mt-4">
+            <label className="mb-2 block text-sm font-medium text-gray-700">
+              Search transactions...
+            </label>
+            <input
+              type="text"
+              value={transactionSearch}
+              onChange={(event) => setTransactionSearch(event.target.value)}
+              placeholder="Bilty No, Challan No, Party, description..."
+              className="w-full rounded-lg border border-gray-300 px-3 py-2.5 text-sm outline-none focus:border-blue-500"
+            />
+          </div>
+
+          <div className="mt-4 flex flex-wrap gap-2">
+            {(["TODAY", "YESTERDAY", "THIS_WEEK", "THIS_MONTH", "LAST_MONTH", "THIS_YEAR", "ALL_TIME"] as const).map((key) => (
+              <button
+                key={key}
+                type="button"
+                onClick={() => {
+                  const range = presetRange(key);
+                  handlePreset(range.from, range.to);
+                }}
+                className="text-xs rounded-lg border border-gray-300 px-3 py-1.5 hover:bg-gray-50 text-gray-600"
+              >
+                {key
+                  .split("_")
+                  .map((w) => w[0] + w.slice(1).toLowerCase())
+                  .join(" ")}
+              </button>
+            ))}
+          </div>
+
+          {transactionSearch.trim() && resultCount !== null && (
+            <p className="mt-3 text-xs text-gray-500">
+              {resultCount === 0 ? "No transactions found" : `${resultCount} transaction${resultCount === 1 ? "" : "s"} found`}
+            </p>
+          )}
 
           <div className="mt-5 flex justify-end gap-3">
 

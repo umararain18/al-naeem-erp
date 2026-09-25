@@ -57,6 +57,7 @@ export async function GET(request: NextRequest, context: { params: Promise<{ id:
       currentBalance: data.currentBalance,
       currentStatus: data.currentStatus,
       entries: displayEntries,
+      resultCount: search ? displayEntries.length : null,
       summary: data.summary,
       filters: { from: from || null, to: to || null, search: search || null },
     });

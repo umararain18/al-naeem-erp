@@ -55,6 +55,16 @@ export async function GET(request: NextRequest) {
     });
 
     const phonchIds = phonches.map((p) => p.id);
+    // Keyed by `${sourceId}:${accountId}` - NEVER by sourceId alone.
+    // A Daily Posting's own main Cash/Bank account line is tagged with
+    // this SAME sourceType/sourceId as the Transporter's own line (see
+    // buildLinePair() in app/api/daily-posting/route.ts), so summing
+    // credit-debit across ALL lines for a given sourceId (regardless of
+    // account) always cancels the Bank's debit against the
+    // Transporter's credit and yields 0 - this was the actual root
+    // cause of the list's stale Received/Remaining/status (the detail
+    // page's own getPhonchPaymentState() was never affected, since it
+    // already filters to the Transporter's specific accountId).
     const receiptLines = phonchIds.length
       ? await prisma.journalLine.findMany({
           where: {
@@ -62,13 +72,14 @@ export async function GET(request: NextRequest) {
             sourceId: { in: phonchIds },
             journalEntry: { referenceType: "DAILY_POSTING", isDeleted: false },
           },
-          select: { sourceId: true, debit: true, credit: true },
+          select: { sourceId: true, accountId: true, debit: true, credit: true },
         })
       : [];
-    const receivedByPhonchId = new Map<string, number>();
+    const receivedByKey = new Map<string, number>();
     for (const line of receiptLines) {
-      const prev = receivedByPhonchId.get(line.sourceId!) || 0;
-      receivedByPhonchId.set(line.sourceId!, prev + Number(line.credit) - Number(line.debit));
+      const key = `${line.sourceId}:${line.accountId}`;
+      const prev = receivedByKey.get(key) || 0;
+      receivedByKey.set(key, prev + Number(line.credit) - Number(line.debit));
     }
 
     const items = phonches.map((p) => {
@@ -76,7 +87,9 @@ export async function GET(request: NextRequest) {
       const totalOtherExpense = p.vehicles.reduce((s, v) => s + Number(v.otherExpenseAmount), 0);
       const totalClaim = p.vehicles.reduce((s, v) => s + Number(v.claimAmount), 0);
       const totalAmount = totalDeliveryCharges + totalOtherExpense + totalClaim;
-      const receivedAmount = Math.max(0, Math.round((receivedByPhonchId.get(p.id) || 0) * 100) / 100);
+      const transporterAccountId = p.transporterParty.account?.id;
+      const receivedRaw = transporterAccountId ? receivedByKey.get(`${p.id}:${transporterAccountId}`) || 0 : 0;
+      const receivedAmount = Math.max(0, Math.round(receivedRaw * 100) / 100);
       const remainingDue = Math.max(0, Math.round((totalAmount - receivedAmount) * 100) / 100);
 
       return {

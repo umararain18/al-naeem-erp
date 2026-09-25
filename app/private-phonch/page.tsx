@@ -2,38 +2,48 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
-import PhonchForm from "./PhonchForm";
+import PrivatePhonchForm from "./PrivatePhonchForm";
 
 // ============================================================
-// SHOWROOM PHONCH / DELIVERY - list + create
+// PRIVATE PHONCH - list + create
 //
-// The create/edit FORM itself lives in ./PhonchForm.tsx, reused
-// unchanged by app/phonch/[id]/page.tsx's "Edit" action. "Received"/
-// "Remaining Due" are never form inputs here - both come back
-// pre-computed from the API (lib/phonch-accounting.ts's
-// getPhonchPaymentState()), derived from actual Daily Posting
-// receipts.
+// Mirrors app/phonch/page.tsx's own structure exactly. The create/
+// edit FORM itself lives in ./PrivatePhonchForm.tsx, reused unchanged
+// by app/private-phonch/[id]/page.tsx's "Edit" action. "Paid"/
+// "Remaining" are never form inputs here - both come back pre-
+// computed from the API (lib/private-phonch-accounting.ts's
+// getPrivatePhonchPaymentState()), derived from actual Daily Posting
+// payments/deposits.
 // ============================================================
 
-type PhonchListItem = {
+type PrivatePhonchListItem = {
   id: string;
   phonchNo: string;
   date: string;
-  carrierNumber: string | null;
+  billNo: string | null;
   transporterParty: { id: string; partyName: string };
   vehicleCount: number;
-  totalAmount: number;
-  receivedAmount: number;
-  remainingDue: number;
-  status: "RECEIVABLE" | "CLEARED";
+  vehicleNames: string[];
+  totalCarrierPayable: number;
+  totalCaPayable: number;
+  totalDeliveryRecovery: number;
+  transporterPaid: number;
+  transporterRemaining: number;
+  transporterRecovered: number;
+  transporterRecoveryRemaining: number;
+  caPaidTotal: number;
+  caRemaining: number;
+  caRecovered: number;
+  caRecoveryRemaining: number;
+  status: "PAYABLE" | "RECEIVABLE" | "MIXED" | "CLEARED";
 };
 
 function formatCurrency(value: number) {
   return `Rs. ${Math.round(value).toLocaleString()}`;
 }
 
-export default function PhonchPage() {
-  const [items, setItems] = useState<PhonchListItem[]>([]);
+export default function PrivatePhonchPage() {
+  const [items, setItems] = useState<PrivatePhonchListItem[]>([]);
   const [capabilities, setCapabilities] = useState({ canEdit: false, canBin: false });
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
@@ -44,7 +54,7 @@ export default function PhonchPage() {
   async function loadList() {
     try {
       setLoading(true);
-      const res = await fetch(`/api/phonch?search=${encodeURIComponent(search)}`, { cache: "no-store" });
+      const res = await fetch(`/api/private-phonch?search=${encodeURIComponent(search)}`, { cache: "no-store" });
       const data = await res.json();
       if (data.success) {
         setItems(data.items);
@@ -64,11 +74,11 @@ export default function PhonchPage() {
   }, [search]);
 
   async function handleBin(id: string) {
-    if (!window.confirm("Move this Phonch to Bin?")) return;
+    if (!window.confirm("Move this Private Phonch to Bin?")) return;
     try {
       setActionId(id);
       setError("");
-      const res = await fetch(`/api/phonch/${id}`, { method: "DELETE" });
+      const res = await fetch(`/api/private-phonch/${id}`, { method: "DELETE" });
       const data = await res.json();
       if (!res.ok || !data.success) throw new Error(data.message || "Unable to move to Bin");
       setMessage(data.message);
@@ -84,9 +94,10 @@ export default function PhonchPage() {
     <main className="min-h-screen bg-gray-50 p-6">
       <div className="mx-auto max-w-7xl">
         <div className="mb-6">
-          <h1 className="text-2xl font-bold text-gray-900">Showroom Phonch / Delivery</h1>
+          <h1 className="text-2xl font-bold text-gray-900">Private Phonch</h1>
           <p className="mt-1 text-sm text-gray-500">
-            Record delivered vehicles and the charges billed to the Transporter.
+            Vehicle/rent settlement - Carrier Rent Payable to the Transporter and Amanat Payable to each vehicle&apos;s
+            Clearing Agent.
           </p>
         </div>
 
@@ -100,25 +111,25 @@ export default function PhonchPage() {
           </div>
         )}
 
-        <PhonchForm
+        <PrivatePhonchForm
           mode="create"
           onSaved={(phonch) => {
-            setMessage(`Phonch ${phonch.phonchNo} created successfully.`);
+            setMessage(`Private Phonch ${phonch.phonchNo} created successfully.`);
             void loadList();
           }}
         />
 
         <div className="mt-6 rounded-xl border bg-white shadow-sm">
           <div className="flex items-center justify-between gap-3 border-b p-4">
-            <h2 className="text-sm font-semibold text-gray-700">Phonch Records</h2>
+            <h2 className="text-sm font-semibold text-gray-700">Private Phonch Records</h2>
             <div className="flex items-center gap-3">
               <input
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
-                placeholder="Search Phonch No, Carrier No, Transporter..."
+                placeholder="Search Private Phonch No, Transporter..."
                 className="w-72 rounded-lg border px-3 py-1.5 text-sm"
               />
-              <Link href="/phonch/bin" className="text-xs text-gray-500 hover:underline">
+              <Link href="/private-phonch/bin" className="text-xs text-gray-500 hover:underline">
                 Bin
               </Link>
             </div>
@@ -127,59 +138,85 @@ export default function PhonchPage() {
             {loading ? (
               <div className="p-10 text-center text-sm text-gray-500">Loading...</div>
             ) : items.length === 0 ? (
-              <div className="p-10 text-center text-sm text-gray-500">No Phonch records found.</div>
+              <div className="p-10 text-center text-sm text-gray-500">No Private Phonch records found.</div>
             ) : (
-              <table className="w-full min-w-[1000px] text-sm">
+              <table className="w-full min-w-[1100px] text-sm">
                 <thead className="bg-gray-50 text-left text-xs uppercase text-gray-500">
                   <tr>
-                    <th className="px-4 py-3">Phonch No</th>
+                    <th className="px-4 py-3">Private Phonch No</th>
                     <th className="px-4 py-3">Date</th>
                     <th className="px-4 py-3">Transporter</th>
                     <th className="px-4 py-3">Vehicles</th>
-                    <th className="px-4 py-3">Total Amount</th>
-                    <th className="px-4 py-3">Received</th>
-                    <th className="px-4 py-3">Remaining Due</th>
+                    <th className="px-4 py-3">Transporter Remaining</th>
+                    <th className="px-4 py-3">CA Remaining</th>
                     <th className="px-4 py-3">Status</th>
                     <th className="px-4 py-3">Actions</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y">
                   {items.map((p) => {
-                    // Bin remains blocked once any receipt exists
-                    // (unchanged - only Edit's own gate changed, since
-                    // the backend now validates financial edits per-
-                    // amount rather than blocking outright).
-                    const isUnpaid = p.receivedAmount <= 0.009;
+                    const isUnpaid =
+                      p.transporterPaid <= 0.009 &&
+                      p.transporterRecovered <= 0.009 &&
+                      p.caPaidTotal <= 0.009 &&
+                      p.caRecovered <= 0.009;
+                    const statusLabel =
+                      p.status === "CLEARED" ? "Cleared" : p.status === "RECEIVABLE" ? "Receivable" : p.status === "MIXED" ? "Mixed" : "Payable";
+                    const statusClass =
+                      p.status === "CLEARED"
+                        ? "bg-green-50 text-green-700"
+                        : p.status === "RECEIVABLE"
+                        ? "bg-blue-50 text-blue-700"
+                        : p.status === "MIXED"
+                        ? "bg-purple-50 text-purple-700"
+                        : "bg-amber-50 text-amber-700";
                     return (
                       <tr key={p.id} className="hover:bg-gray-50">
                         <td className="px-4 py-3">
-                          <Link href={`/phonch/${p.id}`} className="font-medium text-blue-600 hover:underline">
+                          <Link href={`/private-phonch/${p.id}`} className="font-medium text-blue-600 hover:underline">
                             {p.phonchNo}
                           </Link>
                         </td>
                         <td className="px-4 py-3">{new Date(p.date).toLocaleDateString("en-GB")}</td>
                         <td className="px-4 py-3">{p.transporterParty.partyName}</td>
-                        <td className="px-4 py-3">{p.vehicleCount}</td>
-                        <td className="px-4 py-3">{formatCurrency(p.totalAmount)}</td>
-                        <td className="px-4 py-3">{formatCurrency(p.receivedAmount)}</td>
-                        <td className="px-4 py-3">{formatCurrency(p.remainingDue)}</td>
+                        <td className="px-4 py-3">{p.vehicleNames.length > 0 ? p.vehicleNames.join(", ") : p.vehicleCount}</td>
                         <td className="px-4 py-3">
-                          <span
-                            className={`rounded-full px-2 py-0.5 text-xs font-medium ${
-                              p.status === "CLEARED" ? "bg-green-50 text-green-700" : "bg-amber-50 text-amber-700"
-                            }`}
-                          >
-                            {p.status === "CLEARED" ? "Cleared / Received" : "Receivable"}
-                          </span>
+                          {p.transporterRemaining <= 0.009 && p.transporterRecoveryRemaining <= 0.009 ? (
+                            formatCurrency(0)
+                          ) : (
+                            <div className="space-y-0.5">
+                              {p.transporterRemaining > 0.009 && (
+                                <div className="text-amber-700">{formatCurrency(p.transporterRemaining)} Payable</div>
+                              )}
+                              {p.transporterRecoveryRemaining > 0.009 && (
+                                <div className="text-blue-700">{formatCurrency(p.transporterRecoveryRemaining)} Receivable</div>
+                              )}
+                            </div>
+                          )}
+                        </td>
+                        <td className="px-4 py-3">
+                          {p.caRemaining <= 0.009 && p.caRecoveryRemaining <= 0.009 ? (
+                            formatCurrency(0)
+                          ) : (
+                            <div className="space-y-0.5">
+                              {p.caRemaining > 0.009 && <div className="text-amber-700">{formatCurrency(p.caRemaining)} Payable</div>}
+                              {p.caRecoveryRemaining > 0.009 && (
+                                <div className="text-blue-700">{formatCurrency(p.caRecoveryRemaining)} Receivable</div>
+                              )}
+                            </div>
+                          )}
+                        </td>
+                        <td className="px-4 py-3">
+                          <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${statusClass}`}>{statusLabel}</span>
                         </td>
                         <td className="px-4 py-3">
                           <div className="flex gap-2">
-                            <Link href={`/phonch/${p.id}`} className="rounded border px-2 py-1 text-xs hover:bg-gray-50">
+                            <Link href={`/private-phonch/${p.id}`} className="rounded border px-2 py-1 text-xs hover:bg-gray-50">
                               View
                             </Link>
                             {capabilities.canEdit && (
                               <Link
-                                href={`/phonch/${p.id}?edit=1`}
+                                href={`/private-phonch/${p.id}?edit=1`}
                                 className="rounded border px-2 py-1 text-xs hover:bg-gray-50"
                               >
                                 Edit

@@ -97,9 +97,9 @@ export interface ChallanSettlementSummary {
    * lib/settlement-correction.ts), reused here rather than
    * recalculated from currently-visible payer rows alone, so a
    * party's residual OLD-mechanism attribution (e.g. a Bilty's
-   * advance-floor stand-in - see resolveCollectionFloor() in
-   * lib/settlement-payments.ts) is never missed just because the new
-   * multi-payer engine hasn't touched that specific slice.
+   * toPay-floor stand-in - see syncCollectionFloorForNewEngineRows()
+   * in lib/settlement-payments.ts) is never missed just because the
+   * new multi-payer engine hasn't touched that specific slice.
    *
    * PAID is deliberately EXCLUDED from this net - a Bilty's Paid
    * amount is informational/context only per the approved business
@@ -252,8 +252,8 @@ export async function computeChallanSettlementSummaryBatch(
     // Collection, and for this Challan's Carrier Rent - resolved
     // UNCONDITIONALLY (not just when no live rows exist for that
     // component), because a party's residual OLD-mechanism
-    // attribution (e.g. resolveCollectionFloor()'s Bilty.advance
-    // stand-in) can remain non-zero even once the new multi-payer
+    // attribution (e.g. syncCollectionFloorForNewEngineRows()'s
+    // toPay-floor stand-in) can remain non-zero even once the new multi-payer
     // engine already has its own rows for that same component - see
     // PartyNetEntry's own doc comment above for why this must be
     // considered for an authoritative party net, not just for the

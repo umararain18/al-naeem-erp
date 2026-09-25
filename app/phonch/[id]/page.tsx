@@ -117,7 +117,15 @@ export default function PhonchDetailPage({ params }: { params: Promise<{ id: str
 
   if (!phonch) return null;
 
-  const canEditNow = capabilities.canEdit && phonch.receivedAmount <= 0.009 && !phonch.isDeleted;
+  // Edit is no longer blocked merely because a receipt exists - the
+  // backend now allows non-financial edits and financial edits that
+  // don't drop below what's already been received via Daily Posting,
+  // rejecting anything unsafe with its own business-readable error
+  // (see lib/phonch-accounting.ts's assertPhonchEditNotBelowSettled()).
+  // phonch.receivedAmount is still used below for the Bin gate/warning
+  // banner, which are unchanged and still block entirely once any
+  // receipt exists.
+  const canEditNow = capabilities.canEdit && !phonch.isDeleted;
 
   if (editing) {
     return (

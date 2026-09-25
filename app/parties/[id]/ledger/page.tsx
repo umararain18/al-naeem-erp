@@ -9,6 +9,7 @@ import PaymentsView from "./PaymentsView";
 import SummaryView from "./SummaryView";
 import ReconciliationView from "./ReconciliationView";
 import StatementView from "./StatementView";
+import { presetRange } from "@/components/LedgerFilters";
 
 type PartyType = "TRANSPORTER" | "CLEARING_AGENT" | "CUSTOMER" | "VENDOR";
 
@@ -172,6 +173,30 @@ function LedgerTable({
             placeholder="To"
           />
         </div>
+        <div className="flex flex-wrap gap-2 mt-3">
+          {(["TODAY", "YESTERDAY", "THIS_WEEK", "THIS_MONTH", "LAST_MONTH", "THIS_YEAR", "ALL_TIME"] as const).map((key) => (
+            <button
+              key={key}
+              type="button"
+              onClick={() => {
+                const range = presetRange(key);
+                setFrom(range.from);
+                setTo(range.to);
+              }}
+              className="text-xs border rounded-lg px-3 py-1.5 hover:bg-gray-50 text-gray-600"
+            >
+              {key
+                .split("_")
+                .map((w) => w[0] + w.slice(1).toLowerCase())
+                .join(" ")}
+            </button>
+          ))}
+        </div>
+        {search.trim() && (
+          <p className="text-xs text-gray-500 mt-2">
+            {filtered.length === 0 ? "No transactions found" : `${filtered.length} transaction${filtered.length === 1 ? "" : "s"} found`}
+          </p>
+        )}
         <div className="flex justify-end mt-3 gap-2">
           <a
             href={`/api/parties/${partyId}/ledger/pdf?${exportQuery}`}

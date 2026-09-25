@@ -10,18 +10,22 @@
 import { useEffect, useState } from "react";
 
 export type DocumentSearchResult = {
-  type: "CHALLAN" | "BILTY" | "PHONCH";
+  type: "CHALLAN" | "BILTY" | "PHONCH" | "PRIVATE_PHONCH";
   id: string;
   number: string;
   subtitle: string;
   detail: string;
   resolvedParty: { accountId: string; partyName: string } | null;
+  // CHALLAN and PRIVATE_PHONCH only, and only once `direction` is
+  // known - see app/api/daily-posting/search-documents/route.ts.
+  eligibleParties?: { accountId: string; partyName: string; amount: number }[];
 };
 
 export function DocumentSearchSelect({
   sourceType,
   sourceId,
   sourceNumber,
+  direction,
   onSelect,
   onClear,
   readOnly = false,
@@ -29,6 +33,11 @@ export function DocumentSearchSelect({
   sourceType: string;
   sourceId: string;
   sourceNumber: string;
+  // The line's DEBIT/CREDIT direction, forwarded to the resolver so a
+  // CHALLAN's auto-resolved party reflects the LOCKED Receivable/
+  // Payable rule (see resolveChallanParty() in
+  // lib/document-party-resolution.ts). Unused for BILTY/PHONCH.
+  direction?: "DEBIT" | "CREDIT";
   onSelect: (result: DocumentSearchResult) => void;
   onClear: () => void;
   // When true, the field only DISPLAYS the already-linked document
@@ -64,8 +73,9 @@ export function DocumentSearchSelect({
       try {
         setLoading(true);
 
+        const directionQuery = direction ? `&direction=${direction}` : "";
         const response = await fetch(
-          `/api/daily-posting/search-documents?q=${encodeURIComponent(search)}`
+          `/api/daily-posting/search-documents?q=${encodeURIComponent(search)}${directionQuery}`
         );
 
         const data = await response.json();
@@ -81,7 +91,56 @@ export function DocumentSearchSelect({
     }, 300);
 
     return () => window.clearTimeout(handle);
-  }, [query, open, readOnly]);
+  }, [query, open, readOnly, direction]);
+
+  // A document may be selected BEFORE its line's direction is chosen
+  // (the "Type" column is filled in after "Document No." in the
+  // Create table) - re-resolve the already-selected CHALLAN/BILTY/
+  // PRIVATE_PHONCH's counterparty whenever direction changes
+  // afterward, so the LOCKED Receivable/Payable rule (Challan), the
+  // narrow Gross Bilty Receivable RECEIPT-only exception (Bilty), and
+  // the payable-vs-deposit eligibility split (Private Phonch) are
+  // applied to whichever direction is current at save time, not just
+  // whichever was current at selection time. A no-op for PHONCH
+  // (direction never affects its resolution) and for any caller that
+  // never passes a direction prop at all (e.g.
+  // app/cash-book/TransactionEditModal.tsx, which resolves the
+  // Counter Account server-side instead) - only fires once a
+  // concrete direction is actually known.
+  useEffect(() => {
+    if (
+      readOnly ||
+      !sourceId ||
+      (sourceType !== "CHALLAN" && sourceType !== "BILTY" && sourceType !== "PRIVATE_PHONCH") ||
+      !direction
+    )
+      return;
+
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const directionQuery = direction ? `&direction=${direction}` : "";
+        const response = await fetch(
+          `/api/daily-posting/search-documents?q=${encodeURIComponent(sourceNumber)}${directionQuery}`
+        );
+        const data = await response.json();
+        if (cancelled || !response.ok || !data.success) return;
+
+        const match = (data.results || []).find(
+          (r: DocumentSearchResult) => r.type === sourceType && r.id === sourceId
+        );
+        if (match) onSelect(match);
+      } catch {
+        // silent - identical failure handling to the search above.
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [direction]);
 
   const displayValue = sourceId
     ? `${sourceType} ${sourceNumber}`

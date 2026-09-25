@@ -366,12 +366,19 @@ export async function getEmployeeLedgerData(
     return { id: line.id, date: line.journalEntry.entryDate.toISOString(), description, debit, credit, balance: runningBalance };
   });
 
+  // Search only narrows which rows are DISPLAYED - Total Debit/Total
+  // Credit/Closing Balance below are computed from the FULL (search-
+  // unfiltered) period, matching every other ledger's "search must
+  // not distort the accounting balance" rule. Each row's own
+  // `balance` was already computed above from the full period too,
+  // so it stays the true running balance even when displayed within
+  // a filtered subset.
   const filteredEntries = filters.search
     ? entries.filter((e) => e.description.toLowerCase().includes(filters.search!.toLowerCase()))
     : entries;
 
-  const totalDebit = round2(filteredEntries.reduce((s, e) => s + e.debit, 0));
-  const totalCredit = round2(filteredEntries.reduce((s, e) => s + e.credit, 0));
+  const totalDebit = round2(entries.reduce((s, e) => s + e.debit, 0));
+  const totalCredit = round2(entries.reduce((s, e) => s + e.credit, 0));
   const closingBalance = entries.length > 0 ? entries[entries.length - 1].balance : openingBalance;
 
   const overallBalance = round2(allLines.reduce((s, l) => s + Number(l.credit) - Number(l.debit), 0));

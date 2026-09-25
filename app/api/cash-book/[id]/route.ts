@@ -23,6 +23,10 @@ import {
   assertPhonchReceiptNotExceeded,
   PhonchAccountingError,
 } from "@/lib/phonch-accounting";
+import {
+  assertPrivatePhonchPaymentNotExceeded,
+  PrivatePhonchAccountingError,
+} from "@/lib/private-phonch-accounting";
 
 function isValidDate(value: string) {
   const date = new Date(`${value}T00:00:00`);
@@ -360,6 +364,7 @@ export async function PATCH(
                 sourceId: effectiveSourceId,
                 sourceNumber: typeof documentNo === "string" ? documentNo.trim() : undefined,
                 counterAccountId: documentUnchanged ? counterLine.accountId : undefined,
+                direction: newDebit > 0 ? "DEBIT" : "CREDIT",
               });
 
               finalSourceId = resolved.sourceId;
@@ -400,6 +405,23 @@ export async function PATCH(
               const mainDirection: "DEBIT" | "CREDIT" = newDebit > 0 ? "DEBIT" : "CREDIT";
               const mainAmount = newDebit > 0 ? newDebit : newCredit;
               await assertPhonchReceiptNotExceeded(
+                tx,
+                finalSourceId,
+                finalCounterAccountId,
+                mainAmount,
+                mainDirection,
+                currentLine.journalEntryId
+              );
+            }
+
+            // Same ceiling, applied to a Private Phonch's per-party
+            // remaining payable instead of a Phonch's Total Amount -
+            // see lib/private-phonch-accounting.ts's
+            // assertPrivatePhonchPaymentNotExceeded().
+            if (finalSourceType === "PRIVATE_PHONCH" && finalSourceId) {
+              const mainDirection: "DEBIT" | "CREDIT" = newDebit > 0 ? "DEBIT" : "CREDIT";
+              const mainAmount = newDebit > 0 ? newDebit : newCredit;
+              await assertPrivatePhonchPaymentNotExceeded(
                 tx,
                 finalSourceId,
                 finalCounterAccountId,
@@ -466,6 +488,12 @@ export async function PATCH(
           );
         }
         if (error instanceof PhonchAccountingError) {
+          return NextResponse.json(
+            { success: false, code: error.code, message: error.message },
+            { status: 400 }
+          );
+        }
+        if (error instanceof PrivatePhonchAccountingError) {
           return NextResponse.json(
             { success: false, code: error.code, message: error.message },
             { status: 400 }

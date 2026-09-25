@@ -66,7 +66,22 @@ export type CommissionResponsibility =
 export interface BiltySettlementInput {
   biltyId: string;
   biltyNo: string;
+  // The full Bilty amount (rent + insurance + expense) - drives ONLY
+  // the Carrier Rent pro-rata allocation weight below, unchanged.
+  // Never used for the Collection reclassification itself - see
+  // `collectionAmount`.
   amount: number | string | Decimal;
+
+  // The amount to actually reclassify for the Collection component -
+  // per the LOCKED rule, this must be only the genuinely outstanding
+  // (To-Pay) portion, never the Paid amount (Paid is not a Collection
+  // amount - its own receipt is verified only through Daily Posting,
+  // see lib/document-party-resolution.ts's
+  // resolveUnclaimedGrossBiltyReceivable()). Optional and defaults to
+  // `amount` when omitted, so any existing caller that does not pass
+  // it (e.g. the legacy POST /settle route) keeps its exact current
+  // behavior unchanged.
+  collectionAmount?: number | string | Decimal;
 
   // Who is responsible for / holds this Bilty's customer collection.
   // Must already be resolved to a real, active PARTY account id.
@@ -150,6 +165,12 @@ function round2(value: number): number {
   return Number(value.toFixed(2));
 }
 
+// Defaults to the full `amount` when `collectionAmount` is not
+// supplied - see BiltySettlementInput.collectionAmount's own comment.
+function getCollectionAmount(bilty: BiltySettlementInput): number {
+  return bilty.collectionAmount !== undefined ? toNumber(bilty.collectionAmount) : toNumber(bilty.amount);
+}
+
 function responsibilityLabel(
   responsibility: string | null | undefined
 ): string {
@@ -199,10 +220,10 @@ export function buildSettlementEntries(
   }
 
   for (const bilty of input.bilties) {
-    const amount = toNumber(bilty.amount);
+    const collectionAmount = getCollectionAmount(bilty);
     const commission = toNumber(bilty.agentCommission);
 
-    if (amount > 0 && !bilty.collectionPartyAccountId) {
+    if (collectionAmount > 0 && !bilty.collectionPartyAccountId) {
       errors.push({
         field: `bilty:${bilty.biltyNo}.collection`,
         message: `A responsible party account is required for Bilty ${bilty.biltyNo}'s collection.`,
@@ -240,7 +261,15 @@ export function buildSettlementEntries(
 
   for (let i = 0; i < input.bilties.length; i++) {
     const bilty = input.bilties[i];
+    // `amount` (Bilty.total) drives ONLY the Carrier Rent pro-rata
+    // split below, unchanged - it deliberately still reflects the
+    // Bilty's full rent regardless of how much of it is Paid, so
+    // Carrier Rent allocation weighting is not affected by this
+    // change. The Collection reclassification itself uses
+    // `collectionAmount` (the genuinely outstanding To-Pay portion)
+    // instead - see BiltySettlementInput.collectionAmount.
     const amount = toNumber(bilty.amount);
+    const collectionAmount = getCollectionAmount(bilty);
     const commission = toNumber(bilty.agentCommission);
 
     let allocatedRent = 0;
@@ -253,14 +282,20 @@ export function buildSettlementEntries(
 
     // A. Bilty Rent / Customer Collection.
     // Reclassification only: Dr [responsible party]  Cr Gross Bilty
-    // Receivable. Booking Income was already recognized once, at
+    // Receivable, for the outstanding (To-Pay) portion ONLY - the
+    // Paid portion is never a Collection amount (LOCKED rule) and is
+    // left exactly where Bilty creation put it (Gross Bilty
+    // Receivable), to be cleared only by an actual Daily Posting
+    // receipt or reclassified to a real Party independently (see
+    // resolveBiltyPaidResponsibleParty() in lib/document-party-
+    // resolution.ts). Booking Income was already recognized once, at
     // Bilty creation - this does NOT touch it again.
-    if (amount > 0 && bilty.collectionPartyAccountId) {
+    if (collectionAmount > 0 && bilty.collectionPartyAccountId) {
       const description = `Settlement - ${input.challanNo} - Bilty ${bilty.biltyNo} - Collection reclassified to ${responsibilityLabel(bilty.collectionResponsibility)}`;
 
       lines.push({
         accountId: bilty.collectionPartyAccountId,
-        debit: amount,
+        debit: collectionAmount,
         credit: 0,
         description,
         sourceType: "BILTY",
@@ -270,14 +305,14 @@ export function buildSettlementEntries(
       lines.push({
         accountId: input.accounts.grossBiltyReceivableId,
         debit: 0,
-        credit: amount,
+        credit: collectionAmount,
         description,
         sourceType: "BILTY",
         sourceId: bilty.biltyId,
         sourceNumber: bilty.biltyNo,
       });
 
-      debitParty(bilty.collectionPartyAccountId, amount);
+      debitParty(bilty.collectionPartyAccountId, collectionAmount);
     }
 
     // B. Carrier Rent (allocated pro-rata across bilties, same as

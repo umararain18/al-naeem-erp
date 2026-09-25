@@ -695,6 +695,16 @@ async function main() {
         return challan;
       });
 
+      addCleanup({
+        name: 'Soft delete new challan (Phase 6)',
+        fn: async function() {
+          await prisma.challan.update({
+            where: { id: deliveredChallan.id },
+            data: { isDeleted: true, deletedAt: new Date() }
+          });
+        }
+      });
+
       // Verify bilty is IN_TRANSIT
       var biltyInTransit = await prisma.bilty.findUnique({
         where: { id: testBilty.id }

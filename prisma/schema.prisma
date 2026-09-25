@@ -35,6 +35,9 @@ model User {
   createdPhonches           Phonch[]            @relation("PhonchCreatedBy")
   updatedPhonches           Phonch[]            @relation("PhonchUpdatedBy")
   deletedPhonches           Phonch[]            @relation("PhonchDeletedBy")
+  createdPrivatePhonches    PrivatePhonch[]     @relation("PrivatePhonchCreatedBy")
+  updatedPrivatePhonches    PrivatePhonch[]     @relation("PrivatePhonchUpdatedBy")
+  deletedPrivatePhonches    PrivatePhonch[]     @relation("PrivatePhonchDeletedBy")
 }
 
 model Party {
@@ -61,6 +64,9 @@ model Party {
   transporterChallans    Challan[]       @relation("ChallanTransporterParty")
   transporterPhonches    Phonch[]        @relation("PhonchTransporterParty")
   phonchVehicleLines     PhonchVehicle[] @relation("PhonchVehicleParty")
+
+  transporterPrivatePhonches             PrivatePhonch[]        @relation("PrivatePhonchTransporterParty")
+  privatePhonchVehicleClearingAgentLines PrivatePhonchVehicle[] @relation("PrivatePhonchVehicleClearingAgent")
 }
 
 // ============================================================
@@ -645,4 +651,123 @@ model PhonchVehicle {
   createdAt DateTime @default(now())
 
   @@index([phonchId])
+}
+
+// ============================================================
+// PRIVATE PHONCH - vehicle/rent settlement record.
+//
+// Distinct from Showroom Phonch above (a RECEIVABLE from a
+// Transporter for delivery/handling charges ANC billed them): Private
+// Phonch records a PAYABLE - Carrier Rent that ANC owes OUT to the
+// Transporter (for actually carrying the vehicle) and, per vehicle,
+// optionally to a Clearing Agent (their own share of that same rent -
+// "amanat"). Bilty No./Challan No. on each vehicle line are, exactly
+// like Showroom Phonch's own biltyNo/challanNo, plain manual
+// reference text, NEVER a foreign key into this system's own
+// Bilty/Challan tables - Private Phonch is a fully independent
+// economic record. Linking it to a real Bilty/Challan row would risk
+// double-recognizing that same Bilty/Challan's own, separate,
+// Settlement-driven Carrier Rent and Collection accounting - a
+// business decision confirmed explicitly, not inferred.
+//
+// Accounting (see lib/private-phonch-accounting.ts): a single
+// JournalEntry is created once at creation, referenceType
+// "PRIVATE_PHONCH", referenceId = this record's id - Debit the
+// "Private Phonch Carrier Rent Expense" system account for the full
+// sum of Total Rent across every vehicle line; Credit the Transporter
+// for the sum of Carrier Payable, Credit each distinct Clearing Agent
+// for the sum of CA Payable attributed to them, and Credit the
+// "Private Phonch Delivery Income" system account for the sum of
+// Delivery Charges - so Total Rent = Carrier Payable + CA Payable +
+// Delivery Charges balances in one entry, exactly mirroring Showroom
+// Phonch's own single-entry-at-creation shape. Never a second
+// JournalEntry per vehicle line. Actual Cash/Bank payment to the
+// Transporter/a Clearing Agent, or a Clearing Agent's own deposit
+// receipt, happens ONLY through Daily Posting (sourceType
+// "PRIVATE_PHONCH", sourceId = this record's id) - mirrored from
+// lib/bilty-paid-verification.ts's getBiltyPaidVerification() /
+// lib/phonch-accounting.ts's getPhonchPaymentState(), never stored
+// here directly.
+// ============================================================
+
+model PrivatePhonch {
+  id       String   @id @default(cuid())
+  phonchNo String   @unique
+  date     DateTime
+
+  transporterPartyId String
+  transporterParty   Party  @relation("PrivatePhonchTransporterParty", fields: [transporterPartyId], references: [id], onDelete: Restrict)
+
+  // Bill Book link placeholder (Step 22 of the spec) - manual text,
+  // set only by a future Bill Book feature via its own update path;
+  // this task never writes it itself beyond leaving it null. Display-
+  // only here.
+  billNo String?
+
+  vehicles PrivatePhonchVehicle[]
+
+  // Bin
+  isDeleted   Boolean   @default(false)
+  deletedAt   DateTime?
+  deletedById String?
+  deletedBy   User?     @relation("PrivatePhonchDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+
+  // Audit
+  createdById String?
+  createdBy   User?   @relation("PrivatePhonchCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?
+  updatedBy   User?   @relation("PrivatePhonchUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([date])
+  @@index([isDeleted, deletedAt])
+  @@index([transporterPartyId])
+}
+
+model PrivatePhonchVehicle {
+  id       String        @id @default(cuid())
+  phonchId String
+  phonch   PrivatePhonch @relation(fields: [phonchId], references: [id], onDelete: Cascade)
+  lineNo   Int
+
+  // Manual reference text only - see the module doc comment above.
+  biltyNo   String?
+  challanNo String?
+
+  chassisNumber String?
+  engineNumber  String?
+  vehicleName   String?
+
+  // Distinct per vehicle row - the SAME Clearing Agent may appear on
+  // several rows of the same Private Phonch, and different rows may
+  // each name a different Clearing Agent (Step 5 of the spec) -
+  // deliberately NOT a single Private Phonch-level field.
+  clearingAgentPartyId String?
+  clearingAgentParty   Party?  @relation("PrivatePhonchVehicleClearingAgent", fields: [clearingAgentPartyId], references: [id], onDelete: SetNull)
+
+  // Raw inputs only - Net Rent (totalRent - deliveryCharges) and CA
+  // Payable (netRent - carrierPayable) are ALWAYS derived fresh, both
+  // server-side (resolvePrivatePhonchInput()) and on every read,
+  // exactly like Showroom Phonch's own totals are never trusted from
+  // a stored, independently-editable column.
+  totalRent       Decimal @default(0) @db.Decimal(15, 2)
+  deliveryCharges Decimal @default(0) @db.Decimal(15, 2)
+  carrierPayable  Decimal @default(0) @db.Decimal(15, 2)
+
+  // Only meaningful when totalRent = 0 and deliveryCharges > 0 (a
+  // fully-paid vehicle) - "TRANSPORTER" or "CLEARING_AGENT", who this
+  // vehicle's Delivery Charges are recovered FROM. Null for every
+  // normal (totalRent > 0) vehicle, where Delivery Charges are instead
+  // absorbed into Net Rent/CA Payable exactly as before this field
+  // existed. See lib/private-phonch-accounting.ts's own doc comment.
+  deliveryRecoveryParty String?
+
+  note String?
+
+  createdAt DateTime @default(now())
+
+  @@index([phonchId])
+  @@index([clearingAgentPartyId])
 }
