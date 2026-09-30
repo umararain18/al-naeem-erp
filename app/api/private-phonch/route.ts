@@ -17,6 +17,9 @@ import {
   getPrivatePhonchCarrierRentExpenseAccountId,
   getPrivatePhonchDeliveryIncomeAccountId,
 } from "@/lib/gross-accounts";
+import { getBillPaymentState, resolveBillClientAccountId } from "@/lib/bill-accounting";
+import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
+import { privatePhonchListSearchOr } from "@/lib/search-helpers";
 
 // ============================================================
 // GET /api/private-phonch - list (search)
@@ -50,29 +53,7 @@ export async function GET(request: NextRequest) {
         // the number/Transporter - every field a user would actually
         // search by, including per-vehicle fields (via the `some`
         // relation filter) and each vehicle's own Clearing Agent name.
-        ...(search
-          ? {
-              OR: [
-                { phonchNo: { contains: search, mode: "insensitive" } },
-                { billNo: { contains: search, mode: "insensitive" } },
-                { transporterParty: { partyName: { contains: search, mode: "insensitive" } } },
-                {
-                  vehicles: {
-                    some: {
-                      OR: [
-                        { biltyNo: { contains: search, mode: "insensitive" } },
-                        { challanNo: { contains: search, mode: "insensitive" } },
-                        { chassisNumber: { contains: search, mode: "insensitive" } },
-                        { engineNumber: { contains: search, mode: "insensitive" } },
-                        { vehicleName: { contains: search, mode: "insensitive" } },
-                        { clearingAgentParty: { partyName: { contains: search, mode: "insensitive" } } },
-                      ],
-                    },
-                  },
-                },
-              ],
-            }
-          : {}),
+        ...(search ? { OR: privatePhonchListSearchOr(search) } : {}),
       },
       include: {
         transporterParty: { select: { id: true, partyName: true, account: { select: { id: true } } } },
@@ -86,14 +67,68 @@ export async function GET(request: NextRequest) {
             clearingAgentPartyId: true,
             deliveryRecoveryParty: true,
             clearingAgentParty: { select: { account: { select: { id: true } } } },
+            // Compact reverse Bill Book link for the List (Section 20).
+            billSourceLinks: {
+              where: { bill: { isDeleted: false } },
+              take: 1,
+              select: { bill: { select: { id: true, billNo: true } } },
+            },
           },
         },
       },
       orderBy: [{ date: "desc" }, { createdAt: "desc" }],
     });
 
+    // ------------------------------------------------------------
+    // Bill summary (Agent 2 - "PP-001 / Bill: B-1025 / Amount: Rs.
+    // 43,000 / Status: Partially Paid") - batched across every distinct
+    // Bill linked from any vehicle on this page, computed through the
+    // SAME authoritative getBillPaymentState() the Bill list/detail
+    // pages use, never re-derived. Only ever shown when a Private
+    // Phonch's billed vehicles all point to exactly ONE distinct Bill -
+    // when different vehicles are billed to DIFFERENT Bills, this stays
+    // null and the UI falls back to the existing per-vehicle
+    // vehicleBillLabels below, so one Bill's status is never wrongly
+    // shown as if it applied to the whole Phonch (Section 21).
+    // ------------------------------------------------------------
+    const distinctBillIds = new Set<string>();
+    for (const p of phonches) {
+      for (const v of p.vehicles) {
+        const billId = v.billSourceLinks[0]?.bill.id;
+        if (billId) distinctBillIds.add(billId);
+      }
+    }
+    const billSummaryById = new Map<string, { billId: string; billNo: string; amount: number; status: "UNPAID" | "PARTIALLY_PAID" | "PAID" }>();
+    if (distinctBillIds.size > 0) {
+      const bills = await prisma.bill.findMany({
+        where: { id: { in: [...distinctBillIds] } },
+        select: {
+          id: true,
+          billNo: true,
+          clientParty: { select: { account: { select: { id: true } } } },
+          items: { select: { rent: true, delivery: true, otherExpense: true } },
+        },
+      });
+      for (const bill of bills) {
+        const amount = Math.round(bill.items.reduce((s, i) => s + Number(i.rent) + Number(i.delivery) + Number(i.otherExpense), 0) * 100) / 100;
+        const accountId = await resolveBillClientAccountId(prisma, bill.clientParty);
+        const state = accountId
+          ? await getBillPaymentState(prisma, bill.id, accountId, amount)
+          : { status: "UNPAID" as const };
+        billSummaryById.set(bill.id, { billId: bill.id, billNo: bill.billNo, amount, status: state.status });
+      }
+    }
+
     const items = await Promise.all(
       phonches.map(async (p) => {
+        // Distinct Bill ids across this Phonch's own vehicles - a
+        // compact billSummary is only produced when there is exactly
+        // one, per the module comment above.
+        const phonchBillIds = new Set(
+          p.vehicles.map((v) => v.billSourceLinks[0]?.bill.id).filter((id): id is string => !!id)
+        );
+        const billSummary =
+          phonchBillIds.size === 1 ? billSummaryById.get([...phonchBillIds][0]) || null : null;
         const totalCarrierPayable = Math.round(p.vehicles.reduce((s, v) => s + Number(v.carrierPayable), 0) * 100) / 100;
         const totalCaPayable = Math.round(
           p.vehicles.reduce(
@@ -199,6 +234,13 @@ export async function GET(request: NextRequest) {
         });
 
         const vehicleNames = p.vehicles.map((v) => v.vehicleName).filter((n): n is string => !!n && n.trim().length > 0);
+        // Compact per-vehicle Bill reference for the List (Section 20)
+        // - "Vehicle (Bill No)" when billed, plain vehicle name
+        // otherwise. Never one misleading Bill status for the whole
+        // document (Section 21).
+        const vehicleBillLabels = p.vehicles
+          .filter((v) => v.vehicleName && v.vehicleName.trim().length > 0)
+          .map((v) => (v.billSourceLinks[0] ? `${v.vehicleName} (${v.billSourceLinks[0].bill.billNo})` : v.vehicleName!));
 
         return {
           id: p.id,
@@ -208,6 +250,8 @@ export async function GET(request: NextRequest) {
           transporterParty: p.transporterParty,
           vehicleCount: p.vehicles.length,
           vehicleNames,
+          vehicleBillLabels,
+          billSummary,
           totalCarrierPayable,
           totalCaPayable,
           totalDeliveryRecovery,
@@ -497,6 +541,21 @@ export async function POST(request: NextRequest) {
               createdById: currentUser.userId,
               lines: { create: lines },
             },
+          });
+
+          await auditCreate(tx, {
+            actor: actorFromUser(currentUser),
+            module: "PRIVATE_PHONCH",
+            entityType: "PrivatePhonch",
+            entityId: createdPhonch.id,
+            documentNo: createdPhonch.phonchNo,
+            description: `Created Private Phonch ${createdPhonch.phonchNo} (Transporter: ${transporterParty.partyName}, ${resolved.vehicles.length} vehicle(s))`,
+            newValues: {
+              phonchNo: createdPhonch.phonchNo,
+              transporterPartyId: resolved.transporterPartyId,
+              vehicleCount: resolved.vehicles.length,
+            },
+            ...requestContext(request),
           });
 
           return createdPhonch;

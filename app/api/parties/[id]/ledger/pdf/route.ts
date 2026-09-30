@@ -1,9 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
-import { jsPDF } from "jspdf";
 import autoTable from "jspdf-autotable";
+import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
-import { getPartyLedgerData, PartyLedgerLookupError } from "@/lib/ledger-description";
+import { getPartyLedgerData, PartyLedgerLookupError, parseLedgerEntryType, filterLedgerRowsBySearch } from "@/lib/ledger-description";
+import { resolvePdfPresentation } from "@/lib/pdf-presentation";
+import { createPdfDocument, drawPdfHeader, drawPdfFooter, applyWatermark, resolveAutoTableTheme, resolveJsPdfFont } from "@/lib/pdf-render-helpers";
 
 // ============================================================
 // GET /api/parties/[id]/ledger/pdf?from=&to=
@@ -28,6 +30,15 @@ function formatDate(value: string) {
   return new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "2-digit", year: "numeric" }).format(new Date(value));
 }
 
+const DOCUMENT_TYPE_LABELS: Record<string, string> = {
+  BILTY: "Bilty",
+  CHALLAN: "Challan",
+  PRIVATE_PHONCH: "Private Phonch",
+  SHOWROOM_PHONCH: "Showroom Phonch",
+  BILL: "Bill",
+  OTHER: "Other",
+};
+
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -45,38 +56,66 @@ export async function GET(
     const { searchParams } = new URL(request.url);
     const from = searchParams.get("from");
     const to = searchParams.get("to");
+    const documentType = parseLedgerEntryType(searchParams.get("type"));
+    const search = searchParams.get("search") || searchParams.get("q");
 
     // Client-facing formal statement: ALWAYS chronological
     // (Opening Balance -> oldest -> newest -> Totals -> Closing
     // Balance), regardless of how the browser Party Ledger screen
-    // orders itself.
-    const data = await getPartyLedgerData(id, { from, to, order: "asc" });
+    // orders itself. When a Type filter is active, every row AND the
+    // Opening/Closing balance shown below are scoped to only that
+    // type - see getPartyLedgerData()'s own doc comment - so the
+    // exported PDF always matches exactly what the filtered screen
+    // shows, never the full unfiltered account.
+    const data = await getPartyLedgerData(id, { from, to, order: "asc", documentType });
 
-    const doc = new jsPDF();
+    // Search narrows which ROWS appear - the exact same
+    // filterLedgerRowsBySearch() the screen/General Ledger already
+    // use, never a second matching rule. Opening/Closing Balance
+    // intentionally stay as data.summary's own figures (the full
+    // Type+Date-filtered account state) and are NEVER narrowed by
+    // search - this mirrors the screen's own existing, approved
+    // behavior (its search box only narrows the displayed table; the
+    // Summary Cards above it are untouched by search) rather than
+    // inventing a new balance rule for export.
+    const exportRows = filterLedgerRowsBySearch(data.ledger, search);
+
+    // No dedicated "party ledger" SettingsDocumentType value exists in
+    // the fixed enum - PARTY_STATEMENT (the party-facing document type
+    // the enum does provide) is used for both this Ledger PDF and the
+    // separate Statement PDF, so they share one Header/Footer/Logo
+    // override rather than each getting its own.
+    const presentation = await resolvePdfPresentation(prisma, "PARTY_STATEMENT");
+    const bodyFont = resolveJsPdfFont(presentation.pdf.defaultFont);
+
+    const doc = createPdfDocument(presentation);
     const pageWidth = doc.internal.pageSize.getWidth();
-    let y = 14;
 
-    doc.setFontSize(14);
-    doc.setFont("helvetica", "bold");
-    doc.text("AL NAEEM CAR CARRIERS SERVICE", pageWidth / 2, y, { align: "center" });
-    y += 7;
-    doc.setFontSize(12);
-    doc.text("Party Ledger", pageWidth / 2, y, { align: "center" });
-    y += 10;
+    const { nextY } = await drawPdfHeader(doc, presentation, "PARTY LEDGER");
+    let y = nextY;
 
     doc.setFontSize(10);
-    doc.setFont("helvetica", "normal");
+    doc.setFont(bodyFont, "normal");
     doc.text(`Party: ${data.party.partyName}`, 14, y);
     if (from || to) {
       doc.text(`Period: ${from || "-"}  to  ${to || "-"}`, pageWidth - 14, y, { align: "right" });
     }
-    y += 8;
+    y += 6;
+    if (documentType) {
+      doc.text(`Type: ${DOCUMENT_TYPE_LABELS[documentType] || documentType}`, 14, y);
+      y += 6;
+    }
+    if (search) {
+      doc.text(`Search: "${search}"`, 14, y);
+      y += 6;
+    }
+    y += 2;
 
-    doc.setFont("helvetica", "bold");
+    doc.setFont(bodyFont, "bold");
     doc.text(`Opening Balance: ${formatCurrency(data.summary.openingBalance)}`, 14, y);
     y += 8;
 
-    const tableRows = data.ledger.map((row) => [
+    const tableRows = exportRows.map((row) => [
       formatDate(row.date),
       row.description,
       row.debit > 0 ? formatCurrency(row.debit) : "-",
@@ -88,7 +127,7 @@ export async function GET(
       startY: y,
       head: [["Date", "Description", "Debit", "Credit", "Balance"]],
       body: tableRows,
-      theme: "grid",
+      theme: resolveAutoTableTheme(presentation.pdf.tableBorderStyle),
       headStyles: { fontSize: 9, cellPadding: 2, fillColor: [37, 99, 235] },
       bodyStyles: { fontSize: 8, cellPadding: 2 },
       columnStyles: {
@@ -107,9 +146,12 @@ export async function GET(
       doc.addPage();
       closingY = 14;
     }
-    doc.setFont("helvetica", "bold");
+    doc.setFont(bodyFont, "bold");
     doc.setFontSize(10);
     doc.text(`Closing Balance: ${formatCurrency(data.summary.closingBalance)}`, 14, closingY);
+
+    drawPdfFooter(doc, presentation);
+    applyWatermark(doc, presentation);
 
     const pdfBuffer = doc.output("arraybuffer");
 
@@ -118,6 +160,7 @@ export async function GET(
       headers: {
         "Content-Type": "application/pdf",
         "Content-Disposition": `inline; filename=Ledger-${data.party.partyName.replace(/\s+/g, "-")}.pdf`,
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
       },
     });
   } catch (error) {

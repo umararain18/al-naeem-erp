@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
-import { jsPDF } from "jspdf";
 import autoTable from "jspdf-autotable";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { getEmployeeLedgerData } from "@/lib/payroll-accounting";
+import { resolvePdfPresentation } from "@/lib/pdf-presentation";
+import { createPdfDocument, drawPdfHeader, drawPdfFooter, applyWatermark, resolveAutoTableTheme, resolveJsPdfFont } from "@/lib/pdf-render-helpers";
 
 // ============================================================
 // GET /api/employees/[id]/ledger/pdf?from=&to=
@@ -43,27 +44,30 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       return NextResponse.json({ success: false, message: "Employee not found" }, { status: 404 });
     }
 
-    const doc = new jsPDF();
-    const pageWidth = doc.internal.pageSize.getWidth();
-    let y = 14;
+    // No dedicated "employee ledger" SettingsDocumentType value exists
+    // in the fixed enum (BILTY/CHALLAN/BILL/PRIVATE_PHONCH/
+    // SHOWROOM_PHONCH/RECEIPT/PARTY_STATEMENT/REPORTS) - REPORTS is the
+    // closest existing generic bucket, used here rather than inventing
+    // a new enum value. Documented as a known limitation, not a silent
+    // guess.
+    const presentation = await resolvePdfPresentation(prisma, "REPORTS");
+    const bodyFont = resolveJsPdfFont(presentation.pdf.defaultFont);
 
-    doc.setFontSize(14);
-    doc.setFont("helvetica", "bold");
-    doc.text("AL NAEEM CAR CARRIERS SERVICE", pageWidth / 2, y, { align: "center" });
-    y += 7;
-    doc.setFontSize(12);
-    doc.text("Employee Ledger", pageWidth / 2, y, { align: "center" });
-    y += 10;
+    const doc = createPdfDocument(presentation);
+    const pageWidth = doc.internal.pageSize.getWidth();
+
+    const { nextY } = await drawPdfHeader(doc, presentation, "EMPLOYEE LEDGER");
+    let y = nextY;
 
     doc.setFontSize(10);
-    doc.setFont("helvetica", "normal");
+    doc.setFont(bodyFont, "normal");
     doc.text(`Employee: ${data.employee.name} (${data.employee.employeeCode})`, 14, y);
     if (from || to) {
       doc.text(`Period: ${from || "-"}  to  ${to || "-"}`, pageWidth - 14, y, { align: "right" });
     }
     y += 8;
 
-    doc.setFont("helvetica", "bold");
+    doc.setFont(bodyFont, "bold");
     doc.text(`Opening Balance: ${formatCurrency(data.summary.openingBalance)}`, 14, y);
     y += 8;
 
@@ -79,7 +83,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       startY: y,
       head: [["Date", "Description", "Debit", "Credit", "Balance"]],
       body: tableRows,
-      theme: "grid",
+      theme: resolveAutoTableTheme(presentation.pdf.tableBorderStyle),
       headStyles: { fontSize: 9, cellPadding: 2, fillColor: [37, 99, 235] },
       bodyStyles: { fontSize: 8, cellPadding: 2 },
       columnStyles: {
@@ -98,9 +102,12 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       doc.addPage();
       closingY = 14;
     }
-    doc.setFont("helvetica", "bold");
+    doc.setFont(bodyFont, "bold");
     doc.setFontSize(10);
     doc.text(`Closing Balance: ${formatCurrency(data.summary.closingBalance)}`, 14, closingY);
+
+    drawPdfFooter(doc, presentation);
+    applyWatermark(doc, presentation);
 
     const pdfBuffer = doc.output("arraybuffer");
 
@@ -109,6 +116,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       headers: {
         "Content-Type": "application/pdf",
         "Content-Disposition": `inline; filename=Employee-Ledger-${data.employee.name.replace(/\s+/g, "-")}.pdf`,
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
       },
     });
   } catch (error) {

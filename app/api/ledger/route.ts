@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
-import { getAccountLedgerData, filterLedgerRowsBySearch, PartyLedgerLookupError } from "@/lib/ledger-description";
+import { getAccountLedgerData, filterLedgerRowsBySearch, parseLedgerEntryType, PartyLedgerLookupError } from "@/lib/ledger-description";
 
 export async function GET(request: NextRequest) {
   try {
@@ -87,13 +87,18 @@ export async function GET(request: NextRequest) {
     // never as several raw JournalEntries. Never hides a genuine,
     // non-zero-net remainder - see buildUserFacingLedgerRows()'s own
     // guards.
-    const data = await getAccountLedgerData(accountId, { from, to, order: "desc" });
+    const documentType = parseLedgerEntryType(searchParams.get("type"));
+    const data = await getAccountLedgerData(accountId, { from, to, order: "desc", documentType });
 
     // Transaction search narrows which rows are DISPLAYED only - the
     // summary (opening/period/closing balance) above is computed from
-    // the full, unfiltered selected date range and is never touched
+    // the full, unfiltered selected date range (and, when a Type
+    // filter is active, from only that type - see
+    // getAccountLedgerData()'s own doc comment) and is never touched
     // by a search term. See filterLedgerRowsBySearch()'s own doc
-    // comment (lib/ledger-description.ts).
+    // comment (lib/ledger-description.ts). Search + Type therefore
+    // combine with AND semantics: Type narrows data.ledger first,
+    // then search narrows the already-type-filtered rows further.
     const transactionSearch = searchParams.get("q") || searchParams.get("transactionSearch");
     const entries = filterLedgerRowsBySearch(data.ledger, transactionSearch);
 

@@ -38,6 +38,10 @@ model User {
   createdPrivatePhonches    PrivatePhonch[]     @relation("PrivatePhonchCreatedBy")
   updatedPrivatePhonches    PrivatePhonch[]     @relation("PrivatePhonchUpdatedBy")
   deletedPrivatePhonches    PrivatePhonch[]     @relation("PrivatePhonchDeletedBy")
+  createdBills              Bill[]              @relation("BillCreatedBy")
+  updatedBills              Bill[]              @relation("BillUpdatedBy")
+  deletedBills              Bill[]              @relation("BillDeletedBy")
+  updatedBusinessSettings   BusinessSettings[]  @relation("BusinessSettingsUpdatedBy")
 }
 
 model Party {
@@ -67,6 +71,8 @@ model Party {
 
   transporterPrivatePhonches             PrivatePhonch[]        @relation("PrivatePhonchTransporterParty")
   privatePhonchVehicleClearingAgentLines PrivatePhonchVehicle[] @relation("PrivatePhonchVehicleClearingAgent")
+
+  bills Bill[] @relation("BillClientParty")
 }
 
 // ============================================================
@@ -650,6 +656,12 @@ model PhonchVehicle {
 
   createdAt DateTime @default(now())
 
+  // Reverse Bill Book link (see model BillSourceLink below) - a vehicle
+  // is billed by at most one ACTIVE Bill at a time (enforced at the
+  // application level, never a hard DB constraint, so a binned Bill's
+  // own link never permanently blocks re-billing the same vehicle).
+  billSourceLinks BillSourceLink[]
+
   @@index([phonchId])
 }
 
@@ -768,6 +780,427 @@ model PrivatePhonchVehicle {
 
   createdAt DateTime @default(now())
 
+  // Reverse Bill Book link - see the identical comment on
+  // PhonchVehicle.billSourceLinks above.
+  billSourceLinks BillSourceLink[]
+
   @@index([phonchId])
   @@index([clearingAgentPartyId])
+}
+
+// ============================================================
+// BILL BOOK - client-side billing/receivable document.
+//
+// Distinct from Private Phonch/Showroom Phonch: those two record
+// ANC's CARRIER-SIDE transaction (what ANC owes/earns from the
+// Transporter for physically moving the vehicle - completely
+// unchanged, untouched by Bill Book). A Bill records the separate
+// CLIENT-SIDE transaction - the amount ANC actually charges the
+// paying client (Rent + Delivery + Other Expense per vehicle), which
+// is an independent, editable figure that merely defaults from the
+// linked source vehicle's own numbers for convenience (see
+// resolveBillInput() in lib/bill-accounting.ts) - it is NEVER
+// structurally tied to the source's own Carrier Payable/CA Payable/
+// Delivery Income figures. Billing the client for a different amount
+// than what ANC pays the carrier (the margin) is the normal case, not
+// an edge case.
+//
+// Accounting (lib/bill-accounting.ts): ONE JournalEntry per Bill,
+// referenceType "BILL", referenceId = this Bill's id - Debit the
+// Client Party (Bill Total, establishing their receivable) / Credit
+// the dedicated "Bill Income" system account (lib/gross-accounts.ts's
+// getBillIncomeAccountId()) - never Private/Showroom Phonch's own
+// Carrier Rent Expense/Payable/Delivery Income accounts, which stay
+// completely untouched. Actual client payment happens ONLY through
+// Daily Posting (sourceType "BILL", sourceId = this Bill's id),
+// mirrored from getPhonchPaymentState()'s exact shape - never stored
+// here directly.
+//
+// ONE Bill = ONE client Party, and (Section 3) at most ONE source
+// type across all its items - never mixed Private Phonch + Showroom
+// Phonch on the same Bill. sourceType is null for a Manual Bill (no
+// linked source vehicles at all).
+// ============================================================
+
+enum BillSourceType {
+  PRIVATE_PHONCH
+  SHOWROOM_PHONCH
+}
+
+model Bill {
+  id     String   @id @default(cuid())
+  billNo String   @unique
+  date   DateTime
+
+  // A Bill's client is EITHER an existing, explicitly-selected Party
+  // (clientPartyId set, using that Party's own Account) OR a random/
+  // one-time client typed by name only (clientPartyId left null) -
+  // never a Party/Account transparently created just because a typed
+  // name doesn't match an existing Party. A null-clientPartyId Bill's
+  // accounting posts against the single shared "Bill Book - Walk-in
+  // Customers" system account instead (see
+  // lib/gross-accounts.ts's getBillWalkInReceivableAccountId() and
+  // lib/bill-accounting.ts's resolveBillClientAccountId()) - each such
+  // Bill's own payment state still resolves correctly and
+  // independently, since getBillPaymentState() filters by sourceId
+  // (this Bill's own id), never by accountId alone. clientName/
+  // clientPhone are always the source of truth for display/search/
+  // print (mirrors Bilty's own consignorName/consignorPhone pattern
+  // alongside its optional consignorPartyId) - never a live re-read of
+  // a selected Party's own (possibly since-changed) name/phone.
+  clientPartyId String?
+  clientParty   Party?  @relation("BillClientParty", fields: [clientPartyId], references: [id], onDelete: Restrict)
+  clientName    String
+  clientPhone   String?
+
+  sourceType BillSourceType?
+
+  items       BillItem[]
+  sourceLinks BillSourceLink[]
+
+  // Bin
+  isDeleted   Boolean   @default(false)
+  deletedAt   DateTime?
+  deletedById String?
+  deletedBy   User?     @relation("BillDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+
+  // Audit
+  createdById String?
+  createdBy   User?   @relation("BillCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?
+  updatedBy   User?   @relation("BillUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([clientPartyId])
+  @@index([isDeleted, deletedAt])
+  @@index([date])
+}
+
+model BillItem {
+  id     String @id @default(cuid())
+  billId String
+  bill   Bill   @relation(fields: [billId], references: [id], onDelete: Cascade)
+  lineNo Int
+
+  // Only the fields Bill Book actually supports (Section 8) - never
+  // the source document's full field set. Auto-populated from the
+  // linked source vehicle when one exists, but always independently
+  // editable raw inputs - see the model's own doc comment above.
+  vehicleName   String?
+  fromText      String?
+  toText        String?
+  engineNumber  String?
+  chassisNumber String?
+  regdNumber    String?
+
+  // Raw inputs - Vehicle Total (rent + delivery + otherExpense) is
+  // ALWAYS derived fresh server-side and on every read, exactly like
+  // every other module's own vehicle-row total, never a stored column.
+  rent         Decimal @default(0) @db.Decimal(15, 2)
+  delivery     Decimal @default(0) @db.Decimal(15, 2)
+  otherExpense Decimal @default(0) @db.Decimal(15, 2)
+
+  sourceLink BillSourceLink?
+
+  createdAt DateTime @default(now())
+
+  @@index([billId])
+}
+
+model BillSourceLink {
+  id     String @id @default(cuid())
+  billId String
+  bill   Bill   @relation(fields: [billId], references: [id], onDelete: Cascade)
+
+  billItemId String   @unique
+  billItem   BillItem @relation(fields: [billItemId], references: [id], onDelete: Cascade)
+
+  sourceType BillSourceType
+
+  // Exactly one of these two is set, matching the parent Bill's own
+  // sourceType - never both, never neither (a BillItem with no source
+  // link at all simply has no BillSourceLink row - a Manual Bill row).
+  // onDelete: Restrict - a source vehicle that has ever been billed
+  // can never be hard-deleted (nor can its parent Phonch/Private
+  // Phonch be permanently deleted) while this link exists, protecting
+  // the financial record exactly like every other linked-document
+  // protection in this ERP.
+  privatePhonchVehicleId String?
+  privatePhonchVehicle   PrivatePhonchVehicle? @relation(fields: [privatePhonchVehicleId], references: [id], onDelete: Restrict)
+
+  phonchVehicleId String?
+  phonchVehicle   PhonchVehicle? @relation(fields: [phonchVehicleId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now())
+
+  @@index([billId])
+  @@index([privatePhonchVehicleId])
+  @@index([phonchVehicleId])
+}
+
+// ============================================================
+// CENTRAL SETTINGS MODULE
+//
+// One authoritative BusinessSettings row for the entire ERP - business
+// identity, branding file references, document header/footer
+// configuration, invoice/bill preferences, and PDF/print defaults.
+// Never a duplicate row: enforced at the application level exactly
+// like this ERP's own system Account rows (lib/gross-accounts.ts's
+// getOrCreateSystemAccount()) - lib/business-settings.ts's
+// getBusinessSettings() always finds the existing row first, creating
+// the very first one only if none exists yet, and every PATCH updates
+// that SAME row by its own id - never a second insert.
+//
+// Purely a configuration source for FUTURE document generation - never
+// touches JournalEntry/JournalLine, never rewrites an already-generated
+// PDF, never affects any accounting calculation. Document generators
+// are NOT rewired to consume this in this phase (see the module's own
+// README-equivalent, the Final Report, for exactly which ones still
+// need that follow-up integration).
+//
+// Branding images are stored on local disk under public/uploads/branding/
+// (this project has no existing file-storage/S3-equivalent architecture
+// to reuse - see app/api/settings/branding/upload/route.ts), with only
+// the resulting stable /uploads/... URL saved on this row - never a
+// binary blob in the database.
+// ============================================================
+
+enum LogoPosition {
+  LEFT
+  CENTER
+  RIGHT
+}
+
+enum HeaderAlignment {
+  LEFT
+  CENTER
+  RIGHT
+}
+
+enum PdfPageSize {
+  A4
+  A5
+}
+
+enum PdfOrientation {
+  PORTRAIT
+  LANDSCAPE
+}
+
+enum SettingsDocumentType {
+  BILTY
+  CHALLAN
+  BILL
+  PRIVATE_PHONCH
+  SHOWROOM_PHONCH
+  RECEIPT
+  PARTY_STATEMENT
+  REPORTS
+}
+
+model BusinessSettings {
+  id String @id @default(cuid())
+
+  // Real DB-level backstop against a second row ever existing - every
+  // row has this exact same value, and the UNIQUE constraint means a
+  // second concurrent INSERT fails outright (P2002) instead of quietly
+  // succeeding as a duplicate. getBusinessSettings() (lib/business-
+  // settings.ts) catches that failure and re-reads the row the OTHER
+  // concurrent request just won, rather than assuming its own findFirst
+  // (not atomic with the create that follows it) was race-free.
+  singleton String @unique @default("SINGLETON")
+
+  // ---- Business Details (Section 2) - all optional except the
+  // business name itself, per "Optional fields must remain optional.
+  // Do not invent mandatory tax/legal fields." ----
+  businessName         String  @default("")
+  legalName            String?
+  shortName            String?
+  phone1               String?
+  phone2               String?
+  whatsapp             String?
+  email                String?
+  website              String?
+  address              String?
+  city                 String?
+  province             String?
+  country              String?
+  ntnNumber            String?
+  registrationNumber   String?
+
+  // ---- Branding (Section 3) - stable file references only, never
+  // binary data. ----
+  mainLogoUrl          String?
+  smallLogoUrl         String?
+  faviconUrl           String?
+  signatureUrl         String?
+  stampUrl             String?
+  brandPrimaryColor    String?
+  brandSecondaryColor  String?
+
+  // ---- Header & Footer (Section 4) ----
+  headerShowLogo         Boolean         @default(true)
+  headerShowBusinessName Boolean         @default(true)
+  headerShowAddress      Boolean         @default(true)
+  headerShowPhone        Boolean         @default(true)
+  headerShowWhatsapp     Boolean         @default(false)
+  headerShowEmail        Boolean         @default(false)
+  headerShowWebsite      Boolean         @default(false)
+  headerLogoPosition     LogoPosition    @default(LEFT)
+  headerAlignment        HeaderAlignment @default(CENTER)
+  headerSubtitle         String?
+
+  // Global fallback for a document type with no explicit
+  // DocumentTypeSettings override (or no override row at all) - see
+  // getDocumentTypeSettings() in lib/business-settings.ts, the one
+  // place this fallback is actually resolved.
+  defaultUseHeader Boolean @default(true)
+  defaultUseFooter Boolean @default(true)
+  defaultUseLogo   Boolean @default(true)
+
+  footerText             String?
+  footerShowPhone        Boolean @default(true)
+  footerShowAddress      Boolean @default(false)
+  footerShowWebsite      Boolean @default(false)
+  footerShowPageNumber   Boolean @default(true)
+  footerShowGeneratedDate Boolean @default(true)
+  termsAndConditions     String?
+
+  // ---- Invoice / Bill Settings (Section 6) - display/document
+  // preferences only. Never a second Bill numbering system: Bill's own
+  // billNo is still entered per-Bill exactly as today (see
+  // lib/bill-accounting.ts) - invoiceNumberPrefix here is a purely
+  // presentational default the Bill form MAY offer to pre-fill in a
+  // future integration, never an authoritative counter of its own. ----
+  invoiceTitle           String  @default("BILL")
+  invoiceNumberPrefix    String?
+  currencyLabel          String  @default("Rs.")
+  paymentInstructions    String?
+  defaultTermsAndConditions String?
+  authorizedByLabel      String  @default("Authorized Signature")
+  signatureLabel         String  @default("Signature")
+
+  // ---- PDF & Print Settings (Section 7) ----
+  pdfPageSize            PdfPageSize    @default(A4)
+  pdfOrientation         PdfOrientation @default(PORTRAIT)
+  pdfDefaultFont         String?
+  pdfDefaultFontSize     Int            @default(10)
+  pdfTableBorderStyle    String?
+  pdfShowWatermark       Boolean        @default(false)
+  pdfWatermarkText       String?
+  pdfShowPageNumber      Boolean        @default(true)
+  pdfShowGeneratedDate   Boolean        @default(true)
+
+  documentTypeSettings DocumentTypeSettings[]
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  updatedById String?
+  updatedBy   User?    @relation("BusinessSettingsUpdatedBy", fields: [updatedById], references: [id])
+}
+
+// Per-document-type override of the global header/footer/logo defaults
+// above (Section 5) - one row per SettingsDocumentType, at most. A null
+// field means "not explicitly configured, use the global
+// BusinessSettings default" - see lib/business-settings.ts's
+// getDocumentTypeSettings(), the single place this fallback is
+// resolved (never re-derived per-caller).
+model DocumentTypeSettings {
+  id                 String               @id @default(cuid())
+  businessSettingsId String
+  businessSettings   BusinessSettings     @relation(fields: [businessSettingsId], references: [id], onDelete: Cascade)
+  documentType       SettingsDocumentType
+
+  useHeader Boolean?
+  useFooter Boolean?
+  useLogo   Boolean?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([businessSettingsId, documentType])
+}
+
+// ============================================================
+// AUDIT LOG - append-only accountability trail (WHO/WHAT/WHEN/WHICH
+// RECORD/OLD VALUE/NEW VALUE). A SECURITY + ACCOUNTABILITY layer,
+// completely separate from and never a substitute for
+// JournalEntry/JournalLine (the real accounting ledger) - writing an
+// AuditLog row must never itself create accounting records, and a
+// business action's own JournalEntry/JournalLine must never be
+// skipped or altered because of audit logging.
+//
+// No relation to User is declared, on purpose: userId/
+// userNameSnapshot/userRoleSnapshot are a point-in-time SNAPSHOT that
+// must stay legible even if the User row is later renamed, has its
+// role changed, or is removed - a live FK relation would let a rename
+// silently rewrite history via Prisma's own relation resolution,
+// exactly what this table must never do.
+//
+// `module`/`entityType` are deliberately plain Strings, matching this
+// schema's own existing JournalEntry.referenceType / JournalLine.
+// sourceType convention (see those fields' own comments) rather than
+// a new enum vocabulary that would need a migration every time a new
+// module gets audited. `action` IS a bounded, stable enum
+// (AuditAction) - the same reasoning that already makes
+// PartyType/AccountType/BillSourceType real enums in this schema.
+//
+// Rows are never updated or deleted by the application - see
+// lib/audit-log.ts (the one place rows are ever written) and
+// app/api/audit-log/route.ts (GET/list only - no PATCH/DELETE route
+// exists for this model at all).
+// ============================================================
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  RESTORE
+  POST
+  PAYMENT
+  RECEIPT
+  SETTLEMENT
+  SETTLEMENT_PAYMENT
+  LOGIN_SUCCESS
+  LOGIN_FAILED
+  LOGOUT
+  EXPORT
+  SETTINGS_CHANGE
+  PERMISSION_CHANGE
+}
+
+model AuditLog {
+  id        String   @id @default(cuid())
+  createdAt DateTime @default(now())
+
+  // Snapshot, not a live relation - see this model's own doc comment
+  // above for why.
+  userId           String?
+  userNameSnapshot String?
+  userRoleSnapshot String?
+
+  action     AuditAction
+  module     String
+  entityType String
+  entityId   String?
+  documentNo String?
+
+  description String
+
+  oldValues     Json?
+  newValues     Json?
+  changedFields Json?
+
+  ipAddress String?
+  userAgent String?
+  requestId String?
+
+  @@index([createdAt])
+  @@index([userId])
+  @@index([action])
+  @@index([module])
+  @@index([entityType, entityId])
+  @@index([documentNo])
 }

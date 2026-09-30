@@ -4,12 +4,31 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { PartyType, Prisma, BiltyStatus } from "@prisma/client";
-import {
-  getGrossBiltyReceivableAccountId,
-  getGrossCommissionPayableAccountId,
-} from "@/lib/gross-accounts";
+import { getGrossBiltyReceivableAccountId } from "@/lib/gross-accounts";
 import { resolveBiltyPaidResponsibleParty } from "@/lib/document-party-resolution";
 import { createSettlementPayment, SettlementPaymentError } from "@/lib/settlement-payments";
+import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
+import { biltyListSearchOr } from "@/lib/search-helpers";
+
+// Comma-separated, fully business-readable description for the Bilty
+// Commission/Referral expense JournalLine pair - stored verbatim at
+// creation (mirrors Phonch/Bill's own "pre-composed once, displayed
+// as-is" convention) and recognized as such by
+// lib/ledger-description.ts's own display layer, which passes it
+// through unchanged rather than recomputing a generic Bilty
+// description over it. Never hard-coded - built fresh from this
+// specific Bilty's own stored fields every time.
+function buildBiltyCommissionDescription(
+  bilty: { biltyNo: string; vehicleType: string | null; vehicleModel: string | null; chassisNumber: string | null },
+  amount: number
+): string {
+  const parts: string[] = [`Bilty No ${bilty.biltyNo}`];
+  const vehicle = bilty.vehicleModel || bilty.vehicleType;
+  if (vehicle) parts.push(vehicle);
+  if (bilty.chassisNumber) parts.push(`Chassis No ${bilty.chassisNumber}`);
+  parts.push(`bilty expense. ${Math.round(amount).toLocaleString()}.`);
+  return parts.join(", ");
+}
 
 const createBiltySchema = z.object({
   biltyNo: z
@@ -210,7 +229,22 @@ export async function GET(request: NextRequest) {
         ? (statusParam as BiltyStatus)
         : null;
 
-    const page = Math.max(1, parseInt(searchParams.get("page") || "1", 10) || 1);
+    // A syntactically valid but astronomically large `page` (e.g. from a
+    // hand-edited URL) must never reach Prisma's `skip` calculation - it
+    // overflows there and throws, which the generic catch below would
+    // otherwise turn into an unexplained 500. Number.isSafeInteger() is
+    // the exact boundary: a garbage/non-numeric value (parses to NaN)
+    // still falls back to page 1 exactly as before - only a real,
+    // enormous number is rejected.
+    const rawPage = searchParams.get("page");
+    const parsedPage = rawPage ? parseInt(rawPage, 10) : 1;
+    if (rawPage && !Number.isNaN(parsedPage) && !Number.isSafeInteger(parsedPage)) {
+      return NextResponse.json(
+        { success: false, message: "Invalid page number" },
+        { status: 400 }
+      );
+    }
+    const page = Math.max(1, parsedPage || 1);
     const pageSize = Math.min(
       100,
       Math.max(1, parseInt(searchParams.get("pageSize") || "25", 10) || 25)
@@ -219,21 +253,7 @@ export async function GET(request: NextRequest) {
     const where: Prisma.BiltyWhereInput = {
       isDeleted: false,
       ...(status ? { status } : {}),
-      ...(search
-        ? {
-            OR: [
-              { biltyNo: { contains: search, mode: "insensitive" } },
-              { consignorName: { contains: search, mode: "insensitive" } },
-              { consigneeName: { contains: search, mode: "insensitive" } },
-              { vehicleType: { contains: search, mode: "insensitive" } },
-              { registrationNumber: { contains: search, mode: "insensitive" } },
-              { clearingAgentName: { contains: search, mode: "insensitive" } },
-              { fromLocation: { name: { contains: search, mode: "insensitive" } } },
-              { toLocation: { name: { contains: search, mode: "insensitive" } } },
-              { clearingAgentParty: { partyName: { contains: search, mode: "insensitive" } } },
-            ],
-          }
-        : {}),
+      ...(search ? { OR: biltyListSearchOr(search) } : {}),
     };
 
     const [bilties, total] =
@@ -312,6 +332,16 @@ export async function GET(request: NextRequest) {
             fullName: true,
             username: true,
           },
+        },
+
+        // Reverse reference to this Bilty's own Challan (Goal #10 of
+        // the navigation audit - only Challan pages linked DOWN to
+        // their Bilties before; this is the missing link back UP).
+        // Only the current, non-deleted Challan.
+        challanBilties: {
+          where: { challan: { isDeleted: false } },
+          take: 1,
+          select: { challan: { select: { id: true, challanNo: true } } },
         },
       },
 
@@ -657,6 +687,7 @@ export async function POST(
     // ------------------------------------------------
 
     let agentPartyId: string | null = null;
+    let agentAccountId: string | null = null;
 
     if (data.agentPartyId) {
       const agentParty = await prisma.party.findUnique({
@@ -699,6 +730,7 @@ export async function POST(
       }
 
       agentPartyId = agentParty.id;
+      agentAccountId = agentParty.account.id;
     }
 
     // ------------------------------------------------
@@ -1089,24 +1121,40 @@ export async function POST(
         );
       }
 
-      if (agentCommission > 0 && commissionExpenseAccountId) {
-        const grossCommissionPayableId = await getGrossCommissionPayableAccountId(tx);
+      // Commission/Referral is credited DIRECTLY to the selected
+      // agentParty's own account, immediately, in this same Bilty-
+      // creation transaction - never a gross/suspense clearing account.
+      // Unlike Bilty Rent (Collection) or Challan's own Carrier Rent,
+      // the responsible party for Commission is already fully known at
+      // booking time (agentPartyId, selected right here) - there is no
+      // "responsibility not yet determined until Settlement" ambiguity
+      // to defer, so the gross-account-then-reclassify pattern (see
+      // lib/gross-accounts.ts) does not apply to this component.
+      // Settlement's own commission reclassification
+      // (lib/settlement-accounting.ts) is made a data-driven no-op for
+      // any Bilty whose commission was posted this way (see that
+      // file's own updated comment) - it still correctly reclassifies
+      // a genuinely pre-existing, not-yet-settled Bilty created before
+      // this change, whose commission is still sitting in the gross
+      // account.
+      if (agentCommission > 0 && commissionExpenseAccountId && agentAccountId) {
+        const commissionDescription = buildBiltyCommissionDescription(createdBilty, agentCommission);
 
         journalLines.push(
           {
             accountId: commissionExpenseAccountId,
             debit: agentCommission,
             credit: 0,
-            description: `Booking - ${createdBilty.biltyNo} - Booking Agent Commission`,
+            description: commissionDescription,
             sourceType: "BILTY",
             sourceId: createdBilty.id,
             sourceNumber: createdBilty.biltyNo,
           },
           {
-            accountId: grossCommissionPayableId,
+            accountId: agentAccountId,
             debit: 0,
             credit: agentCommission,
-            description: `Booking - ${createdBilty.biltyNo} - Booking Agent Commission`,
+            description: commissionDescription,
             sourceType: "BILTY",
             sourceId: createdBilty.id,
             sourceNumber: createdBilty.biltyNo,
@@ -1152,6 +1200,29 @@ export async function POST(
           );
         }
       }
+
+      await auditCreate(tx, {
+        actor: actorFromUser(currentUser),
+        module: "BILTY",
+        entityType: "Bilty",
+        entityId: createdBilty.id,
+        documentNo: createdBilty.biltyNo,
+        description: `Created Bilty ${createdBilty.biltyNo} (${data.consigneeName}, Rent Rs. ${rent.toLocaleString()}, To Pay Rs. ${toPay.toLocaleString()})`,
+        newValues: {
+          biltyNo: createdBilty.biltyNo,
+          fromLocationId: data.fromLocationId,
+          toLocationId: data.toLocationId,
+          consignorName: data.consignorName,
+          consigneeName: data.consigneeName,
+          rent,
+          insurance,
+          expense,
+          total,
+          advance,
+          toPay,
+        },
+        ...requestContext(request),
+      });
 
       return createdBilty;
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });

@@ -7,6 +7,15 @@ import {
   createSettlementPayment,
   getComponentPaymentState,
 } from "@/lib/settlement-payments";
+import { prisma } from "@/lib/prisma";
+import { auditSettlementPayment, actorFromUser, requestContext } from "@/lib/audit-log";
+
+// NOTE: createSettlementPayment() (lib/settlement-payments.ts) manages
+// its OWN internal transaction and is an accounting helper this task
+// must not modify (Section 0 of the audit log spec) - so the audit
+// write below happens on the plain `prisma` client, immediately after
+// that call succeeds, rather than inside its transaction. See
+// lib/audit-log.ts's own doc comment on this documented exception.
 
 function errorStatus(code: string): number {
   switch (code) {
@@ -153,6 +162,19 @@ export async function POST(
       createdById: currentUser.userId,
       idempotencyKey: data.idempotencyKey,
     });
+
+    if (!outcome.idempotentReplay) {
+      await auditSettlementPayment(prisma, {
+        actor: actorFromUser(currentUser),
+        module: "SETTLEMENT",
+        entityType: "SettlementPayment",
+        entityId: outcome.row.id,
+        documentNo: challanId,
+        description: `Added Settlement Payment on Challan (${data.component}${data.biltyId ? `, Bilty ${data.biltyId}` : ""}): Rs. ${outcome.row.amount.toLocaleString()}`,
+        newValues: { component: data.component, biltyId: data.biltyId || null, payerAccountId: data.payerAccountId, amount: outcome.row.amount },
+        ...requestContext(request),
+      });
+    }
 
     return NextResponse.json({
       success: true,

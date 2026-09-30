@@ -2,9 +2,10 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
+import { auditUpdate, actorFromUser, requestContext } from "@/lib/audit-log";
 
 export async function POST(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
@@ -113,6 +114,17 @@ export async function POST(
           }
         }
       }
+
+      await auditUpdate(tx, {
+        actor: actorFromUser(currentUser),
+        module: "CHALLAN",
+        entityType: "Challan",
+        entityId: id,
+        documentNo: cancelled.challanNo,
+        description: `Cancelled Challan ${cancelled.challanNo}`,
+        changedFields: { status: { old: challan.status, new: "CANCELLED" } },
+        ...requestContext(request),
+      });
 
       return cancelled;
     });

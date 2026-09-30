@@ -273,6 +273,7 @@ export default function DailyPostingPage() {
         line.sourceType !== "BILTY" &&
         line.sourceType !== "PHONCH" &&
         line.sourceType !== "PRIVATE_PHONCH" &&
+        line.sourceType !== "BILL" &&
         !line.counterAccountId
       ) {
         setError(
@@ -607,7 +608,8 @@ export default function DailyPostingPage() {
                             {(line.sourceType === "CHALLAN" ||
                               line.sourceType === "BILTY" ||
                               line.sourceType === "PHONCH" ||
-                              line.sourceType === "PRIVATE_PHONCH") &&
+                              line.sourceType === "PRIVATE_PHONCH" ||
+                              line.sourceType === "BILL") &&
                               line.sourceId &&
                               line.resolvedPartyLabel && (
                                 <p className="mt-1 text-xs text-green-600">
@@ -623,7 +625,8 @@ export default function DailyPostingPage() {
                             {(line.sourceType === "CHALLAN" ||
                               line.sourceType === "BILTY" ||
                               line.sourceType === "PHONCH" ||
-                              line.sourceType === "PRIVATE_PHONCH") &&
+                              line.sourceType === "PRIVATE_PHONCH" ||
+                              line.sourceType === "BILL") &&
                               line.sourceId &&
                               !line.resolvedPartyLabel &&
                               !line.counterAccountId &&
@@ -657,7 +660,8 @@ export default function DailyPostingPage() {
                       {line.sourceType === "CHALLAN" ||
                       line.sourceType === "BILTY" ||
                       line.sourceType === "PHONCH" ||
-                      line.sourceType === "PRIVATE_PHONCH" ? (
+                      line.sourceType === "PRIVATE_PHONCH" ||
+                      line.sourceType === "BILL" ? (
                         <DocumentSearchSelect
                           sourceType={line.sourceType}
                           sourceId={line.sourceId}

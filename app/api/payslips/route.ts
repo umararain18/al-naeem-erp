@@ -13,6 +13,7 @@ import {
   postSalaryRecognition,
   validatePayslipInput,
 } from "@/lib/payroll-accounting";
+import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
 
 // ============================================================
 // PAYSLIPS - LIST (Payroll register) + CREATE
@@ -259,6 +260,17 @@ export async function POST(request: NextRequest) {
             entryDate: created.payDate,
             description: `Salary — ${payrollMonthLabel(data.payrollMonth)}`,
             createdById: currentUser.userId,
+          });
+
+          await auditCreate(tx, {
+            actor: actorFromUser(currentUser),
+            module: "PAYROLL",
+            entityType: "Payslip",
+            entityId: created.id,
+            documentNo: created.payslipNo,
+            description: `Created Payslip ${created.payslipNo} for ${employee.name} (${payrollMonthLabel(data.payrollMonth)}, Net Pay Rs. ${netPay.toLocaleString()})`,
+            newValues: { employeeId: data.employeeId, payrollMonth: data.payrollMonth, grossPay: data.grossPay, deduction: data.deduction, netPay },
+            ...requestContext(request),
           });
 
           return created;

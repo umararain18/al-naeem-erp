@@ -2,10 +2,11 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
+import { auditRestore, actorFromUser, requestContext } from "@/lib/audit-log";
 
 // Mirrors app/api/phonch/[id]/restore/route.ts exactly.
 export async function POST(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
@@ -19,15 +20,27 @@ export async function POST(
 
     const { id } = await params;
     const phonch = await prisma.$transaction(async (tx) => {
-      const current = await tx.privatePhonch.findUnique({ where: { id }, select: { id: true, isDeleted: true } });
+      const current = await tx.privatePhonch.findUnique({ where: { id }, select: { id: true, isDeleted: true, phonchNo: true } });
       if (!current) return null;
       if (!current.isDeleted) {
         throw new Error("NOT_BINNED");
       }
-      return tx.privatePhonch.update({
+      const restored = await tx.privatePhonch.update({
         where: { id },
         data: { isDeleted: false, deletedAt: null, deletedById: null },
       });
+
+      await auditRestore(tx, {
+        actor: actorFromUser(currentUser),
+        module: "PRIVATE_PHONCH",
+        entityType: "PrivatePhonch",
+        entityId: id,
+        documentNo: current.phonchNo,
+        description: `Restored Private Phonch ${current.phonchNo} from Bin`,
+        ...requestContext(request),
+      });
+
+      return restored;
     });
 
     if (!phonch) {

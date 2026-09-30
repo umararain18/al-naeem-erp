@@ -10,6 +10,7 @@ import {
   payrollMonthLabel,
   round2,
 } from "@/lib/payroll-accounting";
+import { writeAuditLog, actorFromUser, requestContext } from "@/lib/audit-log";
 
 // ============================================================
 // RECORD AN ACTUAL SALARY PAYMENT
@@ -139,6 +140,18 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
                 ],
               },
             },
+          });
+
+          await writeAuditLog(tx, {
+            actor: actorFromUser(currentUser),
+            action: "PAYMENT",
+            module: "PAYROLL",
+            entityType: "Payslip",
+            entityId: id,
+            documentNo: payslip.payslipNo,
+            description: `Recorded Salary Payment for Payslip ${payslip.payslipNo} (${payslip.employee.name}): Rs. ${amount.toLocaleString()}`,
+            newValues: { amount, paymentDate: data.paymentDate, accountId: data.accountId },
+            ...requestContext(request),
           });
         },
         { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }

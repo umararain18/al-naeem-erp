@@ -396,6 +396,13 @@ export default function AccountsPage() {
         ? `/api/accounts/${editingAccount.id}`
         : "/api/accounts";
 
+      // A system account can only have its Name/Description changed
+      // (see app/api/accounts/[id]/route.ts's own enforcement) - only
+      // those two fields are sent, so an unrelated stale value in the
+      // form (accountCode/accountType/category/parentId/partyId, all
+      // disabled below) is never mistaken for an intended change.
+      const isSystemEdit = !!editingAccount?.isSystem;
+
       const response = await fetch(url, {
         method: editingAccount
           ? "PATCH"
@@ -406,24 +413,31 @@ export default function AccountsPage() {
             "application/json",
         },
 
-        body: JSON.stringify({
-          accountName:
-            accountName.trim(),
+        body: JSON.stringify(
+          isSystemEdit
+            ? {
+                accountName: accountName.trim(),
+                description: description.trim(),
+              }
+            : {
+                accountName:
+                  accountName.trim(),
 
-          accountCode:
-            accountCode.trim(),
+                accountCode:
+                  accountCode.trim(),
 
-          accountType,
+                accountType,
 
-          category,
+                category,
 
-          description:
-            description.trim(),
+                description:
+                  description.trim(),
 
-          parentId: parentId || "",
+                parentId: parentId || "",
 
-          partyId: partyId || "",
-        }),
+                partyId: partyId || "",
+              }
+        ),
       });
 
       const data = await response.json();
@@ -725,9 +739,20 @@ export default function AccountsPage() {
 
             <h2 className="text-xl font-semibold mb-5">
               {editingAccount
-                ? "Edit Account"
+                ? editingAccount.isSystem
+                  ? "Rename System Account"
+                  : "Edit Account"
                 : "Create Account"}
             </h2>
+
+            {editingAccount?.isSystem && (
+              <p className="mb-4 text-sm text-blue-700 bg-blue-50 border border-blue-200 rounded-lg px-4 py-3">
+                This is a system account used by automatic postings. Only its Name and
+                Description can be changed - the account code, type, category, parent,
+                and active state are fixed so existing and future JournalLines keep
+                pointing to this same account.
+              </p>
+            )}
 
             <form
               onSubmit={handleSubmit}
@@ -751,24 +776,26 @@ export default function AccountsPage() {
                 type="text"
                 placeholder="Account Code (optional)"
                 value={accountCode}
+                disabled={!!editingAccount?.isSystem}
                 onChange={(e) =>
                   setAccountCode(
                     e.target.value
                   )
                 }
-                className="w-full border rounded-lg px-4 py-3"
+                className="w-full border rounded-lg px-4 py-3 disabled:bg-gray-100 disabled:text-gray-400"
               />
 
               {/* ACCOUNT TYPE */}
 
               <select
                 value={accountType}
+                disabled={!!editingAccount?.isSystem}
                 onChange={(e) =>
                   handleAccountTypeChange(
                     e.target.value as AccountType
                   )
                 }
-                className="w-full border rounded-lg px-4 py-3 bg-white"
+                className="w-full border rounded-lg px-4 py-3 bg-white disabled:bg-gray-100 disabled:text-gray-400"
               >
                 {accountTypes.map(
                   (type) => (
@@ -786,12 +813,13 @@ export default function AccountsPage() {
 
               <select
                 value={category}
+                disabled={!!editingAccount?.isSystem}
                 onChange={(e) =>
                   setCategory(
                     e.target.value as AccountCategory
                   )
                 }
-                className="w-full border rounded-lg px-4 py-3 bg-white"
+                className="w-full border rounded-lg px-4 py-3 bg-white disabled:bg-gray-100 disabled:text-gray-400"
               >
                 {categoriesByType[
                   accountType
@@ -809,12 +837,13 @@ export default function AccountsPage() {
 
               <select
                 value={parentId}
+                disabled={!!editingAccount?.isSystem}
                 onChange={(e) =>
                   setParentId(
                     e.target.value
                   )
                 }
-                className="w-full border rounded-lg px-4 py-3 bg-white"
+                className="w-full border rounded-lg px-4 py-3 bg-white disabled:bg-gray-100 disabled:text-gray-400"
               >
                 <option value="">
                   No Parent Account
@@ -839,12 +868,13 @@ export default function AccountsPage() {
 
               <select
                 value={partyId}
+                disabled={!!editingAccount?.isSystem}
                 onChange={(e) =>
                   setPartyId(
                     e.target.value
                   )
                 }
-                className="w-full border rounded-lg px-4 py-3 bg-white"
+                className="w-full border rounded-lg px-4 py-3 bg-white disabled:bg-gray-100 disabled:text-gray-400"
               >
                 <option value="">
                   No Party Link
@@ -1159,12 +1189,9 @@ export default function AccountsPage() {
                                     account
                                   )
                                 }
-                                disabled={
-                                  account.isSystem
-                                }
                                 className="border rounded-lg px-3 py-1 text-sm hover:bg-gray-50 disabled:opacity-40"
                               >
-                                Edit
+                                {account.isSystem ? "Rename" : "Edit"}
                               </button>
 
                               <button

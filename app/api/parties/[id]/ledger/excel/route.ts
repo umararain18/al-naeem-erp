@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
-import { getPartyLedgerData, PartyLedgerLookupError } from "@/lib/ledger-description";
+import { getPartyLedgerData, PartyLedgerLookupError, parseLedgerEntryType, filterLedgerRowsBySearch } from "@/lib/ledger-description";
 
 // ============================================================
 // GET /api/parties/[id]/ledger/excel?from=&to=
@@ -42,6 +42,15 @@ function formatDate(value: string) {
   return new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "2-digit", year: "numeric" }).format(new Date(value));
 }
 
+const DOCUMENT_TYPE_LABELS: Record<string, string> = {
+  BILTY: "Bilty",
+  CHALLAN: "Challan",
+  PRIVATE_PHONCH: "Private Phonch",
+  SHOWROOM_PHONCH: "Showroom Phonch",
+  BILL: "Bill",
+  OTHER: "Other",
+};
+
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
@@ -59,14 +68,24 @@ export async function GET(
     const { searchParams } = new URL(request.url);
     const from = searchParams.get("from");
     const to = searchParams.get("to");
+    const documentType = parseLedgerEntryType(searchParams.get("type"));
+    const search = searchParams.get("search") || searchParams.get("q");
 
     // Client-facing formal statement: ALWAYS chronological
     // (Opening Balance -> oldest -> newest -> Totals -> Closing
     // Balance), regardless of how the browser Party Ledger screen
-    // orders itself.
-    const data = await getPartyLedgerData(id, { from, to, order: "asc" });
+    // orders itself. When a Type filter is active, every row AND the
+    // Opening/Closing balance below are scoped to only that type -
+    // see getPartyLedgerData()'s own doc comment.
+    const data = await getPartyLedgerData(id, { from, to, order: "asc", documentType });
 
-    const rowsHtml = data.ledger
+    // Search narrows ROWS only - Opening/Closing Balance stay as
+    // data.summary's own Type+Date-filtered figures, exactly mirroring
+    // the screen's own existing search semantics (see the PDF route's
+    // identical comment for the full reasoning).
+    const exportRows = filterLedgerRowsBySearch(data.ledger, search);
+
+    const rowsHtml = exportRows
       .map(
         (row) => `
         <tr>
@@ -83,6 +102,10 @@ export async function GET(
       from || to
         ? `<div>Period: ${escapeHtml(from || "-")} to ${escapeHtml(to || "-")}</div>`
         : "";
+    const typeLine = documentType
+      ? `<div>Type: ${escapeHtml(DOCUMENT_TYPE_LABELS[documentType] || documentType)}</div>`
+      : "";
+    const searchLine = search ? `<div>Search: "${escapeHtml(search)}"</div>` : "";
 
     const html = `<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel" xmlns="http://www.w3.org/TR/REC-html40">
 <head>
@@ -98,6 +121,8 @@ th { background: #2563eb; color: #ffffff; }
 <h2>AL NAEEM CAR CARRIERS SERVICE - Party Ledger</h2>
 <div>Party: ${escapeHtml(data.party.partyName)}</div>
 ${periodLine}
+${typeLine}
+${searchLine}
 <div>Opening Balance: ${escapeHtml(formatCurrency(data.summary.openingBalance))}</div>
 <br/>
 <table>

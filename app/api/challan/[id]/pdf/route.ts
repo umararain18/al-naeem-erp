@@ -2,8 +2,9 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
-import { jsPDF } from "jspdf";
 import autoTable from "jspdf-autotable";
+import { resolvePdfPresentation } from "@/lib/pdf-presentation";
+import { createPdfDocument, drawPdfHeader, drawPdfFooter, applyWatermark, resolveAutoTableTheme, resolveJsPdfFont } from "@/lib/pdf-render-helpers";
 
 export async function GET(
   _request: NextRequest,
@@ -55,21 +56,17 @@ export async function GET(
       );
     }
 
-    const doc = new jsPDF();
+    const presentation = await resolvePdfPresentation(prisma, "CHALLAN");
+    const bodyFont = resolveJsPdfFont(presentation.pdf.defaultFont);
+
+    const doc = createPdfDocument(presentation);
     const pageWidth = doc.internal.pageSize.getWidth();
-    let y = 10;
 
-    doc.setFontSize(14);
-    doc.setFont("helvetica", "bold");
-    doc.text("AL NAEEM CAR CARRIERS SERVICE", pageWidth / 2, y, { align: "center" });
-    y += 6;
-
-    doc.setFontSize(16);
-    doc.text("CHALLAN", pageWidth / 2, y, { align: "center" });
-    y += 8;
+    const { nextY } = await drawPdfHeader(doc, presentation, "CHALLAN");
+    let y = nextY;
 
     doc.setFontSize(10);
-    doc.setFont("helvetica", "normal");
+    doc.setFont(bodyFont, "normal");
 
     const detailRows = [
       ["Challan No", challan.challanNo],
@@ -81,9 +78,9 @@ export async function GET(
     ];
 
     for (const [label, value] of detailRows) {
-      doc.setFont("helvetica", "bold");
+      doc.setFont(bodyFont, "bold");
       doc.text(`${label}:`, 14, y);
-      doc.setFont("helvetica", "normal");
+      doc.setFont(bodyFont, "normal");
       doc.text(String(value), 50, y);
       y += 5;
     }
@@ -113,7 +110,7 @@ export async function GET(
       startY: y,
       head: [tableColumn],
       body: tableRows,
-      theme: "grid",
+      theme: resolveAutoTableTheme(presentation.pdf.tableBorderStyle),
       headStyles: { fontSize: 9, cellPadding: 2 },
       bodyStyles: { fontSize: 9, cellPadding: 2 },
       columnStyles: {
@@ -143,7 +140,7 @@ export async function GET(
     const receivable = Math.max(totalToPay - carrierRent, 0);
     const net = totalToPay - carrierRent;
 
-    doc.setFont("helvetica", "bold");
+    doc.setFont(bodyFont, "bold");
     doc.setFontSize(10);
     doc.text("Financial Summary", 14, summaryY);
     summaryY += 5;
@@ -155,21 +152,21 @@ export async function GET(
     ];
 
     for (const [label, value] of financialRows) {
-      doc.setFont("helvetica", "bold");
+      doc.setFont(bodyFont, "bold");
       doc.text(`${label}:`, 14, summaryY);
-      doc.setFont("helvetica", "normal");
+      doc.setFont(bodyFont, "normal");
       doc.text(String(value), 50, summaryY);
       summaryY += 5;
     }
 
     if (challan.isSettled) {
       summaryY += 4;
-      doc.setFont("helvetica", "bold");
+      doc.setFont(bodyFont, "bold");
       doc.setFontSize(10);
       doc.text("FINAL SETTLEMENT", 14, summaryY);
       summaryY += 5;
 
-      doc.setFont("helvetica", "normal");
+      doc.setFont(bodyFont, "normal");
       doc.setFontSize(9);
 
       const settlementRows = [
@@ -181,27 +178,33 @@ export async function GET(
       ];
 
       for (const [label, value] of settlementRows) {
-        doc.setFont("helvetica", "bold");
+        doc.setFont(bodyFont, "bold");
         doc.text(`${label}:`, 14, summaryY);
-        doc.setFont("helvetica", "normal");
+        doc.setFont(bodyFont, "normal");
         doc.text(String(value), 60, summaryY);
         summaryY += 4;
       }
 
       if (challan.settlementNotes) {
-        doc.setFont("helvetica", "bold");
+        doc.setFont(bodyFont, "bold");
         doc.text(`Notes:`, 14, summaryY);
-        doc.setFont("helvetica", "normal");
+        doc.setFont(bodyFont, "normal");
         const splitNotes = doc.splitTextToSize(String(challan.settlementNotes), pageWidth - 70);
         doc.text(splitNotes, 60, summaryY);
         summaryY += splitNotes.length * 4;
       }
     }
 
+    // Challan's own Status line is business content (not a Settings
+    // concern) - kept, just repositioned slightly above the new
+    // Settings-driven footer block so the two never overlap.
     doc.setFontSize(8);
     doc.setTextColor(100);
-    doc.text(`Status: ${challan.status.replace("_", " ")}`, 14, 285);
-    doc.text(`Generated: ${new Date().toLocaleString()}`, pageWidth - 14, 285, { align: "right" });
+    doc.text(`Status: ${challan.status.replace("_", " ")}`, 14, doc.internal.pageSize.getHeight() - 20);
+    doc.setTextColor(0);
+
+    drawPdfFooter(doc, presentation);
+    applyWatermark(doc, presentation);
 
     const pdfBuffer = doc.output("arraybuffer");
 
@@ -210,6 +213,7 @@ export async function GET(
       headers: {
         "Content-Type": "application/pdf",
         "Content-Disposition": `attachment; filename=challan-${challan.challanNo}.pdf`,
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
       },
     });
   } catch (error) {

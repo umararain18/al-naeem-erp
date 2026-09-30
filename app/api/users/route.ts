@@ -5,6 +5,7 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { Role } from "@prisma/client";
+import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
 
 const createUserSchema = z.object({
   fullName: z.string().min(2, "Full name is required"),
@@ -144,6 +145,18 @@ export async function POST(request: NextRequest) {
         isActive: true,
         createdAt: true,
       },
+    });
+
+    // Never logs the password/hash - only identity/role fields.
+    await auditCreate(prisma, {
+      actor: actorFromUser(currentUser),
+      module: "USER",
+      entityType: "User",
+      entityId: user.id,
+      documentNo: user.username,
+      description: `Created User ${user.username} (${user.fullName}, role: ${user.role})`,
+      newValues: { fullName: user.fullName, username: user.username, role: user.role, phone: user.phone },
+      ...requestContext(request),
     });
 
     return NextResponse.json(

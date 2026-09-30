@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
+import Image from "next/image";
 
 type BiltyStatus = "PENDING" | "IN_TRANSIT" | "DELIVERED" | "CANCELLED";
 
@@ -77,9 +78,85 @@ const statusLabels: Record<BiltyStatus, string> = {
   CANCELLED: "Cancelled",
 };
 
+// Same shape lib/pdf-presentation.ts's ResolvedPdfPresentation returns
+// - this page uses the /api/settings/presentation read surface (not
+// /api/settings/business, which is settings.view-gated) since a
+// printed Bilty's own branding must be visible to anyone who can view
+// the Bilty itself. See that route's own doc comment. A completely
+// safe, all-off default is used if the fetch fails for any reason -
+// printing must never break over a Settings problem (Step 9).
+type Presentation = {
+  business: {
+    businessName: string;
+    address: string | null;
+    city: string | null;
+    province: string | null;
+    country: string | null;
+    phone1: string | null;
+    whatsapp: string | null;
+    email: string | null;
+    website: string | null;
+    mainLogoUrl: string | null;
+  };
+  header: {
+    show: boolean;
+    showLogo: boolean;
+    showBusinessName: boolean;
+    showAddress: boolean;
+    showPhone: boolean;
+    showWhatsapp: boolean;
+    showEmail: boolean;
+    showWebsite: boolean;
+    logoPosition: "LEFT" | "CENTER" | "RIGHT";
+    alignment: "LEFT" | "CENTER" | "RIGHT";
+    subtitle: string | null;
+  };
+  footer: {
+    show: boolean;
+    text: string | null;
+    showPhone: boolean;
+    showAddress: boolean;
+    showWebsite: boolean;
+    showGeneratedDate: boolean;
+    termsAndConditions: string | null;
+  };
+  useLogo: boolean;
+};
+
+const FALLBACK_PRESENTATION: Presentation = {
+  business: {
+    businessName: "Al Naeem Car Carriers Service",
+    address: null,
+    city: null,
+    province: null,
+    country: null,
+    phone1: null,
+    whatsapp: null,
+    email: null,
+    website: null,
+    mainLogoUrl: null,
+  },
+  header: {
+    show: true,
+    showLogo: false,
+    showBusinessName: true,
+    showAddress: false,
+    showPhone: false,
+    showWhatsapp: false,
+    showEmail: false,
+    showWebsite: false,
+    logoPosition: "LEFT",
+    alignment: "CENTER",
+    subtitle: null,
+  },
+  footer: { show: false, text: null, showPhone: false, showAddress: false, showWebsite: false, showGeneratedDate: false, termsAndConditions: null },
+  useLogo: false,
+};
+
 export default function BiltyPrintPage() {
   const params = useParams<{ id: string }>();
   const [bilty, setBilty] = useState<Bilty | null>(null);
+  const [presentation, setPresentation] = useState<Presentation>(FALLBACK_PRESENTATION);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
@@ -107,6 +184,18 @@ export default function BiltyPrintPage() {
 
     load();
   }, [params.id]);
+
+  useEffect(() => {
+    // Best-effort - a Settings/network problem here must never block
+    // printing the Bilty itself, so failures just keep the safe
+    // all-off FALLBACK_PRESENTATION already in state.
+    fetch("/api/settings/presentation?documentType=BILTY")
+      .then((r) => r.json())
+      .then((d) => {
+        if (d?.success && d.presentation) setPresentation(d.presentation);
+      })
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     if (!loading && !error && bilty) {
@@ -145,12 +234,67 @@ export default function BiltyPrintPage() {
   return (
     <div className="min-h-screen bg-white">
       <div className="max-w-[210mm] mx-auto p-8">
-        {/* Header */}
-
-        <div className="text-center border-b-2 border-black pb-4 mb-6">
-          <h1 className="text-2xl font-bold uppercase tracking-wide">Al Naeem Car Carriers Service</h1>
-          <p className="text-lg font-semibold mt-1">BILTY</p>
-        </div>
+        {/* Header - Settings-driven (Phase 2 Central Settings
+            integration). If the document-type Header override
+            resolved OFF, only the title itself still renders - never
+            nothing at all. */}
+        {presentation.header.show ? (
+          <div
+            className={`border-b-2 border-black pb-4 mb-6 ${
+              presentation.header.alignment === "LEFT" ? "text-left" : presentation.header.alignment === "RIGHT" ? "text-right" : "text-center"
+            }`}
+          >
+            <div
+              className={`flex items-center gap-3 ${
+                presentation.header.alignment === "LEFT"
+                  ? "justify-start"
+                  : presentation.header.alignment === "RIGHT"
+                  ? "justify-end"
+                  : "justify-center"
+              } ${presentation.header.logoPosition === "RIGHT" ? "flex-row-reverse" : ""}`}
+            >
+              {presentation.useLogo && presentation.header.showLogo && presentation.business.mainLogoUrl && (
+                <Image
+                  src={presentation.business.mainLogoUrl}
+                  alt={presentation.business.businessName}
+                  width={48}
+                  height={48}
+                  className="h-12 w-12 object-contain"
+                  unoptimized
+                />
+              )}
+              <div>
+                {presentation.header.showBusinessName && presentation.business.businessName && (
+                  <h1 className="text-2xl font-bold uppercase tracking-wide">{presentation.business.businessName}</h1>
+                )}
+                {presentation.header.subtitle && <p className="text-sm text-gray-600">{presentation.header.subtitle}</p>}
+              </div>
+            </div>
+            {presentation.header.showAddress &&
+              [presentation.business.address, presentation.business.city, presentation.business.province, presentation.business.country]
+                .filter((v): v is string => !!v && v.trim().length > 0).length > 0 && (
+                <p className="text-xs text-gray-600 mt-1">
+                  {[presentation.business.address, presentation.business.city, presentation.business.province, presentation.business.country]
+                    .filter((v): v is string => !!v && v.trim().length > 0)
+                    .join(", ")}
+                </p>
+              )}
+            {(() => {
+              const contact = [
+                presentation.header.showPhone && presentation.business.phone1 ? `Phone: ${presentation.business.phone1}` : null,
+                presentation.header.showWhatsapp && presentation.business.whatsapp ? `WhatsApp: ${presentation.business.whatsapp}` : null,
+                presentation.header.showEmail && presentation.business.email ? presentation.business.email : null,
+                presentation.header.showWebsite && presentation.business.website ? presentation.business.website : null,
+              ].filter((v): v is string => !!v);
+              return contact.length > 0 ? <p className="text-xs text-gray-600 mt-0.5">{contact.join("  |  ")}</p> : null;
+            })()}
+            <p className="text-lg font-semibold mt-1">BILTY</p>
+          </div>
+        ) : (
+          <div className="text-center pb-4 mb-6">
+            <p className="text-lg font-semibold">BILTY</p>
+          </div>
+        )}
 
         <div className="flex justify-between items-start mb-6">
           <div>
@@ -370,6 +514,24 @@ export default function BiltyPrintPage() {
             <p className="text-sm font-medium">Authorized Signature</p>
           </div>
         </div>
+
+        {/* Footer - Settings-driven, only when this document type's
+            own Footer override resolved ON. */}
+        {presentation.footer.show && (
+          <div className="border-t border-gray-300 pt-3 mb-6 text-center text-xs text-gray-600 space-y-0.5">
+            {presentation.footer.text && <p>{presentation.footer.text}</p>}
+            {(() => {
+              const parts = [
+                presentation.footer.showPhone && presentation.business.phone1 ? `Phone: ${presentation.business.phone1}` : null,
+                presentation.footer.showAddress && presentation.business.address ? presentation.business.address : null,
+                presentation.footer.showWebsite && presentation.business.website ? presentation.business.website : null,
+              ].filter((v): v is string => !!v);
+              return parts.length > 0 ? <p>{parts.join("  |  ")}</p> : null;
+            })()}
+            {presentation.footer.termsAndConditions && <p className="whitespace-pre-line">{presentation.footer.termsAndConditions}</p>}
+            {presentation.footer.showGeneratedDate && <p>Generated: {new Date().toLocaleString()}</p>}
+          </div>
+        )}
 
         {/* Actions */}
 

@@ -3,6 +3,7 @@
 import { use, useEffect, useState } from "react";
 import Link from "next/link";
 import PhonchForm from "../PhonchForm";
+import { DocumentFooter, DocumentHeader, useDocumentPresentation } from "@/components/documents/DocumentPresentation";
 
 function formatCurrency(value: number) {
   return `Rs. ${Math.round(value).toLocaleString()}`;
@@ -27,6 +28,9 @@ type PhonchVehicle = {
   otherExpenseReason: string | null;
   claimAmount: string;
   claimReason: string | null;
+  // Reverse Bill Book link (Section 20/21 of the Bill Book spec) -
+  // null when this vehicle has not been billed yet.
+  billInfo: { billId: string; billNo: string; billAmount: number; billStatus: "UNPAID" | "PARTIALLY_PAID" | "PAID" } | null;
 };
 
 type PhonchDetail = {
@@ -55,6 +59,7 @@ export default function PhonchDetailPage({ params }: { params: Promise<{ id: str
   const [message, setMessage] = useState("");
   const [binning, setBinning] = useState(false);
   const [editing, setEditing] = useState(false);
+  const presentation = useDocumentPresentation("SHOWROOM_PHONCH");
 
   async function load() {
     try {
@@ -165,6 +170,8 @@ export default function PhonchDetailPage({ params }: { params: Promise<{ id: str
   return (
     <main className="min-h-screen bg-gray-50 p-6">
       <div className="mx-auto max-w-6xl">
+        <DocumentHeader presentation={presentation} title="SHOWROOM PHONCH" />
+
         <div className="mb-6 flex items-center justify-between">
           <div>
             <Link href="/phonch" className="text-xs text-gray-500 hover:underline">
@@ -270,6 +277,7 @@ export default function PhonchDetailPage({ params }: { params: Promise<{ id: str
                 {hasOtherExpense && <th className="px-3 py-3">Other Expense</th>}
                 {hasClaim && <th className="px-3 py-3">Claim</th>}
                 <th className="px-3 py-3">Note / Condition</th>
+                <th className="px-3 py-3">Bill</th>
               </tr>
             </thead>
             <tbody className="divide-y">
@@ -308,6 +316,19 @@ export default function PhonchDetailPage({ params }: { params: Promise<{ id: str
                     </td>
                   )}
                   <td className="px-3 py-2">{v.note || "—"}</td>
+                  <td className="px-3 py-2">
+                    {v.billInfo ? (
+                      <Link href={`/bill/${v.billInfo.billId}`} className="text-blue-600 hover:underline">
+                        {v.billInfo.billNo}
+                        <div className="text-xs text-gray-500">
+                          {formatCurrency(v.billInfo.billAmount)} ·{" "}
+                          {v.billInfo.billStatus === "PAID" ? "Paid" : v.billInfo.billStatus === "PARTIALLY_PAID" ? "Partially Paid" : "Unpaid"}
+                        </div>
+                      </Link>
+                    ) : (
+                      <span className="text-xs text-gray-400">Not Billed</span>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>
@@ -348,6 +369,8 @@ export default function PhonchDetailPage({ params }: { params: Promise<{ id: str
             </div>
           </div>
         </div>
+
+        <DocumentFooter presentation={presentation} />
       </div>
     </main>
   );

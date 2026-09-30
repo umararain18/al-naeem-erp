@@ -5,6 +5,7 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { Role } from "@prisma/client";
+import { auditUpdate, auditDelete, auditPermissionChange, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 
 const updateUserSchema = z.object({
   fullName: z.string().min(2).optional(),
@@ -224,6 +225,41 @@ export async function PATCH(
       },
     });
 
+    // Role change is its own PERMISSION_CHANGE audit event (Section M
+    // of the audit log spec); every other field change is a plain
+    // UPDATE - never logs the password/hash.
+    if (data.role !== undefined && data.role !== existingUser.role) {
+      await auditPermissionChange(prisma, {
+        actor: actorFromUser(currentUser),
+        module: "USER",
+        entityType: "User",
+        entityId: id,
+        documentNo: existingUser.username,
+        description: `Changed role for User ${existingUser.username}: ${existingUser.role} → ${data.role}`,
+        changedFields: { role: { old: existingUser.role, new: data.role } },
+        ...requestContext(request),
+      });
+    }
+
+    const otherChangedFields = diffFields(
+      { fullName: existingUser.fullName, username: existingUser.username, phone: existingUser.phone, isActive: existingUser.isActive },
+      { fullName: data.fullName, username: data.username, phone: data.phone, isActive: data.isActive },
+      ["fullName", "username", "phone", "isActive"]
+    );
+    if (Object.keys(otherChangedFields).length > 0) {
+      const summary = Object.entries(otherChangedFields).map(([f, { old, new: nv }]) => `${f} ${old ?? "—"} → ${nv ?? "—"}`).join("; ");
+      await auditUpdate(prisma, {
+        actor: actorFromUser(currentUser),
+        module: "USER",
+        entityType: "User",
+        entityId: id,
+        documentNo: existingUser.username,
+        description: `Updated User ${existingUser.username}: ${summary}`,
+        changedFields: otherChangedFields,
+        ...requestContext(request),
+      });
+    }
+
     return NextResponse.json({
       success: true,
       message: "User updated successfully",
@@ -241,7 +277,7 @@ export async function PATCH(
 
 // DELETE /api/users/[id]
 export async function DELETE(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
@@ -290,6 +326,17 @@ export async function DELETE(
 
     await prisma.user.delete({
       where: { id },
+    });
+
+    await auditDelete(prisma, {
+      actor: actorFromUser(currentUser),
+      module: "USER",
+      entityType: "User",
+      entityId: id,
+      documentNo: existingUser.username,
+      description: `Deleted User ${existingUser.username} (${existingUser.fullName})`,
+      oldValues: { fullName: existingUser.fullName, username: existingUser.username, role: existingUser.role },
+      ...requestContext(request),
     });
 
     return NextResponse.json({

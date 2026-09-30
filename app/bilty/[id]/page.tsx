@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { getBiltyShareMessage } from "@/lib/share-messages";
 import { normalizePhone } from "@/lib/phone";
+import { DocumentFooter, DocumentHeader, useDocumentPresentation } from "@/components/documents/DocumentPresentation";
 
 type BiltyStatus = "PENDING" | "IN_TRANSIT" | "DELIVERED" | "CANCELLED";
 
@@ -72,6 +73,7 @@ type Bilty = {
   notes: string | null;
   createdBy: Creator | null;
   createdAt: string;
+  challanBilties: { challan: { id: string; challanNo: string } }[];
 };
 
 const statusColors: Record<BiltyStatus, string> = {
@@ -90,6 +92,7 @@ export default function BiltyDetailPage({
   const [bilty, setBilty] = useState<Bilty | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const presentation = useDocumentPresentation("BILTY");
 
   useEffect(() => {
     async function load() {
@@ -153,11 +156,12 @@ export default function BiltyDetailPage({
   return (
     <main className="min-h-screen bg-gray-50">
       <div className="max-w-4xl mx-auto p-6">
+        <DocumentHeader presentation={presentation} title="BILTY" />
+
         {/* Header */}
 
-        <div className="mb-6">
-          <div className="text-xs text-gray-500 mb-1">Al Naeem Car Carriers Service</div>
-          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+        <div className="mb-4">
+          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
             <div>
               <h1 className="text-2xl font-bold">Bilty #{bilty.biltyNo}</h1>
               <p className="text-gray-600">
@@ -171,6 +175,15 @@ export default function BiltyDetailPage({
               >
                 {bilty.status.replace("_", " ")}
               </span>
+
+              {bilty.challanBilties[0] && (
+                <Link
+                  href={`/challan/${bilty.challanBilties[0].challan.id}`}
+                  className="text-sm text-blue-600 hover:underline"
+                >
+                  Challan {bilty.challanBilties[0].challan.challanNo}
+                </Link>
+              )}
 
               <Link
                 href="/bilty"
@@ -189,11 +202,11 @@ export default function BiltyDetailPage({
           </div>
         </div>
 
-        <div className="space-y-6">
+        <div className="space-y-3">
           {/* Route */}
 
-          <section className="bg-white rounded-xl shadow-sm p-6">
-            <h2 className="text-lg font-semibold mb-4">Route</h2>
+          <section className="bg-white rounded-xl shadow-sm p-4">
+            <h2 className="text-lg font-semibold mb-2">Route</h2>
             <div className="flex items-center gap-2 text-lg">
               <span className="font-medium">{bilty.fromLocation.name}</span>
               <span className="text-gray-400">→</span>
@@ -203,9 +216,9 @@ export default function BiltyDetailPage({
 
           {/* Consignor */}
 
-          <section className="bg-white rounded-xl shadow-sm p-6">
-            <h2 className="text-lg font-semibold mb-4">Consignor</h2>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <section className="bg-white rounded-xl shadow-sm p-4">
+            <h2 className="text-lg font-semibold mb-2">Consignor</h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
               <div>
                 <p className="text-xs text-gray-500 uppercase tracking-wide">Party</p>
                 <p className="text-sm mt-1">
@@ -227,9 +240,9 @@ export default function BiltyDetailPage({
 
           {/* Consignee */}
 
-          <section className="bg-white rounded-xl shadow-sm p-6">
-            <h2 className="text-lg font-semibold mb-4">Consignee</h2>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <section className="bg-white rounded-xl shadow-sm p-4">
+            <h2 className="text-lg font-semibold mb-2">Consignee</h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
               <div>
                 <p className="text-xs text-gray-500 uppercase tracking-wide">Party</p>
                 <p className="text-sm mt-1">
@@ -251,9 +264,9 @@ export default function BiltyDetailPage({
 
           {/* Clearing Agent / Delivery Point */}
 
-          <section className="bg-white rounded-xl shadow-sm p-6">
-            <h2 className="text-lg font-semibold mb-4">Clearing Agent / Delivery Point</h2>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <section className="bg-white rounded-xl shadow-sm p-4">
+            <h2 className="text-lg font-semibold mb-2">Clearing Agent / Delivery Point</h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
               <div>
                 <p className="text-xs text-gray-500 uppercase tracking-wide">Name</p>
                 <p className="text-sm mt-1">{bilty.clearingAgentName || "-"}</p>
@@ -270,9 +283,9 @@ export default function BiltyDetailPage({
 
           {/* Vehicle Details */}
 
-          <section className="bg-white rounded-xl shadow-sm p-6">
-            <h2 className="text-lg font-semibold mb-4">Vehicle Details</h2>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <section className="bg-white rounded-xl shadow-sm p-4">
+            <h2 className="text-lg font-semibold mb-2">Vehicle Details</h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
               {bilty.vehicleType && (
                 <div>
                   <p className="text-xs text-gray-500 uppercase tracking-wide">Type</p>
@@ -330,8 +343,8 @@ export default function BiltyDetailPage({
 
           {/* Financial Summary */}
 
-          <section className="bg-white rounded-xl shadow-sm p-6">
-            <h2 className="text-lg font-semibold mb-4">Financial Summary</h2>
+          <section className="bg-white rounded-xl shadow-sm p-4">
+            <h2 className="text-lg font-semibold mb-2">Financial Summary</h2>
             <div className="space-y-2 text-sm">
               <div className="flex justify-between">
                 <span className="text-gray-600">Rent</span>
@@ -363,9 +376,9 @@ export default function BiltyDetailPage({
           {/* Commission / Referral */}
 
           {(bilty.agentParty || (bilty.agentCommission ?? 0) > 0 || bilty.agentDescription) && (
-            <section className="bg-white rounded-xl shadow-sm p-6">
-              <h2 className="text-lg font-semibold mb-4">Commission / Referral</h2>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+            <section className="bg-white rounded-xl shadow-sm p-4">
+              <h2 className="text-lg font-semibold mb-2">Commission / Referral</h2>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
                 <div>
                   <p className="text-xs text-gray-500 uppercase tracking-wide">Agent / Referral Party</p>
                   <p className="mt-1">{bilty.agentParty?.partyName || "-"}</p>
@@ -394,8 +407,8 @@ export default function BiltyDetailPage({
           {/* Notes */}
 
           {bilty.notes && (
-            <section className="bg-white rounded-xl shadow-sm p-6">
-              <h2 className="text-lg font-semibold mb-4">Notes</h2>
+            <section className="bg-white rounded-xl shadow-sm p-4">
+              <h2 className="text-lg font-semibold mb-2">Notes</h2>
               <p className="text-sm whitespace-pre-line">{bilty.notes}</p>
             </section>
           )}
@@ -403,9 +416,9 @@ export default function BiltyDetailPage({
           {/* Audit Information */}
 
           {bilty.createdBy && (
-            <section className="bg-white rounded-xl shadow-sm p-6">
-              <h2 className="text-lg font-semibold mb-4">Audit Information</h2>
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
+            <section className="bg-white rounded-xl shadow-sm p-4">
+              <h2 className="text-lg font-semibold mb-2">Audit Information</h2>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
                 <div>
                   <p className="text-xs text-gray-500 uppercase tracking-wide">Created By</p>
                   <p className="mt-1">{bilty.createdBy.fullName || bilty.createdBy.username}</p>
@@ -416,6 +429,8 @@ export default function BiltyDetailPage({
               </div>
             </section>
           )}
+
+          <DocumentFooter presentation={presentation} />
 
            {/* Actions */}
 

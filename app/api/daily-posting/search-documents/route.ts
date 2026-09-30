@@ -7,6 +7,7 @@ import {
   getPrivatePhonchEligibleParties,
   resolveDocumentPartyAccount,
 } from "@/lib/document-party-resolution";
+import { getBillPaymentState, resolveBillClientAccountId } from "@/lib/bill-accounting";
 
 // ============================================================
 // GET /api/daily-posting/search-documents?q=4001
@@ -20,7 +21,7 @@ import {
 // ============================================================
 
 type DocumentSearchResult = {
-  type: "CHALLAN" | "BILTY" | "PHONCH" | "PRIVATE_PHONCH";
+  type: "CHALLAN" | "BILTY" | "PHONCH" | "PRIVATE_PHONCH" | "BILL";
   id: string;
   number: string;
   subtitle: string;
@@ -71,6 +72,7 @@ export async function GET(request: NextRequest) {
     const canViewBilties = hasPermission(currentUser, "bilty.view");
     const canViewPhonch = hasPermission(currentUser, "phonch.view");
     const canViewPrivatePhonch = hasPermission(currentUser, "privatePhonch.view");
+    const canViewBill = hasPermission(currentUser, "bill.view");
 
     const results: DocumentSearchResult[] = [];
 
@@ -248,6 +250,71 @@ export async function GET(request: NextRequest) {
           detail: `${privatePhonch._count.vehicles} Vehicle(s)`,
           resolvedParty,
           eligibleParties,
+        });
+      }
+    }
+
+    if (canViewBill) {
+      const bills = await prisma.bill.findMany({
+        where: {
+          isDeleted: false,
+          OR: [
+            { billNo: { contains: q, mode: "insensitive" } },
+            { clientName: { contains: q, mode: "insensitive" } },
+            { clientPhone: { contains: q, mode: "insensitive" } },
+            {
+              items: {
+                some: {
+                  OR: [
+                    { vehicleName: { contains: q, mode: "insensitive" } },
+                    { chassisNumber: { contains: q, mode: "insensitive" } },
+                    { engineNumber: { contains: q, mode: "insensitive" } },
+                    { regdNumber: { contains: q, mode: "insensitive" } },
+                  ],
+                },
+              },
+            },
+            {
+              sourceLinks: {
+                some: {
+                  OR: [
+                    { privatePhonchVehicle: { phonch: { phonchNo: { contains: q, mode: "insensitive" } } } },
+                    { phonchVehicle: { phonch: { phonchNo: { contains: q, mode: "insensitive" } } } },
+                  ],
+                },
+              },
+            },
+          ],
+        },
+        select: {
+          id: true,
+          billNo: true,
+          clientName: true,
+          clientParty: { select: { account: { select: { id: true } } } },
+          items: { select: { rent: true, delivery: true, otherExpense: true } },
+          _count: { select: { items: true } },
+        },
+        orderBy: { date: "desc" },
+        take: 8,
+      });
+
+      for (const bill of bills) {
+        const resolvedParty = await resolveDocumentPartyAccount("BILL", bill.id);
+        const totalAmount = Math.round(
+          bill.items.reduce((s, i) => s + Number(i.rent) + Number(i.delivery) + Number(i.otherExpense), 0) * 100
+        ) / 100;
+        const searchClientAccountId = await resolveBillClientAccountId(prisma, bill.clientParty);
+        const remainingDetail = searchClientAccountId
+          ? await getBillPaymentState(prisma, bill.id, searchClientAccountId, totalAmount)
+          : null;
+
+        results.push({
+          type: "BILL",
+          id: bill.id,
+          number: bill.billNo,
+          subtitle: `Client: ${bill.clientName}`,
+          detail: `${bill._count.items} Vehicle(s)${remainingDetail ? ` • Remaining: Rs. ${Math.round(remainingDetail.remainingDue).toLocaleString()}` : ""}`,
+          resolvedParty,
         });
       }
     }

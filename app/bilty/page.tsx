@@ -1302,42 +1302,41 @@ export default function BiltyPage() {
                 {search ? "No matching bilties found." : "No bilties found."}
               </p>
             ) : (
+              // Compact, scannable list (Private Phonch's own list as the UX
+              // reference) - one flat row per Bilty, Client/Vehicle/Route/
+              // Rent/Paid-ToPay/Status/Actions only. Consignee, Clearing
+              // Agent, Advance-vs-ToPay breakdown, and every other field
+              // remain on the Bilty detail page, never removed - only kept
+              // out of this list's row.
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b text-left">
                       <th className="py-3 pr-4">Bilty No</th>
                       <th className="py-3 pr-4">Date</th>
+                      <th className="py-3 pr-4">Client</th>
+                      <th className="py-3 pr-4">Vehicle</th>
                       <th className="py-3 pr-4">Route</th>
-                      <th className="py-3 pr-4">Consignor</th>
-                      <th className="py-3 pr-4">Consignee</th>
-                      <th className="py-3 pr-4">Vehicle / Reg</th>
-                      <th className="py-3 pr-4">Clearing Agent</th>
-                      <th className="py-3 pr-4">Rent</th>
-                      <th className="py-3 pr-4">Advance</th>
-                      <th className="py-3 pr-4">To Pay</th>
+                      <th className="py-3 pr-4 text-right">Rent</th>
+                      <th className="py-3 pr-4 text-right">Paid / To Pay</th>
                       <th className="py-3 pr-4">Status</th>
                       <th className="py-3 pr-4">Actions</th>
                     </tr>
                   </thead>
                   <tbody>
                     {filteredBilties.map((bilty) => (
-                      <tr key={bilty.id} className="border-b">
+                      <tr key={bilty.id} className="border-b hover:bg-gray-50">
                         <td className="py-3 pr-4">
-                          <div className="font-medium">{bilty.biltyNo}</div>
+                          <Link href={`/bilty/${bilty.id}`} className="font-medium text-blue-600 hover:underline">
+                            {bilty.biltyNo}
+                          </Link>
                         </td>
 
                         <td className="py-3 pr-4">
                           {new Date(bilty.date).toLocaleDateString()}
                         </td>
 
-                        <td className="py-3 pr-4">
-                          {bilty.fromLocation.name} → {bilty.toLocation.name}
-                        </td>
-
                         <td className="py-3 pr-4">{bilty.consignorName}</td>
-
-                        <td className="py-3 pr-4">{bilty.consigneeName}</td>
 
                         <td className="py-3 pr-4">
                           {bilty.vehicleType
@@ -1346,21 +1345,16 @@ export default function BiltyPage() {
                         </td>
 
                         <td className="py-3 pr-4">
-                          {bilty.clearingAgentParty?.partyName ||
-                            bilty.clearingAgentName ||
-                            "-"}
+                          {bilty.fromLocation.name} → {bilty.toLocation.name}
                         </td>
 
-                        <td className="py-3 pr-4">
+                        <td className="py-3 pr-4 text-right">
                           Rs. {Number(bilty.rent || 0).toLocaleString()}
                         </td>
 
-                        <td className="py-3 pr-4">
-                          Rs. {Number(bilty.advance || 0).toLocaleString()}
-                        </td>
-
-                        <td className="py-3 pr-4">
-                          Rs. {Number(bilty.toPay || 0).toLocaleString()}
+                        <td className="py-3 pr-4 text-right">
+                          <div>Rs. {Number(bilty.advance || 0).toLocaleString()} Paid</div>
+                          <div className="text-xs text-gray-500">Rs. {Number(bilty.toPay || 0).toLocaleString()} To Pay</div>
                         </td>
 
                         <td className="py-3 pr-4">

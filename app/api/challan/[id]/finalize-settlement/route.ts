@@ -17,6 +17,7 @@ import {
   getGrossCommissionPayableAccountId,
 } from "@/lib/gross-accounts";
 import { createSettlementPayment, reconcileCollectionAttributionAtSettlement, SettlementPaymentError } from "@/lib/settlement-payments";
+import { auditSettlement, auditUpdate, actorFromUser, requestContext } from "@/lib/audit-log";
 
 // ============================================================
 // POST /api/challan/[id]/finalize-settlement
@@ -157,6 +158,40 @@ export async function POST(
     }
 
     // ------------------------------------------------------------
+    // ACTUAL outstanding Gross Commission Payable per Bilty (never
+    // `bilty.agentCommission` blindly) - as of app/api/bilty/route.ts's
+    // own commission-at-creation change, a NEW Bilty's commission is
+    // credited DIRECTLY to the agentParty's own account at booking and
+    // never touches this gross account at all, so this correctly comes
+    // back 0 for it (nothing left here to reclassify - the party was
+    // already paid). A Bilty created BEFORE that change still has its
+    // full commission sitting here, so this correctly reproduces the
+    // exact reclassification this route always performed for it. This
+    // is what prevents a double credit to the same agentParty account
+    // (once at booking, once again here) without needing any new flag
+    // or schema change - it is entirely derived from the real ledger.
+    const grossCommissionPayableIdForLookup = await getGrossCommissionPayableAccountId(prisma);
+    const biltyIdsForCommissionLookup = challan.bilties.map((cb) => cb.bilty.id);
+    const outstandingCommissionLines =
+      biltyIdsForCommissionLookup.length > 0
+        ? await prisma.journalLine.findMany({
+            where: {
+              accountId: grossCommissionPayableIdForLookup,
+              sourceType: "BILTY",
+              sourceId: { in: biltyIdsForCommissionLookup },
+              journalEntry: { isDeleted: false },
+            },
+            select: { sourceId: true, debit: true, credit: true },
+          })
+        : [];
+    const outstandingCommissionByBiltyId = new Map<string, number>();
+    for (const line of outstandingCommissionLines) {
+      if (!line.sourceId) continue;
+      const current = outstandingCommissionByBiltyId.get(line.sourceId) || 0;
+      outstandingCommissionByBiltyId.set(line.sourceId, current + Number(line.credit) - Number(line.debit));
+    }
+
+    // ------------------------------------------------------------
     // SAFE, DETERMINISTIC DEFAULTS - never a user choice, never a
     // guess: each Bilty's own already-recorded Clearing Agent, the
     // Challan's own already-recorded Transporter, and a Bilty's own
@@ -216,7 +251,9 @@ export async function POST(
       // needs no Collection party at all. See
       // lib/settlement-accounting.ts's BiltySettlementInput.collectionAmount.
       const collectionAmount = Number(bilty.toPay);
-      const commissionAmount = Number(bilty.agentCommission);
+      // See the outstandingCommissionByBiltyId comment above - never
+      // bilty.agentCommission directly.
+      const commissionAmount = Math.max(0, outstandingCommissionByBiltyId.get(bilty.id) || 0);
 
       let collectionResponsibility: CollectionResponsibility;
       let collectionPartyAccountId: string | null = null;
@@ -263,7 +300,7 @@ export async function POST(
         collectionAmount: bilty.toPay,
         collectionResponsibility,
         collectionPartyAccountId,
-        agentCommission: bilty.agentCommission,
+        agentCommission: commissionAmount,
         commissionResponsibility,
         commissionPartyAccountId,
       };
@@ -471,6 +508,22 @@ export async function POST(
             });
           }
 
+          await auditSettlement(tx, {
+            actor: actorFromUser(currentUser),
+            module: "SETTLEMENT",
+            entityType: "Challan",
+            entityId: id,
+            documentNo: settled.challanNo,
+            description: `Finalized Settlement for Challan ${settled.challanNo} (Receivable Rs. ${settlementResult.outstandingReceivable.toLocaleString()}, Payable Rs. ${settlementResult.outstandingPayable.toLocaleString()}, ${createdAllocations.length} payment allocation(s))`,
+            newValues: {
+              settlementNotes: data.settlementNotes || null,
+              outstandingReceivable: settlementResult.outstandingReceivable,
+              outstandingPayable: settlementResult.outstandingPayable,
+              allocations: createdAllocations,
+            },
+            ...requestContext(request),
+          });
+
           return settled;
         },
         { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
@@ -542,7 +595,10 @@ export async function PATCH(
       return NextResponse.json({ success: false, message: "Invalid request" }, { status: 400 });
     }
 
-    const challan = await prisma.challan.findUnique({ where: { id }, select: { id: true, isDeleted: true, isSettled: true } });
+    const challan = await prisma.challan.findUnique({
+      where: { id },
+      select: { id: true, isDeleted: true, isSettled: true, challanNo: true, settlementNotes: true },
+    });
     if (!challan || challan.isDeleted) {
       return NextResponse.json({ success: false, message: "Challan not found" }, { status: 404 });
     }
@@ -556,6 +612,17 @@ export async function PATCH(
     await prisma.challan.update({
       where: { id },
       data: { settlementNotes: result.data.settlementNotes || undefined, updatedById: currentUser.userId },
+    });
+
+    await auditUpdate(prisma, {
+      actor: actorFromUser(currentUser),
+      module: "SETTLEMENT",
+      entityType: "Challan",
+      entityId: id,
+      documentNo: challan.challanNo,
+      description: `Updated Settlement notes on Challan ${challan.challanNo}`,
+      changedFields: { settlementNotes: { old: challan.settlementNotes, new: result.data.settlementNotes || null } },
+      ...requestContext(request),
     });
 
     return NextResponse.json({ success: true, message: "Settlement notes updated." });

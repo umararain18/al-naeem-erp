@@ -10,6 +10,8 @@ import {
   type PhonchInput,
 } from "@/lib/phonch-accounting";
 import { getShowroomDeliveryIncomeAccountId, getClaimRecoveryAccountId } from "@/lib/gross-accounts";
+import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
+import { phonchListSearchOr } from "@/lib/search-helpers";
 
 // ============================================================
 // GET /api/phonch - list (search/filter)
@@ -37,19 +39,20 @@ export async function GET(request: NextRequest) {
     const phonches = await prisma.phonch.findMany({
       where: {
         isDeleted: false,
-        ...(search
-          ? {
-              OR: [
-                { phonchNo: { contains: search, mode: "insensitive" } },
-                { carrierNumber: { contains: search, mode: "insensitive" } },
-                { transporterParty: { partyName: { contains: search, mode: "insensitive" } } },
-              ],
-            }
-          : {}),
+        ...(search ? { OR: phonchListSearchOr(search) } : {}),
       },
       include: {
         transporterParty: { select: { id: true, partyName: true, account: { select: { id: true } } } },
-        vehicles: true,
+        vehicles: {
+          include: {
+            // Compact reverse Bill Book link for the List (Section 20).
+            billSourceLinks: {
+              where: { bill: { isDeleted: false } },
+              take: 1,
+              select: { bill: { select: { id: true, billNo: true } } },
+            },
+          },
+        },
       },
       orderBy: [{ date: "desc" }, { createdAt: "desc" }],
     });
@@ -92,6 +95,13 @@ export async function GET(request: NextRequest) {
       const receivedAmount = Math.max(0, Math.round(receivedRaw * 100) / 100);
       const remainingDue = Math.max(0, Math.round((totalAmount - receivedAmount) * 100) / 100);
 
+      // Compact per-vehicle Bill reference for the List (Section 20) -
+      // "Vehicle (Bill No)" when billed, plain vehicle name otherwise.
+      const vehicleNames = p.vehicles.map((v) => v.vehicleName).filter((n): n is string => !!n && n.trim().length > 0);
+      const vehicleBillLabels = p.vehicles
+        .filter((v) => v.vehicleName && v.vehicleName.trim().length > 0)
+        .map((v) => (v.billSourceLinks[0] ? `${v.vehicleName} (${v.billSourceLinks[0].bill.billNo})` : v.vehicleName!));
+
       return {
         id: p.id,
         phonchNo: p.phonchNo,
@@ -99,6 +109,8 @@ export async function GET(request: NextRequest) {
         carrierNumber: p.carrierNumber,
         transporterParty: p.transporterParty,
         vehicleCount: p.vehicles.length,
+        vehicleNames,
+        vehicleBillLabels,
         totalDeliveryCharges,
         totalOtherExpense,
         totalClaim,
@@ -318,6 +330,22 @@ export async function POST(request: NextRequest) {
               createdById: currentUser.userId,
               lines: { create: lines },
             },
+          });
+
+          await auditCreate(tx, {
+            actor: actorFromUser(currentUser),
+            module: "SHOWROOM_PHONCH",
+            entityType: "Phonch",
+            entityId: createdPhonch.id,
+            documentNo: createdPhonch.phonchNo,
+            description: `Created Showroom Phonch ${createdPhonch.phonchNo} (Transporter: ${transporterParty.partyName}, Total Rs. ${resolved.totalAmount.toLocaleString()})`,
+            newValues: {
+              phonchNo: createdPhonch.phonchNo,
+              transporterPartyId: resolved.transporterPartyId,
+              carrierNumber: resolved.carrierNumber,
+              totalAmount: resolved.totalAmount,
+            },
+            ...requestContext(request),
           });
 
           return createdPhonch;

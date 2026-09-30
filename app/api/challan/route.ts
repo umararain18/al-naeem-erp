@@ -9,6 +9,7 @@ import { getGrossCarrierRentPayableAccountId } from "@/lib/gross-accounts";
 import { getChallanResponsiblePartiesBatch } from "@/lib/document-party-resolution";
 import { computeChallanSettlementSummaryBatch } from "@/lib/challan-settlement-summary";
 import { SettlementPaymentError } from "@/lib/settlement-payments";
+import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
 
 // Re-check status codes for the in-transaction Bilty-availability
 // re-validation below (POST) - kept separate from the pre-transaction
@@ -71,7 +72,97 @@ const createChallanSchema = z.object({
     .min(1, "At least one bilty is required"),
 });
 
-export async function GET() {
+const CHALLAN_STATUS_VALUES = ["IN_TRANSIT", "DELIVERED", "CANCELLED"] as const;
+
+// Newest-Challan-first list ordering. challanNo is a plain String
+// column (real data: "4028", "4029", ... - no fixed-width guarantee,
+// so a lexicographic sort/orderBy would wrongly rank "10000" behind
+// "9999" once the sequence crosses a digit boundary) - Prisma has no
+// numeric-cast `orderBy`, so this compares the trailing digit run of
+// each challanNo as a BigInt (safe for any length) instead. Falls
+// back to a plain string compare only when a challanNo has no digits
+// at all, so a genuinely non-numeric value still sorts deterministically
+// instead of crashing. createdAt (desc) is the secondary tiebreak for a
+// genuine tie (e.g. two Challans sharing a challanNo pattern) - never
+// loadingDate (a user-editable, often-backdated business field) and
+// never vehicle/updatedAt/DB default order.
+function extractChallanSeq(challanNo: string): bigint | null {
+  const match = challanNo.match(/(\d+)(?!.*\d)/);
+  if (!match) return null;
+  try {
+    return BigInt(match[1]);
+  } catch {
+    return null;
+  }
+}
+
+function compareChallanNoDesc(a: string, b: string): number {
+  const seqA = extractChallanSeq(a);
+  const seqB = extractChallanSeq(b);
+  if (seqA !== null && seqB !== null && seqA !== seqB) {
+    return seqA > seqB ? -1 : 1;
+  }
+  return b.localeCompare(a);
+}
+
+// Mirrors app/challan/page.tsx's own compactStatus()/matchesFinancialFilter()
+// exactly (same field names, same derivation) - a single source of truth so
+// the dashboard's "Active/Delivered/Settled Challan" drill-down cards get a
+// REAL server-side filtered result, never a trust-the-client filter. This
+// value is computed (not a raw column), so it is applied by filtering the
+// already-batch-computed `items` array below, after settlementSummary is
+// available - never pushed into the Prisma `where` clause directly.
+type CompactStatus = "BEFORE SETTLEMENT" | "RECEIVABLE" | "PAYABLE" | "RECEIVABLE + PAYABLE" | "DUE" | "CLEARED";
+
+function totalDueFromSummary(item: { settlementSummary?: { bilties: { toPay: { remaining: number } }[]; carrierRent: { remaining: number } } }): number {
+  const summary = item.settlementSummary;
+  if (!summary) return 0;
+  const toPayRemaining = summary.bilties.reduce((s, b) => s + b.toPay.remaining, 0);
+  return toPayRemaining + summary.carrierRent.remaining;
+}
+
+function compactStatus(item: {
+  isSettled: boolean;
+  settlementSummary?: { partyNet: { net: number }[]; bilties: { toPay: { remaining: number } }[]; carrierRent: { remaining: number } };
+}): CompactStatus {
+  if (!item.isSettled) return "BEFORE SETTLEMENT";
+
+  const partyNet = item.settlementSummary?.partyNet || [];
+  const hasReceivable = partyNet.some((p) => p.net > 0);
+  const hasPayable = partyNet.some((p) => p.net < 0);
+
+  if (hasReceivable && hasPayable) return "RECEIVABLE + PAYABLE";
+  if (hasReceivable) return "RECEIVABLE";
+  if (hasPayable) return "PAYABLE";
+
+  return totalDueFromSummary(item) > 0.009 ? "DUE" : "CLEARED";
+}
+
+type FinancialFilterValue = "BEFORE_SETTLEMENT" | "AFTER_SETTLEMENT" | "RECEIVABLE" | "PAYABLE" | "RECEIVABLE_PAYABLE" | "DUE" | "CLEARED";
+const FINANCIAL_FILTER_VALUES: FinancialFilterValue[] = ["BEFORE_SETTLEMENT", "AFTER_SETTLEMENT", "RECEIVABLE", "PAYABLE", "RECEIVABLE_PAYABLE", "DUE", "CLEARED"];
+
+function matchesFinancialFilter(item: { isSettled: boolean; settlementSummary?: { partyNet: { net: number }[]; bilties: { toPay: { remaining: number } }[]; carrierRent: { remaining: number } } }, filter: FinancialFilterValue): boolean {
+  switch (filter) {
+    case "BEFORE_SETTLEMENT":
+      return !item.isSettled;
+    case "AFTER_SETTLEMENT":
+      return item.isSettled;
+    case "RECEIVABLE":
+      return compactStatus(item) === "RECEIVABLE";
+    case "PAYABLE":
+      return compactStatus(item) === "PAYABLE";
+    case "RECEIVABLE_PAYABLE":
+      return compactStatus(item) === "RECEIVABLE + PAYABLE";
+    case "DUE":
+      return compactStatus(item) === "DUE";
+    case "CLEARED":
+      return compactStatus(item) === "CLEARED";
+    default:
+      return true;
+  }
+}
+
+export async function GET(request: NextRequest) {
   try {
     const currentUser = await getCurrentUser();
 
@@ -89,8 +180,15 @@ export async function GET() {
       );
     }
 
+    const { searchParams } = new URL(request.url);
+    const statusParam = searchParams.get("status");
+    const status: (typeof CHALLAN_STATUS_VALUES)[number] | null =
+      statusParam && (CHALLAN_STATUS_VALUES as readonly string[]).includes(statusParam) ? (statusParam as (typeof CHALLAN_STATUS_VALUES)[number]) : null;
+    const financialParam = searchParams.get("financial");
+    const financial = financialParam && FINANCIAL_FILTER_VALUES.includes(financialParam as FinancialFilterValue) ? (financialParam as FinancialFilterValue) : null;
+
     const challans = await prisma.challan.findMany({
-      where: { isDeleted: false },
+      where: { isDeleted: false, ...(status ? { status } : {}) },
       include: {
         transporterParty: {
           select: {
@@ -114,11 +212,17 @@ export async function GET() {
           orderBy: { addedAt: "asc" },
         },
       },
-      orderBy: [
-        { loadingDate: "desc" },
-        { createdAt: "desc" },
-      ],
+      orderBy: { createdAt: "desc" },
     });
+
+    // Definitive display order: Challan number sequence, numeric-aware,
+    // descending - see compareChallanNoDesc() above. The Prisma
+    // `orderBy` above is only a reasonable DB-level starting order;
+    // this in-memory sort is what actually determines the final
+    // order (this list has no pagination - it always returns every
+    // non-deleted Challan - so a stable, full in-memory sort is safe
+    // and correct here, never partial/page-dependent).
+    challans.sort((a, b) => compareChallanNoDesc(a.challanNo, b.challanNo) || b.createdAt.getTime() - a.createdAt.getTime());
 
     const financialsMap = await computeChallanFinancialsBatch(
       challans.map((c) => ({
@@ -143,12 +247,20 @@ export async function GET() {
     // what the list UI displays for Financial Summary changes.
     const settlementSummaryMap = await computeChallanSettlementSummaryBatch(challans.map((c) => c.id));
 
-    const items = challans.map((c) => ({
+    const itemsBeforeFinancialFilter = challans.map((c) => ({
       ...c,
       financials: financialsMap[c.id],
       responsibleParties: responsiblePartiesMap[c.id],
       settlementSummary: settlementSummaryMap[c.id],
     }));
+
+    // "financial" (RECEIVABLE/PAYABLE/DUE/CLEARED/...) is a computed
+    // value, not a raw column - filtered here, server-side, AFTER the
+    // batch computation above, rather than in the Prisma `where`
+    // clause. Real server-side filtering either way - the dashboard's
+    // "Settled Challan" etc. drill-down cards never rely on the client
+    // to filter an unfiltered fetch.
+    const items = financial ? itemsBeforeFinancialFilter.filter((item) => matchesFinancialFilter(item, financial)) : itemsBeforeFinancialFilter;
 
     return NextResponse.json({
       success: true,
@@ -433,6 +545,22 @@ export async function POST(request: NextRequest) {
           },
         });
       }
+
+      await auditCreate(tx, {
+        actor: actorFromUser(currentUser),
+        module: "CHALLAN",
+        entityType: "Challan",
+        entityId: createdChallan.id,
+        documentNo: createdChallan.challanNo,
+        description: `Created Challan ${createdChallan.challanNo} (${data.biltyIds.length} Bilties, Carrier Rent Rs. ${carrierRentAmount.toLocaleString()})`,
+        newValues: {
+          challanNo: createdChallan.challanNo,
+          transporterPartyId: data.transporterPartyId || null,
+          carrierRent: carrierRentAmount,
+          biltyIds: data.biltyIds,
+        },
+        ...requestContext(request),
+      });
 
       return createdChallan;
       }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });

@@ -10,6 +10,8 @@ import {
   nextEmployeeCode,
   validateEmployeeInput,
 } from "@/lib/payroll-accounting";
+import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
+import { employeeListSearchOr } from "@/lib/search-helpers";
 
 // ============================================================
 // EMPLOYEES - LIST + CREATE
@@ -52,16 +54,7 @@ export async function GET(request: NextRequest) {
         ...(status === "ACTIVE" ? { isActive: true } : {}),
         ...(status === "INACTIVE" ? { isActive: false } : {}),
         ...(designation ? { designation: { equals: designation, mode: "insensitive" } } : {}),
-        ...(search
-          ? {
-              OR: [
-                { name: { contains: search, mode: "insensitive" } },
-                { employeeCode: { contains: search, mode: "insensitive" } },
-                { designation: { contains: search, mode: "insensitive" } },
-                { phone: { contains: search, mode: "insensitive" } },
-              ],
-            }
-          : {}),
+        ...(search ? { OR: employeeListSearchOr(search) } : {}),
       },
       include: { account: { select: { id: true } } },
       orderBy: [{ isActive: "desc" }, { name: "asc" }],
@@ -170,6 +163,17 @@ export async function POST(request: NextRequest) {
               isSystem: false,
               isActive: true,
             },
+          });
+
+          await auditCreate(tx, {
+            actor: actorFromUser(currentUser),
+            module: "EMPLOYEE",
+            entityType: "Employee",
+            entityId: created.id,
+            documentNo: created.employeeCode,
+            description: `Created Employee ${created.employeeCode} (${created.name}, Rs. ${Number(created.monthlySalary).toLocaleString()}/month)`,
+            newValues: { employeeCode: created.employeeCode, name: created.name, designation: created.designation, monthlySalary: Number(created.monthlySalary) },
+            ...requestContext(request),
           });
 
           return tx.employee.findUniqueOrThrow({

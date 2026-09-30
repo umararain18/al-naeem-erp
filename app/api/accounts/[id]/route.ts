@@ -4,6 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { AccountCategory, AccountType } from "@prisma/client";
+import { auditUpdate, auditDelete, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 
 const updateAccountSchema = z.object({
   accountName: z
@@ -262,17 +263,6 @@ export async function PATCH(
       );
     }
 
-    if (existingAccount.isSystem) {
-      return NextResponse.json(
-        {
-          success: false,
-          message:
-            "System accounts cannot be modified",
-        },
-        { status: 400 }
-      );
-    }
-
     const body = await request.json();
 
     const result =
@@ -291,6 +281,39 @@ export async function PATCH(
     }
 
     const data = result.data;
+
+    // System accounts (isSystem: true) are the fixed accounting
+    // structure every module's own posting logic resolves by
+    // accountCode (see lib/gross-accounts.ts's getOrCreateSystemAccount())
+    // - their accountCode/accountType/category/parentId/partyId/
+    // isActive must never change underneath that resolution, and
+    // isActive/delete already have their own separate system-account
+    // guards elsewhere. Only the display accountName and the
+    // documentation-only description may be changed here - the exact
+    // same account id, still found by the exact same accountCode, by
+    // every future posting. Any attempt to change a structural field
+    // is rejected outright rather than silently ignored, so a caller
+    // never mistakenly believes a structural change was applied.
+    if (existingAccount.isSystem) {
+      const attemptsStructuralChange =
+        (data.accountCode !== undefined && (data.accountCode || null) !== existingAccount.accountCode) ||
+        (data.accountType !== undefined && data.accountType !== existingAccount.accountType) ||
+        (data.category !== undefined && data.category !== existingAccount.category) ||
+        (data.parentId !== undefined && (data.parentId || null) !== existingAccount.parentId) ||
+        (data.partyId !== undefined && (data.partyId || null) !== existingAccount.partyId) ||
+        data.isActive !== undefined;
+
+      if (attemptsStructuralChange) {
+        return NextResponse.json(
+          {
+            success: false,
+            message:
+              "System accounts can only have their Name and Description changed - the account code, type, category, parent, and active state are fixed.",
+          },
+          { status: 400 }
+        );
+      }
+    }
 
     const accountType =
       (data.accountType ||
@@ -466,6 +489,25 @@ export async function PATCH(
         },
       });
 
+    const changedFields = diffFields(
+      existingAccount as unknown as Record<string, unknown>,
+      data as Record<string, unknown>,
+      Object.keys(data) as (keyof typeof existingAccount)[]
+    );
+    if (Object.keys(changedFields).length > 0) {
+      const summary = Object.entries(changedFields).map(([f, { old, new: nv }]) => `${f} ${old ?? "—"} → ${nv ?? "—"}`).join("; ");
+      await auditUpdate(prisma, {
+        actor: actorFromUser(currentUser),
+        module: "ACCOUNT",
+        entityType: "Account",
+        entityId: id,
+        documentNo: updatedAccount.accountName,
+        description: `Updated Account ${updatedAccount.accountName}: ${summary}`,
+        changedFields,
+        ...requestContext(request),
+      });
+    }
+
     return NextResponse.json({
       success: true,
       message:
@@ -490,7 +532,7 @@ export async function PATCH(
 
 // DELETE ACCOUNT
 export async function DELETE(
-  _request: NextRequest,
+  request: NextRequest,
   {
     params,
   }: {
@@ -586,6 +628,17 @@ export async function DELETE(
       where: {
         id,
       },
+    });
+
+    await auditDelete(prisma, {
+      actor: actorFromUser(currentUser),
+      module: "ACCOUNT",
+      entityType: "Account",
+      entityId: id,
+      documentNo: account.accountName,
+      description: `Deleted Account ${account.accountName}`,
+      oldValues: { accountName: account.accountName, accountCode: account.accountCode, accountType: account.accountType, category: account.category },
+      ...requestContext(request),
     });
 
     return NextResponse.json({

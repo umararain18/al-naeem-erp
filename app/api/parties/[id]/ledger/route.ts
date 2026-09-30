@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
-import { getPartyLedgerData, PartyLedgerLookupError } from "@/lib/ledger-description";
+import { getPartyLedgerData, PartyLedgerLookupError, parseLedgerEntryType } from "@/lib/ledger-description";
 
 export async function GET(
   request: NextRequest,
@@ -23,13 +23,14 @@ export async function GET(
     const { searchParams } = new URL(request.url);
     const from = searchParams.get("from");
     const to = searchParams.get("to");
+    const documentType = parseLedgerEntryType(searchParams.get("type"));
 
     // Normal browser Party Ledger screen: newest -> oldest, like
     // every other normal ERP transaction/list screen. The
     // client-facing PDF/Excel export (ledger/pdf, ledger/excel) is
     // the ONLY place that stays chronological (oldest -> newest) -
     // see getPartyLedgerData()'s own doc comment.
-    const data = await getPartyLedgerData(id, { from, to, order: "desc" });
+    const data = await getPartyLedgerData(id, { from, to, order: "desc", documentType });
 
     return NextResponse.json({ success: true, ...data });
   } catch (error) {

@@ -1,10 +1,11 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { LedgerFilters } from "@/components/LedgerFilters";
 
 type ReceivableEntry = {
-  partyId: string;
+  partyId: string | null;
   partyName: string;
   accountId: string;
   accountName: string;
@@ -12,6 +13,11 @@ type ReceivableEntry = {
   totalDebit: number;
   totalCredit: number;
   balance: number;
+  // true only for the shared system BILL-WALKIN-RECEIVABLE row - it has
+  // no Party (partyId null), so it renders as plain text instead of a
+  // Party Ledger link.
+  isSystemAccount?: boolean;
+  phone: string | null;
 };
 
 type ReceivableResponse = {
@@ -32,11 +38,25 @@ export default function ReceivablePage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
+  // Search is client-side (the same small, already-fully-fetched list
+  // every render - no server round-trip needed, unlike a transaction
+  // ledger). "to" is the one date filter genuinely meaningful for a
+  // point-in-time Receivable balance (an "as of" date, reusing
+  // getReceivablePayable's existing asOfExclusive parameter - never a
+  // new calculation); "from" has no defined meaning for a closing
+  // balance and is kept only so the shared LedgerFilters component's
+  // controlled inputs render consistently with every other ledger
+  // screen - it is never sent to the API.
+  const [search, setSearch] = useState("");
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+
   useEffect(() => {
     async function load() {
       try {
         setError("");
-        const response = await fetch("/api/reports/receivable");
+        const query = to ? `?to=${encodeURIComponent(to)}` : "";
+        const response = await fetch(`/api/reports/receivable${query}`);
         const result = await response.json();
 
         if (!response.ok || !result.success) {
@@ -53,7 +73,26 @@ export default function ReceivablePage() {
     }
 
     load();
-  }, []);
+  }, [to]);
+
+  const filteredReceivable = useMemo(() => {
+    if (!data) return [];
+    const q = search.trim().toLowerCase();
+    if (!q) return data.receivable;
+    return data.receivable.filter((entry) => {
+      return (
+        entry.partyName.toLowerCase().includes(q) ||
+        entry.accountName.toLowerCase().includes(q) ||
+        (entry.accountCode || "").toLowerCase().includes(q) ||
+        (entry.phone || "").toLowerCase().includes(q)
+      );
+    });
+  }, [data, search]);
+
+  const filteredTotal = useMemo(
+    () => filteredReceivable.reduce((sum, entry) => sum + entry.balance, 0),
+    [filteredReceivable]
+  );
 
   if (loading) {
     return (
@@ -78,7 +117,8 @@ export default function ReceivablePage() {
     );
   }
 
-  const { receivable, summary } = data;
+  const { summary } = data;
+  const isFiltered = search.trim().length > 0;
 
   return (
     <main className="min-h-screen bg-gray-50">
@@ -102,10 +142,32 @@ export default function ReceivablePage() {
           </div>
         </div>
 
+        <LedgerFilters
+          search={search}
+          onSearchChange={setSearch}
+          from={from}
+          to={to}
+          onFromChange={setFrom}
+          onToChange={setTo}
+          onReset={() => {
+            setSearch("");
+            setFrom("");
+            setTo("");
+          }}
+          resultLabel={
+            isFiltered
+              ? `${filteredReceivable.length} of ${data.receivable.length} found, ${formatCurrency(filteredTotal)}`
+              : null
+          }
+          searchPlaceholder="Search party, account, or phone..."
+        />
+
         {/* Table */}
         <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-          {receivable.length === 0 ? (
-            <div className="p-10 text-center text-gray-500">No receivables found.</div>
+          {filteredReceivable.length === 0 ? (
+            <div className="p-10 text-center text-gray-500">
+              {isFiltered ? "No matching receivables found." : "No receivables found."}
+            </div>
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
@@ -119,12 +181,20 @@ export default function ReceivablePage() {
                   </tr>
                 </thead>
                 <tbody className="divide-y">
-                  {receivable.map((entry) => (
-                    <tr key={entry.partyId} className="hover:bg-gray-50">
+                  {filteredReceivable.map((entry) => (
+                    <tr key={entry.partyId ?? entry.accountId} className="hover:bg-gray-50">
                       <td className="px-4 py-3 font-medium">
-                        <Link href={`/parties/${entry.partyId}/ledger`} className="text-blue-600 hover:underline">
-                          {entry.partyName}
-                        </Link>
+                        {entry.partyId ? (
+                          <Link href={`/parties/${entry.partyId}/ledger`} className="text-blue-600 hover:underline">
+                            {entry.partyName}
+                          </Link>
+                        ) : (
+                          <span className="text-gray-700">
+                            {entry.partyName}
+                            <span className="ml-1.5 text-xs font-normal text-gray-400">(system account)</span>
+                          </span>
+                        )}
+                        {entry.phone && <span className="block text-xs text-gray-400">{entry.phone}</span>}
                       </td>
                       <td className="px-4 py-3">
                         {entry.accountCode ? `[${entry.accountCode}] ` : ""}
@@ -133,9 +203,13 @@ export default function ReceivablePage() {
                       <td className="px-4 py-3 text-right">{formatCurrency(entry.totalDebit)}</td>
                       <td className="px-4 py-3 text-right">{formatCurrency(entry.totalCredit)}</td>
                       <td className="px-4 py-3 text-right text-green-600 font-medium">
-                        <Link href={`/parties/${entry.partyId}/ledger`} className="hover:underline">
-                          {formatCurrency(entry.balance)}
-                        </Link>
+                        {entry.partyId ? (
+                          <Link href={`/parties/${entry.partyId}/ledger`} className="hover:underline">
+                            {formatCurrency(entry.balance)}
+                          </Link>
+                        ) : (
+                          formatCurrency(entry.balance)
+                        )}
                       </td>
                     </tr>
                   ))}
@@ -143,10 +217,10 @@ export default function ReceivablePage() {
                 <tfoot className="bg-gray-50 font-semibold">
                   <tr>
                     <td colSpan={4} className="px-4 py-3 text-right">
-                      Total Receivable
+                      Total{isFiltered ? " (filtered)" : ""}
                     </td>
                     <td className="px-4 py-3 text-right text-green-600">
-                      {formatCurrency(summary.totalReceivable)}
+                      {formatCurrency(isFiltered ? filteredTotal : summary.totalReceivable)}
                     </td>
                   </tr>
                 </tfoot>

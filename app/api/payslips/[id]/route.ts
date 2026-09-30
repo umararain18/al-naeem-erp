@@ -11,6 +11,7 @@ import {
   postSalaryRecognition,
   validatePayslipInput,
 } from "@/lib/payroll-accounting";
+import { auditUpdate, auditDelete, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 
 // ============================================================
 // PAYSLIP - VIEW / EDIT / BIN
@@ -207,6 +208,25 @@ export async function PATCH(request: NextRequest, context: { params: Promise<{ i
               notes: data.notes?.trim() || null,
             },
           });
+
+          const changedFields = diffFields(
+            { grossPay: Number(current.grossPay), deduction: Number(current.deduction), contribution: Number(current.contribution), netPay: Number(current.netPay) },
+            { grossPay: data.grossPay, deduction: data.deduction, contribution: data.contribution, netPay },
+            ["grossPay", "deduction", "contribution", "netPay"]
+          );
+          if (Object.keys(changedFields).length > 0) {
+            const summary = Object.entries(changedFields).map(([f, { old, new: nv }]) => `${f} ${old ?? "—"} → ${nv ?? "—"}`).join("; ");
+            await auditUpdate(tx, {
+              actor: actorFromUser(currentUser),
+              module: "PAYROLL",
+              entityType: "Payslip",
+              entityId: id,
+              documentNo: current.payslipNo,
+              description: `Updated Payslip ${current.payslipNo}: ${summary}`,
+              changedFields,
+              ...requestContext(request),
+            });
+          }
         },
         { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
       );
@@ -224,7 +244,7 @@ export async function PATCH(request: NextRequest, context: { params: Promise<{ i
   }
 }
 
-export async function DELETE(_request: NextRequest, context: { params: Promise<{ id: string }> }) {
+export async function DELETE(request: NextRequest, context: { params: Promise<{ id: string }> }) {
   try {
     const currentUser = await getCurrentUser();
     if (!currentUser) {
@@ -268,6 +288,16 @@ export async function DELETE(_request: NextRequest, context: { params: Promise<{
       await tx.payslip.update({
         where: { id },
         data: { isDeleted: true, deletedAt: new Date(), deletedById: currentUser.userId },
+      });
+
+      await auditDelete(tx, {
+        actor: actorFromUser(currentUser),
+        module: "PAYROLL",
+        entityType: "Payslip",
+        entityId: id,
+        documentNo: current.payslipNo,
+        description: `Moved Payslip ${current.payslipNo} to Bin`,
+        ...requestContext(request),
       });
     });
 

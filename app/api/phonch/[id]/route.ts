@@ -12,6 +12,8 @@ import {
   type PhonchInput,
 } from "@/lib/phonch-accounting";
 import { getShowroomDeliveryIncomeAccountId, getClaimRecoveryAccountId } from "@/lib/gross-accounts";
+import { getBillPaymentState, resolveBillClientAccountId } from "@/lib/bill-accounting";
+import { auditUpdate, auditDelete, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 
 export async function GET(
   _request: NextRequest,
@@ -27,13 +29,44 @@ export async function GET(
     }
 
     const { id } = await params;
+
+    // See the identical guard in app/api/challan/[id]/route.ts - a raw
+    // null byte in the id is rejected by PostgreSQL's text encoding
+    // before Prisma even gets to compare it against a real row,
+    // throwing an exception that would otherwise become an
+    // unexplained 500. A real Phonch id can never contain one.
+    if (id.includes("\u0000")) {
+      return NextResponse.json(
+        { success: false, message: "Phonch not found" },
+        { status: 404 }
+      );
+    }
+
     const phonch = await prisma.phonch.findUnique({
       where: { id },
       include: {
         transporterParty: { select: { id: true, partyName: true, account: { select: { id: true } } } },
         vehicles: {
           orderBy: { lineNo: "asc" },
-          include: { party: { select: { id: true, partyName: true } } },
+          include: {
+            party: { select: { id: true, partyName: true } },
+            // Reverse Bill Book link (Section 20/21 of the Bill Book
+            // spec) - at most one ACTIVE Bill per vehicle.
+            billSourceLinks: {
+              where: { bill: { isDeleted: false } },
+              take: 1,
+              select: {
+                bill: {
+                  select: {
+                    id: true,
+                    billNo: true,
+                    clientParty: { select: { account: { select: { id: true } } } },
+                    items: { select: { rent: true, delivery: true, otherExpense: true } },
+                  },
+                },
+              },
+            },
+          },
         },
         createdBy: { select: { id: true, fullName: true, username: true } },
         deletedBy: { select: { id: true, fullName: true, username: true } },
@@ -53,10 +86,31 @@ export async function GET(
       ? await getPhonchPaymentState(prisma, phonch.id, phonch.transporterParty.account.id, totalAmount)
       : { receivedAmount: 0, remainingDue: totalAmount, isInconsistent: false, status: "RECEIVABLE" as const };
 
+    // Compact per-vehicle Bill reference (Section 20/21) - "Bill No |
+    // Amount | Status", or null when not yet billed.
+    const vehiclesWithBillInfo = await Promise.all(
+      phonch.vehicles.map(async (v) => {
+        const link = v.billSourceLinks[0]?.bill;
+        if (!link) return { ...v, billInfo: null };
+        const billTotal = Math.round(
+          link.items.reduce((s, i) => s + Number(i.rent) + Number(i.delivery) + Number(i.otherExpense), 0) * 100
+        ) / 100;
+        const linkAccountId = await resolveBillClientAccountId(prisma, link.clientParty);
+        const billState = linkAccountId
+          ? await getBillPaymentState(prisma, link.id, linkAccountId, billTotal)
+          : { status: "UNPAID" as const };
+        return {
+          ...v,
+          billInfo: { billId: link.id, billNo: link.billNo, billAmount: billTotal, billStatus: billState.status },
+        };
+      })
+    );
+
     return NextResponse.json({
       success: true,
       phonch: {
         ...phonch,
+        vehicles: vehiclesWithBillInfo,
         totals: { totalDeliveryCharges, totalOtherExpense, totalClaim, totalAmount },
         ...paymentState,
       },
@@ -85,6 +139,15 @@ export async function PATCH(
     }
 
     const { id } = await params;
+
+    // See the identical guard in this file's GET handler.
+    if (id.includes("\u0000")) {
+      return NextResponse.json(
+        { success: false, message: "Phonch not found" },
+        { status: 404 }
+      );
+    }
+
     const body = await request.json();
     const data = body as PhonchInput;
 
@@ -302,6 +365,32 @@ export async function PATCH(
               lines: { create: lines },
             },
           });
+
+          const currentTotals = {
+            phonchNo: current.phonchNo,
+            transporterPartyId: current.transporterPartyId,
+            carrierNumber: current.carrierNumber,
+            totalAmount: currentTotal,
+          };
+          const changedFields = diffFields(currentTotals, {
+            phonchNo: resolved.phonchNo,
+            transporterPartyId: resolved.transporterPartyId,
+            carrierNumber: resolved.carrierNumber,
+            totalAmount: resolved.totalAmount,
+          }, ["phonchNo", "transporterPartyId", "carrierNumber", "totalAmount"]);
+          if (Object.keys(changedFields).length > 0) {
+            const summary = Object.entries(changedFields).map(([f, { old, new: nv }]) => `${f} ${old ?? "—"} → ${nv ?? "—"}`).join("; ");
+            await auditUpdate(tx, {
+              actor: actorFromUser(currentUser),
+              module: "SHOWROOM_PHONCH",
+              entityType: "Phonch",
+              entityId: id,
+              documentNo: resolved.phonchNo,
+              description: `Updated Showroom Phonch ${resolved.phonchNo}: ${summary}`,
+              changedFields,
+              ...requestContext(request),
+            });
+          }
         },
         { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
       );
@@ -336,6 +425,15 @@ export async function DELETE(
     }
 
     const { id } = await params;
+
+    // See the identical guard in this file's GET handler.
+    if (id.includes("\u0000")) {
+      return NextResponse.json(
+        { success: false, message: "Phonch not found" },
+        { status: 404 }
+      );
+    }
+
     const body = await request.json().catch(() => ({}));
     const confirmation = body?.confirmation;
 
@@ -344,7 +442,7 @@ export async function DELETE(
         return NextResponse.json({ success: false, message: "Forbidden" }, { status: 403 });
       }
 
-      const existing = await prisma.phonch.findUnique({ where: { id }, select: { id: true, isDeleted: true } });
+      const existing = await prisma.phonch.findUnique({ where: { id }, select: { id: true, isDeleted: true, phonchNo: true } });
       if (!existing) {
         return NextResponse.json({ success: false, message: "Phonch not found" }, { status: 404 });
       }
@@ -358,6 +456,16 @@ export async function DELETE(
       // historical accounting remains fully intact regardless of
       // whether the source document itself still exists.
       await prisma.phonch.delete({ where: { id } });
+
+      await auditDelete(prisma, {
+        actor: actorFromUser(currentUser),
+        module: "SHOWROOM_PHONCH",
+        entityType: "Phonch",
+        entityId: id,
+        documentNo: existing.phonchNo,
+        description: `Permanently deleted Showroom Phonch ${existing.phonchNo}`,
+        ...requestContext(request),
+      });
 
       return NextResponse.json({ success: true, message: "Phonch permanently deleted.", phonchId: id });
     }
@@ -397,6 +505,16 @@ export async function DELETE(
     await prisma.phonch.update({
       where: { id },
       data: { isDeleted: true, deletedAt: new Date(), deletedById: currentUser.userId },
+    });
+
+    await auditDelete(prisma, {
+      actor: actorFromUser(currentUser),
+      module: "SHOWROOM_PHONCH",
+      entityType: "Phonch",
+      entityId: id,
+      documentNo: phonch.phonchNo,
+      description: `Moved Showroom Phonch ${phonch.phonchNo} to Bin`,
+      ...requestContext(request),
     });
 
     return NextResponse.json({ success: true, message: "Phonch moved to Bin successfully." });

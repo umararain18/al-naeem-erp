@@ -58,6 +58,24 @@ export interface DisplayHistoryItem {
   credit: number;
 }
 
+// Reliable document-type classification, derived from the SAME
+// sourceType/referenceType/sourceId relationships every branch below
+// already resolves a Bilty/Challan/Phonch/PrivatePhonch context from -
+// never inferred from description text. This is the ONE centralized
+// classification for the whole ledger (screen, PDF, Excel, General
+// Ledger all read it from here) - no separate type-detection logic
+// exists anywhere else.
+export type LedgerEntryType = "BILTY" | "CHALLAN" | "PRIVATE_PHONCH" | "SHOWROOM_PHONCH" | "BILL" | "OTHER";
+
+const LEDGER_ENTRY_TYPES: readonly LedgerEntryType[] = ["BILTY", "CHALLAN", "PRIVATE_PHONCH", "SHOWROOM_PHONCH", "BILL", "OTHER"];
+
+/** Shared query-param parser for every ledger route (screen/PDF/Excel/General Ledger) - "All"/missing/unrecognized all mean no filter (null), never a thrown error, so a stale/bad `type` param degrades safely to the existing unfiltered view. */
+export function parseLedgerEntryType(value: string | null | undefined): LedgerEntryType | null {
+  if (!value) return null;
+  const upper = value.toUpperCase();
+  return (LEDGER_ENTRY_TYPES as readonly string[]).includes(upper) ? (upper as LedgerEntryType) : null;
+}
+
 export interface DisplayLedgerRow {
   id: string;
   date: string;
@@ -69,10 +87,51 @@ export interface DisplayLedgerRow {
   isGrouped: boolean;
   isRemoved: boolean;
   history: DisplayHistoryItem[];
+  documentType: LedgerEntryType;
+  // Internal-only ordering keys (never rendered, and deliberately
+  // dropped before this row is copied into FinalLedgerRow) - see
+  // compareChronological() above. Kept as real Date/id values here,
+  // not a precomputed number, so the SAME comparator can also govern
+  // the running-balance accumulation order in getAccountLedgerData().
+  sortEntryDate: Date;
+  sortCreatedAt: Date;
 }
 
 function round2(value: number): number {
   return Math.round(value * 100) / 100;
+}
+
+// Local calendar-day key (year*10000+month*100+day, in the server's
+// own local time - the same implicit convention already used
+// everywhere else in this codebase, e.g. Daily Posting's entryDate
+// itself). Used ONLY to compare two rows' entryDate at day
+// granularity - never their exact instant - because Daily Posting's
+// entryDate carries no real time-of-day (it is always stored as
+// local midnight; see app/api/daily-posting/route.ts), so comparing
+// full timestamps would make a same-day Daily Posting receipt sort
+// as if it happened before anything else booked that same day, even
+// when it was actually posted hours later.
+function localDayKey(d: Date): number {
+  return d.getFullYear() * 10000 + (d.getMonth() + 1) * 100 + d.getDate();
+}
+
+// Single chronological comparator shared by every ordering decision
+// in this file (both the running-balance accumulation order AND the
+// newest-first display order use this SAME definition - see the
+// "order" option's doc comment on AccountLedgerOptions below). Two
+// rows are compared by calendar day first (their real, business-
+// meaningful transaction date), then - ONLY as a same-day tiebreak -
+// by actual posting time (createdAt, which always has full instant
+// precision, unlike entryDate), then by id for full determinism.
+function compareChronological(
+  a: { sortEntryDate: Date; sortCreatedAt: Date; id: string },
+  b: { sortEntryDate: Date; sortCreatedAt: Date; id: string }
+): number {
+  const dayDiff = localDayKey(a.sortEntryDate) - localDayKey(b.sortEntryDate);
+  if (dayDiff !== 0) return dayDiff;
+  const createdDiff = a.sortCreatedAt.getTime() - b.sortCreatedAt.getTime();
+  if (createdDiff !== 0) return createdDiff;
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }
 
 function formatRs(value: number): string {
@@ -313,7 +372,34 @@ function extractHousekeepingNoise(lines: RawLedgerLine[]): { remaining: RawLedge
 
   for (const line of lines) {
     if (HOUSEKEEPING_REFERENCE_TYPES.has(line.referenceType || "") && line.sourceType && line.sourceId) {
-      const key = `hk:${line.sourceType}:${line.sourceId}`;
+      // The OLD single-payer mechanism's own Carrier Rent reclassification
+      // is tagged sourceType:"BILTY"/sourceId:<biltyId> (it allocates
+      // Carrier Rent PROPORTIONALLY per Bilty - see the identical note
+      // elsewhere in this file), while the NEW multi-payer engine's own
+      // "release back to Gross" transition that is meant to cancel it out
+      // is tagged sourceType:"CHALLAN"/sourceId:<challanId> (it operates
+      // at Challan granularity). Bucketing by sourceType:sourceId alone
+      // therefore puts the two cancelling lines in DIFFERENT buckets -
+      // each with a nonzero net on its own - so neither ever gets
+      // suppressed, and both render as if they were separate real
+      // transactions (this is the confirmed root cause of a Carrier-Rent
+      // Challan appearing to double up in Party Ledger). Fixed by keying
+      // the old mechanism's Carrier Rent line on the SAME Challan id its
+      // own JournalEntry.referenceId already carries (not its
+      // sourceId), so it lands in the identical bucket as the
+      // transition line for the same Challan. Detected via the line's
+      // own already-persisted description text - the same precedent
+      // already used elsewhere in this file for this exact
+      // per-Bilty-tagged-but-Challan-driven distinction - never guessed,
+      // never amount/date matching.
+      const isOldMechanismCarrierRentLine =
+        line.sourceType === "BILTY" &&
+        (line.referenceType === "SETTLEMENT" || line.referenceType === "SETTLEMENT_CORRECTION") &&
+        line.referenceId &&
+        (line.lineDescription || line.entryDescription || "").includes("Carrier Rent");
+      const key = isOldMechanismCarrierRentLine
+        ? `hk:CHALLAN:${line.referenceId}`
+        : `hk:${line.sourceType}:${line.sourceId}`;
       const arr = hkBuckets.get(key) || [];
       arr.push(line);
       hkBuckets.set(key, arr);
@@ -486,6 +572,7 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
       let description: string;
       let reference: string;
       let referenceHref: string | null;
+      let documentType: LedgerEntryType;
 
       if (p.component === "CARRIER_RENT" && p.challanId) {
         const challan = challanCtxById.get(p.challanId);
@@ -495,17 +582,34 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
         description = challan
           ? challanDescription(challan, veh, Math.abs(net), net >= 0 ? "Received" : "Paid")
           : `Carrier Rent, ${net >= 0 ? "Received" : "Paid"} ${formatRs(net)}`;
+        documentType = "CHALLAN";
       } else if (p.biltyId) {
         const bilty = biltyById.get(p.biltyId);
         reference = bilty ? biltyReference(bilty.biltyNo) : "Bilty";
         referenceHref = `/bilty/${p.biltyId}`;
+        // component "PAID" is the Bilty's own declared/document-level
+        // Paid state (Bilty.advance) being established against the
+        // resolved responsible party at booking time (see
+        // app/api/bilty/route.ts's createSettlementPayment({component:
+        // "PAID", ...}) call) - it is NEVER a verified cash receipt,
+        // regardless of debit/credit sign (a later correction/reversal
+        // of that same Paid establishment is still describing the Paid
+        // state, not a cash "Received"). An actual cash receipt is
+        // always a SEPARATE, plain DAILY_POSTING-tagged line, handled
+        // by directionWord() in the standalone-lines loop below, which
+        // this branch never touches. Every other Bilty-related
+        // component (e.g. COLLECTION) keeps its existing sign-based
+        // wording unchanged.
+        const direction = p.component === "PAID" ? "Paid" : net >= 0 ? "Received" : "Paid";
         description = bilty
-          ? biltyDescription(bilty, Math.abs(net), net >= 0 ? "Received" : "Paid")
-          : `Bilty, ${net >= 0 ? "Received" : "Paid"} ${formatRs(net)}`;
+          ? biltyDescription(bilty, Math.abs(net), direction)
+          : `Bilty, ${direction} ${formatRs(net)}`;
+        documentType = "BILTY";
       } else {
         reference = "Settlement Payment";
         referenceHref = `/accounting-transactions/${earliest.journalEntryId}`;
         description = `${net >= 0 ? "Received" : "Paid"} ${formatRs(net)}`;
+        documentType = "OTHER";
       }
 
       rows.push({
@@ -519,6 +623,9 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
         isGrouped: history.length > 1,
         isRemoved: false,
         history,
+        documentType,
+        sortEntryDate: earliest.entryDate,
+        sortCreatedAt: earliest.createdAt,
       });
     } else {
       // Removed (deleted) SettlementPayment - nets to ~0. Shown so
@@ -537,6 +644,11 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
             ? challanReference(sourceNumber)
             : sourceNumber
         : null;
+      const removedDocumentType: LedgerEntryType = combinedText.includes("bilty")
+        ? "BILTY"
+        : combinedText.includes("challan")
+          ? "CHALLAN"
+          : "OTHER";
       rows.push({
         id: `group:${key}`,
         date: latest.entryDate.toISOString(),
@@ -548,6 +660,9 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
         isGrouped: true,
         isRemoved: true,
         history,
+        documentType: removedDocumentType,
+        sortEntryDate: latest.entryDate,
+        sortCreatedAt: latest.createdAt,
       });
     }
   }
@@ -565,6 +680,7 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
     let reference: string;
     let referenceHref: string | null;
     let description: string;
+    let documentType: LedgerEntryType;
 
     if (
       (line.referenceType === "SETTLEMENT" || line.referenceType === "SETTLEMENT_CORRECTION") &&
@@ -586,17 +702,31 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
       reference = challanReference(challan.challanNo);
       referenceHref = `/challan/${line.referenceId}`;
       description = challanDescription(challan, specificBilty, amount, direction);
+      documentType = "CHALLAN";
     } else if (line.sourceType === "BILTY" && line.sourceId && biltyById.has(line.sourceId)) {
       const bilty = biltyById.get(line.sourceId)!;
       reference = biltyReference(bilty.biltyNo);
       referenceHref = `/bilty/${line.sourceId}`;
-      description = biltyDescription(bilty, amount, direction);
+      // Bilty Commission/Referral lines (see app/api/bilty/route.ts's
+      // buildBiltyCommissionDescription()) are fully pre-composed once
+      // at creation and stored directly as the line's own description -
+      // exactly like Phonch's own "PHONCH" branch below does - so they
+      // are passed through as-is rather than recomputed via
+      // biltyDescription()'s generic Paid/Received wording, which does
+      // not apply to an expense recognition. Detected via the line's
+      // own already-persisted text, never guessed.
+      const rawDescription = line.lineDescription || line.entryDescription || "";
+      description = rawDescription.includes("bilty expense.")
+        ? rawDescription
+        : biltyDescription(bilty, amount, direction);
+      documentType = "BILTY";
     } else if (line.sourceType === "CHALLAN" && line.sourceId && challanCtxById.has(line.sourceId)) {
       const challan = challanCtxById.get(line.sourceId)!;
       const veh = challan.soleBiltyId ? biltyById.get(challan.soleBiltyId) : null;
       reference = challanReference(challan.challanNo);
       referenceHref = `/challan/${line.sourceId}`;
       description = challanDescription(challan, veh, amount, direction);
+      documentType = "CHALLAN";
     } else if (
       (line.referenceType === "BILTY_BOOKING" || line.referenceType === "BILTY_BOOKING_CORRECTION") &&
       line.referenceId &&
@@ -606,6 +736,7 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
       reference = biltyReference(bilty.biltyNo);
       referenceHref = `/bilty/${line.referenceId}`;
       description = biltyDescription(bilty, amount, direction);
+      documentType = "BILTY";
     } else if (
       (line.referenceType === "CHALLAN_DISPATCH" ||
         line.referenceType === "CHALLAN_DISPATCH_CORRECTION" ||
@@ -619,6 +750,7 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
       reference = challanReference(challan.challanNo);
       referenceHref = `/challan/${line.referenceId}`;
       description = challanDescription(challan, veh, amount, direction);
+      documentType = "CHALLAN";
     } else if (line.referenceType === "DAILY_POSTING") {
       const alloc = allocationByLineId.get(line.id);
       if (alloc?.targetSourceType === "BILTY" && biltyById.has(alloc.targetSourceId)) {
@@ -626,21 +758,61 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
         reference = biltyReference(bilty.biltyNo);
         referenceHref = `/bilty/${alloc.targetSourceId}`;
         description = biltyDescription(bilty, amount, direction);
+        documentType = "BILTY";
       } else if (alloc?.targetSourceType === "CHALLAN" && challanCtxById.has(alloc.targetSourceId)) {
         const challan = challanCtxById.get(alloc.targetSourceId)!;
         const veh = challan.soleBiltyId ? biltyById.get(challan.soleBiltyId) : null;
         reference = challanReference(challan.challanNo);
         referenceHref = `/challan/${alloc.targetSourceId}`;
         description = challanDescription(challan, veh, amount, direction);
+        documentType = "CHALLAN";
+      } else if (line.sourceType === "PRIVATE_PHONCH" && line.sourceId) {
+        // Daily Posting receipts/payments against Private Phonch never
+        // go through PaymentAllocation (AllocationTargetType is only
+        // "BILTY"|"CHALLAN" - see prisma/schema.prisma) - only the
+        // line's own sourceType/sourceId (set directly by
+        // app/api/daily-posting/route.ts's buildLinePair()) identifies
+        // the document. No live lookup/context map exists for this
+        // (unlike Bilty/Challan), so the reference/href is built
+        // directly from the line's own already-persisted fields,
+        // exactly mirroring the PHONCH/BILL branches below.
+        reference = "Private Phonch";
+        referenceHref = `/private-phonch/${line.sourceId}`;
+        description = line.lineDescription || line.entryDescription || "—";
+        documentType = "PRIVATE_PHONCH";
+      } else if (line.sourceType === "PHONCH" && line.sourceId) {
+        reference = "Phonch";
+        referenceHref = `/phonch/${line.sourceId}`;
+        description = line.lineDescription || line.entryDescription || "—";
+        documentType = "SHOWROOM_PHONCH";
+      } else if (line.sourceType === "BILL" && line.sourceId) {
+        reference = "Bill";
+        referenceHref = `/bill/${line.sourceId}`;
+        description = line.lineDescription || line.entryDescription || "—";
+        documentType = "BILL";
       } else {
         reference = "Direct Entry";
         referenceHref = `/accounting-transactions/${line.journalEntryId}`;
         description = line.lineDescription || line.entryDescription || "—";
+        documentType = "OTHER";
       }
     } else if (line.referenceType === "OPENING_BALANCE") {
       reference = "Opening Balance";
       referenceHref = null;
       description = line.lineDescription || line.entryDescription || "Opening Balance";
+      documentType = "OTHER";
+    } else if (line.referenceType === "PRIVATE_PHONCH" && line.referenceId) {
+      // Private Phonch's own creation/settlement posting - the
+      // description is fully pre-composed at creation time
+      // (lib/private-phonch-accounting.ts) and stored directly as this
+      // line's/entry's own description, exactly like Showroom Phonch's
+      // own pattern just below. Previously had NO branch at all here,
+      // so these lines fell through to the generic Direct-Entry
+      // fallback with the wrong reference/link.
+      reference = "Private Phonch";
+      referenceHref = `/private-phonch/${line.referenceId}`;
+      description = line.lineDescription || line.entryDescription || "—";
+      documentType = "PRIVATE_PHONCH";
     } else if (line.referenceType === "PHONCH" && line.referenceId) {
       // Showroom Phonch / Delivery - the description is fully
       // pre-composed at creation time (lib/phonch-accounting.ts's
@@ -652,6 +824,20 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
       reference = "Phonch";
       referenceHref = `/phonch/${line.referenceId}`;
       description = line.lineDescription || line.entryDescription || "—";
+      documentType = "SHOWROOM_PHONCH";
+    } else if (line.referenceType === "BILL" && line.referenceId) {
+      // Bill Book - client-side receivable, fully independent of
+      // Private/Showroom Phonch's own carrier-side accounting (see
+      // model Bill's own doc comment in prisma/schema.prisma). The
+      // description is fully pre-composed at creation time
+      // (lib/bill-accounting.ts's buildBillLedgerDescription()) and
+      // stored directly as this line's/entry's own description,
+      // exactly like Phonch's own pattern just above - no live
+      // lookup needed here.
+      reference = "Bill";
+      referenceHref = `/bill/${line.referenceId}`;
+      description = line.lineDescription || line.entryDescription || "—";
+      documentType = "BILL";
     } else if (line.referenceType === "MANUAL_JOURNAL") {
       // Manual Journal Entry (Step 15) - never document-linked (v1),
       // so this is always a Direct-Entry-style row. referenceId holds
@@ -661,14 +847,17 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
       reference = line.referenceId ? `Manual Journal ${line.referenceId}` : "Manual Journal Entry";
       referenceHref = `/accounting-transactions/${line.journalEntryId}`;
       description = line.lineDescription || line.entryDescription || "—";
+      documentType = "OTHER";
     } else if (line.referenceType && SIMPLE_REFERENCE_LABELS[line.referenceType]) {
       reference = SIMPLE_REFERENCE_LABELS[line.referenceType];
       referenceHref = `/accounting-transactions/${line.journalEntryId}`;
       description = line.lineDescription || line.entryDescription || reference;
+      documentType = "OTHER";
     } else {
       reference = line.referenceType || "Direct Entry";
       referenceHref = `/accounting-transactions/${line.journalEntryId}`;
       description = line.lineDescription || line.entryDescription || "—";
+      documentType = "OTHER";
     }
 
     rows.push({
@@ -682,22 +871,25 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
       isGrouped: false,
       isRemoved: false,
       history: [toHistoryItem(line)],
+      documentType,
+      sortEntryDate: line.entryDate,
+      sortCreatedAt: line.createdAt,
     });
   }
 
-  // Chronological, and explicitly deterministic on a tie: sort by
-  // date first, then by each row's own construction order (itself
-  // derived from the database's entryDate:"asc" ordering) as an
-  // explicit secondary key - never left to rely only on the sort
-  // algorithm's stability guarantee. Never reorders or changes any
-  // stored JournalLine; this only decides the DISPLAY sequence.
-  const withOrder = rows.map((row, index) => ({ row, index }));
-  withOrder.sort((a, b) => {
-    const dateDiff = new Date(a.row.date).getTime() - new Date(b.row.date).getTime();
-    if (dateDiff !== 0) return dateDiff;
-    return a.index - b.index;
-  });
-  return withOrder.map((w) => w.row);
+  // Chronological (oldest -> newest), using compareChronological()
+  // (calendar day, then actual posting time as a same-day tiebreak,
+  // then id) as the SINGLE ordering definition for this whole ledger -
+  // the same definition getAccountLedgerData() below then also uses,
+  // unmodified, to accumulate the running balance. This is what fixes
+  // a same-day Daily Posting receipt (entryDate flattened to local
+  // midnight, so it always LOOKS earliest-of-the-day) sorting ahead of
+  // a same-day Bilty/Challan transaction that was actually posted
+  // first: entryDate alone can't tell them apart correctly, but
+  // createdAt can. Never reorders or changes any stored JournalLine;
+  // this only decides the row sequence returned to the caller.
+  rows.sort(compareChronological);
+  return rows;
 }
 
 // ============================================================
@@ -733,6 +925,7 @@ export interface FinalLedgerRow {
   isGrouped: boolean;
   isRemoved: boolean;
   history: DisplayHistoryItem[];
+  documentType: LedgerEntryType;
 }
 
 export interface AccountLedgerOptions {
@@ -758,11 +951,29 @@ export interface AccountLedgerOptions {
    * for display" instruction.
    */
   order?: "asc" | "desc";
+  /**
+   * Restrict the returned ledger to a single document type - reusing
+   * each row's own already-classified `documentType` (see
+   * LedgerEntryType above), never a second/different classification
+   * pass. `null`/omitted = "All" (existing, fully unfiltered
+   * behavior - byte-for-byte unchanged).
+   *
+   * When set, Opening/Running/Closing balance and Period Debit/Credit
+   * are recomputed from ONLY this type's own rows (still calculated
+   * chronologically first, exactly like the unfiltered path, and only
+   * reversed for display afterward per `order` - see
+   * buildTypeFilteredLedger() below). This is a deliberately
+   * DIFFERENT, self-contained balance - it answers "what does this
+   * document type alone owe/is owed", not a slice of the account's
+   * real overall balance - and must never be confused with or mixed
+   * into the real (unfiltered) account balance shown elsewhere.
+   */
+  documentType?: LedgerEntryType | null;
 }
 
 export interface AccountLedgerData {
   account: { id: string; accountName: string };
-  filters: { from: string | null; to: string | null };
+  filters: { from: string | null; to: string | null; documentType: LedgerEntryType | null };
   summary: {
     openingBalance: number;
     periodDebit: number;
@@ -803,6 +1014,7 @@ export async function getAccountLedgerData(
   const from = options.from || null;
   const to = options.to || null;
   const order = options.order || "asc";
+  const documentType = options.documentType || null;
 
   const account = await prisma.account.findUnique({ where: { id: accountId }, select: { id: true, accountName: true } });
   if (!account) {
@@ -831,24 +1043,6 @@ export async function getAccountLedgerData(
     orderBy: { journalEntry: { entryDate: "asc" } },
   });
 
-  const periodDebit = entries.reduce((sum, entry) => sum + Number(entry.debit), 0);
-  const periodCredit = entries.reduce((sum, entry) => sum + Number(entry.credit), 0);
-  const netBalance = periodDebit - periodCredit;
-
-  let openingBalance = 0;
-  if (from) {
-    const openingEntries = await prisma.journalLine.findMany({
-      where: {
-        accountId: account.id,
-        journalEntry: { is: { isDeleted: false, entryDate: { lt: new Date(`${from}T00:00:00`) } } },
-      },
-      select: { debit: true, credit: true },
-    });
-    openingBalance = openingEntries.reduce((sum, entry) => sum + Number(entry.debit) - Number(entry.credit), 0);
-  }
-
-  const closingBalance = openingBalance + netBalance;
-
   const rawLines: RawLedgerLine[] = entries.map((entry) => ({
     id: entry.id,
     journalEntryId: entry.journalEntryId,
@@ -865,7 +1059,81 @@ export async function getAccountLedgerData(
     credit: Number(entry.credit),
   }));
 
-  const displayRows = await buildUserFacingLedgerRows(account.id, rawLines);
+  const displayRowsAll = await buildUserFacingLedgerRows(account.id, rawLines);
+
+  // Type filter is applied AFTER classification, against each row's
+  // own already-resolved `documentType` (see LedgerEntryType above) -
+  // never a second/different type-detection pass, per the single-
+  // centralized-classifier rule.
+  const displayRows = documentType ? displayRowsAll.filter((row) => row.documentType === documentType) : displayRowsAll;
+
+  let periodDebit: number;
+  let periodCredit: number;
+  let openingBalance = 0;
+
+  if (documentType) {
+    // Type-filtered summary: Opening/Period/Closing balance are a
+    // deliberately SEPARATE, self-contained calculation scoped to
+    // only this document type's own rows - computed chronologically
+    // first (the SAME displayRows order buildUserFacingLedgerRows()
+    // already returns), then only reversed for display below per
+    // `order`. Never derived by slicing/adjusting the real unfiltered
+    // account balance.
+    periodDebit = displayRows.reduce((sum, row) => sum + row.debit, 0);
+    periodCredit = displayRows.reduce((sum, row) => sum + row.credit, 0);
+
+    if (from) {
+      const openingEntries = await prisma.journalLine.findMany({
+        where: {
+          accountId: account.id,
+          journalEntry: { is: { isDeleted: false, entryDate: { lt: new Date(`${from}T00:00:00`) } } },
+        },
+        include: {
+          journalEntry: { select: { id: true, entryDate: true, referenceType: true, referenceId: true, description: true } },
+        },
+        orderBy: { journalEntry: { entryDate: "asc" } },
+      });
+      const openingRawLines: RawLedgerLine[] = openingEntries.map((entry) => ({
+        id: entry.id,
+        journalEntryId: entry.journalEntryId,
+        entryDate: entry.journalEntry.entryDate,
+        createdAt: entry.createdAt,
+        referenceType: entry.journalEntry.referenceType,
+        referenceId: entry.journalEntry.referenceId,
+        entryDescription: entry.journalEntry.description,
+        lineDescription: entry.description,
+        sourceType: entry.sourceType,
+        sourceId: entry.sourceId,
+        sourceNumber: entry.sourceNumber,
+        debit: Number(entry.debit),
+        credit: Number(entry.credit),
+      }));
+      const openingDisplayRows = await buildUserFacingLedgerRows(account.id, openingRawLines);
+      openingBalance = openingDisplayRows
+        .filter((row) => row.documentType === documentType)
+        .reduce((sum, row) => sum + row.debit - row.credit, 0);
+    }
+  } else {
+    // Unfiltered ("All") path - byte-for-byte the original
+    // calculation (raw JournalLine sums, never the grouped/display
+    // rows), untouched.
+    periodDebit = entries.reduce((sum, entry) => sum + Number(entry.debit), 0);
+    periodCredit = entries.reduce((sum, entry) => sum + Number(entry.credit), 0);
+
+    if (from) {
+      const openingEntries = await prisma.journalLine.findMany({
+        where: {
+          accountId: account.id,
+          journalEntry: { is: { isDeleted: false, entryDate: { lt: new Date(`${from}T00:00:00`) } } },
+        },
+        select: { debit: true, credit: true },
+      });
+      openingBalance = openingEntries.reduce((sum, entry) => sum + Number(entry.debit) - Number(entry.credit), 0);
+    }
+  }
+
+  const netBalance = periodDebit - periodCredit;
+  const closingBalance = openingBalance + netBalance;
 
   let displayRunningBalance = openingBalance;
   const ledger: FinalLedgerRow[] = displayRows.map((row) => {
@@ -883,6 +1151,7 @@ export async function getAccountLedgerData(
       isGrouped: row.isGrouped,
       isRemoved: row.isRemoved,
       history: row.history,
+      documentType: row.documentType,
     };
   });
 
@@ -895,7 +1164,7 @@ export async function getAccountLedgerData(
 
   return {
     account: { id: account.id, accountName: account.accountName },
-    filters: { from, to },
+    filters: { from, to, documentType },
     summary: {
       openingBalance,
       periodDebit,

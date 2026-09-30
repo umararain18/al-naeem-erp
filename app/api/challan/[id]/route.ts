@@ -14,6 +14,7 @@ import { getChallanResponsibleParties } from "@/lib/document-party-resolution";
 import { assertComponentTotalNotBelowActiveRows, SettlementPaymentError } from "@/lib/settlement-payments";
 import { getBiltyPaidVerification } from "@/lib/bilty-paid-verification";
 import { computeChallanSettlementSummary } from "@/lib/challan-settlement-summary";
+import { auditUpdate, auditDelete, auditRestore, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 
 function round2(value: number): number {
   return Math.round(value * 100) / 100;
@@ -68,6 +69,19 @@ export async function GET(
     }
 
     const { id } = await params;
+
+    // A raw null byte in the id (e.g. from a hand-crafted/malformed
+    // request) is rejected by PostgreSQL's text encoding before Prisma
+    // even gets to compare it against a real row, throwing an
+    // exception the generic catch below turns into an unexplained 500.
+    // A real Challan id can never contain one, so this is exactly
+    // equivalent to "not found" - never a redesign of ID validation.
+    if (id.includes("\u0000")) {
+      return NextResponse.json(
+        { success: false, message: "Challan not found" },
+        { status: 404 }
+      );
+    }
 
     const challan = await prisma.challan.findUnique({
       where: { id },
@@ -304,6 +318,15 @@ export async function PATCH(
     }
 
     const { id } = await params;
+
+    // See the identical guard in this file's GET handler.
+    if (id.includes("\u0000")) {
+      return NextResponse.json(
+        { success: false, message: "Challan not found" },
+        { status: 404 }
+      );
+    }
+
     const body = await request.json();
 
     const existingChallan = await prisma.challan.findUnique({
@@ -650,7 +673,7 @@ export async function PATCH(
         });
       }
 
-      return tx.challan.update({
+      const updatedChallanRow = await tx.challan.update({
         where: { id },
         data: {
           ...updateData,
@@ -680,6 +703,29 @@ export async function PATCH(
           },
         },
       });
+
+      const changedFields = diffFields(existingChallan, updateData as Record<string, unknown>, Object.keys(updateData) as (keyof typeof existingChallan)[]);
+      if (Object.keys(changedFields).length > 0 || removeBiltyIds.length > 0 || addBiltyIds.length > 0) {
+        const fieldSummary = Object.entries(changedFields)
+          .map(([field, { old, new: nv }]) => `${field} ${old ?? "—"} → ${nv ?? "—"}`)
+          .join("; ");
+        const biltySummary = [
+          addBiltyIds.length > 0 ? `added ${addBiltyIds.length} Bilty(s)` : null,
+          removeBiltyIds.length > 0 ? `removed ${removeBiltyIds.length} Bilty(s)` : null,
+        ].filter(Boolean).join(", ");
+        await auditUpdate(tx, {
+          actor: actorFromUser(currentUser),
+          module: "CHALLAN",
+          entityType: "Challan",
+          entityId: id,
+          documentNo: updatedChallanRow.challanNo,
+          description: `Updated Challan ${updatedChallanRow.challanNo}${fieldSummary ? `: ${fieldSummary}` : ""}${biltySummary ? ` (${biltySummary})` : ""}`,
+          changedFields,
+          ...requestContext(request),
+        });
+      }
+
+      return updatedChallanRow;
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
     } catch (correctionError) {
       if (correctionError instanceof MissingResponsiblePartyError) {
@@ -737,9 +783,18 @@ export async function DELETE(
     }
 
     const { id } = await params;
+
+    // See the identical guard in this file's GET handler.
+    if (id.includes("\u0000")) {
+      return NextResponse.json(
+        { success: false, message: "Challan not found" },
+        { status: 404 }
+      );
+    }
+
     const existingChallan = await prisma.challan.findUnique({
       where: { id },
-      select: { id: true, isDeleted: true, isSettled: true },
+      select: { id: true, isDeleted: true, isSettled: true, challanNo: true },
     });
 
     if (!existingChallan) {
@@ -768,6 +823,16 @@ export async function DELETE(
       }
 
       await prisma.challan.delete({ where: { id } });
+
+      await auditDelete(prisma, {
+        actor: actorFromUser(currentUser),
+        module: "CHALLAN",
+        entityType: "Challan",
+        entityId: id,
+        documentNo: existingChallan.challanNo,
+        description: `Permanently deleted Challan ${existingChallan.challanNo}`,
+        ...requestContext(request),
+      });
 
       return NextResponse.json({
         success: true,
@@ -804,6 +869,16 @@ export async function DELETE(
         deletedAt: new Date(),
         deletedById: currentUser.userId,
       },
+    });
+
+    await auditDelete(prisma, {
+      actor: actorFromUser(currentUser),
+      module: "CHALLAN",
+      entityType: "Challan",
+      entityId: id,
+      documentNo: existingChallan.challanNo,
+      description: `Moved Challan ${existingChallan.challanNo} to Bin`,
+      ...requestContext(request),
     });
 
     return NextResponse.json({

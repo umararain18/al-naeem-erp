@@ -55,7 +55,15 @@ export type Permission =
   | "privatePhonch.bin"
   | "privatePhonch.binView"
   | "privatePhonch.restore"
-  | "privatePhonch.permanentlyDelete";
+  | "privatePhonch.permanentlyDelete"
+  | "bill.view"
+  | "bill.create"
+  | "bill.edit"
+  | "bill.bin"
+  | "bill.binView"
+  | "bill.restore"
+  | "bill.permanentlyDelete"
+  | "audit.view";
 
 const permissions: Record<AuthUser["role"], Permission[]> = {
   SUPER_ADMIN: [
@@ -125,6 +133,16 @@ const permissions: Record<AuthUser["role"], Permission[]> = {
     "privatePhonch.binView",
     "privatePhonch.restore",
     "privatePhonch.permanentlyDelete",
+
+    "bill.view",
+    "bill.create",
+    "bill.edit",
+    "bill.bin",
+    "bill.binView",
+    "bill.restore",
+    "bill.permanentlyDelete",
+
+    "audit.view",
   ],
 
   MANAGER: [
@@ -180,6 +198,13 @@ const permissions: Record<AuthUser["role"], Permission[]> = {
     "privatePhonch.bin",
     "privatePhonch.binView",
     "privatePhonch.restore",
+
+    "bill.view",
+    "bill.create",
+    "bill.edit",
+    "bill.bin",
+    "bill.binView",
+    "bill.restore",
   ],
 
   VIEWER: [
@@ -195,6 +220,7 @@ const permissions: Record<AuthUser["role"], Permission[]> = {
 
     "phonch.view",
     "privatePhonch.view",
+    "bill.view",
   ],
 };
 

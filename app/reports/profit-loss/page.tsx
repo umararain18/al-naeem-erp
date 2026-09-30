@@ -162,7 +162,6 @@ export default function ProfitLossPage() {
                       <tr key={entry.id} className="hover:bg-gray-50">
                         <td className="px-4 py-3">
                           <Link href={`/ledger?accountId=${entry.id}`} className="text-blue-600 hover:underline">
-                            {entry.accountCode ? `[${entry.accountCode}] ` : ""}
                             {entry.accountName}
                           </Link>
                         </td>
@@ -210,7 +209,6 @@ export default function ProfitLossPage() {
                       <tr key={entry.id} className="hover:bg-gray-50">
                         <td className="px-4 py-3">
                           <Link href={`/ledger?accountId=${entry.id}`} className="text-blue-600 hover:underline">
-                            {entry.accountCode ? `[${entry.accountCode}] ` : ""}
                             {entry.accountName}
                           </Link>
                         </td>

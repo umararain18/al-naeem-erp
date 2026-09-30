@@ -4,6 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { PayrollValidationError, getEmployeeBalance, validateEmployeeInput } from "@/lib/payroll-accounting";
+import { auditUpdate, auditDelete, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 
 // ============================================================
 // EMPLOYEE - VIEW / EDIT / BIN
@@ -39,6 +40,16 @@ export async function GET(_request: NextRequest, context: { params: Promise<{ id
     }
 
     const { id } = await context.params;
+
+    // See the identical guard in app/api/challan/[id]/route.ts - a raw
+    // null byte in the id is rejected by PostgreSQL's text encoding
+    // before Prisma even gets to compare it against a real row,
+    // throwing an exception that would otherwise become an
+    // unexplained 500. A real Employee id can never contain one.
+    if (id.includes("\u0000")) {
+      return NextResponse.json({ success: false, message: "Employee not found" }, { status: 404 });
+    }
+
     const employee = await prisma.employee.findUnique({
       where: { id },
       include: {
@@ -107,6 +118,12 @@ export async function PATCH(request: NextRequest, context: { params: Promise<{ i
     }
 
     const { id } = await context.params;
+
+    // See the identical guard in this file's GET handler.
+    if (id.includes("\u0000")) {
+      return NextResponse.json({ success: false, message: "Employee not found" }, { status: 404 });
+    }
+
     const body = await request.json();
     const result = updateSchema.safeParse(body);
     if (!result.success) {
@@ -146,6 +163,25 @@ export async function PATCH(request: NextRequest, context: { params: Promise<{ i
       },
     });
 
+    const changedFields = diffFields(
+      { name: current.name, designation: current.designation, phone: current.phone, monthlySalary: Number(current.monthlySalary), isActive: current.isActive },
+      { name: updated.name, designation: updated.designation, phone: updated.phone, monthlySalary: Number(updated.monthlySalary), isActive: updated.isActive },
+      ["name", "designation", "phone", "monthlySalary", "isActive"]
+    );
+    if (Object.keys(changedFields).length > 0) {
+      const summary = Object.entries(changedFields).map(([f, { old, new: nv }]) => `${f} ${old ?? "—"} → ${nv ?? "—"}`).join("; ");
+      await auditUpdate(prisma, {
+        actor: actorFromUser(currentUser),
+        module: "EMPLOYEE",
+        entityType: "Employee",
+        entityId: id,
+        documentNo: current.employeeCode,
+        description: `Updated Employee ${current.employeeCode}: ${summary}`,
+        changedFields,
+        ...requestContext(request),
+      });
+    }
+
     return NextResponse.json({ success: true, message: "Employee updated successfully.", employeeId: updated.id });
   } catch (error) {
     console.error("Update employee error:", error);
@@ -153,7 +189,7 @@ export async function PATCH(request: NextRequest, context: { params: Promise<{ i
   }
 }
 
-export async function DELETE(_request: NextRequest, context: { params: Promise<{ id: string }> }) {
+export async function DELETE(request: NextRequest, context: { params: Promise<{ id: string }> }) {
   try {
     const currentUser = await getCurrentUser();
     if (!currentUser) {
@@ -164,6 +200,12 @@ export async function DELETE(_request: NextRequest, context: { params: Promise<{
     }
 
     const { id } = await context.params;
+
+    // See the identical guard in this file's GET handler.
+    if (id.includes("\u0000")) {
+      return NextResponse.json({ success: false, message: "Employee not found" }, { status: 404 });
+    }
+
     const current = await prisma.employee.findUnique({ where: { id } });
     if (!current) {
       return NextResponse.json({ success: false, message: "Employee not found" }, { status: 404 });
@@ -175,6 +217,16 @@ export async function DELETE(_request: NextRequest, context: { params: Promise<{
     const deleted = await prisma.employee.update({
       where: { id },
       data: { isDeleted: true, deletedAt: new Date(), deletedById: currentUser.userId },
+    });
+
+    await auditDelete(prisma, {
+      actor: actorFromUser(currentUser),
+      module: "EMPLOYEE",
+      entityType: "Employee",
+      entityId: id,
+      documentNo: current.employeeCode,
+      description: `Moved Employee ${current.employeeCode} (${current.name}) to Bin`,
+      ...requestContext(request),
     });
 
     return NextResponse.json({ success: true, message: "Employee moved to Bin successfully.", employeeId: deleted.id });

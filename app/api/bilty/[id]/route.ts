@@ -14,6 +14,7 @@ import {
   updateSettlementPaymentAmount,
 } from "@/lib/settlement-payments";
 import { BiltyPaidVerificationError, getBiltyPaidVerification } from "@/lib/bilty-paid-verification";
+import { auditUpdate, auditDelete, auditRestore, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 
 const updateBiltySchema = z.object({
   biltyNo: z.string().trim().min(1, "Bilty number is required").optional(),
@@ -114,6 +115,18 @@ export async function GET(
 
     const { id } = await params;
 
+    // See the identical guard in app/api/challan/[id]/route.ts - a raw
+    // null byte in the id is rejected by PostgreSQL's text encoding
+    // before Prisma even gets to compare it against a real row,
+    // throwing an exception that would otherwise become an
+    // unexplained 500. A real Bilty id can never contain one.
+    if (id.includes("\u0000")) {
+      return NextResponse.json(
+        { success: false, message: "Bilty not found" },
+        { status: 404 }
+      );
+    }
+
     const bilty = await prisma.bilty.findUnique({
       where: { id },
       include: {
@@ -207,6 +220,15 @@ export async function GET(
             username: true,
           },
         },
+        // Reverse reference to this Bilty's own Challan (Goal #10 of
+        // the navigation audit - Bilty had a link DOWN from Challan,
+        // never one back UP). Only the current, non-deleted Challan;
+        // a Bilty is linked to at most one active Challan at a time.
+        challanBilties: {
+          where: { challan: { isDeleted: false } },
+          take: 1,
+          select: { challan: { select: { id: true, challanNo: true } } },
+        },
       },
     });
 
@@ -271,6 +293,14 @@ export async function PATCH(
     }
 
     const { id } = await params;
+
+    // See the identical guard in this file's GET handler.
+    if (id.includes("\u0000")) {
+      return NextResponse.json(
+        { success: false, message: "Bilty not found" },
+        { status: 404 }
+      );
+    }
 
     const existingBilty = await prisma.bilty.findUnique({
       where: { id },
@@ -1135,6 +1165,40 @@ export async function PATCH(
         await updateSettlementPaymentAmount({ paymentId: paidRowAfterUpdate.id, newAmount: advance }, tx);
       }
 
+      const changedFields = diffFields(
+        existingBilty,
+        {
+          biltyNo: updatedBiltyRow.biltyNo,
+          consignorName,
+          consigneeName,
+          vehicleType: updatedBiltyRow.vehicleType,
+          registrationNumber: updatedBiltyRow.registrationNumber,
+          rent,
+          insurance,
+          expense,
+          total,
+          advance,
+          toPay,
+          agentCommission,
+        },
+        ["biltyNo", "consignorName", "consigneeName", "vehicleType", "registrationNumber", "rent", "insurance", "expense", "total", "advance", "toPay", "agentCommission"]
+      );
+      if (Object.keys(changedFields).length > 0) {
+        const summary = Object.entries(changedFields)
+          .map(([field, { old, new: nv }]) => `${field} ${old ?? "—"} → ${nv ?? "—"}`)
+          .join("; ");
+        await auditUpdate(tx, {
+          actor: actorFromUser(currentUser),
+          module: "BILTY",
+          entityType: "Bilty",
+          entityId: id,
+          documentNo: updatedBiltyRow.biltyNo,
+          description: `Updated Bilty ${updatedBiltyRow.biltyNo}: ${summary}`,
+          changedFields,
+          ...requestContext(request),
+        });
+      }
+
       return updatedBiltyRow;
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
     } catch (correctionError) {
@@ -1202,9 +1266,18 @@ export async function DELETE(
     }
 
     const { id } = await params;
+
+    // See the identical guard in this file's GET handler.
+    if (id.includes("\u0000")) {
+      return NextResponse.json(
+        { success: false, message: "Bilty not found" },
+        { status: 404 }
+      );
+    }
+
     const existingBilty = await prisma.bilty.findUnique({
       where: { id },
-      select: { id: true, isDeleted: true },
+      select: { id: true, isDeleted: true, biltyNo: true },
     });
 
     if (!existingBilty) {
@@ -1233,6 +1306,16 @@ export async function DELETE(
       }
 
       await prisma.bilty.delete({ where: { id } });
+
+      await auditDelete(prisma, {
+        actor: actorFromUser(currentUser),
+        module: "BILTY",
+        entityType: "Bilty",
+        entityId: id,
+        documentNo: existingBilty.biltyNo,
+        description: `Permanently deleted Bilty ${existingBilty.biltyNo}`,
+        ...requestContext(request),
+      });
 
       return NextResponse.json({
         success: true,
@@ -1303,6 +1386,16 @@ export async function DELETE(
         deletedAt: new Date(),
         deletedById: currentUser.userId,
       },
+    });
+
+    await auditDelete(prisma, {
+      actor: actorFromUser(currentUser),
+      module: "BILTY",
+      entityType: "Bilty",
+      entityId: id,
+      documentNo: existingBilty.biltyNo,
+      description: `Moved Bilty ${existingBilty.biltyNo} to Bin`,
+      ...requestContext(request),
     });
 
     return NextResponse.json({

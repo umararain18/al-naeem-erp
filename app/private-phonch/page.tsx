@@ -24,6 +24,8 @@ type PrivatePhonchListItem = {
   transporterParty: { id: string; partyName: string };
   vehicleCount: number;
   vehicleNames: string[];
+  vehicleBillLabels: string[];
+  billSummary: { billId: string; billNo: string; amount: number; status: "UNPAID" | "PARTIALLY_PAID" | "PAID" } | null;
   totalCarrierPayable: number;
   totalCaPayable: number;
   totalDeliveryRecovery: number;
@@ -176,10 +178,28 @@ export default function PrivatePhonchPage() {
                           <Link href={`/private-phonch/${p.id}`} className="font-medium text-blue-600 hover:underline">
                             {p.phonchNo}
                           </Link>
+                          {p.billSummary && (
+                            <div className="mt-0.5 text-xs text-gray-500">
+                              Bill:{" "}
+                              <Link href={`/bill/${p.billSummary.billId}`} className="text-blue-600 hover:underline">
+                                {p.billSummary.billNo}
+                              </Link>
+                              {" · "}
+                              {formatCurrency(p.billSummary.amount)}
+                              {" · "}
+                              {p.billSummary.status === "PAID"
+                                ? "Paid"
+                                : p.billSummary.status === "PARTIALLY_PAID"
+                                ? "Partially Paid"
+                                : "Unpaid"}
+                            </div>
+                          )}
                         </td>
                         <td className="px-4 py-3">{new Date(p.date).toLocaleDateString("en-GB")}</td>
                         <td className="px-4 py-3">{p.transporterParty.partyName}</td>
-                        <td className="px-4 py-3">{p.vehicleNames.length > 0 ? p.vehicleNames.join(", ") : p.vehicleCount}</td>
+                        <td className="px-4 py-3">
+                          {p.vehicleBillLabels.length > 0 ? p.vehicleBillLabels.join(", ") : p.vehicleNames.length > 0 ? p.vehicleNames.join(", ") : p.vehicleCount}
+                        </td>
                         <td className="px-4 py-3">
                           {p.transporterRemaining <= 0.009 && p.transporterRecoveryRemaining <= 0.009 ? (
                             formatCurrency(0)

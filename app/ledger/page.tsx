@@ -22,6 +22,12 @@ type LedgerHistoryItem = {
   credit: number;
 };
 
+// Matches lib/ledger-description.ts's LedgerEntryType - the SAME
+// centralized classification Party Ledger reads (see
+// getLedgerEntryType-equivalent row.documentType, populated once in
+// buildUserFacingLedgerRows()). Never re-derived here.
+type LedgerEntryType = "BILTY" | "CHALLAN" | "PRIVATE_PHONCH" | "SHOWROOM_PHONCH" | "BILL" | "OTHER";
+
 // Matches lib/ledger-description.ts's FinalLedgerRow - the same
 // business-readable, duplicate-collapsing row shape Party Ledger
 // already uses, now shared by General Ledger for ANY account (see
@@ -39,6 +45,7 @@ type LedgerEntry = {
   isGrouped: boolean;
   isRemoved: boolean;
   history: LedgerHistoryItem[];
+  documentType: LedgerEntryType;
 };
 
 type Summary = {
@@ -55,8 +62,20 @@ type LedgerResponse = {
   selectedAccount: Account | null;
   entries: LedgerEntry[];
   summary: Summary | null;
-  filters: { from: string | null; to: string | null };
+  filters: { from: string | null; to: string | null; documentType: LedgerEntryType | null };
 };
+
+type TxType = "ALL" | LedgerEntryType;
+
+const TYPE_OPTIONS: { value: TxType; label: string }[] = [
+  { value: "ALL", label: "All Types" },
+  { value: "BILTY", label: "Bilty" },
+  { value: "CHALLAN", label: "Challan" },
+  { value: "PRIVATE_PHONCH", label: "Private Phonch" },
+  { value: "SHOWROOM_PHONCH", label: "Showroom Phonch" },
+  { value: "BILL", label: "Bill" },
+  { value: "OTHER", label: "Other" },
+];
 
 function formatCurrency(value: number) {
   return `Rs. ${Math.round(value).toLocaleString()}`;
@@ -87,6 +106,7 @@ export default function LedgerPage() {
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
   const [search, setSearch] = useState("");
+  const [typeFilter, setTypeFilter] = useState<TxType>("ALL");
 
   // Every active account is fetched ONCE (no accountId/date params) so
   // the account picker can filter instantly client-side - the same
@@ -117,6 +137,7 @@ export default function LedgerPage() {
         if (from) query.set("from", from);
         if (to) query.set("to", to);
         if (search.trim()) query.set("q", search.trim());
+        if (typeFilter !== "ALL") query.set("type", typeFilter);
 
         const response = await fetch(`/api/ledger?${query.toString()}`);
         const result = await response.json();
@@ -136,7 +157,7 @@ export default function LedgerPage() {
     }
 
     load();
-  }, [accountId, from, to, search]);
+  }, [accountId, from, to, search, typeFilter]);
 
   const accountOptions: SearchOption[] = useMemo(
     () =>
@@ -181,6 +202,7 @@ export default function LedgerPage() {
             setFrom("");
             setTo("");
             setSearch("");
+            setTypeFilter("ALL");
           }}
           resultLabel={
             data
@@ -190,13 +212,26 @@ export default function LedgerPage() {
               : null
           }
           extra={
-            <div className="mb-3">
-              <SearchableSelect
-                value={accountId}
-                options={accountOptions}
-                placeholder="Search account name or code..."
-                onChange={setAccountId}
-              />
+            <div className="mb-3 grid grid-cols-1 md:grid-cols-3 gap-3">
+              <div className="md:col-span-2">
+                <SearchableSelect
+                  value={accountId}
+                  options={accountOptions}
+                  placeholder="Search account name or code..."
+                  onChange={setAccountId}
+                />
+              </div>
+              <select
+                value={typeFilter}
+                onChange={(e) => setTypeFilter(e.target.value as TxType)}
+                className="border rounded-lg px-3 py-2 text-sm"
+              >
+                {TYPE_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
             </div>
           }
         />
@@ -229,6 +264,12 @@ export default function LedgerPage() {
             </div>
 
             {/* Summary */}
+            {typeFilter !== "ALL" && (
+              <p className="text-xs text-gray-500 mb-2">
+                Showing balances for <span className="font-medium">{TYPE_OPTIONS.find((o) => o.value === typeFilter)?.label}</span> only
+                - not this account&apos;s overall balance.
+              </p>
+            )}
             {summary && (
               <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
                 <div className="bg-white rounded-xl p-5 shadow-sm">

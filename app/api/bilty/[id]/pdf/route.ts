@@ -2,7 +2,8 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
-import { jsPDF } from "jspdf";
+import { resolvePdfPresentation } from "@/lib/pdf-presentation";
+import { createPdfDocument, drawPdfHeader, drawPdfFooter, applyWatermark, resolveJsPdfFont } from "@/lib/pdf-render-helpers";
 
 export async function GET(
   _request: NextRequest,
@@ -47,21 +48,17 @@ export async function GET(
       );
     }
 
-    const doc = new jsPDF();
+    const presentation = await resolvePdfPresentation(prisma, "BILTY");
+    const bodyFont = resolveJsPdfFont(presentation.pdf.defaultFont);
+
+    const doc = createPdfDocument(presentation);
     const pageWidth = doc.internal.pageSize.getWidth();
-    let y = 10;
 
-    doc.setFontSize(14);
-    doc.setFont("helvetica", "bold");
-    doc.text("AL NAEEM CAR CARRIERS SERVICE", pageWidth / 2, y, { align: "center" });
-    y += 6;
-
-    doc.setFontSize(16);
-    doc.text("BILTY", pageWidth / 2, y, { align: "center" });
-    y += 8;
+    const { nextY } = await drawPdfHeader(doc, presentation, "BILTY");
+    let y = nextY;
 
     doc.setFontSize(10);
-    doc.setFont("helvetica", "normal");
+    doc.setFont(bodyFont, "normal");
 
     const detailRows = [
       ["Bilty No", bilty.biltyNo],
@@ -70,16 +67,16 @@ export async function GET(
     ];
 
     for (const [label, value] of detailRows) {
-      doc.setFont("helvetica", "bold");
+      doc.setFont(bodyFont, "bold");
       doc.text(`${label}:`, 14, y);
-      doc.setFont("helvetica", "normal");
+      doc.setFont(bodyFont, "normal");
       doc.text(String(value), 50, y);
       y += 5;
     }
 
     y += 4;
 
-    doc.setFont("helvetica", "bold");
+    doc.setFont(bodyFont, "bold");
     doc.setFontSize(10);
     doc.text("ROUTE", pageWidth / 2, y, { align: "center" });
     y += 5;
@@ -94,7 +91,7 @@ export async function GET(
     y += 8;
 
     doc.setFontSize(10);
-    doc.setFont("helvetica", "bold");
+    doc.setFont(bodyFont, "bold");
     doc.text("CONSIGNOR", 14, y);
     doc.text("CONSIGNEE", pageWidth - 14, y, { align: "right" });
     y += 4;
@@ -117,16 +114,16 @@ export async function GET(
     for (let i = 0; i < Math.max(leftItems.length, rightItems.length); i++) {
       if (i < leftItems.length) {
         const [label, value] = leftItems[i];
-        doc.setFont("helvetica", "bold");
+        doc.setFont(bodyFont, "bold");
         doc.text(`${label}:`, leftX, y);
-        doc.setFont("helvetica", "normal");
+        doc.setFont(bodyFont, "normal");
         doc.text(String(value), leftX + 22, y);
       }
       if (i < rightItems.length) {
         const [label, value] = rightItems[i];
-        doc.setFont("helvetica", "bold");
+        doc.setFont(bodyFont, "bold");
         doc.text(`${label}:`, rightX, y);
-        doc.setFont("helvetica", "normal");
+        doc.setFont(bodyFont, "normal");
         doc.text(String(value), rightX + 22, y);
       }
       y += 5;
@@ -134,7 +131,7 @@ export async function GET(
 
     y += 4;
 
-    doc.setFont("helvetica", "bold");
+    doc.setFont(bodyFont, "bold");
     doc.setFontSize(10);
     doc.text("CLEARING AGENT / DELIVERY POINT", 14, y);
     y += 5;
@@ -145,16 +142,16 @@ export async function GET(
     ];
 
     for (const [label, value] of agentRows) {
-      doc.setFont("helvetica", "bold");
+      doc.setFont(bodyFont, "bold");
       doc.text(`${label}:`, 14, y);
-      doc.setFont("helvetica", "normal");
+      doc.setFont(bodyFont, "normal");
       doc.text(String(value), 50, y);
       y += 5;
     }
 
     y += 4;
 
-    doc.setFont("helvetica", "bold");
+    doc.setFont(bodyFont, "bold");
     doc.setFontSize(10);
     doc.text("VEHICLE DETAILS", 14, y);
     y += 5;
@@ -169,16 +166,16 @@ export async function GET(
     ];
 
     for (const [label, value] of vehicleRows) {
-      doc.setFont("helvetica", "bold");
+      doc.setFont(bodyFont, "bold");
       doc.text(`${label}:`, 14, y);
-      doc.setFont("helvetica", "normal");
+      doc.setFont(bodyFont, "normal");
       doc.text(String(value), 60, y);
       y += 5;
     }
 
     y += 4;
 
-    doc.setFont("helvetica", "bold");
+    doc.setFont(bodyFont, "bold");
     doc.setFontSize(10);
     doc.text("FINANCIAL SUMMARY", 14, y);
     y += 5;
@@ -193,9 +190,9 @@ export async function GET(
     ];
 
     for (const [label, value] of financialRows) {
-      doc.setFont("helvetica", "bold");
+      doc.setFont(bodyFont, "bold");
       doc.text(`${label}:`, 14, y);
-      doc.setFont("helvetica", "normal");
+      doc.setFont(bodyFont, "normal");
       doc.text(String(value), 50, y);
       y += 5;
     }
@@ -203,7 +200,7 @@ export async function GET(
     y += 4;
 
     if (bilty.agentParty || Number(bilty.agentCommission || 0) > 0 || bilty.agentDescription) {
-      doc.setFont("helvetica", "bold");
+      doc.setFont(bodyFont, "bold");
       doc.setFontSize(10);
       doc.text("COMMISSION / REFERRAL", 14, y);
       y += 5;
@@ -218,9 +215,9 @@ export async function GET(
       }
 
       for (const [label, value] of commissionRows) {
-        doc.setFont("helvetica", "bold");
+        doc.setFont(bodyFont, "bold");
         doc.text(`${label}:`, 14, y);
-        doc.setFont("helvetica", "normal");
+        doc.setFont(bodyFont, "normal");
         doc.text(String(value), 60, y);
         y += 5;
       }
@@ -229,12 +226,12 @@ export async function GET(
     }
 
     if (bilty.notes) {
-      doc.setFont("helvetica", "bold");
+      doc.setFont(bodyFont, "bold");
       doc.setFontSize(10);
       doc.text("NOTES", 14, y);
       y += 5;
 
-      doc.setFont("helvetica", "normal");
+      doc.setFont(bodyFont, "normal");
       doc.setFontSize(9);
 
       const splitNotes = doc.splitTextToSize(String(bilty.notes), pageWidth - 28);
@@ -246,7 +243,7 @@ export async function GET(
       y += 4;
     }
 
-    doc.setFont("helvetica", "bold");
+    doc.setFont(bodyFont, "bold");
     doc.setFontSize(10);
     doc.text("SIGNATURES", 14, y);
     y += 6;
@@ -254,7 +251,7 @@ export async function GET(
     const signatureY = y;
     doc.line(14, signatureY + 14, 60, signatureY + 14);
     doc.setFontSize(9);
-    doc.setFont("helvetica", "normal");
+    doc.setFont(bodyFont, "normal");
     doc.text("Received By", 14, signatureY + 18, { align: "center" });
 
     doc.line(pageWidth / 2 - 23, signatureY + 14, pageWidth / 2 + 23, signatureY + 14);
@@ -263,9 +260,8 @@ export async function GET(
     doc.line(pageWidth - 60, signatureY + 14, pageWidth - 14, signatureY + 14);
     doc.text("Authorized Signature", pageWidth - 37, signatureY + 18, { align: "center" });
 
-    doc.setFontSize(8);
-    doc.setTextColor(100);
-    doc.text("Generated: " + new Date().toLocaleString(), pageWidth - 14, 285, { align: "right" });
+    drawPdfFooter(doc, presentation);
+    applyWatermark(doc, presentation);
 
     const pdfBuffer = doc.output("arraybuffer");
 
@@ -274,6 +270,7 @@ export async function GET(
       headers: {
         "Content-Type": "application/pdf",
         "Content-Disposition": `attachment; filename=Bilty-${bilty.biltyNo}.pdf`,
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
       },
     });
   } catch (error) {

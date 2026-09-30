@@ -27,6 +27,7 @@ import {
   assertPrivatePhonchPaymentNotExceeded,
   PrivatePhonchAccountingError,
 } from "@/lib/private-phonch-accounting";
+import { auditUpdate, auditDelete, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 
 function isValidDate(value: string) {
   const date = new Date(`${value}T00:00:00`);
@@ -464,6 +465,25 @@ export async function PATCH(
               },
             });
 
+            const changedFields = diffFields(
+              { amount: Number(currentLine.debit) || Number(currentLine.credit), date: currentLine.journalEntry.entryDate, description: currentLine.description },
+              { amount: newDebit || newCredit, date: new Date(`${date}T00:00:00`), description: description?.trim() || null },
+              ["amount", "date", "description"]
+            );
+            if (Object.keys(changedFields).length > 0) {
+              const summary = Object.entries(changedFields).map(([f, { old, new: nv }]) => `${f} ${old ?? "—"} → ${nv ?? "—"}`).join("; ");
+              await auditUpdate(tx, {
+                actor: actorFromUser(currentUser),
+                module: "CASH_BOOK",
+                entityType: "JournalLine",
+                entityId: currentLine.id,
+                documentNo: currentLine.account.accountName,
+                description: `Edited Cash Book entry on ${currentLine.account.accountName}: ${summary}`,
+                changedFields,
+                ...requestContext(request),
+              });
+            }
+
             return updatedJournalEntry;
           },
           { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
@@ -592,6 +612,25 @@ export async function PATCH(
                   : counterLine.sourceNumber,
             },
           });
+
+          const changedFields = diffFields(
+            { amount: Number(currentLine.debit) || Number(currentLine.credit), date: currentLine.journalEntry.entryDate, description: currentLine.description },
+            { amount: newDebit || newCredit, date: new Date(`${date}T00:00:00`), description: description?.trim() || null },
+            ["amount", "date", "description"]
+          );
+          if (Object.keys(changedFields).length > 0) {
+            const summary = Object.entries(changedFields).map(([f, { old, new: nv }]) => `${f} ${old ?? "—"} → ${nv ?? "—"}`).join("; ");
+            await auditUpdate(tx, {
+              actor: actorFromUser(currentUser),
+              module: "CASH_BOOK",
+              entityType: "JournalLine",
+              entityId: currentLine.id,
+              documentNo: currentLine.account.accountName,
+              description: `Edited Cash Book entry on ${currentLine.account.accountName}: ${summary}`,
+              changedFields,
+              ...requestContext(request),
+            });
+          }
 
           return updatedJournalEntry;
         }
@@ -793,6 +832,17 @@ export async function DELETE(
           deletedById: currentUser.userId,
         },
       });
+
+    await auditDelete(prisma, {
+      actor: actorFromUser(currentUser),
+      module: "CASH_BOOK",
+      entityType: "JournalLine",
+      entityId: currentLine.id,
+      documentNo: currentLine.account.accountName,
+      description: `Moved Cash Book entry on ${currentLine.account.accountName} to Bin (Rs. ${(Number(currentLine.debit) || Number(currentLine.credit)).toLocaleString()})`,
+      oldValues: { amount: Number(currentLine.debit) || Number(currentLine.credit), date: currentLine.journalEntry.entryDate, description: currentLine.description },
+      ...requestContext(request),
+    });
 
     // ============================================================
     // SUCCESS

@@ -86,23 +86,49 @@ export async function getBiltyPaidVerification(
   // plus the current one, so history is never lost and nothing is
   // ever double-counted (each Daily Posting line is still counted
   // exactly once, by its own accountId).
+  //
+  // CRITICAL: "SETTLEMENT_PAYMENT"/"..._CORRECTION"/"..._REVERSAL" are
+  // NOT exclusive to the Paid component - a Collection ("To-Pay")
+  // SettlementPayment lifecycle event uses the IDENTICAL sourceType:
+  // "BILTY"/sourceId:<this Bilty> tag (confirmed live - both "Settlement
+  // Payment - Bilty 108 Paid - 7000" and "Settlement Payment - Bilty
+  // 108 To-Pay - 50000" carry that same tag). The two are reliably
+  // distinguished only by the JournalEntry's own referenceId, set at
+  // write time by createSettlementPayment() (lib/settlement-payments.ts):
+  // a Paid-component event's referenceId is this Bilty's own id; a
+  // Collection-component event's referenceId is the Bilty's owning
+  // Challan's id. Filtering on this explicit relation (never on
+  // description text) is what makes this an accurate PAID-only query -
+  // without it, a Collection payer's own real receipts get counted as
+  // if they verified the unrelated Paid amount too (confirmed live on
+  // Bilty 108: 7,000 Paid + 50,000 Collection receipts wrongly summed
+  // to a reported 57,000 "verified").
   const paidTaggedLines = await tx.journalLine.findMany({
     where: {
       sourceType: "BILTY",
       sourceId: biltyId,
-      journalEntry: {
-        isDeleted: false,
-        referenceType: {
-          in: [
-            "SETTLEMENT_PAYMENT",
-            "SETTLEMENT_PAYMENT_CORRECTION",
-            "SETTLEMENT_PAYMENT_REVERSAL",
-            "PAID_RESPONSIBILITY_REASSIGNMENT",
-          ],
-        },
-        ...(excludeJournalEntryId ? { id: { not: excludeJournalEntryId } } : {}),
-      },
       account: { category: "PARTY" },
+      OR: [
+        {
+          journalEntry: {
+            isDeleted: false,
+            referenceType: { in: ["SETTLEMENT_PAYMENT", "SETTLEMENT_PAYMENT_CORRECTION", "SETTLEMENT_PAYMENT_REVERSAL"] },
+            referenceId: biltyId,
+            ...(excludeJournalEntryId ? { id: { not: excludeJournalEntryId } } : {}),
+          },
+        },
+        // PAID_RESPONSIBILITY_REASSIGNMENT is exclusively a Paid-
+        // component referenceType - Collection has no mechanism under
+        // this name at all - so it is never ambiguous and needs no
+        // referenceId filter.
+        {
+          journalEntry: {
+            isDeleted: false,
+            referenceType: "PAID_RESPONSIBILITY_REASSIGNMENT",
+            ...(excludeJournalEntryId ? { id: { not: excludeJournalEntryId } } : {}),
+          },
+        },
+      ],
     },
     select: { accountId: true },
     distinct: ["accountId"],

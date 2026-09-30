@@ -3,6 +3,7 @@
 import { use, useEffect, useState } from "react";
 import Link from "next/link";
 import PrivatePhonchForm from "../PrivatePhonchForm";
+import { DocumentFooter, DocumentHeader, useDocumentPresentation } from "@/components/documents/DocumentPresentation";
 
 function formatCurrency(value: number) {
   return `Rs. ${Math.round(value).toLocaleString()}`;
@@ -26,6 +27,9 @@ type PrivatePhonchVehicle = {
   carrierPayable: string;
   deliveryRecoveryParty: string | null;
   note: string | null;
+  // Reverse Bill Book link (Section 20/21 of the Bill Book spec) -
+  // null when this vehicle has not been billed yet.
+  billInfo: { billId: string; billNo: string; billAmount: number; billStatus: "UNPAID" | "PARTIALLY_PAID" | "PAID" } | null;
 };
 
 type PaymentState = {
@@ -86,6 +90,7 @@ export default function PrivatePhonchDetailPage({ params }: { params: Promise<{ 
   const [message, setMessage] = useState("");
   const [binning, setBinning] = useState(false);
   const [editing, setEditing] = useState(false);
+  const presentation = useDocumentPresentation("PRIVATE_PHONCH");
 
   async function load() {
     try {
@@ -199,6 +204,8 @@ export default function PrivatePhonchDetailPage({ params }: { params: Promise<{ 
   return (
     <main className="min-h-screen bg-gray-50 p-6">
       <div className="mx-auto max-w-6xl">
+        <DocumentHeader presentation={presentation} title="PRIVATE PHONCH" />
+
         <div className="mb-6 flex items-center justify-between">
           <div>
             <Link href="/private-phonch" className="text-xs text-gray-500 hover:underline">
@@ -313,6 +320,7 @@ export default function PrivatePhonchDetailPage({ params }: { params: Promise<{ 
                 <th className="px-3 py-3">Net Rent</th>
                 <th className="px-3 py-3">Carrier Payable</th>
                 <th className="px-3 py-3">CA Payable</th>
+                <th className="px-3 py-3">Bill</th>
               </tr>
             </thead>
             <tbody className="divide-y">
@@ -336,6 +344,19 @@ export default function PrivatePhonchDetailPage({ params }: { params: Promise<{ 
                     <td className="px-3 py-2">{formatCurrency(netRent)}</td>
                     <td className="px-3 py-2">{formatCurrency(carrierPayable)}</td>
                     <td className="px-3 py-2">{formatCurrency(caPayable)}</td>
+                    <td className="px-3 py-2">
+                      {v.billInfo ? (
+                        <Link href={`/bill/${v.billInfo.billId}`} className="text-blue-600 hover:underline">
+                          {v.billInfo.billNo}
+                          <div className="text-xs text-gray-500">
+                            {formatCurrency(v.billInfo.billAmount)} ·{" "}
+                            {v.billInfo.billStatus === "PAID" ? "Paid" : v.billInfo.billStatus === "PARTIALLY_PAID" ? "Partially Paid" : "Unpaid"}
+                          </div>
+                        </Link>
+                      ) : (
+                        <span className="text-xs text-gray-400">Not Billed</span>
+                      )}
+                    </td>
                   </tr>
                 );
               })}
@@ -440,6 +461,8 @@ export default function PrivatePhonchDetailPage({ params }: { params: Promise<{ 
             </div>
           </div>
         </div>
+
+        <DocumentFooter presentation={presentation} />
       </div>
     </main>
   );

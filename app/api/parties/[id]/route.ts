@@ -4,6 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { BalanceType, PartyType } from "@prisma/client";
+import { auditUpdate, auditDelete, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 
 const updatePartySchema = z.object({
   partyName: z.string().min(2).optional(),
@@ -70,6 +71,18 @@ export async function GET(
     }
 
     const { id } = await params;
+
+    // See the identical guard in app/api/challan/[id]/route.ts - a raw
+    // null byte in the id is rejected by PostgreSQL's text encoding
+    // before Prisma even gets to compare it against a real row,
+    // throwing an exception that would otherwise become an
+    // unexplained 500. A real Party id can never contain one.
+    if (id.includes("\u0000")) {
+      return NextResponse.json(
+        { success: false, message: "Party not found" },
+        { status: 404 }
+      );
+    }
 
     const party = await prisma.party.findUnique({
       where: { id },
@@ -144,6 +157,14 @@ export async function PATCH(
     }
 
     const { id } = await params;
+
+    // See the identical guard in this file's GET handler.
+    if (id.includes("\u0000")) {
+      return NextResponse.json(
+        { success: false, message: "Party not found" },
+        { status: 404 }
+      );
+    }
 
     const existingParty = await prisma.party.findUnique({
       where: { id },
@@ -397,6 +418,25 @@ export async function PATCH(
           }
         }
 
+        const changedFields = diffFields(
+          existingParty as unknown as Record<string, unknown>,
+          data as Record<string, unknown>,
+          Object.keys(data) as (keyof typeof existingParty)[]
+        );
+        if (Object.keys(changedFields).length > 0) {
+          const summary = Object.entries(changedFields).map(([f, { old, new: nv }]) => `${f} ${old ?? "—"} → ${nv ?? "—"}`).join("; ");
+          await auditUpdate(tx, {
+            actor: actorFromUser(currentUser),
+            module: "PARTY",
+            entityType: "Party",
+            entityId: id,
+            documentNo: party.partyName,
+            description: `Updated Party ${party.partyName}: ${summary}`,
+            changedFields,
+            ...requestContext(request),
+          });
+        }
+
         return party;
       }
     );
@@ -425,7 +465,7 @@ export async function PATCH(
 
 // DELETE PARTY
 export async function DELETE(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
@@ -453,6 +493,14 @@ export async function DELETE(
     }
 
     const { id } = await params;
+
+    // See the identical guard in this file's GET handler.
+    if (id.includes("\u0000")) {
+      return NextResponse.json(
+        { success: false, message: "Party not found" },
+        { status: 404 }
+      );
+    }
 
     const existingParty =
       await prisma.party.findUnique({
@@ -510,6 +558,22 @@ export async function DELETE(
           where: {
             id,
           },
+        });
+
+        await auditDelete(tx, {
+          actor: actorFromUser(currentUser),
+          module: "PARTY",
+          entityType: "Party",
+          entityId: id,
+          documentNo: existingParty.partyName,
+          description: `Deleted Party ${existingParty.partyName}`,
+          oldValues: {
+            partyName: existingParty.partyName,
+            phone: existingParty.phone,
+            address: existingParty.address,
+            partyTypes: existingParty.partyTypes,
+          },
+          ...requestContext(request),
         });
       }
     );

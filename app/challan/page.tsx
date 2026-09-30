@@ -1,7 +1,15 @@
 "use client";
 
-import { FormEvent, Fragment, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
+
+// Shared sticky-header cell styling (see the table wrapper's own doc
+// comment below for why `sticky top-0` only works correctly once the
+// wrapper div is a real, bounded scroll container). Opaque bg + z-10
+// keep scrolling rows from showing through; the inset box-shadow gives
+// a visible bottom border without needing an extra element.
+const challanHeaderCellClass = "sticky top-0 z-10 bg-gray-50 px-4 py-3 shadow-[0_1px_0_0_rgba(0,0,0,0.08)]";
 
 type Bilty = {
   id: string;
@@ -285,11 +293,88 @@ function clearingAgentSummary(challan: Challan): string {
   return "Multiple";
 }
 
-// Numeric-aware Challan No. comparator: "4002" sorts before
-// "40010" (unlike plain string comparison). Non-numeric challan
-// numbers sort after numeric ones, alphabetically among themselves.
-// Used only as a deterministic TIEBREAKER below, never as the
-// primary sort key.
+// The single Clearing Agent's own Party id, when every linked Bilty
+// shares the exact same one (never when "Multiple" applies - no single
+// party to link to in that case).
+function clearingAgentPartyId(challan: Challan): string | null {
+  const ids = challan.bilties
+    .map((cb) => cb.bilty.clearingAgentParty?.id)
+    .filter((id): id is string => Boolean(id));
+  const unique = Array.from(new Set(ids));
+  return unique.length === 1 ? unique[0] : null;
+}
+
+// Clickable "107, 108" (both linked) / "107, 108 +2 more" (3+, only
+// the shown ones are links) - never guesses an id, always the exact
+// Bilty this Challan is actually linked to.
+function BiltyLinks({ challan }: { challan: Challan }) {
+  const bilties = challan.bilties.map((cb) => cb.bilty);
+  if (bilties.length === 0) return <>—</>;
+
+  const shown = bilties.slice(0, 2);
+  const rest = bilties.length - shown.length;
+
+  return (
+    <>
+      {shown.map((b, i) => (
+        <span key={b.id}>
+          {i > 0 && ", "}
+          <Link href={`/bilty/${b.id}`} className="text-blue-600 hover:underline">
+            {b.biltyNo}
+          </Link>
+        </span>
+      ))}
+      {rest > 0 && ` +${rest} more`}
+    </>
+  );
+}
+
+// Authoritative per-Bilty rent, summed - reuses
+// challan.settlementSummary.bilties[].rent (lib/challan-settlement-
+// summary.ts) exactly, never independently recomputed from the raw
+// Bilty rows.
+function biltyRentTotal(challan: Challan): number {
+  return (challan.settlementSummary?.bilties || []).reduce((s, b) => s + Number(b.rent || 0), 0);
+}
+
+// "ABC Motors" / "ABC Motors + Ali Clearing" (exactly 2, both
+// clickable) / "ABC Motors + 2 more" (3+, only the first is clickable,
+// "+N more" is plain text) - never nets unrelated parties into one
+// balance, each name comes straight from settlementSummary.partyNet
+// (lib/challan-settlement-summary.ts), split by its own `direction`,
+// linked by its own partyId straight to that Party's own Ledger.
+function PartyLinks({ parties }: { parties: { partyId: string | null; partyName: string }[] }) {
+  if (parties.length === 0) return <>—</>;
+
+  function nameNode(p: { partyId: string | null; partyName: string }, key: string) {
+    return p.partyId ? (
+      <Link key={key} href={`/parties/${p.partyId}/ledger`} className="hover:underline">
+        {p.partyName}
+      </Link>
+    ) : (
+      <span key={key}>{p.partyName}</span>
+    );
+  }
+
+  if (parties.length === 1) return nameNode(parties[0], parties[0].partyId || parties[0].partyName);
+  if (parties.length === 2) {
+    return (
+      <>
+        {nameNode(parties[0], "a")} + {nameNode(parties[1], "b")}
+      </>
+    );
+  }
+  return (
+    <>
+      {nameNode(parties[0], "a")} + {parties.length - 1} more
+    </>
+  );
+}
+
+// Numeric-aware Challan No. comparator (ascending): "4002" sorts
+// before "40010" (unlike plain string comparison, which would put
+// "40010" first). Non-numeric challan numbers sort after numeric
+// ones, alphabetically among themselves.
 function compareChallanNo(a: Challan, b: Challan): number {
   const aNum = /^\d+$/.test(a.challanNo.trim());
   const bNum = /^\d+$/.test(b.challanNo.trim());
@@ -301,115 +386,17 @@ function compareChallanNo(a: Challan, b: Challan): number {
   return a.challanNo.localeCompare(b.challanNo);
 }
 
-// Normal ERP list ordering: newest -> oldest by loadingDate, then
-// createdAt, then Challan No. as a final deterministic tiebreaker -
-// never left to unspecified/database-default order.
+// Newest-Challan-first list ordering. Primary key: Challan No.
+// sequence, numeric-aware, descending - the actual identity of "which
+// Challan is newer", never loadingDate (a user-editable, often-
+// backdated business field - see app/api/challan/route.ts's matching
+// server-side fix for the same reason) and never vehicle/updatedAt/
+// unspecified order. Secondary tiebreak: createdAt descending, for
+// the rare case of two Challans sharing a challanNo pattern.
 function compareChallanNewestFirst(a: Challan, b: Challan): number {
-  const dateDiff = new Date(b.loadingDate).getTime() - new Date(a.loadingDate).getTime();
-  if (dateDiff !== 0) return dateDiff;
-  const createdDiff = new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
-  if (createdDiff !== 0) return createdDiff;
-  return -compareChallanNo(a, b);
-}
-
-// Combines a payer breakdown that may span several Bilties (the
-// per-Challan "To-Pay" line aggregates each Bilty's own Collection
-// payers) into one list, summing amounts for a party appearing more
-// than once rather than listing them twice.
-function mergePayers(payers: SettlementPayerBreakdown[]): SettlementPayerBreakdown[] {
-  const byAccount = new Map<string, SettlementPayerBreakdown>();
-  for (const p of payers) {
-    const existing = byAccount.get(p.accountId);
-    if (existing) existing.amount += p.amount;
-    else byAccount.set(p.accountId, { ...p });
-  }
-  return [...byAccount.values()];
-}
-
-function payerLabel(payers: SettlementPayerBreakdown[]): string {
-  if (payers.length === 0) return "—";
-  if (payers.length === 1) return payers[0].partyName;
-  return `${payers.length} parties`;
-}
-
-// The compact, dimensionally-separated settlement summary for one
-// row's expanded details - Bilty Rent / Paid (+ Verified/Unverified) /
-// To-Pay (Due/Received/Remaining) / Carrier Rent (Due/Paid/Remaining).
-// Sourced entirely from challan.settlementSummary (lib/challan-
-// settlement-summary.ts) - never recomputed here. Matches the same
-// dimensions Final Settlement and the Challan Detail page show.
-function SettlementDetails({ challan }: { challan: Challan }) {
-  const summary = challan.settlementSummary;
-  if (!summary) {
-    return <p className="text-sm text-gray-500">Loading...</p>;
-  }
-
-  const rentTotal = challan.bilties.reduce((sum, cb) => sum + Number(cb.bilty.total || 0), 0);
-  const paidTotal = summary.bilties.reduce((s, b) => s + b.paidAmount, 0);
-  const paidUnverifiedTotal = summary.bilties.reduce((s, b) => s + b.paidUnverified, 0);
-
-  const toPayDue = summary.bilties.reduce((s, b) => s + b.toPay.total, 0);
-  const toPayReceived = summary.bilties.reduce((s, b) => s + b.toPay.paidOrReceived, 0);
-  const toPayRemaining = summary.bilties.reduce((s, b) => s + b.toPay.remaining, 0);
-
-  const cr = summary.carrierRent;
-
-  return (
-    <div className="text-sm space-y-2">
-      <div className="grid grid-cols-2 gap-x-6 gap-y-1">
-        <div className="text-gray-500">Bilty Rent</div>
-        <div className="text-right font-medium">Rs. {rentTotal.toLocaleString()}</div>
-
-        <div className="text-gray-500">Paid</div>
-        <div className="text-right font-medium">Rs. {paidTotal.toLocaleString()}</div>
-
-        <div className="text-gray-500">To-Pay</div>
-        <div className="text-right">
-          Rs. {toPayReceived.toLocaleString()} / {toPayDue.toLocaleString()}{" "}
-          {toPayRemaining <= 0.009 && toPayDue > 0 ? (
-            <span className="text-green-700">✓</span>
-          ) : null}
-        </div>
-
-        <div className="text-gray-500">Carrier Rent</div>
-        <div className="text-right">
-          Rs. {cr.paidOrReceived.toLocaleString()} / {cr.total.toLocaleString()}{" "}
-          {cr.remaining <= 0.009 && cr.total > 0 ? <span className="text-green-700">✓</span> : null}
-        </div>
-      </div>
-
-      {paidUnverifiedTotal > 0.009 && (
-        <p className="text-xs font-semibold text-amber-700">
-          🟡 Paid Not Received: Rs. {paidUnverifiedTotal.toLocaleString()}
-        </p>
-      )}
-      {cr.remaining > 0.009 && (
-        <p className="text-xs font-semibold text-amber-700">
-          🟡 Carrier Rent Due: Rs. {cr.remaining.toLocaleString()}
-          {cr.residualPartyName ? ` (Payable to: ${cr.residualPartyName})` : ""}
-        </p>
-      )}
-
-      <p className="text-xs text-gray-500">
-        Collected by: {payerLabel(mergePayers(summary.bilties.flatMap((b) => b.toPay.payers)))} · Carrier Rent paid by:{" "}
-        {payerLabel(cr.payers)}
-      </p>
-
-      {/* Cross-component PARTY NET POSITION - deliberately separate
-          from the component grid above; never implies Carrier Rent
-          or To-Pay is what's due. See lib/challan-settlement-summary.ts. */}
-      {summary.partyNet.length > 0 && (
-        <div className="pt-1 border-t">
-          <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mt-1">Party Position</p>
-          {summary.partyNet.map((p) => (
-            <p key={p.accountId} className={`text-xs font-semibold ${p.direction === "RECEIVABLE" ? "text-blue-700" : "text-purple-700"}`}>
-              {p.direction} Rs. {Math.abs(p.net).toLocaleString()} {p.direction === "RECEIVABLE" ? "from" : "to"} {p.partyName}
-            </p>
-          ))}
-        </div>
-      )}
-    </div>
-  );
+  const noDiff = -compareChallanNo(a, b);
+  if (noDiff !== 0) return noDiff;
+  return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
 }
 
 export default function ChallanPage() {
@@ -424,18 +411,28 @@ export default function ChallanPage() {
   const [search, setSearch] = useState("");
   // A drill-down link (e.g. Dashboard's Challan status counts) may
   // deep-link straight to a filter via ?status=... / ?financial=...
-  const [statusFilter, setStatusFilter] = useState(() => {
-    if (typeof window === "undefined") return "ALL";
-    return new URLSearchParams(window.location.search).get("status") || "ALL";
-  });
-  const [financialFilter, setFinancialFilter] = useState<FinancialFilter>(() => {
-    if (typeof window === "undefined") return "ALL";
-    return (new URLSearchParams(window.location.search).get("financial") as FinancialFilter) || "ALL";
-  });
+  // Seeded from the URL on first mount, then kept in sync via the
+  // useSearchParams()-driven effect below - a plain
+  // window.location.search read (this app's usual pattern elsewhere)
+  // only fires once per component instance and goes stale when
+  // Next.js's client-side router reuses this SAME mounted page across
+  // two different /challan?... navigations (e.g. Dashboard -> Challan
+  // -> Dashboard -> a different Challan filter card), which is exactly
+  // the "works after a manual refresh" bug this fixes. Manually
+  // changing the dropdown below still works exactly as before - it
+  // only touches this state, never the URL, so it can never fight with
+  // the sync effect.
+  const searchParams = useSearchParams();
+  const [statusFilter, setStatusFilter] = useState(() => searchParams.get("status") || "ALL");
+  const [financialFilter, setFinancialFilter] = useState<FinancialFilter>(() => (searchParams.get("financial") as FinancialFilter) || "ALL");
+
+  useEffect(() => {
+    setStatusFilter(searchParams.get("status") || "ALL");
+    setFinancialFilter((searchParams.get("financial") as FinancialFilter) || "ALL");
+  }, [searchParams]);
+
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
-
-  const [expandedId, setExpandedId] = useState<string | null>(null);
 
   const [showForm, setShowForm] = useState(false);
 
@@ -522,7 +519,16 @@ export default function ChallanPage() {
   async function loadChallans() {
     try {
       setError("");
-      const response = await fetch("/api/challan");
+      // Real server-side filtering (Dashboard's "Active/Delivered/
+      // Settled Challan" drill-down cards) - status/financial are sent
+      // to GET /api/challan and applied there, never trusted to the
+      // client-only filteredChallans re-check below (which stays, as a
+      // harmless no-op once the server already filtered, and still
+      // does the actual work for date range/free-text search).
+      const query = new URLSearchParams();
+      if (statusFilter !== "ALL") query.set("status", statusFilter);
+      if (financialFilter !== "ALL") query.set("financial", financialFilter);
+      const response = await fetch(`/api/challan${query.toString() ? `?${query.toString()}` : ""}`);
       const data = await response.json();
       if (!response.ok || !data.success) {
         setError(data.message || "Unable to load challans");
@@ -590,9 +596,14 @@ export default function ChallanPage() {
   }
 
   useEffect(() => {
-    loadChallans();
     loadTransporters();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    void loadChallans();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [statusFilter, financialFilter]);
 
   function resetForm() {
     setChallanNo("");
@@ -1082,179 +1093,192 @@ export default function ChallanPage() {
                 : "No challans found."}
             </div>
           ) : (
-            <div className="overflow-x-auto">
+            // Compact, scannable list (Private Phonch's own list as the UX
+            // reference) - one flat row per Challan, no per-row expandable
+            // sub-table. The full Financial Details / per-Bilty breakdown
+            // this used to show inline remains fully available on the
+            // Challan detail page's own "Settlement Breakdown"/"Bilties"
+            // sections - nothing here was removed, only moved one click
+            // away.
+            // ROOT CAUSE of the previous attempt's failure: `sticky top-0`
+            // on the <th> was never actually broken by itself, but its
+            // positioning ancestor was wrong. The wrapping div only had
+            // `overflow-x-auto` with no `overflow-y`/height of its own -
+            // per the CSS overflow spec, a non-`visible` overflow-x on an
+            // element whose overflow-y is otherwise `visible` bumps that
+            // axis's COMPUTED value to `auto` too, so this div silently
+            // became a "scroll container" for sticky-positioning purposes
+            // even though it never actually clips/scrolls anything itself
+            // (it has no bounded height - it just grows to fit the whole
+            // table). Because sticky elements stick relative to their
+            // NEAREST scroll-container ancestor, and that ancestor here
+            // never scrolls, the header had nowhere real to "stick" -
+            // it just flowed away with the rest of the table as the page
+            // scrolled. `app/layout.tsx`'s <main> was never reached, and
+            // never mattered either way.
+            //
+            // FIX: make this div the genuine, explicit, BOUNDED scroll
+            // container for the table (both axes) - the standard "frozen
+            // header" data-table pattern. `max-h-[70vh]` + `overflow-auto`
+            // give it a real, definite height smaller than its content, so
+            // it actually scrolls itself, and `sticky top-0` on each <th>
+            // now sticks to a real thing. Horizontal scroll keeps working
+            // exactly as before (still the same `overflow-auto` axis);
+            // header/body columns stay aligned since both are cells of the
+            // one <table>. This nested scroll region is intentional, not a
+            // "double scrollbar" bug - the page still scrolls normally to
+            // reveal the table section; the table's OWN rows then scroll
+            // within their own bounded box, same as any spreadsheet-style
+            // widget.
+            <div className="overflow-auto max-h-[70vh]">
               <table className="w-full text-sm">
-                <thead className="bg-gray-50 text-left text-xs uppercase text-gray-500">
+                <thead className="text-left text-xs uppercase text-gray-500">
                   <tr>
-                    <th className="px-4 py-3">Challan No.</th>
-                    <th className="px-4 py-3">Date</th>
-                    <th className="px-4 py-3">Vehicle</th>
-                    <th className="px-4 py-3">Clearing Agent</th>
-                    <th className="px-4 py-3">Transporter</th>
-                    <th className="px-4 py-3">Bilties</th>
-                    <th className="px-4 py-3">Total Due</th>
-                    <th className="px-4 py-3">Financial Status</th>
-                    <th className="px-4 py-3">Action</th>
+                    <th className={challanHeaderCellClass}>Date</th>
+                    <th className={challanHeaderCellClass}>Challan No.</th>
+                    <th className={challanHeaderCellClass}>Bilty No.</th>
+                    <th className={challanHeaderCellClass}>Vehicle</th>
+                    <th className={challanHeaderCellClass}>Clearing Agent</th>
+                    <th className={challanHeaderCellClass}>Transporter</th>
+                    <th className={challanHeaderCellClass}>Carrier No.</th>
+                    <th className={`${challanHeaderCellClass} text-right`}>Bilty Rent</th>
+                    <th className={`${challanHeaderCellClass} text-right`}>Carrier Rent</th>
+                    <th className={`${challanHeaderCellClass} text-right`}>Received</th>
+                    <th className={`${challanHeaderCellClass} text-right`}>Receivable</th>
+                    <th className={`${challanHeaderCellClass} text-right`}>Payable</th>
+                    <th className={challanHeaderCellClass}>Receivable/Payable Parties</th>
+                    <th className={challanHeaderCellClass}>Details</th>
+                    <th className={challanHeaderCellClass}>Status</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y">
                   {filteredChallans.map((challan) => {
-                    const totalDue = totalDueFromSummary(challan);
                     const status = compactStatus(challan);
-                    const isExpanded = expandedId === challan.id;
+                    const fin = safeFinancials(challan);
+                    const partyNet = challan.settlementSummary?.partyNet || [];
+                    const receivableParties = partyNet.filter((p) => p.direction === "RECEIVABLE").map((p) => ({ partyId: p.partyId, partyName: p.partyName }));
+                    const payableParties = partyNet.filter((p) => p.direction === "PAYABLE").map((p) => ({ partyId: p.partyId, partyName: p.partyName }));
+                    const clearingAgentId = clearingAgentPartyId(challan);
 
                     return (
-                      <Fragment key={challan.id}>
-                        <tr className="hover:bg-gray-50">
-                          <td className="px-4 py-3">
-                            <button
-                              type="button"
-                              onClick={() => setExpandedId(isExpanded ? null : challan.id)}
-                              className="flex items-center gap-1 font-medium text-left hover:underline"
-                            >
-                              <span className={`inline-block w-3 text-xs text-gray-400 transition-transform ${isExpanded ? "rotate-90" : ""}`}>
-                                ▶
-                              </span>
-                              {challan.challanNo}
-                            </button>
-                          </td>
-                          <td className="px-4 py-3">
-                            {new Date(challan.loadingDate).toLocaleDateString()}
-                          </td>
-                          <td className="px-4 py-3">{vehicleSummary(challan)}</td>
-                          <td className="px-4 py-3">{clearingAgentSummary(challan)}</td>
-                          <td className="px-4 py-3">
-                            {challan.transporterParty?.partyName || "—"}
-                          </td>
-                          <td className="px-4 py-3">
-                            {challan.bilties.length} {challan.bilties.length === 1 ? "Bilty" : "Bilties"}
-                          </td>
-                          <td className="px-4 py-3">
-                            {!challan.isSettled ? (
-                              <span className="text-gray-400">—</span>
-                            ) : (
-                              <span>Rs. {totalDue.toLocaleString()}</span>
+                      <tr key={challan.id} className="hover:bg-gray-50">
+                        <td className="px-4 py-3">
+                          {new Date(challan.loadingDate).toLocaleDateString()}
+                        </td>
+                        <td className="px-4 py-3">
+                          <Link href={`/challan/${challan.id}`} className="font-medium text-blue-600 hover:underline">
+                            {challan.challanNo}
+                          </Link>
+                        </td>
+                        <td className="px-4 py-3">
+                          <BiltyLinks challan={challan} />
+                        </td>
+                        <td className="px-4 py-3">{vehicleSummary(challan)}</td>
+                        <td className="px-4 py-3">
+                          {clearingAgentId ? (
+                            <Link href={`/parties/${clearingAgentId}/ledger`} className="text-blue-600 hover:underline">
+                              {clearingAgentSummary(challan)}
+                            </Link>
+                          ) : (
+                            clearingAgentSummary(challan)
+                          )}
+                        </td>
+                        <td className="px-4 py-3">
+                          {challan.transporterParty ? (
+                            <Link href={`/parties/${challan.transporterParty.id}/ledger`} className="text-blue-600 hover:underline">
+                              {challan.transporterParty.partyName}
+                            </Link>
+                          ) : (
+                            "—"
+                          )}
+                        </td>
+                        <td className="px-4 py-3">{challan.carrierNumber || "—"}</td>
+                        <td className="px-4 py-3 text-right">
+                          Rs. {biltyRentTotal(challan).toLocaleString()}
+                        </td>
+                        <td className="px-4 py-3 text-right">
+                          Rs. {Number(challan.carrierRent || 0).toLocaleString()}
+                        </td>
+                        <td className="px-4 py-3 text-right">Rs. {fin.received.toLocaleString()}</td>
+                        <td className="px-4 py-3 text-right">
+                          {fin.remainingReceivable > 0.009 ? `Rs. ${fin.remainingReceivable.toLocaleString()}` : "—"}
+                        </td>
+                        <td className="px-4 py-3 text-right">
+                          {fin.remainingPayable > 0.009 ? `Rs. ${fin.remainingPayable.toLocaleString()}` : "—"}
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className="space-y-0.5">
+                            {receivableParties.length > 0 && (
+                              <div className="text-blue-700">
+                                Receivable: <PartyLinks parties={receivableParties} />
+                              </div>
                             )}
-                          </td>
-                          <td className="px-4 py-3">
-                            <span
-                              className={`rounded-full px-2 py-0.5 text-xs font-semibold ${compactStatusStyles[status]}`}
+                            {payableParties.length > 0 && (
+                              <div className="text-purple-700">
+                                Payable: <PartyLinks parties={payableParties} />
+                              </div>
+                            )}
+                            {receivableParties.length === 0 && payableParties.length === 0 && (
+                              <span className="text-gray-400">—</span>
+                            )}
+                          </div>
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className="flex flex-wrap gap-2">
+                            <Link
+                              href={`/challan/${challan.id}`}
+                              className="border rounded-lg px-3 py-1 text-xs hover:bg-gray-50"
                             >
-                              {status}
-                            </span>
-                          </td>
-                          <td className="px-4 py-3">
-                            <div className="flex flex-wrap gap-2">
-                              <Link
-                                href={`/challan/${challan.id}`}
-                                className="border rounded-lg px-3 py-1 text-xs hover:bg-gray-50"
-                              >
-                                View
-                              </Link>
-                              {challan.status === "IN_TRANSIT" && (
-                                <>
-                                  <button
-                                    type="button"
-                                    onClick={() => deliverChallan(challan)}
-                                    disabled={actionLoading === challan.id}
-                                    className="border rounded-lg px-3 py-1 text-xs hover:bg-gray-50 disabled:opacity-50"
-                                  >
-                                    Deliver
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => cancelChallan(challan)}
-                                    disabled={actionLoading === challan.id}
-                                    className="border border-red-300 text-red-600 rounded-lg px-3 py-1 text-xs hover:bg-red-50 disabled:opacity-50"
-                                  >
-                                    Cancel
-                                  </button>
-                                </>
-                              )}
-                              {challan.status === "DELIVERED" && !challan.isSettled && (
-                                <Link
-                                  href={`/challan/${challan.id}`}
-                                  className="bg-green-600 text-white rounded-lg px-3 py-1 text-xs hover:bg-green-700"
-                                >
-                                  Settle
-                                </Link>
-                              )}
-                              {capabilities.canBin && (
+                              View
+                            </Link>
+                            {challan.status === "IN_TRANSIT" && (
+                              <>
                                 <button
                                   type="button"
+                                  onClick={() => deliverChallan(challan)}
                                   disabled={actionLoading === challan.id}
-                                  onClick={() => deleteChallan(challan)}
+                                  className="border rounded-lg px-3 py-1 text-xs hover:bg-gray-50 disabled:opacity-50"
+                                >
+                                  Deliver
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => cancelChallan(challan)}
+                                  disabled={actionLoading === challan.id}
                                   className="border border-red-300 text-red-600 rounded-lg px-3 py-1 text-xs hover:bg-red-50 disabled:opacity-50"
                                 >
-                                  Delete
+                                  Cancel
                                 </button>
-                              )}
-                            </div>
-                          </td>
-                        </tr>
-
-                        {isExpanded && (
-                          <tr className="bg-gray-50">
-                            <td colSpan={9} className="px-4 py-4">
-                              <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-                                {/* Financial Details - dimensionally separated (Bilty
-                                    Rent / Paid / To-Pay / Carrier Rent), sourced from
-                                    the same authoritative data Final Settlement itself
-                                    reads. See lib/challan-settlement-summary.ts. */}
-                                <div>
-                                  <h4 className="text-xs font-semibold uppercase text-gray-500 mb-2">
-                                    Financial Details
-                                  </h4>
-                                  <SettlementDetails challan={challan} />
-                                </div>
-
-                                {/* Bilty breakdown */}
-                                <div>
-                                  <h4 className="text-xs font-semibold uppercase text-gray-500 mb-2">
-                                    Bilties
-                                  </h4>
-                                  <div className="overflow-x-auto">
-                                    <table className="w-full text-xs">
-                                      <thead className="text-left text-gray-500">
-                                        <tr>
-                                          <th className="pr-3 pb-1">Bilty No</th>
-                                          <th className="pr-3 pb-1">Vehicle</th>
-                                          <th className="pr-3 pb-1">From</th>
-                                          <th className="pr-3 pb-1">To</th>
-                                          <th className="pr-3 pb-1">Clearing Agent</th>
-                                          <th className="pr-3 pb-1 text-right">Rent</th>
-                                        </tr>
-                                      </thead>
-                                      <tbody className="divide-y divide-gray-200">
-                                        {challan.bilties.map((cb) => (
-                                          <tr key={cb.bilty.id}>
-                                            <td className="pr-3 py-1">
-                                              <Link href={`/bilty/${cb.bilty.id}`} className="text-blue-600 hover:underline">
-                                                {cb.bilty.biltyNo}
-                                              </Link>
-                                            </td>
-                                            <td className="pr-3 py-1">
-                                              {[cb.bilty.vehicleType, cb.bilty.vehicleModel, cb.bilty.registrationNumber]
-                                                .filter(Boolean)
-                                                .join(" / ") || "—"}
-                                            </td>
-                                            <td className="pr-3 py-1">{cb.bilty.fromLocation.name}</td>
-                                            <td className="pr-3 py-1">{cb.bilty.toLocation.name}</td>
-                                            <td className="pr-3 py-1">{cb.bilty.clearingAgentParty?.partyName || "—"}</td>
-                                            <td className="pr-3 py-1 text-right">
-                                              Rs. {Number(cb.bilty.toPay || 0).toLocaleString()}
-                                            </td>
-                                          </tr>
-                                        ))}
-                                      </tbody>
-                                    </table>
-                                  </div>
-                                </div>
-                              </div>
-                            </td>
-                          </tr>
-                        )}
-                      </Fragment>
+                              </>
+                            )}
+                            {challan.status === "DELIVERED" && !challan.isSettled && (
+                              <Link
+                                href={`/challan/${challan.id}`}
+                                className="bg-green-600 text-white rounded-lg px-3 py-1 text-xs hover:bg-green-700"
+                              >
+                                Settle
+                              </Link>
+                            )}
+                            {capabilities.canBin && (
+                              <button
+                                type="button"
+                                disabled={actionLoading === challan.id}
+                                onClick={() => deleteChallan(challan)}
+                                className="border border-red-300 text-red-600 rounded-lg px-3 py-1 text-xs hover:bg-red-50 disabled:opacity-50"
+                              >
+                                Delete
+                              </button>
+                            )}
+                          </div>
+                        </td>
+                        <td className="px-4 py-3">
+                          <span
+                            className={`rounded-full px-2 py-0.5 text-xs font-semibold ${compactStatusStyles[status]}`}
+                          >
+                            {status}
+                          </span>
+                        </td>
+                      </tr>
                     );
                   })}
                 </tbody>

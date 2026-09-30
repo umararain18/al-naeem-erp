@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
-import { jsPDF } from "jspdf";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { getPartyDocumentStates } from "@/lib/payment-allocation";
 import { getPartyLedgerData } from "@/lib/ledger-description";
+import { resolvePdfPresentation } from "@/lib/pdf-presentation";
+import { createPdfDocument, drawPdfHeader, drawPdfFooter, applyWatermark, resolveJsPdfFont } from "@/lib/pdf-render-helpers";
 
 // ============================================================
 // GET /api/parties/[id]/statement/pdf?from=&to=
@@ -104,35 +105,35 @@ export async function GET(
       lines.push(parts.join(" | "));
     }
 
-    const doc = new jsPDF();
-    const pageWidth = doc.internal.pageSize.getWidth();
-    let y = 14;
+    // Shares PARTY_STATEMENT's Header/Footer/Logo override with the
+    // separate Party Ledger PDF (see that route's own comment) - the
+    // enum has one party-facing document type, not two.
+    const presentation = await resolvePdfPresentation(prisma, "PARTY_STATEMENT");
+    const bodyFont = resolveJsPdfFont(presentation.pdf.defaultFont);
 
-    doc.setFontSize(14);
-    doc.setFont("helvetica", "bold");
-    doc.text("AL NAEEM CAR CARRIERS SERVICE", pageWidth / 2, y, { align: "center" });
-    y += 7;
-    doc.setFontSize(12);
-    doc.text("Statement of Account", pageWidth / 2, y, { align: "center" });
-    y += 10;
+    const doc = createPdfDocument(presentation);
+    const pageWidth = doc.internal.pageSize.getWidth();
+
+    const { nextY } = await drawPdfHeader(doc, presentation, "STATEMENT OF ACCOUNT");
+    let y = nextY;
 
     doc.setFontSize(10);
-    doc.setFont("helvetica", "normal");
+    doc.setFont(bodyFont, "normal");
     doc.text(`Party: ${party.partyName}`, 14, y);
     doc.text(`Period: ${from || "-"}  to  ${to || "-"}`, pageWidth - 14, y, { align: "right" });
     y += 10;
 
-    doc.setFont("helvetica", "bold");
+    doc.setFont(bodyFont, "bold");
     doc.text(`Opening Balance: ${formatCurrency(openingBalance)}`, 14, y);
     doc.text(`Total Debit: ${formatCurrency(periodDebit)}`, 14, y + 6);
     doc.text(`Total Credit: ${formatCurrency(periodCredit)}`, 14, y + 12);
     doc.text(`Closing Balance: ${formatCurrency(closingBalance)}`, 14, y + 18);
     y += 28;
 
-    doc.setFont("helvetica", "bold");
+    doc.setFont(bodyFont, "bold");
     doc.text("Transaction Details", 14, y);
     y += 7;
-    doc.setFont("helvetica", "normal");
+    doc.setFont(bodyFont, "normal");
     doc.setFontSize(9);
 
     for (const line of lines) {
@@ -149,6 +150,9 @@ export async function GET(
       doc.text("No documents found for this period.", 14, y);
     }
 
+    drawPdfFooter(doc, presentation);
+    applyWatermark(doc, presentation);
+
     const pdfBuffer = doc.output("arraybuffer");
 
     return new NextResponse(pdfBuffer, {
@@ -156,6 +160,7 @@ export async function GET(
       headers: {
         "Content-Type": "application/pdf",
         "Content-Disposition": `inline; filename=Statement-${party.partyName.replace(/\s+/g, "-")}.pdf`,
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
       },
     });
   } catch (error) {

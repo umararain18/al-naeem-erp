@@ -207,6 +207,78 @@ export async function getPrivatePhonchCarrierRentExpenseAccountId(tx: Tx): Promi
   );
 }
 
+// ============================================================
+// BILL BOOK - dedicated client billing income account.
+//
+// NOT the same income as Private Phonch's own "Private Phonch
+// Delivery Income" or Showroom Phonch's own "Showroom Delivery
+// Income" - those recognize ANC's CARRIER-side income (billed to the
+// Transporter). Bill Income recognizes the separate CLIENT-side
+// income (billed to the actual paying client) - a genuinely different
+// counterparty and, in the normal case, a genuinely different dollar
+// amount (the client price, not the carrier cost) - see model Bill's
+// own doc comment in prisma/schema.prisma. Classified under the
+// existing DELIVERY_INCOME category, grouping it in reports alongside
+// Private Phonch/Showroom Phonch's own Delivery Income accounts - no
+// new AccountCategory enum value required.
+// ============================================================
+
+export async function getBillIncomeAccountId(tx: Tx): Promise<string> {
+  return getOrCreateSystemAccount(
+    tx,
+    "BILL-INCOME",
+    "Bill Income",
+    "INCOME",
+    "DELIVERY_INCOME",
+    "Client billing income recognized when a Bill is created - the amount ANC charges the client for Rent/Delivery/Other Expense, independent of Private/Showroom Phonch's own carrier-side accounting with the Transporter."
+  );
+}
+
+// ============================================================
+// BILL BOOK - shared WALK-IN / ONE-TIME CLIENT receivable account.
+//
+// Used ONLY when a Bill's client is a random/one-time customer with
+// no selected existing Party (clientPartyId left null) - a Bill must
+// NEVER transparently create a new Party or a new per-client Account
+// just because a typed name doesn't match an existing Party (see model
+// Bill's own doc comment in prisma/schema.prisma). This ONE shared,
+// system-level account absorbs every such Bill's own receivable
+// posting instead - the same "found once, reused forever" idiom as
+// every other system account in this file. Each walk-in Bill's own
+// payment state still resolves correctly and independently, because
+// getBillPaymentState() filters by sourceId (the specific Bill's own
+// id), never by accountId alone - sharing this account across many
+// walk-in Bills never conflates their receipts.
+//
+// getBillWalkInReceivableAccountId() is write-capable (creates the
+// account on first use) and is only ever called from a Bill
+// create/edit transaction. findBillWalkInReceivableAccountId() is a
+// pure read - used by every read-only path (list/detail/PDF/Daily
+// Posting search/reverse Bill links) - and returns null rather than
+// creating anything if no walk-in Bill has ever been created yet.
+// ============================================================
+
+const BILL_WALKIN_ACCOUNT_CODE = "BILL-WALKIN-RECEIVABLE";
+
+export async function getBillWalkInReceivableAccountId(tx: Tx): Promise<string> {
+  return getOrCreateSystemAccount(
+    tx,
+    BILL_WALKIN_ACCOUNT_CODE,
+    "Bill Book - Walk-in Customers (Unallocated)",
+    "ASSET",
+    "RECEIVABLE",
+    "Shared receivable account for one-time/random Bill Book clients who have no selected Party - never a new Party or Account is created per client."
+  );
+}
+
+export async function findBillWalkInReceivableAccountId(tx: Tx): Promise<string | null> {
+  const existing = await tx.account.findFirst({
+    where: { accountCode: BILL_WALKIN_ACCOUNT_CODE, isSystem: true },
+    select: { id: true },
+  });
+  return existing?.id ?? null;
+}
+
 export async function getPrivatePhonchDeliveryIncomeAccountId(tx: Tx): Promise<string> {
   const parent = await tx.account.findFirst({
     where: { category: "DELIVERY_INCOME", parentId: null },

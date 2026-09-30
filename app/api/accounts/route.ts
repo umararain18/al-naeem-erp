@@ -3,7 +3,9 @@ import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
-import { AccountCategory, AccountType } from "@prisma/client";
+import { AccountCategory, AccountType, Prisma } from "@prisma/client";
+import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
+import { accountSearchOr } from "@/lib/search-helpers";
 
 const createAccountSchema = z.object({
   accountName: z
@@ -124,7 +126,12 @@ function isCategoryValidForType(
 }
 
 // GET /api/accounts
-export async function GET() {
+// GET /api/accounts?search=... - NEW, additive: omitted `search`
+// behaves exactly as before (every existing caller fetches the full
+// list and filters client-side); when supplied, filters server-side
+// on accountName/accountCode/linked Party name only - never exposes
+// any account field beyond what this route already returned.
+export async function GET(request: NextRequest) {
   try {
     const currentUser = await getCurrentUser();
 
@@ -148,7 +155,11 @@ export async function GET() {
       );
     }
 
+    const search = new URL(request.url).searchParams.get("search")?.trim();
+    const where: Prisma.AccountWhereInput = search ? { OR: accountSearchOr(search) } : {};
+
     const accounts = await prisma.account.findMany({
+      where,
       include: {
         parent: {
           select: {
@@ -394,6 +405,17 @@ export async function POST(
           },
         },
       });
+
+    await auditCreate(prisma, {
+      actor: actorFromUser(currentUser),
+      module: "ACCOUNT",
+      entityType: "Account",
+      entityId: account.id,
+      documentNo: account.accountName,
+      description: `Created Account ${account.accountName} (${accountType}/${category})`,
+      newValues: { accountName: account.accountName, accountCode: account.accountCode, accountType, category, parentId: data.parentId || null },
+      ...requestContext(request),
+    });
 
     return NextResponse.json(
       {

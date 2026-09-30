@@ -5,6 +5,7 @@ import Link from "next/link";
 import { t, loadStoredLang, storeLang, type Lang } from "@/lib/i18n/party-ledger";
 import { notoNastaliqUrdu } from "@/lib/fonts";
 import DocumentsView from "./DocumentsView";
+import OutstandingView from "./OutstandingView";
 import PaymentsView from "./PaymentsView";
 import SummaryView from "./SummaryView";
 import ReconciliationView from "./ReconciliationView";
@@ -21,6 +22,8 @@ type LedgerHistoryItem = {
   credit: number;
 };
 
+type LedgerEntryType = "BILTY" | "CHALLAN" | "PRIVATE_PHONCH" | "SHOWROOM_PHONCH" | "BILL" | "OTHER";
+
 type LedgerEntry = {
   id: string;
   date: string;
@@ -34,6 +37,7 @@ type LedgerEntry = {
   isGrouped: boolean;
   isRemoved: boolean;
   history: LedgerHistoryItem[];
+  documentType: LedgerEntryType;
 };
 
 type Party = {
@@ -58,6 +62,7 @@ type Summary = {
 type Filters = {
   from: string | null;
   to: string | null;
+  documentType: LedgerEntryType | null;
 };
 
 type LedgerResponse = {
@@ -87,13 +92,17 @@ type ViewKey = "ledger" | "summary" | "documents" | "outstanding" | "payments" |
 
 const VIEW_KEYS: ViewKey[] = ["ledger", "summary", "documents", "outstanding", "payments", "reconciliation", "statement"];
 
-type TxType = "ALL" | "BILTY" | "CHALLAN" | "OTHER";
+type TxType = "ALL" | LedgerEntryType;
 
-function txType(entry: LedgerEntry): Exclude<TxType, "ALL"> {
-  if (entry.reference.startsWith("Bilty")) return "BILTY";
-  if (entry.reference.startsWith("Challan")) return "CHALLAN";
-  return "OTHER";
-}
+const TYPE_OPTIONS: { value: TxType; label: string }[] = [
+  { value: "ALL", label: "All Types" },
+  { value: "BILTY", label: "Bilty" },
+  { value: "CHALLAN", label: "Challan" },
+  { value: "PRIVATE_PHONCH", label: "Private Phonch" },
+  { value: "SHOWROOM_PHONCH", label: "Showroom Phonch" },
+  { value: "BILL", label: "Bill" },
+  { value: "OTHER", label: "Other" },
+];
 
 function LedgerTable({
   partyId,
@@ -103,6 +112,8 @@ function LedgerTable({
   to,
   setFrom,
   setTo,
+  typeFilter,
+  setTypeFilter,
 }: {
   partyId: string;
   ledger: LedgerEntry[];
@@ -111,9 +122,10 @@ function LedgerTable({
   to: string;
   setFrom: (v: string) => void;
   setTo: (v: string) => void;
+  typeFilter: TxType;
+  setTypeFilter: (v: TxType) => void;
 }) {
   const [search, setSearch] = useState("");
-  const [typeFilter, setTypeFilter] = useState<TxType>("ALL");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
   function toggleExpanded(id: string) {
@@ -125,16 +137,26 @@ function LedgerTable({
     });
   }
 
+  // Type filtering already happened server-side (getAccountLedgerData's
+  // documentType option, lib/ledger-description.ts) - `ledger` here is
+  // ALREADY scoped to the selected type, with balance/summary already
+  // recomputed from only that subset. Search narrows the already-
+  // type-filtered rows further, so the two combine with AND semantics
+  // exactly like the spec requires.
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
-    return ledger.filter((entry) => {
-      if (typeFilter !== "ALL" && txType(entry) !== typeFilter) return false;
-      if (!q) return true;
-      return entry.reference.toLowerCase().includes(q) || entry.description.toLowerCase().includes(q);
-    });
-  }, [ledger, search, typeFilter]);
+    if (!q) return ledger;
+    return ledger.filter(
+      (entry) => entry.reference.toLowerCase().includes(q) || entry.description.toLowerCase().includes(q)
+    );
+  }, [ledger, search]);
 
-  const exportQuery = new URLSearchParams({ ...(from ? { from } : {}), ...(to ? { to } : {}) }).toString();
+  const exportQuery = new URLSearchParams({
+    ...(from ? { from } : {}),
+    ...(to ? { to } : {}),
+    ...(typeFilter !== "ALL" ? { type: typeFilter } : {}),
+    ...(search.trim() ? { search: search.trim() } : {}),
+  }).toString();
 
   return (
     <>
@@ -153,10 +175,11 @@ function LedgerTable({
             onChange={(e) => setTypeFilter(e.target.value as TxType)}
             className="border rounded-lg px-3 py-2 text-sm"
           >
-            <option value="ALL">All Types</option>
-            <option value="BILTY">Bilty</option>
-            <option value="CHALLAN">Challan</option>
-            <option value="OTHER">Other</option>
+            {TYPE_OPTIONS.map((opt) => (
+              <option key={opt.value} value={opt.value}>
+                {opt.label}
+              </option>
+            ))}
           </select>
           <input
             type="date"
@@ -379,6 +402,7 @@ export default function PartyLedgerPage({
 
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
+  const [typeFilter, setTypeFilter] = useState<TxType>("ALL");
 
   useEffect(() => {
     if (!partyId) return;
@@ -388,6 +412,7 @@ export default function PartyLedgerPage({
         const query = new URLSearchParams();
         if (from) query.set("from", from);
         if (to) query.set("to", to);
+        if (typeFilter !== "ALL") query.set("type", typeFilter);
 
         const response = await fetch(`/api/parties/${partyId}/ledger?${query.toString()}`);
         const result = await response.json();
@@ -406,7 +431,7 @@ export default function PartyLedgerPage({
     }
 
     load();
-  }, [partyId, from, to]);
+  }, [partyId, from, to, typeFilter]);
 
   const balanceTypeColor = useMemo(() => {
     if (!data) return "text-gray-600";
@@ -526,6 +551,12 @@ export default function PartyLedgerPage({
         </div>
 
         {/* Summary Cards */}
+        {typeFilter !== "ALL" && view === "ledger" && (
+          <p className="text-xs text-gray-500 mb-2">
+            Showing balances for <span className="font-medium">{TYPE_OPTIONS.find((o) => o.value === typeFilter)?.label}</span> only
+            - not the party&apos;s overall account balance.
+          </p>
+        )}
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
           <div className="bg-white rounded-xl p-5 shadow-sm">
             <p className="text-sm text-gray-500">{t("openingBalance", lang)}</p>
@@ -564,12 +595,22 @@ export default function PartyLedgerPage({
         </div>
 
         {view === "ledger" && (
-          <LedgerTable partyId={partyId} ledger={ledger} lang={lang} from={from} to={to} setFrom={setFrom} setTo={setTo} />
+          <LedgerTable
+            partyId={partyId}
+            ledger={ledger}
+            lang={lang}
+            from={from}
+            to={to}
+            setFrom={setFrom}
+            setTo={setTo}
+            typeFilter={typeFilter}
+            setTypeFilter={setTypeFilter}
+          />
         )}
 
         {view === "summary" && <SummaryView partyId={partyId} lang={lang} />}
         {view === "documents" && <DocumentsView partyId={partyId} lang={lang} onlyOutstanding={false} />}
-        {view === "outstanding" && <DocumentsView partyId={partyId} lang={lang} onlyOutstanding={true} />}
+        {view === "outstanding" && <OutstandingView partyId={partyId} lang={lang} />}
         {view === "payments" && <PaymentsView partyId={partyId} lang={lang} />}
         {view === "reconciliation" && <ReconciliationView partyId={partyId} lang={lang} />}
         {view === "statement" && <StatementView partyId={partyId} partyName={party.partyName} lang={lang} />}

@@ -19,6 +19,8 @@ import {
   getPrivatePhonchCarrierRentExpenseAccountId,
   getPrivatePhonchDeliveryIncomeAccountId,
 } from "@/lib/gross-accounts";
+import { getBillPaymentState, resolveBillClientAccountId } from "@/lib/bill-accounting";
+import { auditUpdate, auditDelete, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 
 type Tx = Prisma.TransactionClient | typeof prisma;
 
@@ -114,13 +116,46 @@ export async function GET(
     }
 
     const { id } = await params;
+
+    // See the identical guard in app/api/challan/[id]/route.ts - a raw
+    // null byte in the id is rejected by PostgreSQL's text encoding
+    // before Prisma even gets to compare it against a real row,
+    // throwing an exception that would otherwise become an
+    // unexplained 500. A real Private Phonch id can never contain one.
+    if (id.includes("\u0000")) {
+      return NextResponse.json(
+        { success: false, message: "Private Phonch not found" },
+        { status: 404 }
+      );
+    }
+
     const phonch = await prisma.privatePhonch.findUnique({
       where: { id },
       include: {
         transporterParty: { select: { id: true, partyName: true, account: { select: { id: true } } } },
         vehicles: {
           orderBy: { lineNo: "asc" },
-          include: { clearingAgentParty: { select: { id: true, partyName: true, account: { select: { id: true } } } } },
+          include: {
+            clearingAgentParty: { select: { id: true, partyName: true, account: { select: { id: true } } } },
+            // Reverse Bill Book link (Section 20/21 of the Bill Book
+            // spec) - at most one ACTIVE Bill per vehicle, per the
+            // application-level duplicate-billing guard in
+            // app/api/bill/route.ts.
+            billSourceLinks: {
+              where: { bill: { isDeleted: false } },
+              take: 1,
+              select: {
+                bill: {
+                  select: {
+                    id: true,
+                    billNo: true,
+                    clientParty: { select: { account: { select: { id: true } } } },
+                    items: { select: { rent: true, delivery: true, otherExpense: true } },
+                  },
+                },
+              },
+            },
+          },
         },
         createdBy: { select: { id: true, fullName: true, username: true } },
         deletedBy: { select: { id: true, fullName: true, username: true } },
@@ -231,10 +266,32 @@ export async function GET(
       recoveryRemaining: Math.round((transporterDeliveryRecoveryState.remainingDue + caRecoveryRemainingTotal) * 100) / 100,
     });
 
+    // Compact per-vehicle Bill reference (Section 20/21) - "Bill No |
+    // Amount | Status", or null when not yet billed. Never a single
+    // misleading Bill status for the whole Private Phonch.
+    const vehiclesWithBillInfo = await Promise.all(
+      phonch.vehicles.map(async (v) => {
+        const link = v.billSourceLinks[0]?.bill;
+        if (!link) return { ...v, billInfo: null };
+        const billTotal = Math.round(
+          link.items.reduce((s, i) => s + Number(i.rent) + Number(i.delivery) + Number(i.otherExpense), 0) * 100
+        ) / 100;
+        const linkAccountId = await resolveBillClientAccountId(prisma, link.clientParty);
+        const billState = linkAccountId
+          ? await getBillPaymentState(prisma, link.id, linkAccountId, billTotal)
+          : { status: "UNPAID" as const };
+        return {
+          ...v,
+          billInfo: { billId: link.id, billNo: link.billNo, billAmount: billTotal, billStatus: billState.status },
+        };
+      })
+    );
+
     return NextResponse.json({
       success: true,
       phonch: {
         ...phonch,
+        vehicles: vehiclesWithBillInfo,
         totals: { totalRent, totalDeliveryCharges, totalCarrierPayable, totalCaPayable, totalDeliveryRecovery },
         transporterState,
         clearingAgentRecoveryStates,
@@ -267,6 +324,15 @@ export async function PATCH(
     }
 
     const { id } = await params;
+
+    // See the identical guard in this file's GET handler.
+    if (id.includes("\u0000")) {
+      return NextResponse.json(
+        { success: false, message: "Private Phonch not found" },
+        { status: 404 }
+      );
+    }
+
     const body = await request.json();
     const data = body as PrivatePhonchInput;
 
@@ -524,6 +590,34 @@ export async function PATCH(
               lines: { create: lines },
             },
           });
+
+          const currentTotals = {
+            phonchNo: current.phonchNo,
+            transporterPartyId: current.transporterPartyId,
+            totalRent: current.vehicles.reduce((s, v) => s + Number(v.totalRent), 0),
+            totalDeliveryCharges: current.vehicles.reduce((s, v) => s + Number(v.deliveryCharges), 0),
+            totalCarrierPayable: current.vehicles.reduce((s, v) => s + Number(v.carrierPayable), 0),
+          };
+          const changedFields = diffFields(currentTotals, {
+            phonchNo: resolved.phonchNo,
+            transporterPartyId: resolved.transporterPartyId,
+            totalRent: resolved.totalRent,
+            totalDeliveryCharges: resolved.totalDeliveryCharges,
+            totalCarrierPayable: resolved.totalCarrierPayable,
+          }, ["phonchNo", "transporterPartyId", "totalRent", "totalDeliveryCharges", "totalCarrierPayable"]);
+          if (Object.keys(changedFields).length > 0) {
+            const summary = Object.entries(changedFields).map(([f, { old, new: nv }]) => `${f} ${old ?? "—"} → ${nv ?? "—"}`).join("; ");
+            await auditUpdate(tx, {
+              actor: actorFromUser(currentUser),
+              module: "PRIVATE_PHONCH",
+              entityType: "PrivatePhonch",
+              entityId: id,
+              documentNo: resolved.phonchNo,
+              description: `Updated Private Phonch ${resolved.phonchNo}: ${summary}`,
+              changedFields,
+              ...requestContext(request),
+            });
+          }
         },
         { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
       );
@@ -558,6 +652,15 @@ export async function DELETE(
     }
 
     const { id } = await params;
+
+    // See the identical guard in this file's GET handler.
+    if (id.includes("\u0000")) {
+      return NextResponse.json(
+        { success: false, message: "Private Phonch not found" },
+        { status: 404 }
+      );
+    }
+
     const body = await request.json().catch(() => ({}));
     const confirmation = body?.confirmation;
 
@@ -566,7 +669,7 @@ export async function DELETE(
         return NextResponse.json({ success: false, message: "Forbidden" }, { status: 403 });
       }
 
-      const existing = await prisma.privatePhonch.findUnique({ where: { id }, select: { id: true, isDeleted: true } });
+      const existing = await prisma.privatePhonch.findUnique({ where: { id }, select: { id: true, isDeleted: true, phonchNo: true } });
       if (!existing) {
         return NextResponse.json({ success: false, message: "Private Phonch not found" }, { status: 404 });
       }
@@ -580,6 +683,16 @@ export async function DELETE(
       // historical accounting remains fully intact regardless of
       // whether the source document itself still exists.
       await prisma.privatePhonch.delete({ where: { id } });
+
+      await auditDelete(prisma, {
+        actor: actorFromUser(currentUser),
+        module: "PRIVATE_PHONCH",
+        entityType: "PrivatePhonch",
+        entityId: id,
+        documentNo: existing.phonchNo,
+        description: `Permanently deleted Private Phonch ${existing.phonchNo}`,
+        ...requestContext(request),
+      });
 
       return NextResponse.json({ success: true, message: "Private Phonch permanently deleted.", phonchId: id });
     }
@@ -633,6 +746,16 @@ export async function DELETE(
     await prisma.privatePhonch.update({
       where: { id },
       data: { isDeleted: true, deletedAt: new Date(), deletedById: currentUser.userId },
+    });
+
+    await auditDelete(prisma, {
+      actor: actorFromUser(currentUser),
+      module: "PRIVATE_PHONCH",
+      entityType: "PrivatePhonch",
+      entityId: id,
+      documentNo: phonch.phonchNo,
+      description: `Moved Private Phonch ${phonch.phonchNo} to Bin`,
+      ...requestContext(request),
     });
 
     return NextResponse.json({ success: true, message: "Private Phonch moved to Bin successfully." });

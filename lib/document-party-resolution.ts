@@ -4,6 +4,7 @@ import { findSettledPartyAccountId } from "@/lib/settlement-correction";
 import { getActiveSettlementPayers } from "@/lib/settlement-payments";
 import { computeChallanSettlementSummary } from "@/lib/challan-settlement-summary";
 import { getGrossBiltyReceivableAccountId, getUnclaimedGrossBiltyReceivableAmount } from "@/lib/gross-accounts";
+import { resolveBillClientAccountId } from "@/lib/bill-accounting";
 
 type Tx = PrismaClient | Prisma.TransactionClient;
 
@@ -360,19 +361,20 @@ export async function getChallanEligiblePartyAccountIds(
 }
 
 export async function resolveDocumentPartyAccount(
-  sourceType: "CHALLAN" | "BILTY" | "PHONCH" | "PRIVATE_PHONCH",
+  sourceType: "CHALLAN" | "BILTY" | "PHONCH" | "PRIVATE_PHONCH" | "BILL",
   sourceId: string,
   // Consulted for CHALLAN (see resolveChallanParty() above), for
   // BILTY's own narrow Gross Bilty Receivable fallback (see
   // resolveUnclaimedGrossBiltyReceivable() above), and for
   // PRIVATE_PHONCH's own multi-party eligibility (see
-  // resolvePrivatePhonchParty() above) - PHONCH resolution is
+  // resolvePrivatePhonchParty() above) - PHONCH/BILL resolution is
   // entirely unaffected by this parameter.
   direction?: "DEBIT" | "CREDIT"
 ): Promise<ResolvedDocumentParty | null> {
   if (sourceType === "BILTY") return resolveBiltyParty(sourceId, direction);
   if (sourceType === "PHONCH") return resolvePhonchParty(sourceId);
   if (sourceType === "PRIVATE_PHONCH") return resolvePrivatePhonchParty(sourceId, direction);
+  if (sourceType === "BILL") return resolveBillParty(sourceId);
   return resolveChallanParty(sourceId, direction);
 }
 
@@ -381,6 +383,51 @@ export async function resolveDocumentPartyAccount(
 // always-required Transporter field, unlike Bilty/Challan's
 // multi-party fallback chains above).
 // ============================================================
+
+// ============================================================
+// BILL -> CLIENT PARTY (unambiguous - a Bill has exactly one, always-
+// required Client Party field, same shape as Phonch's own Transporter
+// above).
+// ============================================================
+
+async function resolveBillParty(billId: string): Promise<ResolvedDocumentParty | null> {
+  const bill = await prisma.bill.findUnique({
+    where: { id: billId },
+    select: {
+      clientName: true,
+      clientParty: { select: { account: { select: { id: true, isActive: true } } } },
+    },
+  });
+
+  if (!bill) return null;
+
+  // A selected Party's account must be active to be a valid posting
+  // destination (unchanged rule) - the shared Walk-in Customers system
+  // account (for a random/one-time client, no selected Party) is
+  // always active by construction, so it's always eligible once it
+  // exists.
+  if (bill.clientParty) {
+    if (!bill.clientParty.account || !bill.clientParty.account.isActive) return null;
+    return { accountId: bill.clientParty.account.id, partyName: bill.clientName };
+  }
+
+  const walkInAccountId = await resolveBillClientAccountId(prisma, null);
+  if (!walkInAccountId) return null;
+  return { accountId: walkInAccountId, partyName: bill.clientName };
+}
+
+// A manually-supplied Counter Account for a Bill-linked Daily Posting
+// line must belong to that EXACT Bill's own Client Party - the only
+// legitimate counterparty, mirroring getPhonchEligiblePartyAccountIds()
+// exactly (reused via resolveBillParty() above, never a second,
+// separately-written Client lookup). An empty set (no active Client
+// account) rejects every manually-supplied account, matching
+// Phonch's/Bilty's own "nothing established -> reject everything"
+// behavior.
+export async function getBillEligiblePartyAccountIds(billId: string): Promise<Set<string>> {
+  const resolved = await resolveBillParty(billId);
+  return resolved ? new Set([resolved.accountId]) : new Set();
+}
 
 async function resolvePhonchParty(phonchId: string): Promise<ResolvedDocumentParty | null> {
   const phonch = await prisma.phonch.findUnique({

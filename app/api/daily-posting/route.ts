@@ -10,11 +10,14 @@ import {
   getChallanEligiblePartyAccountIds,
   getPhonchEligiblePartyAccountIds,
   getPrivatePhonchEligiblePartyAccountIds,
+  getBillEligiblePartyAccountIds,
   resolveDocumentPartyAccount,
 } from "@/lib/document-party-resolution";
 import { assertPaidVerificationNotExceeded, BiltyPaidVerificationError } from "@/lib/bilty-paid-verification";
 import { assertPhonchReceiptNotExceeded, PhonchAccountingError } from "@/lib/phonch-accounting";
 import { assertPrivatePhonchPaymentNotExceeded, PrivatePhonchAccountingError } from "@/lib/private-phonch-accounting";
+import { assertBillReceiptNotExceeded, BillAccountingError } from "@/lib/bill-accounting";
+import { auditPost, actorFromUser, requestContext } from "@/lib/audit-log";
 
 const lineSchema = z.object({
   // Required for non-document-linked entries; optional for a
@@ -357,14 +360,15 @@ export async function POST(request: NextRequest) {
       }
 
       // Counter account remains REQUIRED for every entry that is
-      // not linked to a Challan/Bilty/Phonch/Private Phonch - only
-      // those can auto-resolve the responsible party from the
+      // not linked to a Challan/Bilty/Phonch/Private Phonch/Bill -
+      // only those can auto-resolve the responsible party from the
       // document itself (see below).
       if (
         line.sourceType !== "CHALLAN" &&
         line.sourceType !== "BILTY" &&
         line.sourceType !== "PHONCH" &&
         line.sourceType !== "PRIVATE_PHONCH" &&
+        line.sourceType !== "BILL" &&
         !line.counterAccountId
       ) {
         return NextResponse.json(
@@ -408,6 +412,9 @@ export async function POST(request: NextRequest) {
     const privatePhonchLineEntries = indexedLines.filter(
       ({ line }) => line.sourceType === "PRIVATE_PHONCH"
     );
+    const billLineEntries = indexedLines.filter(
+      ({ line }) => line.sourceType === "BILL"
+    );
 
     if (challanLineEntries.length > 0 && !hasPermission(currentUser, "challan.view")) {
       return NextResponse.json(
@@ -437,6 +444,13 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    if (billLineEntries.length > 0 && !hasPermission(currentUser, "bill.view")) {
+      return NextResponse.json(
+        { success: false, message: "Forbidden" },
+        { status: 403 }
+      );
+    }
+
     const challanIds = Array.from(
       new Set(challanLineEntries.map(({ line }) => line.sourceId!))
     );
@@ -448,6 +462,9 @@ export async function POST(request: NextRequest) {
     );
     const privatePhonchIds = Array.from(
       new Set(privatePhonchLineEntries.map(({ line }) => line.sourceId!))
+    );
+    const billIds = Array.from(
+      new Set(billLineEntries.map(({ line }) => line.sourceId!))
     );
 
     const linkedChallans = challanIds.length > 0
@@ -478,10 +495,18 @@ export async function POST(request: NextRequest) {
         })
       : [];
 
+    const linkedBills = billIds.length > 0
+      ? await prisma.bill.findMany({
+          where: { id: { in: billIds }, isDeleted: false },
+          select: { id: true, billNo: true },
+        })
+      : [];
+
     const challanNoById = new Map(linkedChallans.map((c) => [c.id, c.challanNo]));
     const biltyNoById = new Map(linkedBilties.map((b) => [b.id, b.biltyNo]));
     const phonchNoById = new Map(linkedPhonches.map((p) => [p.id, p.phonchNo]));
     const privatePhonchNoById = new Map(linkedPrivatePhonches.map((p) => [p.id, p.phonchNo]));
+    const billNoById = new Map(linkedBills.map((b) => [b.id, b.billNo]));
 
     for (const { line, index } of challanLineEntries) {
       if (!challanNoById.has(line.sourceId!)) {
@@ -531,6 +556,18 @@ export async function POST(request: NextRequest) {
       }
     }
 
+    for (const { line, index } of billLineEntries) {
+      if (!billNoById.has(line.sourceId!)) {
+        return NextResponse.json(
+          {
+            success: false,
+            message: `Selected Bill was not found in entry ${index + 1}`,
+          },
+          { status: 400 }
+        );
+      }
+    }
+
     // ========================================================
     // AUTO-RESOLVE COUNTER ACCOUNT FROM THE DOCUMENT
     //
@@ -554,10 +591,10 @@ export async function POST(request: NextRequest) {
       }
 
       // VALIDATE LINES (above) already guarantees only CHALLAN/BILTY/
-      // PHONCH/PRIVATE_PHONCH lines can reach here without a
+      // PHONCH/PRIVATE_PHONCH/BILL lines can reach here without a
       // counterAccountId.
       const resolved = await resolveDocumentPartyAccount(
-        line.sourceType as "CHALLAN" | "BILTY" | "PHONCH" | "PRIVATE_PHONCH",
+        line.sourceType as "CHALLAN" | "BILTY" | "PHONCH" | "PRIVATE_PHONCH" | "BILL",
         line.sourceId!,
         line.direction
       );
@@ -726,6 +763,35 @@ export async function POST(request: NextRequest) {
     }
 
     // ========================================================
+    // HARD REJECT: manually-supplied Counter Account mismatching a
+    // Bill's own Client Party. Per the LOCKED rule
+    // (lib/document-party-resolution.ts's resolveBillParty(), reused
+    // by getBillEligiblePartyAccountIds()): a Bill has exactly one
+    // legitimate counterparty, its own Client - never an unrelated
+    // Party (e.g. a Clearing Agent named on the source Phonch) merely
+    // because it was typed in manually. Same strict "reject everything
+    // when nothing legitimate exists" behavior as Phonch's own
+    // equivalent guard above, since a Bill's Client is a required
+    // field at creation.
+    // ========================================================
+
+    for (const { line, index } of preparedLines.map((line, index) => ({ line, index }))) {
+      if (line.sourceType !== "BILL" || !line.wasManuallySupplied || !line.sourceId) continue;
+
+      const eligibleAccountIds = await getBillEligiblePartyAccountIds(line.sourceId);
+
+      if (!eligibleAccountIds.has(line.counterAccountId)) {
+        return NextResponse.json(
+          {
+            success: false,
+            message: `Entry ${index + 1}: The selected Counter Account is not this Bill's own Client. Select the correct Client, or leave Counter Account blank to auto-resolve.`,
+          },
+          { status: 400 }
+        );
+      }
+    }
+
+    // ========================================================
     // COUNTER ACCOUNTS
     // ========================================================
 
@@ -824,7 +890,8 @@ export async function POST(request: NextRequest) {
           line.sourceType === "CHALLAN" ||
           line.sourceType === "BILTY" ||
           line.sourceType === "PHONCH" ||
-          line.sourceType === "PRIVATE_PHONCH"
+          line.sourceType === "PRIVATE_PHONCH" ||
+          line.sourceType === "BILL"
       );
 
     for (const { line, index } of preparedChallanBiltyLines) {
@@ -843,7 +910,7 @@ export async function POST(request: NextRequest) {
         return NextResponse.json(
           {
             success: false,
-            message: `Entry ${index + 1}: Challan/Bilty/Phonch/Private Phonch-linked posting must move money only between a PARTY account and a CASH/BANK account.`,
+            message: `Entry ${index + 1}: Challan/Bilty/Phonch/Private Phonch/Bill-linked posting must move money only between a PARTY account and a CASH/BANK account.`,
           },
           { status: 400 }
         );
@@ -877,6 +944,12 @@ export async function POST(request: NextRequest) {
           sourceNumber: privatePhonchNoById.get(line.sourceId!) || line.sourceNumber,
         };
       }
+      if (line.sourceType === "BILL") {
+        return {
+          ...line,
+          sourceNumber: billNoById.get(line.sourceId!) || line.sourceNumber,
+        };
+      }
       return line;
     });
 
@@ -901,6 +974,7 @@ export async function POST(request: NextRequest) {
         line.sourceType !== "BILTY" &&
         line.sourceType !== "PHONCH" &&
         line.sourceType !== "PRIVATE_PHONCH" &&
+        line.sourceType !== "BILL" &&
         line.sourceId
     );
 
@@ -1171,6 +1245,9 @@ export async function POST(request: NextRequest) {
           if (line.sourceType === "PRIVATE_PHONCH" && line.sourceId) {
             await assertPrivatePhonchPaymentNotExceeded(tx, line.sourceId, line.counterAccountId, line.amount, line.direction);
           }
+          if (line.sourceType === "BILL" && line.sourceId) {
+            await assertBillReceiptNotExceeded(tx, line.sourceId, line.counterAccountId, line.amount, line.direction);
+          }
         }
 
         const created = [];
@@ -1196,6 +1273,30 @@ export async function POST(request: NextRequest) {
 
           created.push(entry);
           index++;
+
+          const lineSummary = groupLines
+            .map((l) => `${l.direction === "DEBIT" ? "Receipt" : "Payment"} Rs. ${l.amount.toLocaleString()}${l.sourceNumber ? ` (${l.sourceType} ${l.sourceNumber})` : ""}`)
+            .join(", ");
+          await auditPost(tx, {
+            actor: actorFromUser(currentUser),
+            module: "DAILY_POSTING",
+            entityType: "JournalEntry",
+            entityId: entry.id,
+            documentNo: mainAccount.accountName,
+            description: `Posted Daily Posting on ${mainAccount.accountName}: ${lineSummary}`,
+            newValues: {
+              accountId: mainAccount.id,
+              lines: groupLines.map((l) => ({
+                direction: l.direction,
+                amount: l.amount,
+                counterAccountId: l.counterAccountId,
+                sourceType: l.sourceType || null,
+                sourceId: l.sourceId || null,
+                sourceNumber: l.sourceNumber || null,
+              })),
+            },
+            ...requestContext(request),
+          });
         }
 
         return created;
@@ -1216,6 +1317,13 @@ export async function POST(request: NextRequest) {
       }
 
       if (error instanceof PrivatePhonchAccountingError) {
+        return NextResponse.json(
+          { success: false, code: error.code, message: error.message },
+          { status: 400 }
+        );
+      }
+
+      if (error instanceof BillAccountingError) {
         return NextResponse.json(
           { success: false, code: error.code, message: error.message },
           { status: 400 }

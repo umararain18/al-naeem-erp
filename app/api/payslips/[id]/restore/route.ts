@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
+import { auditRestore, actorFromUser, requestContext } from "@/lib/audit-log";
 
 // Restores a Bin'd Payslip AND its associated PAYROLL_SALARY
 // JournalEntry together, atomically - keeps the two isDeleted flags
@@ -9,7 +10,7 @@ import { hasPermission } from "@/lib/permissions";
 // exist). Reuses the exact isDeleted/deletedAt/deletedById clearing
 // pattern already used by every other restore in this app.
 
-export async function POST(_request: NextRequest, context: { params: Promise<{ id: string }> }) {
+export async function POST(request: NextRequest, context: { params: Promise<{ id: string }> }) {
   try {
     const currentUser = await getCurrentUser();
     if (!currentUser) {
@@ -42,6 +43,16 @@ export async function POST(_request: NextRequest, context: { params: Promise<{ i
       await tx.payslip.update({
         where: { id },
         data: { isDeleted: false, deletedAt: null, deletedById: null },
+      });
+
+      await auditRestore(tx, {
+        actor: actorFromUser(currentUser),
+        module: "PAYROLL",
+        entityType: "Payslip",
+        entityId: id,
+        documentNo: current.payslipNo,
+        description: `Restored Payslip ${current.payslipNo} from Bin`,
+        ...requestContext(request),
       });
     });
 

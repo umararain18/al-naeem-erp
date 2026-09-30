@@ -36,7 +36,19 @@ export default function LoginPage() {
         return;
       }
 
+      // router.push() alone is a client-side (soft) navigation - since
+      // app/layout.tsx is an async SERVER component shared by /login
+      // and /dashboard, Next.js's Router Cache can keep serving that
+      // layout's PRE-login render (with user: null, so AppSidebar
+      // renders nothing) until something invalidates it. router.refresh()
+      // forces the server tree (including the root layout's
+      // getCurrentUser() call) to re-run against the now-valid session
+      // cookie, so the sidebar appears immediately - the same fix class
+      // logout already relies on (it forces a full window.location.reload()
+      // for the identical reason), just via the lighter-weight, no-flash
+      // App Router mechanism instead of a full page reload.
       router.push("/dashboard");
+      router.refresh();
     } catch {
       setError("Unable to connect to the server");
     } finally {

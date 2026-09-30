@@ -2,9 +2,10 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
+import { auditRestore, actorFromUser, requestContext } from "@/lib/audit-log";
 
 export async function POST(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
@@ -28,7 +29,7 @@ export async function POST(
     const challan = await prisma.$transaction(async (tx) => {
       const currentChallan = await tx.challan.findUnique({
         where: { id },
-        select: { id: true, isDeleted: true },
+        select: { id: true, isDeleted: true, challanNo: true },
       });
 
       if (!currentChallan) {
@@ -39,7 +40,7 @@ export async function POST(
         throw new Error("NOT_BINNED");
       }
 
-      return tx.challan.update({
+      const restored = await tx.challan.update({
         where: { id },
         data: {
           isDeleted: false,
@@ -47,6 +48,18 @@ export async function POST(
           deletedById: null,
         },
       });
+
+      await auditRestore(tx, {
+        actor: actorFromUser(currentUser),
+        module: "CHALLAN",
+        entityType: "Challan",
+        entityId: id,
+        documentNo: currentChallan.challanNo,
+        description: `Restored Challan ${currentChallan.challanNo} from Bin`,
+        ...requestContext(request),
+      });
+
+      return restored;
     });
 
     if (!challan) {

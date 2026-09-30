@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { getChallanShareMessage } from "@/lib/share-messages";
 import { normalizePhone } from "@/lib/phone";
+import { DocumentFooter, DocumentHeader, useDocumentPresentation } from "@/components/documents/DocumentPresentation";
 import FinalSettlementOperations from "./FinalSettlementOperations";
 
 type PartyRef = {
@@ -265,7 +266,7 @@ function FinancialSummaryCards({ challan }: { challan: Challan }) {
   const cr = summary.carrierRent;
 
   return (
-    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
       <div className="rounded-lg border p-3">
         <p className="text-xs text-gray-500">Bilty Rent</p>
         <p className="font-semibold text-lg">Rs. {rentTotal.toLocaleString()}</p>
@@ -328,7 +329,7 @@ function PartyNetPosition({ challan }: { challan: Challan }) {
   if (partyNet.length === 0) return null;
 
   return (
-    <div className="rounded-lg border p-4 bg-gray-50 mt-4">
+    <div className="rounded-lg border p-3 bg-gray-50 mt-3">
       <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Party Net Position</p>
       <div className="space-y-2">
         {partyNet.map((p) => (
@@ -454,6 +455,7 @@ export default function ChallanDetailPage({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [actionLoading, setActionLoading] = useState<string | null>(null);
+  const presentation = useDocumentPresentation("CHALLAN");
 
   // ------------------------------------------------------------
   // EDIT
@@ -838,10 +840,11 @@ export default function ChallanDetailPage({
   return (
     <main className="min-h-screen bg-gray-50">
       <div className="max-w-5xl mx-auto p-6">
+        <DocumentHeader presentation={presentation} title="CHALLAN" />
+
         {/* Header */}
-        <div className="mb-6">
-          <div className="text-xs text-gray-500 mb-1">Al Naeem Car Carriers Service</div>
-          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+        <div className="mb-4">
+          <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
             <div>
               <h1 className="text-2xl font-bold">Challan #{challan.challanNo}</h1>
               <p className="text-gray-600">
@@ -863,9 +866,9 @@ export default function ChallanDetailPage({
         </div>
 
         {/* Details */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-6">
-          <div className="bg-white rounded-xl shadow-sm p-6">
-            <div className="flex items-center justify-between mb-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+          <div className="bg-white rounded-xl shadow-sm p-4">
+            <div className="flex items-center justify-between mb-3">
               <h2 className="text-lg font-semibold">Challan Details</h2>
               {!showEditForm && (
                 <button
@@ -906,8 +909,8 @@ export default function ChallanDetailPage({
             </div>
           </div>
 
-          <div className="bg-white rounded-xl shadow-sm p-6">
-            <h2 className="text-lg font-semibold mb-4">Settlement</h2>
+          <div className="bg-white rounded-xl shadow-sm p-4">
+            <h2 className="text-lg font-semibold mb-3">Settlement</h2>
             <div className="space-y-3 text-sm">
               <div>
                 <p className="text-gray-500">Status</p>
@@ -946,8 +949,8 @@ export default function ChallanDetailPage({
             authoritative data Final Settlement itself reads - see
             lib/challan-settlement-summary.ts. Works identically
             whether the Challan is settled or not. */}
-        <div className="bg-white rounded-xl shadow-sm p-6 mb-6">
-          <div className="flex items-center justify-between mb-4">
+        <div className="bg-white rounded-xl shadow-sm p-4 mb-4">
+          <div className="flex items-center justify-between mb-3">
             <h2 className="text-lg font-semibold">Financial Summary</h2>
             <span
               className={`rounded-full px-3 py-1 text-xs font-semibold ${
@@ -963,8 +966,8 @@ export default function ChallanDetailPage({
 
         {/* Settlement Breakdown (who ended up responsible for what) */}
         {challan.isSettled && challan.settlementJournalEntry && (
-          <div className="bg-white rounded-xl shadow-sm p-6 mb-6">
-            <h2 className="text-lg font-semibold mb-4">Settlement Breakdown</h2>
+          <div className="bg-white rounded-xl shadow-sm p-4 mb-4">
+            <h2 className="text-lg font-semibold mb-3">Settlement Breakdown</h2>
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead className="bg-gray-50 text-left text-xs uppercase text-gray-500">
@@ -1301,41 +1304,41 @@ export default function ChallanDetailPage({
         )}
 
         {/* Bilties */}
-        <div className="bg-white rounded-xl shadow-sm p-6">
-          <h2 className="text-lg font-semibold mb-4">
+        <div className="bg-white rounded-xl shadow-sm p-4">
+          <h2 className="text-lg font-semibold mb-2">
             Bilties ({challan.bilties.length})
           </h2>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead className="bg-gray-50 text-left text-xs uppercase text-gray-500">
                 <tr>
-                  <th className="px-4 py-3">Bilty No</th>
-                  <th className="px-4 py-3">Route</th>
-                  <th className="px-4 py-3">Consignee</th>
-                  <th className="px-4 py-3">Vehicle</th>
-                  <th className="px-4 py-3">To Pay</th>
-                  <th className="px-4 py-3">Clearing Agent</th>
-                  <th className="px-4 py-3">Action</th>
+                  <th className="px-3 py-2">Bilty No</th>
+                  <th className="px-3 py-2">Route</th>
+                  <th className="px-3 py-2">Consignee</th>
+                  <th className="px-3 py-2">Vehicle</th>
+                  <th className="px-3 py-2">To Pay</th>
+                  <th className="px-3 py-2">Clearing Agent</th>
+                  <th className="px-3 py-2">Action</th>
                 </tr>
               </thead>
               <tbody className="divide-y">
                 {challan.bilties.map((cb) => (
                   <tr key={cb.bilty.id} className="hover:bg-gray-50">
-                    <td className="px-4 py-3 font-medium">{cb.bilty.biltyNo}</td>
-                    <td className="px-4 py-3">
+                    <td className="px-3 py-2 font-medium">{cb.bilty.biltyNo}</td>
+                    <td className="px-3 py-2">
                       {cb.bilty.fromLocation.name} → {cb.bilty.toLocation.name}
                     </td>
-                    <td className="px-4 py-3">{cb.bilty.consigneeName}</td>
-                    <td className="px-4 py-3">
+                    <td className="px-3 py-2">{cb.bilty.consigneeName}</td>
+                    <td className="px-3 py-2">
                       {[cb.bilty.vehicleType, cb.bilty.vehicleModel, cb.bilty.registrationNumber].filter(Boolean).join(" / ") || "—"}
                     </td>
-                    <td className="px-4 py-3">
+                    <td className="px-3 py-2">
                       Rs. {Number(cb.bilty.toPay || 0).toLocaleString()}
                     </td>
-                    <td className="px-4 py-3">
+                    <td className="px-3 py-2">
                       {cb.bilty.clearingAgentParty?.partyName || "—"}
                     </td>
-                    <td className="px-4 py-3">
+                    <td className="px-3 py-2">
                       <Link
                         href={`/bilty/${cb.bilty.id}`}
                         className="border rounded-lg px-3 py-1 text-xs hover:bg-gray-50"
@@ -1350,8 +1353,10 @@ export default function ChallanDetailPage({
           </div>
         </div>
 
+        <DocumentFooter presentation={presentation} />
+
         {/* Actions */}
-        <div className="mt-6 flex flex-wrap gap-3">
+        <div className="mt-4 flex flex-wrap gap-3">
           <button
             type="button"
             onClick={downloadPdf}

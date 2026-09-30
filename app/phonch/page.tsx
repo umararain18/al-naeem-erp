@@ -22,6 +22,8 @@ type PhonchListItem = {
   carrierNumber: string | null;
   transporterParty: { id: string; partyName: string };
   vehicleCount: number;
+  vehicleNames: string[];
+  vehicleBillLabels: string[];
   totalAmount: number;
   receivedAmount: number;
   remainingDue: number;
@@ -159,7 +161,9 @@ export default function PhonchPage() {
                         </td>
                         <td className="px-4 py-3">{new Date(p.date).toLocaleDateString("en-GB")}</td>
                         <td className="px-4 py-3">{p.transporterParty.partyName}</td>
-                        <td className="px-4 py-3">{p.vehicleCount}</td>
+                        <td className="px-4 py-3">
+                          {p.vehicleBillLabels.length > 0 ? p.vehicleBillLabels.join(", ") : p.vehicleNames.length > 0 ? p.vehicleNames.join(", ") : p.vehicleCount}
+                        </td>
                         <td className="px-4 py-3">{formatCurrency(p.totalAmount)}</td>
                         <td className="px-4 py-3">{formatCurrency(p.receivedAmount)}</td>
                         <td className="px-4 py-3">{formatCurrency(p.remainingDue)}</td>

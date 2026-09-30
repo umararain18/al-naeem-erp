@@ -3,7 +3,9 @@ import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
-import { BalanceType, PartyType } from "@prisma/client";
+import { BalanceType, PartyType, Prisma } from "@prisma/client";
+import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
+import { partySearchOr, extractPhoneSearchDigits, findIdsByPhoneDigits } from "@/lib/search-helpers";
 
 const createPartySchema = z.object({
   partyName: z
@@ -47,7 +49,16 @@ const createPartySchema = z.object({
 });
 
 // GET /api/parties
-export async function GET() {
+// GET /api/parties?search=... - NEW, additive: when `search` is
+// omitted the response is byte-for-byte identical to before (every
+// existing caller of this route calls it with no params and filters
+// client-side - see BillForm.tsx/PartyAccountSelect - so this can
+// never break an existing caller). When supplied, filters server-side
+// using the same field set Global Search itself uses
+// (lib/search-helpers.ts's partySearchOr), including phone-digit
+// matching so "0300-1234567" and "03001234567" both match regardless
+// of how the stored value is formatted.
+export async function GET(request: NextRequest) {
   try {
     const currentUser =
       await getCurrentUser();
@@ -77,8 +88,16 @@ export async function GET() {
       );
     }
 
+    const search = new URL(request.url).searchParams.get("search")?.trim();
+    let where: Prisma.PartyWhereInput = {};
+    if (search) {
+      const phoneIds = await findIdsByPhoneDigits(prisma, "Party", ["phone", "whatsapp"], extractPhoneSearchDigits(search));
+      where = { OR: [...partySearchOr(search), ...(phoneIds.length ? [{ id: { in: phoneIds } }] : [])] };
+    }
+
     const parties =
       await prisma.party.findMany({
+        where,
         orderBy: {
           createdAt: "desc",
         },
@@ -374,6 +393,25 @@ export async function POST(
               },
             });
           }
+
+          await auditCreate(tx, {
+            actor: actorFromUser(currentUser),
+            module: "PARTY",
+            entityType: "Party",
+            entityId: party.id,
+            documentNo: party.partyName,
+            description: `Created Party ${party.partyName}${data.partyTypes?.length ? ` (${data.partyTypes.join(", ")})` : ""}`,
+            newValues: {
+              partyName: party.partyName,
+              phone: party.phone,
+              whatsapp: party.whatsapp,
+              address: party.address,
+              partyTypes: data.partyTypes,
+              openingBalance: openingAmount,
+              openingBalanceType: data.openingBalanceType || null,
+            },
+            ...requestContext(request),
+          });
 
           return {
             party,

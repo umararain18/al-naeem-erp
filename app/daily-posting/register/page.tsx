@@ -123,12 +123,27 @@ function formatTime(entryDateIso: string): string {
   return new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "Asia/Karachi" }).format(new Date(entryDateIso));
 }
 
-// Business-readable Document label - the existing, authoritative
-// JournalLine.sourceType string, only reformatted for readability
-// (never invented, never re-derived).
+// Business-readable Document label - reuses the SAME canonical
+// sourceType terminology the create-entry form's own Document Type
+// dropdown already shows (SearchableSelect.tsx's sourceOptions, e.g.
+// "CN - Challan"), just without its short code prefix, since this is
+// a read-only register column, not a dropdown. PHONCH is labelled
+// "Showroom Phonch" (not just "Phonch") to match how that module is
+// named everywhere else in the app (as opposed to PRIVATE_PHONCH's
+// own, already-distinct "Private Phonch"). Never invents a new
+// document category - every value here already exists on the raw
+// JournalLine.sourceType.
+const DOCUMENT_LABELS: Record<string, string> = {
+  BILTY: "Bilty",
+  CHALLAN: "Challan",
+  PHONCH: "Showroom Phonch",
+  PRIVATE_PHONCH: "Private Phonch",
+  BILL: "Bill",
+};
+
 function formatDocument(sourceType: string | null): string {
   if (!sourceType || sourceType === "DIRECT") return "Direct Account";
-  return sourceType;
+  return DOCUMENT_LABELS[sourceType] || sourceType;
 }
 
 function isCashOrBank(account: Account): boolean {
@@ -301,8 +316,11 @@ export default function DailyPostingRegisterPage() {
         row.canMoveToBin = capabilities.canMoveToBin && !!eligibility?.canMoveToBin;
       }
 
-      // Oldest -> newest (display ordering only - never touches
-      // accounting chronology). Deterministic tiebreak: journalEntryId.
+      // Oldest -> newest - the chronological computation order the
+      // running balance below depends on (never touches accounting
+      // chronology). Deterministic tiebreak: journalEntryId. The table
+      // itself renders newest-first via the separate `displayRows`
+      // reversal below - this array's own order stays oldest->newest.
       built.sort((a, b) => a.sortKey - b.sortKey || a.journalEntryId.localeCompare(b.journalEntryId));
 
       // Per-(main)-account running balance, advancing ONCE per Daily
@@ -347,6 +365,16 @@ export default function DailyPostingRegisterPage() {
       { debit: 0, credit: 0 }
     );
   }, [rows]);
+
+  // Presentation-only reversal for the table: `rows` itself stays in
+  // chronological oldest->newest order (closingBalancesByAccount below
+  // depends on that order to correctly pick each account's LAST/most
+  // recent balance) - only this derived, render-only array is shown
+  // newest-first, exactly mirroring the "compute oldest->newest,
+  // display newest->oldest" pattern already used elsewhere (see
+  // lib/ledger-description.ts's AccountLedgerOptions.order). Never
+  // recomputes balance or touches accounting.
+  const displayRows = useMemo(() => [...rows].reverse(), [rows]);
 
   // Closing Balance follows the SAME per-account convention as the
   // Balance column - a single blended figure across unrelated
@@ -459,7 +487,7 @@ export default function DailyPostingRegisterPage() {
           <div className="border-b px-6 py-4">
             <h2 className="font-semibold text-gray-900">Daily Register</h2>
             <p className="mt-1 text-xs text-gray-500">
-              One row per Daily Posting transaction. Balance is this day&apos;s movement per Cash/Bank account, starting from 0 - not the account&apos;s true ledger balance.
+              One row per Daily Posting transaction, newest first.
             </p>
           </div>
 
@@ -469,37 +497,31 @@ export default function DailyPostingRegisterPage() {
             <div className="px-6 py-12 text-center text-sm text-gray-500">No Daily Posting transactions for this date.</div>
           ) : (
             <div className="overflow-x-auto">
-              <table className="min-w-[1300px] w-full text-sm">
+              <table className="min-w-[1000px] w-full text-sm">
                 <thead className="bg-gray-50 text-left text-xs font-semibold uppercase text-gray-500">
                   <tr>
-                    <th className="px-4 py-3">No</th>
-                    <th className="px-4 py-3">Time</th>
-                    <th className="px-4 py-3">Party</th>
+                    <th className="px-4 py-3">#</th>
+                    <th className="px-4 py-3">Counter Account</th>
                     <th className="px-4 py-3">Document</th>
-                    <th className="px-4 py-3">Doc No.</th>
-                    <th className="px-4 py-3">Account</th>
+                    <th className="px-4 py-3">Document No.</th>
                     <th className="px-4 py-3">Description</th>
                     <th className="px-4 py-3 text-right">Debit</th>
                     <th className="px-4 py-3 text-right">Credit</th>
-                    <th className="px-4 py-3 text-right">Balance</th>
                     <th className="px-4 py-3">Action</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y">
-                  {rows.map((row, index) => {
+                  {displayRows.map((row, index) => {
                     const isHighlighted = !!highlightId && row.journalEntryId === highlightId;
                     return (
                       <tr key={row.journalEntryId} className={isHighlighted ? "bg-yellow-50" : "hover:bg-gray-50"}>
                         <td className="px-4 py-3 text-gray-500">{index + 1}</td>
-                        <td className="px-4 py-3 text-gray-600">{row.time}</td>
                         <td className="px-4 py-3 font-medium text-gray-900">{row.party}</td>
                         <td className="px-4 py-3 text-gray-900">{row.document}</td>
                         <td className="px-4 py-3 text-gray-600">{row.documentNo || "—"}</td>
-                        <td className="px-4 py-3 text-gray-600">{row.account}</td>
                         <td className="px-4 py-3 text-gray-600">{row.description || "—"}</td>
                         <td className="px-4 py-3 text-right">{row.debit > 0 ? `Rs. ${formatMoney(row.debit)}` : "—"}</td>
                         <td className="px-4 py-3 text-right">{row.credit > 0 ? `Rs. ${formatMoney(row.credit)}` : "—"}</td>
-                        <td className="px-4 py-3 text-right font-semibold">Rs. {formatMoney(row.balance)}</td>
                         <td className="px-4 py-3">
                           <div className="flex flex-wrap gap-2">
                             <Link

@@ -7,6 +7,8 @@ import {
   getSettlementPaymentOrThrow,
   updateSettlementPaymentAmount,
 } from "@/lib/settlement-payments";
+import { prisma } from "@/lib/prisma";
+import { auditSettlementPayment, auditDelete, actorFromUser, requestContext } from "@/lib/audit-log";
 
 function errorStatus(code: string): number {
   switch (code) {
@@ -66,7 +68,7 @@ export async function PATCH(
     }
 
     const { id: challanId, paymentId } = await params;
-    await assertRowBelongsToChallan(paymentId, challanId);
+    const existingRow = await assertRowBelongsToChallan(paymentId, challanId);
 
     const body = await request.json();
     const result = patchSchema.safeParse(body);
@@ -78,6 +80,20 @@ export async function PATCH(
     }
 
     const outcome = await updateSettlementPaymentAmount({ paymentId, newAmount: result.data.newAmount });
+
+    // See app/api/challan/[id]/settlement-payments/route.ts's own note
+    // on why this audit write happens on the plain client, outside
+    // lib/settlement-payments.ts's own internal transaction.
+    await auditSettlementPayment(prisma, {
+      actor: actorFromUser(currentUser),
+      module: "SETTLEMENT",
+      entityType: "SettlementPayment",
+      entityId: paymentId,
+      documentNo: challanId,
+      description: `Edited Settlement Payment amount on Challan (${existingRow.component}): Rs. ${Number(existingRow.amount).toLocaleString()} → Rs. ${result.data.newAmount.toLocaleString()}`,
+      changedFields: { amount: { old: Number(existingRow.amount), new: result.data.newAmount } },
+      ...requestContext(request),
+    });
 
     return NextResponse.json({ success: true, message: "Settlement payment updated successfully.", ...outcome });
   } catch (error) {
@@ -111,9 +127,20 @@ export async function DELETE(
     }
 
     const { id: challanId, paymentId } = await params;
-    await assertRowBelongsToChallan(paymentId, challanId);
+    const existingRow = await assertRowBelongsToChallan(paymentId, challanId);
 
     const outcome = await deleteSettlementPayment(paymentId);
+
+    await auditDelete(prisma, {
+      actor: actorFromUser(currentUser),
+      module: "SETTLEMENT",
+      entityType: "SettlementPayment",
+      entityId: paymentId,
+      documentNo: challanId,
+      description: `Removed Settlement Payment on Challan (${existingRow.component}): Rs. ${Number(existingRow.amount).toLocaleString()}`,
+      oldValues: { component: existingRow.component, biltyId: existingRow.biltyId, payerAccountId: existingRow.payerAccountId, amount: Number(existingRow.amount) },
+      ...requestContext(request),
+    });
 
     return NextResponse.json({ success: true, message: "Settlement payment removed successfully.", ...outcome });
   } catch (error) {

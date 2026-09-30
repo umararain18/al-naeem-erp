@@ -10,7 +10,7 @@
 import { useEffect, useState } from "react";
 
 export type DocumentSearchResult = {
-  type: "CHALLAN" | "BILTY" | "PHONCH" | "PRIVATE_PHONCH";
+  type: "CHALLAN" | "BILTY" | "PHONCH" | "PRIVATE_PHONCH" | "BILL";
   id: string;
   number: string;
   subtitle: string;
@@ -152,7 +152,7 @@ export function DocumentSearchSelect({
         type="text"
         value={displayValue}
         readOnly={readOnly}
-        placeholder="Search Challan/Bilty no..."
+        placeholder="Search document no..."
         onFocus={() => {
           if (readOnly) return;
           setOpen(true);
@@ -195,13 +195,13 @@ export function DocumentSearchSelect({
 
           {!loading && query.trim() && results.length === 0 && (
             <div className="px-3 py-3 text-sm text-gray-500">
-              No Challan or Bilty found.
+              No matching document found.
             </div>
           )}
 
           {!loading && !query.trim() && (
             <div className="px-3 py-3 text-sm text-gray-500">
-              Type a Challan or Bilty number to search.
+              Type a document number to search.
             </div>
           )}
 

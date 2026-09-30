@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { LedgerFilters } from "@/components/LedgerFilters";
 
 type PayableEntry = {
   partyId: string;
@@ -12,6 +13,7 @@ type PayableEntry = {
   totalDebit: number;
   totalCredit: number;
   balance: number;
+  phone: string | null;
 };
 
 type PayableResponse = {
@@ -32,11 +34,22 @@ export default function PayablePage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
+  // See the identical comment on app/reports/receivable/page.tsx -
+  // client-side search over the already-fetched list; "to" is the
+  // one date filter meaningful for a point-in-time Payable balance
+  // (an "as of" date, reusing the existing asOfExclusive parameter);
+  // "from" is kept only for the shared LedgerFilters component's
+  // controlled-input shape and is never sent to the API.
+  const [search, setSearch] = useState("");
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+
   useEffect(() => {
     async function load() {
       try {
         setError("");
-        const response = await fetch("/api/reports/payable");
+        const query = to ? `?to=${encodeURIComponent(to)}` : "";
+        const response = await fetch(`/api/reports/payable${query}`);
         const result = await response.json();
 
         if (!response.ok || !result.success) {
@@ -53,7 +66,26 @@ export default function PayablePage() {
     }
 
     load();
-  }, []);
+  }, [to]);
+
+  const filteredPayable = useMemo(() => {
+    if (!data) return [];
+    const q = search.trim().toLowerCase();
+    if (!q) return data.payable;
+    return data.payable.filter((entry) => {
+      return (
+        entry.partyName.toLowerCase().includes(q) ||
+        entry.accountName.toLowerCase().includes(q) ||
+        (entry.accountCode || "").toLowerCase().includes(q) ||
+        (entry.phone || "").toLowerCase().includes(q)
+      );
+    });
+  }, [data, search]);
+
+  const filteredTotal = useMemo(
+    () => filteredPayable.reduce((sum, entry) => sum + entry.balance, 0),
+    [filteredPayable]
+  );
 
   if (loading) {
     return (
@@ -78,7 +110,8 @@ export default function PayablePage() {
     );
   }
 
-  const { payable, summary } = data;
+  const { summary } = data;
+  const isFiltered = search.trim().length > 0;
 
   return (
     <main className="min-h-screen bg-gray-50">
@@ -102,10 +135,32 @@ export default function PayablePage() {
           </div>
         </div>
 
+        <LedgerFilters
+          search={search}
+          onSearchChange={setSearch}
+          from={from}
+          to={to}
+          onFromChange={setFrom}
+          onToChange={setTo}
+          onReset={() => {
+            setSearch("");
+            setFrom("");
+            setTo("");
+          }}
+          resultLabel={
+            isFiltered
+              ? `${filteredPayable.length} of ${data.payable.length} found, ${formatCurrency(filteredTotal)}`
+              : null
+          }
+          searchPlaceholder="Search party, account, or phone..."
+        />
+
         {/* Table */}
         <div className="bg-white rounded-xl shadow-sm overflow-hidden">
-          {payable.length === 0 ? (
-            <div className="p-10 text-center text-gray-500">No payables found.</div>
+          {filteredPayable.length === 0 ? (
+            <div className="p-10 text-center text-gray-500">
+              {isFiltered ? "No matching payables found." : "No payables found."}
+            </div>
           ) : (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
@@ -119,12 +174,13 @@ export default function PayablePage() {
                   </tr>
                 </thead>
                 <tbody className="divide-y">
-                  {payable.map((entry) => (
+                  {filteredPayable.map((entry) => (
                     <tr key={entry.partyId} className="hover:bg-gray-50">
                       <td className="px-4 py-3 font-medium">
                         <Link href={`/parties/${entry.partyId}/ledger`} className="text-blue-600 hover:underline">
                           {entry.partyName}
                         </Link>
+                        {entry.phone && <span className="block text-xs text-gray-400">{entry.phone}</span>}
                       </td>
                       <td className="px-4 py-3">
                         {entry.accountCode ? `[${entry.accountCode}] ` : ""}
@@ -143,10 +199,10 @@ export default function PayablePage() {
                 <tfoot className="bg-gray-50 font-semibold">
                   <tr>
                     <td colSpan={4} className="px-4 py-3 text-right">
-                      Total Payable
+                      Total{isFiltered ? " (filtered)" : ""}
                     </td>
                     <td className="px-4 py-3 text-right text-red-600">
-                      {formatCurrency(summary.totalPayable)}
+                      {formatCurrency(isFiltered ? filteredTotal : summary.totalPayable)}
                     </td>
                   </tr>
                 </tfoot>

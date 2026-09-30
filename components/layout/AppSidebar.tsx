@@ -24,7 +24,11 @@ import {
   Briefcase,
   Truck,
   HandCoins,
+  Receipt,
+  Settings,
+  History,
 } from "lucide-react";
+import GlobalSearch from "@/components/layout/GlobalSearch";
 
 type User = {
   username: string;
@@ -81,6 +85,13 @@ const navigation: { section: string; items: NavItem[] }[] = [
         icon: HandCoins,
         permission: "privatePhonch.view",
         match: (pathname) => pathname === "/private-phonch" || pathname.startsWith("/private-phonch/"),
+      },
+      {
+        label: "Bill Book",
+        href: "/bill",
+        icon: Receipt,
+        permission: "bill.view",
+        match: (pathname) => pathname === "/bill" || pathname.startsWith("/bill/"),
       },
       {
         label: "Location Master",
@@ -200,6 +211,20 @@ const navigation: { section: string; items: NavItem[] }[] = [
         permission: "users.view",
         match: (pathname) => pathname === "/users" || pathname.startsWith("/users/"),
       },
+      {
+        label: "Settings",
+        href: "/settings",
+        icon: Settings,
+        permission: "settings.view",
+        match: (pathname) => pathname === "/settings" || pathname.startsWith("/settings/"),
+      },
+      {
+        label: "Audit Log",
+        href: "/audit-log",
+        icon: History,
+        permission: "audit.view",
+        match: (pathname) => pathname === "/audit-log" || pathname.startsWith("/audit-log/"),
+      },
     ],
   },
 ];
@@ -286,6 +311,14 @@ export default function AppSidebar({ user }: { user: User | null }) {
             <X className="h-4 w-4" />
           </button>
         </div>
+
+        {/* Global Search trigger (Ctrl+K) - desktop only, does not
+            disturb the nav/layout below it. */}
+        {user && (
+          <div className="px-2 pt-2 flex-shrink-0">
+            <GlobalSearch collapsed={collapsed} />
+          </div>
+        )}
 
         {/* Navigation */}
         <nav className="flex-1 overflow-y-auto py-4 px-2 space-y-4">

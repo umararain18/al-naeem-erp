@@ -1,9 +1,15 @@
-import { NextResponse } from "next/server";
-import { prisma } from "@/lib/prisma";
+import { NextRequest, NextResponse } from "next/server";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
+import { getReceivablePayable } from "@/lib/receivable-payable";
+import { parseISODateStart, toISODate } from "@/lib/date-range";
 
-export async function GET() {
+// GET /api/reports/receivable
+// GET /api/reports/receivable?to=2026-09-27 - optional "as of" date
+// (inclusive), reusing the SAME `getReceivablePayable(asOfExclusive)`
+// parameter Dashboard already uses - never a new calculation. Omitted
+// (or malformed - never a 500) behaves exactly as before: as-of-now.
+export async function GET(request: NextRequest) {
   try {
     const currentUser = await getCurrentUser();
 
@@ -21,77 +27,18 @@ export async function GET() {
       );
     }
 
-    const parties = await prisma.party.findMany({
-      where: {
-        isActive: true,
-        account: {
-          isNot: null,
-        },
-      },
-      include: {
-        account: {
-          select: {
-            id: true,
-            accountName: true,
-            accountCode: true,
-          },
-        },
-      },
-      orderBy: {
-        partyName: "asc",
-      },
-    });
-
-    const receivable: {
-      partyId: string;
-      partyName: string;
-      accountId: string;
-      accountName: string;
-      accountCode: string | null;
-      totalDebit: number;
-      totalCredit: number;
-      balance: number;
-    }[] = [];
-
-    for (const party of parties) {
-      if (!party.account) continue;
-
-      const lines = await prisma.journalLine.findMany({
-        where: {
-          accountId: party.account.id,
-          journalEntry: {
-            is: {
-              isDeleted: false,
-            },
-          },
-        },
-        select: {
-          debit: true,
-          credit: true,
-        },
-      });
-
-      const totalDebit = lines.reduce((sum, line) => sum + Number(line.debit), 0);
-      const totalCredit = lines.reduce((sum, line) => sum + Number(line.credit), 0);
-      const balance = totalDebit - totalCredit;
-
-      if (balance > 0) {
-        receivable.push({
-          partyId: party.id,
-          partyName: party.partyName,
-          accountId: party.account.id,
-          accountName: party.account.accountName,
-          accountCode: party.account.accountCode,
-          totalDebit,
-          totalCredit,
-          balance,
-        });
+    const rawTo = new URL(request.url).searchParams.get("to")?.trim();
+    let asOfExclusive: Date | undefined;
+    if (rawTo) {
+      const inclusiveEnd = parseISODateStart(rawTo);
+      if (!Number.isNaN(inclusiveEnd.getTime())) {
+        const exclusive = new Date(inclusiveEnd);
+        exclusive.setDate(exclusive.getDate() + 1);
+        asOfExclusive = exclusive;
       }
     }
 
-    receivable.sort((a, b) => b.balance - a.balance);
-
-    const totalReceivable = receivable.reduce((sum, entry) => sum + entry.balance, 0);
+    const { receivable, totalReceivable } = await getReceivablePayable(asOfExclusive);
 
     return NextResponse.json({
       success: true,
@@ -99,6 +46,9 @@ export async function GET() {
       summary: {
         totalReceivable,
         partyCount: receivable.length,
+      },
+      filters: {
+        to: asOfExclusive ? toISODate(new Date(asOfExclusive.getTime() - 86400000)) : null,
       },
     });
   } catch (error) {

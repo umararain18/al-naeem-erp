@@ -16,6 +16,7 @@ import {
   getGrossCommissionPayableAccountId,
 } from "@/lib/gross-accounts";
 import { applySettlementReassignment } from "@/lib/settlement-correction";
+import { auditSettlement, actorFromUser, requestContext } from "@/lib/audit-log";
 
 const responsibilitySelectionSchema = z.object({
   responsibility: z.enum(["CLEARING_AGENT", "TRANSPORTER", "THIRD_PARTY"]),
@@ -42,7 +43,7 @@ const settleSchema = z.object({
 });
 
 export async function POST(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
@@ -119,7 +120,7 @@ export async function POST(
       );
     }
 
-    const body = await _request.json();
+    const body = await request.json();
     const result = settleSchema.safeParse(body);
 
     if (!result.success) {
@@ -443,7 +444,7 @@ export async function POST(
 
       const primaryJournalEntryId = journalEntries[0]?.id || null;
 
-      return tx.challan.update({
+      const settledChallan = await tx.challan.update({
         where: { id },
         data: {
           isSettled: true,
@@ -478,6 +479,25 @@ export async function POST(
           },
         },
       });
+
+      await auditSettlement(tx, {
+        actor: actorFromUser(currentUser),
+        module: "SETTLEMENT",
+        entityType: "Challan",
+        entityId: id,
+        documentNo: settledChallan.challanNo,
+        description: `Settled Challan ${settledChallan.challanNo} (Receivable Rs. ${settlementResult.outstandingReceivable.toLocaleString()}, Payable Rs. ${settlementResult.outstandingPayable.toLocaleString()})`,
+        newValues: {
+          settlementNotes: data.settlementNotes || null,
+          outstandingReceivable: settlementResult.outstandingReceivable,
+          outstandingPayable: settlementResult.outstandingPayable,
+          carrierRentResponsibility: data.carrierRent.responsibility,
+          journalEntriesCreated: journalEntries.length,
+        },
+        ...requestContext(request),
+      });
+
+      return settledChallan;
     });
 
     return NextResponse.json({
@@ -880,6 +900,21 @@ export async function PATCH(
         await tx.challan.update({
           where: { id: challan.id },
           data: { settlementNotes: data.settlementNotes || undefined, updatedById: currentUser.userId },
+        });
+      }
+
+      if (reassignments.length > 0) {
+        await auditSettlement(tx, {
+          actor: actorFromUser(currentUser),
+          module: "SETTLEMENT",
+          entityType: "Challan",
+          entityId: challan.id,
+          documentNo: challan.challanNo,
+          description: `Reassigned Settlement responsibility on Challan ${challan.challanNo}: ${reassignments
+            .map((r) => `${r.component}${r.bilty ? ` (Bilty ${r.bilty})` : ""} Rs. ${r.amount.toLocaleString()}`)
+            .join(", ")}`,
+          newValues: { reassignments },
+          ...requestContext(request),
         });
       }
     });
