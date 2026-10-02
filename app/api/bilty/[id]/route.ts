@@ -1379,23 +1379,46 @@ export async function DELETE(
       );
     }
 
-    await prisma.bilty.update({
-      where: { id },
-      data: {
-        isDeleted: true,
-        deletedAt: new Date(),
-        deletedById: currentUser.userId,
-      },
-    });
+    await prisma.$transaction(async (tx) => {
+      // Document-owned accounting (BILTY_BOOKING at creation, plus a
+      // BILTY_BOOKING_CORRECTION per pre-settlement rent/commission
+      // edit - see lib/settlement-correction.ts; these are ADDITIVE,
+      // never replace-on-edit, so every one of them is still active
+      // right up until now) moves to Bin together with the Bilty
+      // itself, in the SAME transaction - never SETTLEMENT/
+      // SETTLEMENT_PAYMENT/DAILY_POSTING etc., which this Bilty can
+      // only reach via an active Challan, already excluded above.
+      await tx.journalEntry.updateMany({
+        where: {
+          referenceType: { in: ["BILTY_BOOKING", "BILTY_BOOKING_CORRECTION"] },
+          referenceId: id,
+          isDeleted: false,
+        },
+        data: {
+          isDeleted: true,
+          deletedAt: new Date(),
+          deletedById: currentUser.userId,
+        },
+      });
 
-    await auditDelete(prisma, {
-      actor: actorFromUser(currentUser),
-      module: "BILTY",
-      entityType: "Bilty",
-      entityId: id,
-      documentNo: existingBilty.biltyNo,
-      description: `Moved Bilty ${existingBilty.biltyNo} to Bin`,
-      ...requestContext(request),
+      await tx.bilty.update({
+        where: { id },
+        data: {
+          isDeleted: true,
+          deletedAt: new Date(),
+          deletedById: currentUser.userId,
+        },
+      });
+
+      await auditDelete(tx, {
+        actor: actorFromUser(currentUser),
+        module: "BILTY",
+        entityType: "Bilty",
+        entityId: id,
+        documentNo: existingBilty.biltyNo,
+        description: `Moved Bilty ${existingBilty.biltyNo} to Bin`,
+        ...requestContext(request),
+      });
     });
 
     return NextResponse.json({

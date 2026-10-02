@@ -40,6 +40,24 @@ export async function POST(
         throw new Error("NOT_BINNED");
       }
 
+      // Restore the SAME document-owned accounting Binned alongside
+      // this Challan (see the DELETE handler's own comment in
+      // app/api/challan/[id]/route.ts) - CHALLAN_DISPATCH and
+      // CHALLAN_DISPATCH_CORRECTION are never soft-deleted by anything
+      // other than this Challan being Bin'd.
+      await tx.journalEntry.updateMany({
+        where: {
+          referenceType: { in: ["CHALLAN_DISPATCH", "CHALLAN_DISPATCH_CORRECTION"] },
+          referenceId: id,
+          isDeleted: true,
+        },
+        data: {
+          isDeleted: false,
+          deletedAt: null,
+          deletedById: null,
+        },
+      });
+
       const restored = await tx.challan.update({
         where: { id },
         data: {

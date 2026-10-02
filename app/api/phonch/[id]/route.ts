@@ -502,19 +502,33 @@ export async function DELETE(
       }
     }
 
-    await prisma.phonch.update({
-      where: { id },
-      data: { isDeleted: true, deletedAt: new Date(), deletedById: currentUser.userId },
-    });
+    await prisma.$transaction(async (tx) => {
+      // Document-owned accounting: a Phonch's PHONCH-referenceType
+      // entry is replace-on-edit (see this file's PATCH handler -
+      // exactly ONE is ever active at a time), so this `updateMany`
+      // scoped to isDeleted: false always touches exactly that one
+      // row. Moves to Bin together with the Phonch itself, in the
+      // SAME transaction - never DAILY_POSTING, already excluded
+      // above (zero received amount required to Bin).
+      await tx.journalEntry.updateMany({
+        where: { referenceType: "PHONCH", referenceId: id, isDeleted: false },
+        data: { isDeleted: true, deletedAt: new Date(), deletedById: currentUser.userId },
+      });
 
-    await auditDelete(prisma, {
-      actor: actorFromUser(currentUser),
-      module: "SHOWROOM_PHONCH",
-      entityType: "Phonch",
-      entityId: id,
-      documentNo: phonch.phonchNo,
-      description: `Moved Showroom Phonch ${phonch.phonchNo} to Bin`,
-      ...requestContext(request),
+      await tx.phonch.update({
+        where: { id },
+        data: { isDeleted: true, deletedAt: new Date(), deletedById: currentUser.userId },
+      });
+
+      await auditDelete(tx, {
+        actor: actorFromUser(currentUser),
+        module: "SHOWROOM_PHONCH",
+        entityType: "Phonch",
+        entityId: id,
+        documentNo: phonch.phonchNo,
+        description: `Moved Showroom Phonch ${phonch.phonchNo} to Bin`,
+        ...requestContext(request),
+      });
     });
 
     return NextResponse.json({ success: true, message: "Phonch moved to Bin successfully." });

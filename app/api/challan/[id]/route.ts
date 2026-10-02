@@ -862,23 +862,46 @@ export async function DELETE(
       );
     }
 
-    await prisma.challan.update({
-      where: { id },
-      data: {
-        isDeleted: true,
-        deletedAt: new Date(),
-        deletedById: currentUser.userId,
-      },
-    });
+    await prisma.$transaction(async (tx) => {
+      // Document-owned accounting (CHALLAN_DISPATCH at creation, plus
+      // a CHALLAN_DISPATCH_CORRECTION per pre-settlement Carrier Rent
+      // edit - see lib/settlement-correction.ts; additive, never
+      // replace-on-edit) moves to Bin together with the Challan, in
+      // the SAME transaction - never SETTLEMENT/SETTLEMENT_PAYMENT/
+      // CARRIER_RENT_MULTI_PAYER_TRANSITION/DAILY_POSTING, which can
+      // only exist on a settled Challan - already excluded above (a
+      // settled Challan cannot be Bin'd).
+      await tx.journalEntry.updateMany({
+        where: {
+          referenceType: { in: ["CHALLAN_DISPATCH", "CHALLAN_DISPATCH_CORRECTION"] },
+          referenceId: id,
+          isDeleted: false,
+        },
+        data: {
+          isDeleted: true,
+          deletedAt: new Date(),
+          deletedById: currentUser.userId,
+        },
+      });
 
-    await auditDelete(prisma, {
-      actor: actorFromUser(currentUser),
-      module: "CHALLAN",
-      entityType: "Challan",
-      entityId: id,
-      documentNo: existingChallan.challanNo,
-      description: `Moved Challan ${existingChallan.challanNo} to Bin`,
-      ...requestContext(request),
+      await tx.challan.update({
+        where: { id },
+        data: {
+          isDeleted: true,
+          deletedAt: new Date(),
+          deletedById: currentUser.userId,
+        },
+      });
+
+      await auditDelete(tx, {
+        actor: actorFromUser(currentUser),
+        module: "CHALLAN",
+        entityType: "Challan",
+        entityId: id,
+        documentNo: existingChallan.challanNo,
+        description: `Moved Challan ${existingChallan.challanNo} to Bin`,
+        ...requestContext(request),
+      });
     });
 
     return NextResponse.json({

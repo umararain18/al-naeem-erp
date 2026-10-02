@@ -453,19 +453,33 @@ export async function DELETE(
       }
     }
 
-    await prisma.bill.update({
-      where: { id },
-      data: { isDeleted: true, deletedAt: new Date(), deletedById: currentUser.userId },
-    });
+    await prisma.$transaction(async (tx) => {
+      // Document-owned accounting: a Bill's BILL-referenceType entry
+      // is replace-on-edit (see this file's PATCH handler - exactly
+      // ONE is ever active at a time), so this `updateMany` scoped to
+      // isDeleted: false always touches exactly that one row. Moves
+      // to Bin together with the Bill itself, in the SAME transaction -
+      // never DAILY_POSTING, already excluded above (zero received
+      // amount required to Bin).
+      await tx.journalEntry.updateMany({
+        where: { referenceType: "BILL", referenceId: id, isDeleted: false },
+        data: { isDeleted: true, deletedAt: new Date(), deletedById: currentUser.userId },
+      });
 
-    await auditDelete(prisma, {
-      actor: actorFromUser(currentUser),
-      module: "BILL",
-      entityType: "Bill",
-      entityId: id,
-      documentNo: bill.billNo,
-      description: `Moved Bill ${bill.billNo} to Bin`,
-      ...requestContext(request),
+      await tx.bill.update({
+        where: { id },
+        data: { isDeleted: true, deletedAt: new Date(), deletedById: currentUser.userId },
+      });
+
+      await auditDelete(tx, {
+        actor: actorFromUser(currentUser),
+        module: "BILL",
+        entityType: "Bill",
+        entityId: id,
+        documentNo: bill.billNo,
+        description: `Moved Bill ${bill.billNo} to Bin`,
+        ...requestContext(request),
+      });
     });
 
     return NextResponse.json({ success: true, message: "Bill moved to Bin successfully." });

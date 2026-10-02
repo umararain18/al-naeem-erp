@@ -40,6 +40,26 @@ export async function POST(
         throw new Error("NOT_BINNED");
       }
 
+      // Restore the SAME document-owned accounting Binned alongside
+      // this Bilty (see the DELETE handler's own comment in
+      // app/api/bilty/[id]/route.ts) - BILTY_BOOKING and
+      // BILTY_BOOKING_CORRECTION are never soft-deleted by anything
+      // other than this Bilty being Bin'd, so every currently-deleted
+      // row under these two referenceTypes for this Bilty is safe to
+      // restore unconditionally.
+      await tx.journalEntry.updateMany({
+        where: {
+          referenceType: { in: ["BILTY_BOOKING", "BILTY_BOOKING_CORRECTION"] },
+          referenceId: id,
+          isDeleted: true,
+        },
+        data: {
+          isDeleted: false,
+          deletedAt: null,
+          deletedById: null,
+        },
+      });
+
       const restored = await tx.bilty.update({
         where: { id },
         data: {

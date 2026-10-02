@@ -25,6 +25,28 @@ export async function POST(
       if (!current.isDeleted) {
         throw new Error("NOT_BINNED");
       }
+
+      // Restore the document-owned PRIVATE_PHONCH entry Bin'd
+      // alongside this PrivatePhonch (see the DELETE handler's own
+      // comment in app/api/private-phonch/[id]/route.ts).
+      // PRIVATE_PHONCH is replace-on-edit, so past edits can each
+      // leave behind an older, already-historical soft-deleted row
+      // (edits are blocked while Bin'd, so Binning always happens
+      // strictly after any such edit) - taking the single newest one
+      // by createdAt is what the Bin operation itself just touched,
+      // never an older edit-replaced entry.
+      const entryToRestore = await tx.journalEntry.findFirst({
+        where: { referenceType: "PRIVATE_PHONCH", referenceId: id, isDeleted: true },
+        orderBy: { createdAt: "desc" },
+        select: { id: true },
+      });
+      if (entryToRestore) {
+        await tx.journalEntry.update({
+          where: { id: entryToRestore.id },
+          data: { isDeleted: false, deletedAt: null, deletedById: null },
+        });
+      }
+
       const restored = await tx.privatePhonch.update({
         where: { id },
         data: { isDeleted: false, deletedAt: null, deletedById: null },
