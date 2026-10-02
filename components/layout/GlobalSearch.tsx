@@ -154,8 +154,8 @@ export default function GlobalSearch({ collapsed = false }: { collapsed?: boolea
         }}
         className={
           collapsed
-            ? "hidden lg:flex items-center justify-center w-8 h-8 rounded-md hover:bg-gray-800 text-gray-400 hover:text-white"
-            : "hidden lg:flex items-center gap-2 w-full rounded-md border border-gray-700 bg-gray-800 px-2.5 py-1.5 text-xs text-gray-400 hover:bg-gray-700 hover:text-white transition-colors"
+            ? "hidden lg:flex items-center justify-center w-8 h-8 rounded-md hover:bg-gray-800 text-[#94A3B8] hover:text-white"
+            : "hidden lg:flex items-center gap-2 w-full rounded-md border border-gray-700 bg-gray-800 px-2.5 py-1.5 text-xs text-[#94A3B8] hover:bg-gray-700 hover:text-white transition-colors"
         }
         aria-label="Global Search"
         title={collapsed ? "Search (Ctrl+K)" : undefined}
