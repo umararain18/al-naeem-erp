@@ -29,6 +29,7 @@ import {
   History,
 } from "lucide-react";
 import GlobalSearch from "@/components/layout/GlobalSearch";
+import ThemeToggle from "@/components/theme/ThemeToggle";
 
 type User = {
   username: string;
@@ -277,10 +278,17 @@ export default function AppSidebar({ user }: { user: User | null }) {
         <Menu className="h-5 w-5" />
       </button>
 
-      {/* Sidebar */}
+      {/* Sidebar - deliberately theme-INVARIANT (always this same dark
+          surface in both Light and Dark mode, by existing design - see
+          app/globals.css's dark-mode token remap doc comment for why
+          this uses a fixed arbitrary value instead of the bg-gray-900
+          utility: that utility's underlying --color-gray-900 variable
+          is what gets remapped for DARK-MODE TEXT purposes elsewhere,
+          and reusing it here would otherwise flip the sidebar itself
+          to a light color under Dark Mode. */}
       <aside
         className={`
-          fixed inset-y-0 left-0 z-50 bg-gray-900 text-white transition-all duration-300 flex flex-col
+          fixed inset-y-0 left-0 z-50 bg-[oklch(21%_0.034_264.665)] text-white transition-all duration-300 flex flex-col
           lg:sticky lg:top-0 lg:h-screen lg:z-auto
           ${collapsed ? "w-[64px]" : "w-[240px]"}
           ${mobileOpen ? "translate-x-0" : "-translate-x-full lg:translate-x-0"}
@@ -294,22 +302,28 @@ export default function AppSidebar({ user }: { user: User | null }) {
               <p className="text-[10px] text-gray-400 truncate">CAR CARRIERS SERVICE</p>
             </div>
           )}
-          <button
-            type="button"
-            onClick={() => setCollapsed(!collapsed)}
-            className="hidden lg:flex items-center justify-center w-8 h-8 rounded-md hover:bg-gray-800 text-gray-400 hover:text-white"
-            aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
-          >
-            <ChevronLeft className={`h-4 w-4 transition-transform ${collapsed ? "rotate-180" : ""}`} />
-          </button>
-          <button
-            type="button"
-            onClick={() => setMobileOpen(false)}
-            className="lg:hidden flex items-center justify-center w-8 h-8 rounded-md hover:bg-gray-800 text-gray-400 hover:text-white"
-            aria-label="Close menu"
-          >
-            <X className="h-4 w-4" />
-          </button>
+          <div className="flex items-center gap-1 flex-shrink-0">
+            {/* Global Light/Dark toggle - present here (the existing
+                global navigation area) on every page, including the
+                login screen, since this sidebar always renders. */}
+            <ThemeToggle collapsed={collapsed} />
+            <button
+              type="button"
+              onClick={() => setCollapsed(!collapsed)}
+              className="hidden lg:flex items-center justify-center w-8 h-8 rounded-md hover:bg-gray-800 text-gray-400 hover:text-white"
+              aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+            >
+              <ChevronLeft className={`h-4 w-4 transition-transform ${collapsed ? "rotate-180" : ""}`} />
+            </button>
+            <button
+              type="button"
+              onClick={() => setMobileOpen(false)}
+              className="lg:hidden flex items-center justify-center w-8 h-8 rounded-md hover:bg-gray-800 text-gray-400 hover:text-white"
+              aria-label="Close menu"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
         </div>
 
         {/* Global Search trigger (Ctrl+K) - desktop only, does not

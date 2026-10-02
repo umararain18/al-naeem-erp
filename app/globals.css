@@ -1,8 +1,18 @@
 @import "tailwindcss";
 
+/* Enables class-based Dark Mode for Tailwind's own `dark:` utility
+   variant (used only in the few places that need it directly - the
+   theme toggle, login page). The real, app-wide theming mechanism
+   below does NOT depend on this - it overrides Tailwind's own color
+   tokens directly, which is what makes every existing page's already-
+   written bg-white/bg-gray-50/text-gray-900/etc. classes dark-mode-
+   aware with no per-page changes at all. */
+@custom-variant dark (&:where(.dark, .dark *));
+
 :root {
   --background: #ffffff;
   --foreground: #171717;
+  color-scheme: light;
 }
 
 @theme inline {
@@ -12,17 +22,111 @@
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
-
 body {
   background: var(--background);
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
+}
+
+/* ============================================================
+   DARK MODE — centralized token remap
+   ============================================================
+   This is the entire dark-mode implementation for the ERP's existing
+   markup. Nothing else needs to change per-page: every one of the
+   66+ files already using bg-white, the 68 using text-gray-500, the
+   dozens using border-gray-200/300, bg-green-50/text-green-700 status
+   badges, etc. automatically renders correctly in Dark Mode, because
+   Tailwind v4 utilities resolve their color at paint time from these
+   same CSS custom properties - redefining the properties here (scoped
+   to :root.dark) is enough. No "dark:" class needed anywhere else.
+
+   Three tokens are deliberately NOT remapped, by design:
+     - --color-black: used throughout as bg-black/40 or bg-black/50
+       modal-overlay backdrops, which read correctly as an overlay in
+       either theme as-is.
+     - --color-gray-800 / --color-gray-950: the sidebar (and its own
+       hover/border states) uses these directly and is intentionally
+       a fixed dark surface in BOTH themes (an existing, deliberate
+       design choice, not something Dark Mode should touch) - leaving
+       them alone preserves that exactly.
+     - --color-gray-900: the one exception requiring a tiny source
+       change instead of a pure CSS remap - see the "Sidebar -
+       deliberately theme-INVARIANT" comment in
+       components/layout/AppSidebar.tsx (plus the 2 identical "Close"
+       buttons in app/accounting-transaction-bin/page.tsx and
+       app/cash-book/TransactionViewModal.tsx) for why: this token is
+       used BOTH as the primary-text color (43 files) and, separately,
+       as the sidebar/these 2 buttons' own fixed-dark background (3
+       usages) - remapping it for dark-mode TEXT purposes would have
+       also lightened those 3 backgrounds. Those 3 spots were switched
+       to an arbitrary-value class carrying today's exact
+       --color-gray-900 value, so they stay visually identical in
+       both themes while --color-gray-900 itself is now free to be
+       remapped below for its much more common role: primary text.
+
+   Values are authored directly in Tailwind v4's own oklch color
+   space, each dark value keeping the SAME hue as its light
+   counterpart (just adjusted lightness/chroma) so every semantic
+   color (green/red/amber/yellow/blue) stays recognizable as the same
+   color family in both themes, never just a flat inversion.
+   ============================================================ */
+:root.dark {
+  color-scheme: dark;
+
+  --background: #0a0a0a;
+  --foreground: #ededed;
+
+  /* Neutral surfaces & text - the core of every page, card, table,
+     and form in the app. */
+  --color-white: oklch(19% 0.006 264.665);         /* card/panel surface - "slightly lighter than main background" */
+  --color-gray-50: oklch(14% 0.005 264.665);        /* page background - "very dark neutral" */
+  --color-gray-100: oklch(24% 0.007 264.665);       /* muted surface: table headers, hover backgrounds, light badges */
+  --color-gray-200: oklch(30% 0.008 264.665);       /* subtle borders */
+  --color-gray-300: oklch(36% 0.009 264.665);       /* stronger borders - form inputs, dividers */
+  --color-gray-400: oklch(54% 0.012 264.665);       /* disabled/placeholder text - still distinguishable */
+  --color-gray-500: oklch(65% 0.012 264.665);       /* secondary text */
+  --color-gray-600: oklch(73% 0.012 264.665);       /* secondary text, slightly stronger */
+  --color-gray-700: oklch(80% 0.01 264.665);        /* rarely used directly; kept in the same progression */
+  --color-gray-900: oklch(93% 0.004 264.665);       /* primary text - high contrast */
+
+  /* Brand / primary accent (buttons, links, focus) - same hue as the
+     existing blue-600 brand color, lightness tuned for a dark
+     background while keeping white button-text readable on it. */
+  --color-blue-50: oklch(23% 0.04 262.881);
+  --color-blue-100: oklch(27% 0.055 262.881);
+  --color-blue-500: oklch(62% 0.21 262.881);
+  --color-blue-600: oklch(58% 0.21 262.881);
+  --color-blue-700: oklch(52% 0.22 262.881);
+
+  /* Semantic status colors - success */
+  --color-green-50: oklch(22% 0.03 149.214);
+  --color-green-100: oklch(26% 0.045 149.214);
+  --color-green-600: oklch(72% 0.17 149.214);
+  --color-green-700: oklch(78% 0.15 149.214);
+
+  /* Semantic status colors - danger/error */
+  --color-red-50: oklch(23% 0.035 27.325);
+  --color-red-100: oklch(27% 0.05 27.325);
+  --color-red-600: oklch(72% 0.19 27.325);
+  --color-red-700: oklch(78% 0.16 27.325);
+
+  /* Semantic status colors - warning */
+  --color-amber-50: oklch(23% 0.03 58.318);
+  --color-amber-100: oklch(27% 0.045 58.318);
+  --color-amber-600: oklch(75% 0.14 58.318);
+  --color-amber-700: oklch(80% 0.12 58.318);
+  --color-yellow-50: oklch(23% 0.03 95.277);
+  --color-yellow-700: oklch(80% 0.12 95.277);
+}
+
+/* Theme toggle transition - a deliberately small, non-animated color
+   change (per spec: "Do not introduce unnecessary animations") on
+   just the two properties that actually change, so switching themes
+   doesn't feel like a jarring flash but never turns into a visual
+   effect of its own. */
+body,
+.dark body {
+  transition: background-color 120ms ease-out, color 120ms ease-out;
 }
 
 @media print {

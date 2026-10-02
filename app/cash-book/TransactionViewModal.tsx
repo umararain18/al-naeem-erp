@@ -197,7 +197,7 @@ export default function TransactionViewModal({
           <button
             type="button"
             onClick={onClose}
-            className="rounded-lg bg-gray-900 px-5 py-2.5 text-sm font-medium text-white hover:bg-gray-800"
+            className="rounded-lg bg-[oklch(21%_0.034_264.665)] px-5 py-2.5 text-sm font-medium text-white hover:bg-gray-800"
           >
             Close
           </button>
