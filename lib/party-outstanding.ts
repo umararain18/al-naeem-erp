@@ -231,8 +231,20 @@ async function fetchAllocationBackedLines(
     select: { journalLineId: true },
   });
   if (allocations.length === 0) return [];
+  // Gap B: the PaymentAllocation row itself is never touched when its
+  // source payment is Bin'd (preserving allocation history, per this
+  // module's own additive/non-destructive design) - but it must stop
+  // contributing to an ACTIVE financial view once its source
+  // JournalEntry is inactive, exactly like every other sourceType/
+  // sourceId-tagged Daily Posting line already excluded via
+  // fetchDailyPostingLines()'s own isDeleted filter above. Restoring
+  // the Daily Posting later makes this line reappear here again, with
+  // no new/duplicate allocation ever created.
   const lines = await tx.journalLine.findMany({
-    where: { id: { in: allocations.map((a) => a.journalLineId) } },
+    where: {
+      id: { in: allocations.map((a) => a.journalLineId) },
+      journalEntry: { isDeleted: false },
+    },
     select: {
       id: true,
       journalEntryId: true,

@@ -27,6 +27,7 @@ import {
   assertPrivatePhonchPaymentNotExceeded,
   PrivatePhonchAccountingError,
 } from "@/lib/private-phonch-accounting";
+import { getAllocatedAmountForPayment } from "@/lib/payment-allocation";
 import { auditUpdate, auditDelete, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 
 function isValidDate(value: string) {
@@ -430,6 +431,38 @@ export async function PATCH(
                 mainDirection,
                 currentLine.journalEntryId
               );
+            }
+
+            // PAYMENT ALLOCATION CEILING (Gap A) - a PaymentAllocation
+            // row can only ever reference the Party-side line of a
+            // Daily Posting pair (see lib/payment-allocation.ts's own
+            // getPaymentLine() validation), which is exactly
+            // counterLine here (currentLine is always the Cash/Bank
+            // side - enforced above). Reducing this payment below what
+            // is already manually allocated against it would silently
+            // leave those PaymentAllocation rows over-committed, with
+            // nothing left to reconcile them - reject instead, the
+            // same way updateSettlementPaymentAmount() already rejects
+            // an over-allocating edit for the separate Settlement
+            // Payment mechanism. The counter account's OWN new amount
+            // (not the Cash/Bank side's) is what a payment's
+            // allocations are measured against - equal in magnitude to
+            // the main line's new amount here, but kept separate for
+            // clarity and to stay correct if that ever changes.
+            if (counterLine.accountId) {
+              const counterAccount = await tx.account.findUnique({
+                where: { id: counterLine.accountId },
+                select: { category: true },
+              });
+              if (counterAccount?.category === "PARTY") {
+                const totalAllocated = await getAllocatedAmountForPayment(tx, counterLine.id);
+                const newCounterAmount = counterDebit > 0 ? counterDebit : counterCredit;
+                if (totalAllocated > newCounterAmount + 0.009) {
+                  throw new DailyPostingValidationError(
+                    `Cannot reduce this payment to ${newCounterAmount} - ${totalAllocated} has already been allocated from it to a Bilty/Challan. Remove or reduce the relevant allocation(s) first.`
+                  );
+                }
+              }
             }
 
             const updatedJournalEntry = await tx.journalEntry.update({
