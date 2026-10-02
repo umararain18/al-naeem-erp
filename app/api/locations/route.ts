@@ -8,7 +8,7 @@ const createLocationSchema = z.object({
   name: z.string().trim().min(2, "Location name must be at least 2 characters"),
 });
 
-export async function GET() {
+export async function GET(request: NextRequest) {
   try {
     const currentUser = await getCurrentUser();
 
@@ -32,10 +32,15 @@ export async function GET() {
       );
     }
 
+    // Bilty's own from/to location dropdowns call this same endpoint
+    // with no query string and must keep seeing active locations only
+    // (unchanged, existing behavior). The Location Master management
+    // page opts in to seeing inactive ones too, via ?includeInactive=1,
+    // so a deactivated location stays visible there to be reactivated.
+    const includeInactive = request.nextUrl.searchParams.get("includeInactive") === "1";
+
     const locations = await prisma.location.findMany({
-      where: {
-        isActive: true,
-      },
+      where: includeInactive ? {} : { isActive: true },
       orderBy: {
         name: "asc",
       },
