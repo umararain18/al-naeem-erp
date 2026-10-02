@@ -117,6 +117,49 @@ body {
   --color-amber-700: oklch(80% 0.12 58.318);
   --color-yellow-50: oklch(23% 0.03 95.277);
   --color-yellow-700: oklch(80% 0.12 95.277);
+
+  /* Semantic/category badge colors - found during the full QA pass
+     (audit-log, challan, daily-posting, dashboard, employees, private
+     phonch all use one or more of these for status/category badges) -
+     same hue-preserving pattern as the colors above, previously
+     missing from this remap entirely, which left these badges with
+     their light-mode near-white background unchanged in Dark Mode. */
+  --color-indigo-50: oklch(24% 0.05 272.314);
+  --color-indigo-100: oklch(28% 0.07 272.314);
+  --color-indigo-600: oklch(70% 0.19 272.314);
+  --color-indigo-700: oklch(76% 0.17 272.314);
+  --color-indigo-800: oklch(82% 0.14 272.314);
+
+  --color-purple-50: oklch(24% 0.05 302.321);
+  --color-purple-100: oklch(28% 0.07 302.321);
+  --color-purple-200: oklch(34% 0.09 302.321);
+  --color-purple-600: oklch(72% 0.19 302.321);
+  --color-purple-700: oklch(78% 0.17 302.321);
+  --color-purple-800: oklch(84% 0.13 302.321);
+
+  --color-pink-50: oklch(24% 0.05 0.584);
+  --color-pink-100: oklch(28% 0.07 0.584);
+  --color-pink-600: oklch(72% 0.19 0.584);
+  --color-pink-700: oklch(78% 0.16 0.584);
+  --color-pink-800: oklch(84% 0.13 0.584);
+
+  --color-orange-50: oklch(24% 0.05 41.116);
+  --color-orange-100: oklch(28% 0.07 41.116);
+  --color-orange-600: oklch(73% 0.17 41.116);
+  --color-orange-700: oklch(79% 0.15 41.116);
+  --color-orange-800: oklch(84% 0.12 41.116);
+
+  --color-teal-50: oklch(24% 0.04 184.704);
+  --color-teal-100: oklch(28% 0.06 184.704);
+  --color-teal-600: oklch(68% 0.13 184.704);
+  --color-teal-700: oklch(75% 0.11 184.704);
+  --color-teal-800: oklch(81% 0.09 184.704);
+
+  --color-sky-50: oklch(24% 0.04 241.966);
+  --color-sky-100: oklch(28% 0.06 241.966);
+  --color-sky-600: oklch(68% 0.16 241.966);
+  --color-sky-700: oklch(75% 0.14 241.966);
+  --color-sky-800: oklch(81% 0.11 241.966);
 }
 
 /* Theme toggle transition - a deliberately small, non-animated color

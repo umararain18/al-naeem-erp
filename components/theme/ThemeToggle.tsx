@@ -19,7 +19,7 @@ export default function ThemeToggle({ collapsed }: { collapsed?: boolean }) {
       onClick={toggleTheme}
       aria-label={isDark ? "Switch to Light Mode" : "Switch to Dark Mode"}
       title={isDark ? "Switch to Light Mode" : "Switch to Dark Mode"}
-      className="flex items-center justify-center w-8 h-8 rounded-md hover:bg-gray-800 text-gray-400 hover:text-white flex-shrink-0"
+      className="flex items-center justify-center w-8 h-8 rounded-md hover:bg-gray-800 text-[#94A3B8] hover:text-white flex-shrink-0"
     >
       {isDark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
       {!collapsed && <span className="sr-only">{isDark ? "Light Mode" : "Dark Mode"}</span>}

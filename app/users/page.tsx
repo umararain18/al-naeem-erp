@@ -561,7 +561,7 @@ export default function UsersPage() {
                 <button
                   onClick={closeEditUser}
                   disabled={saving}
-                  className="text-gray-500 hover:text-black text-xl"
+                  className="text-gray-500 hover:text-gray-900 text-xl"
                 >
                   ×
                 </button>

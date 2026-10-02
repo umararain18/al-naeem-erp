@@ -253,7 +253,9 @@ function SearchPageInner() {
                 setPage(1);
               }}
               className={`rounded-lg border px-3 py-1.5 text-sm font-medium ${
-                activeModule === tab.value ? "border-black bg-black text-white" : "hover:bg-gray-50"
+                activeModule === tab.value
+                  ? "border-[oklch(21%_0.034_264.665)] bg-[oklch(21%_0.034_264.665)] text-white"
+                  : "hover:bg-gray-50"
               }`}
             >
               {tab.label}
