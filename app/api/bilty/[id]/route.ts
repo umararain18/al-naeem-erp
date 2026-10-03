@@ -1138,6 +1138,22 @@ export async function PATCH(
       },
       });
 
+      // Keep the original Bilty booking JournalEntry date synchronized
+      // with the Bilty business date. Correction entries represent
+      // independent correction moments and must not be changed here.
+      if (data.date) {
+        await tx.journalEntry.updateMany({
+          where: {
+            referenceType: "BILTY_BOOKING",
+            referenceId: id,
+            isDeleted: false,
+          },
+          data: {
+            entryDate: biltyDate,
+          },
+        });
+      }
+
       // ESTABLISH / SYNC / RELEASE the PAID row, now that the Bilty's
       // own advance/paidResponsiblePartyId reflect the NEW state -
       // resolveComponentContext() reads Bilty.advance fresh, so this
