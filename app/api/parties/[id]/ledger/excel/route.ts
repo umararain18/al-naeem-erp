@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { getPartyLedgerData, PartyLedgerLookupError, parseLedgerEntryType, filterLedgerRowsBySearch } from "@/lib/ledger-description";
+import { formatBusinessDate } from "@/lib/date-range";
 
 // ============================================================
 // GET /api/parties/[id]/ledger/excel?from=&to=
@@ -36,10 +37,6 @@ function escapeHtml(value: string): string {
 
 function formatCurrency(value: number) {
   return `Rs. ${Math.round(value).toLocaleString()}`;
-}
-
-function formatDate(value: string) {
-  return new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "2-digit", year: "numeric" }).format(new Date(value));
 }
 
 const DOCUMENT_TYPE_LABELS: Record<string, string> = {
@@ -89,7 +86,7 @@ export async function GET(
       .map(
         (row) => `
         <tr>
-          <td>${escapeHtml(formatDate(row.date))}</td>
+          <td>${escapeHtml(formatBusinessDate(row.date))}</td>
           <td>${escapeHtml(row.description)}</td>
           <td align="right">${row.debit > 0 ? escapeHtml(formatCurrency(row.debit)) : ""}</td>
           <td align="right">${row.credit > 0 ? escapeHtml(formatCurrency(row.credit)) : ""}</td>

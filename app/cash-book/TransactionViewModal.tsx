@@ -1,5 +1,7 @@
 "use client";
 
+import { formatBusinessDate } from "@/lib/date-range";
+
 type TransactionEntry = {
   id: string;
   date: string;
@@ -25,16 +27,6 @@ function formatMoney(value: number) {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   }).format(value);
-}
-
-function formatDate(value: string) {
-  const [year, month, day] = value.split("-");
-
-  if (!year || !month || !day) {
-    return value;
-  }
-
-  return `${day}-${month}-${year}`;
 }
 
 export default function TransactionViewModal({
@@ -81,7 +73,7 @@ export default function TransactionViewModal({
               </p>
 
               <p className="mt-1 text-sm font-medium text-gray-900">
-                {formatDate(entry.date)}
+                {formatBusinessDate(entry.date)}
               </p>
             </div>
 

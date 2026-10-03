@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { t, type Lang } from "@/lib/i18n/party-ledger";
+import { formatBusinessDate } from "@/lib/date-range";
 
 type DocumentRow = {
   targetSourceType: "BILTY" | "CHALLAN";
@@ -32,11 +33,6 @@ type DocumentRow = {
 
 function formatCurrency(value: number) {
   return `Rs. ${value.toLocaleString()}`;
-}
-
-function formatDate(value: string) {
-  if (!value) return "—";
-  return new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "2-digit", year: "numeric" }).format(new Date(value));
 }
 
 const ALL_COLUMNS = [
@@ -256,7 +252,7 @@ export default function DocumentsView({
                 const href = documentHref(row);
                 return (
                   <tr key={`${row.targetSourceType}:${row.targetSourceId}`} className="hover:bg-gray-50">
-                    {visibleColumns.has("date") && <td className="px-3 py-2">{formatDate(row.documentDate)}</td>}
+                    {visibleColumns.has("date") && <td className="px-3 py-2">{formatBusinessDate(row.documentDate)}</td>}
                     {visibleColumns.has("documentNo") && (
                       <td className="px-3 py-2 font-medium">
                         {href ? (

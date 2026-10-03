@@ -5,6 +5,7 @@ import Link from "next/link";
 import { t, type Lang } from "@/lib/i18n/party-ledger";
 import { presetRange } from "@/components/LedgerFilters";
 import { filterOutstandingRows, documentDateKey } from "@/lib/outstanding-filters";
+import { formatBusinessDate } from "@/lib/date-range";
 
 // ============================================================
 // PARTY OUTSTANDING LEDGER (document-level) - powered by the NEW,
@@ -78,10 +79,6 @@ type OutstandingResponse = {
 
 function formatCurrency(value: number) {
   return `Rs. ${Math.round(value).toLocaleString()}`;
-}
-
-function formatDate(value: string) {
-  return new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "2-digit", year: "numeric", timeZone: "Asia/Karachi" }).format(new Date(value));
 }
 
 const DOCUMENT_LABELS: Record<OutstandingRow["documentType"], string> = {
@@ -362,7 +359,7 @@ export default function OutstandingView({ partyId, lang }: { partyId: string; la
                   return (
                     <Fragment key={key}>
                       <tr className="hover:bg-gray-50">
-                        <td className="px-4 py-3">{formatDate(row.documentDate)}</td>
+                        <td className="px-4 py-3">{formatBusinessDate(row.documentDate)}</td>
                         <td className="px-4 py-3">{documentLabel(row)}</td>
                         <td className="px-4 py-3 font-medium">
                           {href ? (
@@ -418,7 +415,7 @@ export default function OutstandingView({ partyId, lang }: { partyId: string; la
                               <tbody className="divide-y bg-white">
                                 {row.settledDrillDown!.map((d) => (
                                   <tr key={d.journalLineId}>
-                                    <td className="px-3 py-2">{formatDate(d.date)}</td>
+                                    <td className="px-3 py-2">{formatBusinessDate(d.date)}</td>
                                     <td className="px-3 py-2">{d.accountName}</td>
                                     <td className="px-3 py-2">{d.description}</td>
                                     <td className="px-3 py-2 text-right">{d.debit > 0 ? formatCurrency(d.debit) : "—"}</td>

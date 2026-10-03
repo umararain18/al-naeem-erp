@@ -3,6 +3,7 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
+import { formatBusinessDate } from "@/lib/date-range";
 
 // Shared sticky-header cell styling (see the table wrapper's own doc
 // comment below for why `sticky top-0` only works correctly once the
@@ -1163,7 +1164,7 @@ export default function ChallanPage() {
                     return (
                       <tr key={challan.id} className="hover:bg-gray-50">
                         <td className="px-4 py-3">
-                          {new Date(challan.loadingDate).toLocaleDateString()}
+                          {formatBusinessDate(challan.loadingDate)}
                         </td>
                         <td className="px-4 py-3">
                           <Link href={`/challan/${challan.id}`} className="font-medium text-blue-600 hover:underline">

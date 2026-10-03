@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";import { useRouter } from "next/navigation"; import TransactionViewModal from "./TransactionViewModal"; import TransactionEditModal from "./TransactionEditModal";
 import { presetRange } from "@/components/LedgerFilters";
+import { formatBusinessDate } from "@/lib/date-range";
 
 type Account = {
   id: string;
@@ -67,16 +68,6 @@ function formatMoney(amount: number) {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   }).format(amount);
-}
-
-function formatDate(date: string) {
-  const [year, month, day] = date.split("-");
-
-  if (!year || !month || !day) {
-    return date;
-  }
-
-  return `${day}-${month}-${year}`;
 }
 
 export default function CashBookPage() {
@@ -795,7 +786,7 @@ export default function CashBookPage() {
 
                         <div className="font-semibold text-gray-900">
                           📅{" "}
-                          {formatDate(
+                          {formatBusinessDate(
                             day.date
                           )}
                         </div>
@@ -868,7 +859,7 @@ export default function CashBookPage() {
 
                             <h3 className="font-semibold text-gray-900">
                               📅{" "}
-                              {formatDate(
+                              {formatBusinessDate(
                                 day.date
                               )}
                             </h3>

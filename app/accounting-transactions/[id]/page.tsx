@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import { formatBusinessDate } from "@/lib/date-range";
 
 type Account = {
   id: string;
@@ -152,7 +153,7 @@ export default function AccountingTransactionDetailPage({
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
             <div>
               <p className="text-gray-500">Entry Date</p>
-              <p className="font-medium">{formatDate(entry.entryDate)}</p>
+              <p className="font-medium">{formatBusinessDate(entry.entryDate)}</p>
             </div>
             <div>
               <p className="text-gray-500">Reference Type</p>

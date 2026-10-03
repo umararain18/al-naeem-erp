@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import Image from "next/image";
+import { formatBusinessDate } from "@/lib/date-range";
 
 type BiltyStatus = "PENDING" | "IN_TRANSIT" | "DELIVERED" | "CANCELLED";
 
@@ -304,7 +305,7 @@ export default function BiltyPrintPage() {
 
           <div className="text-right">
             <p className="text-sm font-semibold">Date:</p>
-            <p className="text-base">{new Date(bilty.date).toLocaleDateString()}</p>
+            <p className="text-base">{formatBusinessDate(bilty.date)}</p>
           </div>
 
           <div className="text-right">

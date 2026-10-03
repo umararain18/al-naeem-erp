@@ -4,6 +4,7 @@ import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { resolvePdfPresentation } from "@/lib/pdf-presentation";
 import { createPdfDocument, drawPdfHeader, drawPdfFooter, applyWatermark, resolveJsPdfFont } from "@/lib/pdf-render-helpers";
+import { formatBusinessDate } from "@/lib/date-range";
 
 export async function GET(
   _request: NextRequest,
@@ -62,7 +63,7 @@ export async function GET(
 
     const detailRows = [
       ["Bilty No", bilty.biltyNo],
-      ["Date", new Date(bilty.date).toLocaleDateString()],
+      ["Date", formatBusinessDate(bilty.date)],
       ["Status", bilty.status.replace("_", " ")],
     ];
 

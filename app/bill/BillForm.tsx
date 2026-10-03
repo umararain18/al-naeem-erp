@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { toBusinessDateInputValue } from "@/lib/date-range";
 
 // ============================================================
 // BILL BOOK - shared create/edit form
@@ -179,7 +180,7 @@ export default function BillForm({
 
   const [billNo, setBillNo] = useState(initialData?.billNo || "");
   const [date, setDate] = useState(
-    initialData?.date ? initialData.date.slice(0, 10) : new Date().toISOString().slice(0, 10)
+    initialData?.date ? toBusinessDateInputValue(initialData.date) : toBusinessDateInputValue(new Date())
   );
   const [clientPartyId, setClientPartyId] = useState(initialData?.clientPartyId || "");
   const [clientName, setClientName] = useState(initialData?.clientName || "");
@@ -371,7 +372,7 @@ export default function BillForm({
 
   function resetForm() {
     setBillNo("");
-    setDate(new Date().toISOString().slice(0, 10));
+    setDate(toBusinessDateInputValue(new Date()));
     setClientPartyId("");
     setClientName("");
     setClientPhone("");

@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { toBusinessDateInputValue } from "@/lib/date-range";
 
 // ============================================================
 // SHOWROOM PHONCH / DELIVERY - shared create/edit form
@@ -171,7 +172,7 @@ export default function PhonchForm({
 
   const [phonchNo, setPhonchNo] = useState(initialData?.phonchNo || "");
   const [date, setDate] = useState(
-    initialData?.date ? initialData.date.slice(0, 10) : new Date().toISOString().slice(0, 10)
+    initialData?.date ? toBusinessDateInputValue(initialData.date) : toBusinessDateInputValue(new Date())
   );
   const [transporterPartyId, setTransporterPartyId] = useState(initialData?.transporterParty.id || "");
   const [carrierNumber, setCarrierNumber] = useState(initialData?.carrierNumber || "");
@@ -266,7 +267,7 @@ export default function PhonchForm({
 
   function resetForm() {
     setPhonchNo("");
-    setDate(new Date().toISOString().slice(0, 10));
+    setDate(toBusinessDateInputValue(new Date()));
     setTransporterPartyId("");
     setCarrierNumber("");
     setDescription("");

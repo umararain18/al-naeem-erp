@@ -5,6 +5,7 @@ import { hasPermission } from "@/lib/permissions";
 import autoTable from "jspdf-autotable";
 import { resolvePdfPresentation } from "@/lib/pdf-presentation";
 import { createPdfDocument, drawPdfHeader, drawPdfFooter, applyWatermark, resolveAutoTableTheme, resolveJsPdfFont } from "@/lib/pdf-render-helpers";
+import { formatBusinessDate } from "@/lib/date-range";
 
 export async function GET(
   _request: NextRequest,
@@ -70,7 +71,7 @@ export async function GET(
 
     const detailRows = [
       ["Challan No", challan.challanNo],
-      ["Loading Date", new Date(challan.loadingDate).toLocaleDateString()],
+      ["Loading Date", formatBusinessDate(challan.loadingDate)],
       ["Transporter", challan.transporterParty?.partyName || "—"],
       ["Driver", [challan.driverName, challan.driverPhone].filter(Boolean).join(" / ") || "—"],
       ["Carrier Number", challan.carrierNumber || "—"],

@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { getBiltyShareMessage } from "@/lib/share-messages";
 import { normalizePhone } from "@/lib/phone";
+import { formatBusinessDate } from "@/lib/date-range";
 import { DocumentFooter, DocumentHeader, useDocumentPresentation } from "@/components/documents/DocumentPresentation";
 
 type BiltyStatus = "PENDING" | "IN_TRANSIT" | "DELIVERED" | "CANCELLED";
@@ -165,7 +166,7 @@ export default function BiltyDetailPage({
             <div>
               <h1 className="text-2xl font-bold">Bilty #{bilty.biltyNo}</h1>
               <p className="text-gray-600">
-                {new Date(bilty.date).toLocaleDateString()}
+                {formatBusinessDate(bilty.date)}
               </p>
             </div>
 

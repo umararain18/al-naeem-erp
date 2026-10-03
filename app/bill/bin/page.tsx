@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import { formatBusinessDate } from "@/lib/date-range";
 
 // Mirrors app/private-phonch/bin/page.tsx exactly.
 
@@ -144,7 +145,7 @@ export default function BillBinPage() {
                 {bills.map((b) => (
                   <tr key={b.id} className="hover:bg-gray-50">
                     <td className="px-4 py-3 font-medium">{b.billNo}</td>
-                    <td className="px-4 py-3">{formatDate(b.date)}</td>
+                    <td className="px-4 py-3">{formatBusinessDate(b.date)}</td>
                     <td className="px-4 py-3">{b.clientName}</td>
                     <td className="px-4 py-3">{b.vehicleCount}</td>
                     <td className="px-4 py-3">

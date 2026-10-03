@@ -11,6 +11,7 @@ import SummaryView from "./SummaryView";
 import ReconciliationView from "./ReconciliationView";
 import StatementView from "./StatementView";
 import { presetRange } from "@/components/LedgerFilters";
+import { formatBusinessDate } from "@/lib/date-range";
 
 type PartyType = "TRANSPORTER" | "CLEARING_AGENT" | "CUSTOMER" | "VENDOR";
 
@@ -78,15 +79,6 @@ function formatCurrency(value: number) {
   return `Rs. ${value.toLocaleString()}`;
 }
 
-function formatDate(value: string) {
-  if (!value) return "—";
-  return new Intl.DateTimeFormat("en-GB", {
-    day: "2-digit",
-    month: "2-digit",
-    year: "numeric",
-    timeZone: "Asia/Karachi",
-  }).format(new Date(value));
-}
 
 type ViewKey = "ledger" | "summary" | "documents" | "outstanding" | "payments" | "reconciliation" | "statement";
 
@@ -276,7 +268,7 @@ function LedgerTable({
                   return (
                     <Fragment key={entry.id}>
                       <tr className="hover:bg-gray-50">
-                        <td className="px-4 py-3">{formatDate(entry.date)}</td>
+                        <td className="px-4 py-3">{formatBusinessDate(entry.date)}</td>
                         <td className="px-4 py-3">
                           {entry.referenceHref ? (
                             <Link href={entry.referenceHref} className="text-blue-600 hover:underline" title="View source document">
@@ -338,7 +330,7 @@ function LedgerTable({
                               <tbody className="divide-y bg-white">
                                 {entry.history.map((h, i) => (
                                   <tr key={i}>
-                                    <td className="px-3 py-2">{formatDate(h.date)}</td>
+                                    <td className="px-3 py-2">{formatBusinessDate(h.date)}</td>
                                     <td className="px-3 py-2 text-gray-500">{h.referenceType || "Direct Entry"}</td>
                                     <td className="px-3 py-2">{h.description}</td>
                                     <td className="px-3 py-2 text-right">{h.debit > 0 ? formatCurrency(h.debit) : "—"}</td>

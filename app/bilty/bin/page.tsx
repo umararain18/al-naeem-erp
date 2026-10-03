@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { formatBusinessDate } from "@/lib/date-range";
 
 type Bilty = {
   id: string;
@@ -182,7 +183,7 @@ export default function BiltyBinPage() {
                     <td className="px-4 py-4">
                       <div className="font-medium">{bilty.biltyNo}</div>
                     </td>
-                    <td className="px-4 py-4">{formatDate(bilty.date)}</td>
+                    <td className="px-4 py-4">{formatBusinessDate(bilty.date)}</td>
                     <td className="px-4 py-4">{bilty.fromLocation.name} → {bilty.toLocation.name}</td>
                     <td className="px-4 py-4">{bilty.consignorParty?.partyName || "—"}</td>
                     <td className="px-4 py-4">{bilty.consigneeParty?.partyName || "—"}</td>
@@ -241,7 +242,7 @@ export default function BiltyBinPage() {
                   </div>
                   <div>
                     <span className="text-gray-500">Date</span>
-                    <p>{formatDate(selected.date)}</p>
+                    <p>{formatBusinessDate(selected.date)}</p>
                   </div>
                   <div>
                     <span className="text-gray-500">Route</span>

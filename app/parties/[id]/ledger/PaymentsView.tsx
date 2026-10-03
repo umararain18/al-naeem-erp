@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { t, type Lang } from "@/lib/i18n/party-ledger";
 import AllocationPanel from "./AllocationPanel";
+import { formatBusinessDate } from "@/lib/date-range";
 
 type PaymentRow = {
   journalLineId: string;
@@ -26,11 +27,6 @@ type PaymentRow = {
 
 function formatCurrency(value: number) {
   return `Rs. ${value.toLocaleString()}`;
-}
-
-function formatDate(value: string) {
-  if (!value) return "—";
-  return new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "2-digit", year: "numeric" }).format(new Date(value));
 }
 
 function statusLabel(status: PaymentRow["allocationStatus"], lang: Lang) {
@@ -134,7 +130,7 @@ export default function PaymentsView({ partyId, lang }: { partyId: string; lang:
                 const dest = sourceDestination(row);
                 return (
                   <tr key={row.journalLineId} className="hover:bg-gray-50">
-                    <td className="px-3 py-2">{formatDate(row.date)}</td>
+                    <td className="px-3 py-2">{formatBusinessDate(row.date)}</td>
                     <td className="px-3 py-2">{row.direction === "DEBIT" ? t("receipt", lang) : t("payment", lang)}</td>
                     <td className="px-3 py-2 text-right">{formatCurrency(row.amount)}</td>
                     <td className="px-3 py-2">{row.cashBankAccountName || "—"}</td>

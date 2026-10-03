@@ -9,6 +9,7 @@ import { resolveBiltyPaidResponsibleParty } from "@/lib/document-party-resolutio
 import { createSettlementPayment, SettlementPaymentError } from "@/lib/settlement-payments";
 import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
 import { biltyListSearchOr } from "@/lib/search-helpers";
+import { parseISODateStart } from "@/lib/date-range";
 
 // Comma-separated, fully business-readable description for the Bilty
 // Commission/Referral expense JournalLine pair - stored verbatim at
@@ -461,7 +462,7 @@ export async function POST(
     // ------------------------------------------------
 
     const biltyDate =
-      new Date(data.date);
+      parseISODateStart(data.date);
 
     if (
       Number.isNaN(

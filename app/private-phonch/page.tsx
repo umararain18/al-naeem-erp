@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import PrivatePhonchForm from "./PrivatePhonchForm";
+import { formatBusinessDate } from "@/lib/date-range";
 
 // ============================================================
 // PRIVATE PHONCH - list + create
@@ -195,7 +196,7 @@ export default function PrivatePhonchPage() {
                             </div>
                           )}
                         </td>
-                        <td className="px-4 py-3">{new Date(p.date).toLocaleDateString("en-GB")}</td>
+                        <td className="px-4 py-3">{formatBusinessDate(p.date)}</td>
                         <td className="px-4 py-3">{p.transporterParty.partyName}</td>
                         <td className="px-4 py-3">
                           {p.vehicleBillLabels.length > 0 ? p.vehicleBillLabels.join(", ") : p.vehicleNames.length > 0 ? p.vehicleNames.join(", ") : p.vehicleCount}

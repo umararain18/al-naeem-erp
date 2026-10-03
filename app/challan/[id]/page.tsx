@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { getChallanShareMessage } from "@/lib/share-messages";
 import { normalizePhone } from "@/lib/phone";
+import { formatBusinessDate, toBusinessDateInputValue } from "@/lib/date-range";
 import { DocumentFooter, DocumentHeader, useDocumentPresentation } from "@/components/documents/DocumentPresentation";
 import FinalSettlementOperations from "./FinalSettlementOperations";
 
@@ -578,7 +579,7 @@ export default function ChallanDetailPage({
 
   function openEditForm() {
     if (!challan) return;
-    setEditLoadingDate(new Date(challan.loadingDate).toISOString().split("T")[0]);
+    setEditLoadingDate(toBusinessDateInputValue(challan.loadingDate));
     setEditTransporterPartyId(challan.transporterParty?.id || "");
     setEditDriverName(challan.driverName || "");
     setEditDriverPhone(challan.driverPhone || "");
@@ -848,7 +849,7 @@ export default function ChallanDetailPage({
             <div>
               <h1 className="text-2xl font-bold">Challan #{challan.challanNo}</h1>
               <p className="text-gray-600">
-                {new Date(challan.loadingDate).toLocaleDateString()}
+                {formatBusinessDate(challan.loadingDate)}
               </p>
             </div>
             <div className="flex items-center gap-3">
@@ -1447,7 +1448,7 @@ export default function ChallanDetailPage({
        const title = recipientName ? `Send Challan ${challan.challanNo} to ${recipientName}` : `Challan ${challan.challanNo}`;
        const text = getChallanShareMessage({
          challanNo: challan.challanNo,
-         loadingDate: new Date(challan.loadingDate).toLocaleDateString(),
+         loadingDate: formatBusinessDate(challan.loadingDate),
        });
 
        if (navigator.canShare && navigator.canShare({ files: [file] })) {

@@ -4,13 +4,10 @@ import { use, useEffect, useState } from "react";
 import Link from "next/link";
 import PrivatePhonchForm from "../PrivatePhonchForm";
 import { DocumentFooter, DocumentHeader, useDocumentPresentation } from "@/components/documents/DocumentPresentation";
+import { formatBusinessDate } from "@/lib/date-range";
 
 function formatCurrency(value: number) {
   return `Rs. ${Math.round(value).toLocaleString()}`;
-}
-
-function formatDate(value: string) {
-  return new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "2-digit", year: "numeric" }).format(new Date(value));
 }
 
 type PrivatePhonchVehicle = {
@@ -270,7 +267,7 @@ export default function PrivatePhonchDetailPage({ params }: { params: Promise<{ 
         <div className="grid gap-4 rounded-xl border bg-white p-5 shadow-sm md:grid-cols-4">
           <div>
             <div className="text-xs uppercase text-gray-500">Date</div>
-            <div className="mt-1 text-sm font-medium">{formatDate(phonch.date)}</div>
+            <div className="mt-1 text-sm font-medium">{formatBusinessDate(phonch.date)}</div>
           </div>
           <div>
             <div className="text-xs uppercase text-gray-500">Transporter</div>
