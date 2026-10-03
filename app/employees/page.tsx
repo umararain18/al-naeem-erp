@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { SearchableSelect } from "../daily-posting/SearchableSelect";
+import { formatBusinessDate, toBusinessDateInputValue } from "@/lib/date-range";
 import { presetRange } from "@/components/LedgerFilters";
 import type { EmployeeLedgerData, PayslipPaymentState } from "@/lib/payroll-accounting";
 
@@ -843,7 +844,7 @@ function EmployeeLedgerTab({
                 <tbody className="divide-y">
                   {data.entries.map((e) => (
                     <tr key={e.id}>
-                      <td className="px-4 py-3 text-gray-600">{new Date(e.date).toLocaleDateString("en-GB")}</td>
+                      <td className="px-4 py-3 text-gray-600">{formatBusinessDate(e.date)}</td>
                       <td className="px-4 py-3 text-gray-900">{e.description}</td>
                       <td className="px-4 py-3 text-right">{e.debit > 0 ? `Rs. ${formatMoney(e.debit)}` : "—"}</td>
                       <td className="px-4 py-3 text-right">{e.credit > 0 ? `Rs. ${formatMoney(e.credit)}` : "—"}</td>
@@ -1077,7 +1078,7 @@ function PayrollTab({
                         )}
                       </div>
                     </td>
-                    <td className="px-4 py-3 text-gray-600">{new Date(p.payDate).toLocaleDateString("en-GB")}</td>
+                    <td className="px-4 py-3 text-gray-600">{formatBusinessDate(p.payDate)}</td>
                     <td className="px-4 py-3">
                       <div className="font-medium text-gray-900">{p.employeeName}</div>
                       <div className="text-xs text-gray-500">{p.payslipNo}</div>
@@ -1173,7 +1174,7 @@ function PayslipViewDrawer({ id, onClose, onRecordPayment }: { id: string; onClo
             </div>
             <div>
               <p className="text-xs text-gray-500">Pay Date</p>
-              <p className="font-medium">{new Date(data.payDate).toLocaleDateString("en-GB")}</p>
+              <p className="font-medium">{formatBusinessDate(data.payDate)}</p>
             </div>
           </div>
           <div className="rounded-lg border p-4">
@@ -1233,7 +1234,7 @@ function EmployeeDrawer({ state, onClose, onSaved }: { state: { mode: "new" | "e
           setName(e.name);
           setDesignation(e.designation || "");
           setPhone(e.phone || "");
-          setJoiningDate(e.joiningDate ? e.joiningDate.slice(0, 10) : todayYMD());
+          setJoiningDate(e.joiningDate ? toBusinessDateInputValue(e.joiningDate) : todayYMD());
           setMonthlySalary(String(e.monthlySalary));
           setIsActive(e.isActive);
           setNotes(e.notes || "");
@@ -1378,7 +1379,7 @@ function PayslipDrawer({
           const p = json.payslip;
           setEmployeeId(p.employeeId);
           setPayrollMonth(p.payrollMonth);
-          setPayDate(p.payDate.slice(0, 10));
+          setPayDate(toBusinessDateInputValue(p.payDate));
           setGrossPay(String(p.grossPay));
           setDeduction(String(p.deduction));
           setContribution(String(p.contribution));

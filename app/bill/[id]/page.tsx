@@ -4,13 +4,10 @@ import { use, useEffect, useState } from "react";
 import Link from "next/link";
 import Image from "next/image";
 import BillForm from "../BillForm";
+import { formatBusinessDate } from "@/lib/date-range";
 
 function formatCurrency(value: number, currency: string) {
   return `${currency} ${Math.round(value).toLocaleString()}`;
-}
-
-function formatDate(value: string) {
-  return new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "2-digit", year: "numeric" }).format(new Date(value));
 }
 
 // Same shape lib/pdf-presentation.ts's ResolvedPdfPresentation returns,
@@ -417,14 +414,14 @@ export default function BillDetailPage({ params }: { params: Promise<{ id: strin
                 <div className="mt-1 text-sm">
                   <span className="font-semibold">Bill No:</span> {bill.billNo}
                 </div>
-                <div className="mt-0.5 text-xs text-gray-500">{formatDate(bill.date)}</div>
+                <div className="mt-0.5 text-xs text-gray-500">{formatBusinessDate(bill.date)}</div>
               </div>
             </div>
           ) : (
             <div className="border-b-2 border-gray-900 pb-4 text-center">
               <div className="text-2xl font-extrabold tracking-wide text-gray-900">{presentation.invoice.invoiceTitle || "BILL"}</div>
               <div className="mt-1 text-sm">
-                <span className="font-semibold">Bill No:</span> {bill.billNo} · {formatDate(bill.date)}
+                <span className="font-semibold">Bill No:</span> {bill.billNo} · {formatBusinessDate(bill.date)}
               </div>
             </div>
           )}

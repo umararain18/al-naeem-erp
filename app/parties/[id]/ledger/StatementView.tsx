@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { t, type Lang } from "@/lib/i18n/party-ledger";
+import { formatBusinessDate } from "@/lib/date-range";
 
 type DocumentRow = {
   targetSourceType: "BILTY" | "CHALLAN";
@@ -31,11 +32,6 @@ type LedgerSummary = {
 
 function formatCurrency(value: number) {
   return `Rs. ${value.toLocaleString()}`;
-}
-
-function formatDate(value: string) {
-  if (!value) return "—";
-  return new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "2-digit", year: "numeric" }).format(new Date(value));
 }
 
 function describeBilty(row: DocumentRow): string {
@@ -161,7 +157,7 @@ export default function StatementView({
             <div className="text-right">
               <p className="text-gray-500">{t("period", lang)}</p>
               <p className="font-semibold">
-                {from ? formatDate(from) : "—"} — {to ? formatDate(to) : "—"}
+                {from ? formatBusinessDate(from) : "—"} — {to ? formatBusinessDate(to) : "—"}
               </p>
             </div>
           </div>

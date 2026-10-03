@@ -3,6 +3,7 @@
 import { Suspense, useCallback, useEffect, useState } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import Link from "next/link";
+import { formatBusinessDate } from "@/lib/date-range";
 
 // ============================================================
 // Full Search page - paginated, filterable view over the same
@@ -59,10 +60,6 @@ const MODULE_TABS: { value: string; label: string }[] = [
 // own detail page instead, so EDIT there just opens that same page.
 const SUPPORTS_EDIT_QUERY_PARAM = new Set(["BILL", "PRIVATE_PHONCH", "SHOWROOM_PHONCH"]);
 
-function formatDate(value: string | null) {
-  if (!value) return null;
-  return new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "short", year: "numeric" }).format(new Date(value));
-}
 
 function actionHref(result: SearchResultItem, action: string): string | null {
   if (!result.href) return null;
@@ -103,7 +100,7 @@ function ResultRow({ result }: { result: SearchResultItem }) {
               {result.amount.label}: Rs. {Math.round(result.amount.value).toLocaleString()}
             </div>
           )}
-          {result.date && <div className="mt-1 text-xs text-gray-400">{formatDate(result.date)}</div>}
+          {result.date && <div className="mt-1 text-xs text-gray-400">{formatBusinessDate(result.date)}</div>}
         </div>
         <div className="flex flex-shrink-0 flex-col items-end gap-1.5">
           {result.availableActions.map((action) => {

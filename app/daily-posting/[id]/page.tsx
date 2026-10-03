@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import { formatBusinessDate } from "@/lib/date-range";
 
 type Account = {
   id: string;
@@ -82,10 +83,6 @@ export default function DailyPostingDetailPage({
     return new Date(dateString).toLocaleString();
   }
 
-  function formatDateOnly(dateString: string) {
-    return new Date(dateString).toLocaleDateString();
-  }
-
   if (loading) {
     return (
       <main className="min-h-screen bg-gray-50">
@@ -132,7 +129,7 @@ export default function DailyPostingDetailPage({
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-sm">
             <div>
               <p className="text-gray-500">Posting Date</p>
-              <p className="font-medium">{formatDateOnly(entry.entryDate)}</p>
+              <p className="font-medium">{formatBusinessDate(entry.entryDate)}</p>
             </div>
             <div>
               <p className="text-gray-500">Reference Type</p>

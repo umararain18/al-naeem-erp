@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { t, type Lang } from "@/lib/i18n/party-ledger";
+import { formatBusinessDate } from "@/lib/date-range";
 
 type AllocationRow = {
   id: string;
@@ -31,11 +32,6 @@ type OutstandingDocument = {
 
 function formatCurrency(value: number) {
   return `Rs. ${value.toLocaleString()}`;
-}
-
-function formatDate(value: string) {
-  if (!value) return "—";
-  return new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "2-digit", year: "numeric" }).format(new Date(value));
 }
 
 export default function AllocationPanel({
@@ -385,7 +381,7 @@ export default function AllocationPanel({
                               <tr key={key}>
                                 <td className="px-3 py-2">{doc.documentNo}</td>
                                 <td className="px-3 py-2">{doc.vehicleRegistrationNumber || "—"}</td>
-                                <td className="px-3 py-2">{formatDate(doc.documentDate)}</td>
+                                <td className="px-3 py-2">{formatBusinessDate(doc.documentDate)}</td>
                                 <td className="px-3 py-2 text-right">{formatCurrency(doc.remainingAllocatable)}</td>
                                 <td className="px-3 py-2 text-right">
                                   <input

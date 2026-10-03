@@ -6,6 +6,7 @@ import { hasPermission } from "@/lib/permissions";
 import { getEmployeeLedgerData } from "@/lib/payroll-accounting";
 import { resolvePdfPresentation } from "@/lib/pdf-presentation";
 import { createPdfDocument, drawPdfHeader, drawPdfFooter, applyWatermark, resolveAutoTableTheme, resolveJsPdfFont } from "@/lib/pdf-render-helpers";
+import { formatBusinessDate } from "@/lib/date-range";
 
 // ============================================================
 // GET /api/employees/[id]/ledger/pdf?from=&to=
@@ -18,10 +19,6 @@ import { createPdfDocument, drawPdfHeader, drawPdfFooter, applyWatermark, resolv
 
 function formatCurrency(value: number) {
   return `Rs. ${Math.round(value).toLocaleString()}`;
-}
-
-function formatDate(value: string) {
-  return new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "2-digit", year: "numeric" }).format(new Date(value));
 }
 
 export async function GET(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
@@ -72,7 +69,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     y += 8;
 
     const tableRows = data.entries.map((row) => [
-      formatDate(row.date),
+      formatBusinessDate(row.date),
       row.description,
       row.debit > 0 ? formatCurrency(row.debit) : "-",
       row.credit > 0 ? formatCurrency(row.credit) : "-",

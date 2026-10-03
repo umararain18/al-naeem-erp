@@ -6,6 +6,7 @@ import { getBillPaymentState, resolveBillClientAccountId } from "@/lib/bill-acco
 import autoTable from "jspdf-autotable";
 import { resolvePdfPresentation } from "@/lib/pdf-presentation";
 import { createPdfDocument, drawPdfHeader, drawPdfFooter, applyWatermark, resolveAutoTableTheme, resolveJsPdfFont } from "@/lib/pdf-render-helpers";
+import { formatBusinessDate } from "@/lib/date-range";
 
 // Reuses the existing ANC jsPDF + jspdf-autotable pattern
 // (app/api/bilty/[id]/pdf/route.ts, app/api/challan/[id]/pdf/route.ts)
@@ -64,7 +65,7 @@ export async function GET(
     doc.setFont(bodyFont, "bold");
     doc.text(`Bill No: ${bill.billNo}`, 14, y);
     doc.setFont(bodyFont, "normal");
-    doc.text(`Date: ${new Date(bill.date).toLocaleDateString()}`, pageWidth - 14, y, { align: "right" });
+    doc.text(`Date: ${formatBusinessDate(bill.date)}`, pageWidth - 14, y, { align: "right" });
     y += 8;
 
     // CLIENT SECTION - two bordered boxes (Bill To / Payment Status),

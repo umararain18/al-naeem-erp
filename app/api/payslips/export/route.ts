@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { getPayslipPaymentState, payrollMonthLabel } from "@/lib/payroll-accounting";
+import { formatBusinessDate } from "@/lib/date-range";
 
 // ============================================================
 // GET /api/payslips/export?payrollMonth=YYYY-MM
@@ -24,10 +25,6 @@ function escapeHtml(value: string): string {
 
 function formatCurrency(value: number) {
   return `Rs. ${Math.round(value).toLocaleString()}`;
-}
-
-function formatDate(value: Date) {
-  return new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "2-digit", year: "numeric" }).format(value);
 }
 
 export async function GET(request: NextRequest) {
@@ -90,7 +87,7 @@ export async function GET(request: NextRequest) {
         (r) => `
         <tr>
           <td>${escapeHtml(r.payslipNo)}</td>
-          <td>${escapeHtml(formatDate(r.payDate))}</td>
+          <td>${escapeHtml(formatBusinessDate(r.payDate))}</td>
           <td>${escapeHtml(r.employeeName)}</td>
           <td>${escapeHtml(r.designation || "-")}</td>
           <td align="right">${escapeHtml(formatCurrency(r.grossPay))}</td>

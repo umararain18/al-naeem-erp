@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import PhonchForm from "./PhonchForm";
+import { formatBusinessDate } from "@/lib/date-range";
 
 // ============================================================
 // SHOWROOM PHONCH / DELIVERY - list + create
@@ -159,7 +160,7 @@ export default function PhonchPage() {
                             {p.phonchNo}
                           </Link>
                         </td>
-                        <td className="px-4 py-3">{new Date(p.date).toLocaleDateString("en-GB")}</td>
+                        <td className="px-4 py-3">{formatBusinessDate(p.date)}</td>
                         <td className="px-4 py-3">{p.transporterParty.partyName}</td>
                         <td className="px-4 py-3">
                           {p.vehicleBillLabels.length > 0 ? p.vehicleBillLabels.join(", ") : p.vehicleNames.length > 0 ? p.vehicleNames.join(", ") : p.vehicleCount}

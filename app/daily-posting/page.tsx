@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { DocumentSearchSelect } from "./DocumentSearchSelect";
 import { SearchableSelect, sourceOptions } from "./SearchableSelect";
+import { toBusinessDateInputValue } from "@/lib/date-range";
 
 type Account = {
   id: string;
@@ -72,7 +73,7 @@ function createLine(): PostingLine {
 }
 
 export default function DailyPostingPage() {
-  const today = new Date().toISOString().split("T")[0];
+  const today = toBusinessDateInputValue(new Date());
 
   const [postingDate, setPostingDate] = useState(today);
   const [accountId, setAccountId] = useState("");

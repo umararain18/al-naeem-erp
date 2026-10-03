@@ -4,6 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { payrollMonthLabel } from "@/lib/payroll-accounting";
+import { formatBusinessDate } from "@/lib/date-range";
 
 function startOfDay(value: string) {
   return new Date(`${value}T00:00:00`);
@@ -169,7 +170,7 @@ export async function GET(request: NextRequest) {
           type: "CHALLAN",
           id: challan.id,
           reference: challan.challanNo,
-          title: `${transporter} / ${new Date(challan.loadingDate).toLocaleDateString()}`,
+          title: `${transporter} / ${formatBusinessDate(challan.loadingDate)}`,
           deletedAt: challan.deletedAt ? new Date(challan.deletedAt).toISOString() : "",
           deletedBy: challan.deletedBy,
           moduleUrl: `/challan/${challan.id}`,

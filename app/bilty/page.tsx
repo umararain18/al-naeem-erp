@@ -2,6 +2,7 @@
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { formatBusinessDate, toBusinessDateInputValue } from "@/lib/date-range";
 
 type BiltyStatus = "PENDING" | "IN_TRANSIT" | "DELIVERED" | "CANCELLED";
 
@@ -617,7 +618,7 @@ export default function BiltyPage() {
     setEditingBilty(bilty);
 
     setBiltyNo(bilty.biltyNo);
-    setDate(bilty.date.split("T")[0]);
+    setDate(toBusinessDateInputValue(bilty.date));
     setFromLocationId(bilty.fromLocation.id);
     setToLocationId(bilty.toLocation.id);
     setConsignorPartyId(bilty.consignorParty?.id || "");
@@ -1333,7 +1334,7 @@ export default function BiltyPage() {
                         </td>
 
                         <td className="py-3 pr-4">
-                          {new Date(bilty.date).toLocaleDateString()}
+                          {formatBusinessDate(bilty.date)}
                         </td>
 
                         <td className="py-3 pr-4">{bilty.consignorName}</td>

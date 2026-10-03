@@ -152,6 +152,56 @@ export function parseISODateStart(s: string): Date {
   return new Date(`${s}T00:00:00`);
 }
 
+// Single authoritative business-date display formatter (ANC ERP date
+// standard) - DD-MM-YYYY, deterministic regardless of the viewer's
+// browser locale or the server process's own timezone, since both
+// locale and timeZone are pinned explicitly here rather than left to
+// ambient defaults. For BUSINESS dates only (Bilty/Challan/Bill/
+// Phonch/etc. document dates, report calendar filters) - never for a
+// genuine timestamp (createdAt/updatedAt/deletedAt/settledAt), which
+// must keep showing date+time via its own existing formatting.
+export function formatBusinessDate(value: string | Date): string {
+  const d = typeof value === "string" ? new Date(value) : value;
+  // en-GB's own separator is "/" (03/10/2026) - the ANC ERP standard is
+  // "-" (03-10-2026), so parts are read individually and joined
+  // explicitly rather than relying on the locale's own punctuation.
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    timeZone: "Asia/Karachi",
+  }).formatToParts(d);
+  const day = parts.find((p) => p.type === "day")!.value;
+  const month = parts.find((p) => p.type === "month")!.value;
+  const year = parts.find((p) => p.type === "year")!.value;
+  return `${day}-${month}-${year}`;
+}
+
+// Re-populates a native <input type="date"> (which always needs
+// "YYYY-MM-DD") from a stored business-date value, for an edit form.
+// NEVER slice a stored ISO string's own "T" boundary directly
+// (`value.split("T")[0]`) - a date-only business value is stored as
+// LOCAL midnight expressed in UTC (parseISODateStart's own
+// convention), so on any server whose local timezone has a positive
+// UTC offset (this ERP's - Asia/Karachi, UTC+5), that naive slice
+// reads back the PREVIOUS day. Reading the local (Asia/Karachi)
+// calendar components instead - exactly like formatBusinessDate()
+// does, just in en-CA's "YYYY-MM-DD" part order instead of en-GB's
+// "DD-MM-YYYY" - is the only form that round-trips correctly.
+export function toBusinessDateInputValue(value: string | Date): string {
+  const d = typeof value === "string" ? new Date(value) : value;
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    timeZone: "Asia/Karachi",
+  }).formatToParts(d);
+  const day = parts.find((p) => p.type === "day")!.value;
+  const month = parts.find((p) => p.type === "month")!.value;
+  const year = parts.find((p) => p.type === "year")!.value;
+  return `${year}-${month}-${day}`;
+}
+
 function formatShort(d: Date): string {
   return `${d.getDate()} ${MONTHS_SHORT[d.getMonth()]} ${d.getFullYear()}`;
 }

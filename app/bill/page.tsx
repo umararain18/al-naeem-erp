@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import BillForm from "./BillForm";
+import { formatBusinessDate } from "@/lib/date-range";
 
 // ============================================================
 // BILL BOOK - list + create
@@ -156,7 +157,7 @@ export default function BillPage() {
                             {b.billNo}
                           </Link>
                         </td>
-                        <td className="px-4 py-3">{new Date(b.date).toLocaleDateString("en-GB")}</td>
+                        <td className="px-4 py-3">{formatBusinessDate(b.date)}</td>
                         <td className="px-4 py-3">
                           {b.clientName}
                           {b.clientPhone && <div className="text-xs text-gray-500">{b.clientPhone}</div>}

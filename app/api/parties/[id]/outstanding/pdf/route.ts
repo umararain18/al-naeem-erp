@@ -7,6 +7,7 @@ import { getPartyOutstandingDocuments, getPartyOutstandingSummary } from "@/lib/
 import { filterOutstandingRows, type OutstandingFilterOptions } from "@/lib/outstanding-filters";
 import { resolvePdfPresentation } from "@/lib/pdf-presentation";
 import { createPdfDocument, drawPdfHeader, drawPdfFooter, applyWatermark, resolveAutoTableTheme, resolveJsPdfFont } from "@/lib/pdf-render-helpers";
+import { formatBusinessDate } from "@/lib/date-range";
 
 // ============================================================
 // GET /api/parties/[id]/outstanding/pdf
@@ -148,7 +149,7 @@ export async function GET(
     }
 
     const tableRows = documents.map((d) => [
-      formatDate(d.documentDate),
+      formatBusinessDate(d.documentDate),
       DOCUMENT_TYPE_LABELS[d.documentType] || d.documentType,
       d.documentNo,
       d.description,

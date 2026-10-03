@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import { toBusinessDateInputValue } from "@/lib/date-range";
 
 // ============================================================
 // PRIVATE PHONCH - shared create/edit form
@@ -179,7 +180,7 @@ export default function PrivatePhonchForm({
 
   const [phonchNo, setPhonchNo] = useState(initialData?.phonchNo || "");
   const [date, setDate] = useState(
-    initialData?.date ? initialData.date.slice(0, 10) : new Date().toISOString().slice(0, 10)
+    initialData?.date ? toBusinessDateInputValue(initialData.date) : toBusinessDateInputValue(new Date())
   );
   const [transporterPartyId, setTransporterPartyId] = useState(initialData?.transporterParty.id || "");
 
@@ -300,7 +301,7 @@ export default function PrivatePhonchForm({
 
   function resetForm() {
     setPhonchNo("");
-    setDate(new Date().toISOString().slice(0, 10));
+    setDate(toBusinessDateInputValue(new Date()));
     setTransporterPartyId("");
     setVehicles([emptyVehicleRow(0)]);
     setNextKey(1);

@@ -15,6 +15,7 @@ import {
 } from "@/lib/settlement-payments";
 import { BiltyPaidVerificationError, getBiltyPaidVerification } from "@/lib/bilty-paid-verification";
 import { auditUpdate, auditDelete, auditRestore, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
+import { parseISODateStart } from "@/lib/date-range";
 
 const updateBiltySchema = z.object({
   biltyNo: z.string().trim().min(1, "Bilty number is required").optional(),
@@ -380,7 +381,7 @@ export async function PATCH(
     // Validate date if provided
     let biltyDate = existingBilty.date;
     if (data.date) {
-      const parsedDate = new Date(data.date);
+      const parsedDate = parseISODateStart(data.date);
       if (Number.isNaN(parsedDate.getTime())) {
         return NextResponse.json(
           {

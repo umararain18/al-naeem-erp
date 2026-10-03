@@ -6,6 +6,7 @@ import { hasPermission } from "@/lib/permissions";
 import { getPartyLedgerData, PartyLedgerLookupError, parseLedgerEntryType, filterLedgerRowsBySearch } from "@/lib/ledger-description";
 import { resolvePdfPresentation } from "@/lib/pdf-presentation";
 import { createPdfDocument, drawPdfHeader, drawPdfFooter, applyWatermark, resolveAutoTableTheme, resolveJsPdfFont } from "@/lib/pdf-render-helpers";
+import { formatBusinessDate } from "@/lib/date-range";
 
 // ============================================================
 // GET /api/parties/[id]/ledger/pdf?from=&to=
@@ -26,9 +27,6 @@ function formatCurrency(value: number) {
   return `Rs. ${Math.round(value).toLocaleString()}`;
 }
 
-function formatDate(value: string) {
-  return new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "2-digit", year: "numeric" }).format(new Date(value));
-}
 
 const DOCUMENT_TYPE_LABELS: Record<string, string> = {
   BILTY: "Bilty",
@@ -116,7 +114,7 @@ export async function GET(
     y += 8;
 
     const tableRows = exportRows.map((row) => [
-      formatDate(row.date),
+      formatBusinessDate(row.date),
       row.description,
       row.debit > 0 ? formatCurrency(row.debit) : "-",
       row.credit > 0 ? formatCurrency(row.credit) : "-",

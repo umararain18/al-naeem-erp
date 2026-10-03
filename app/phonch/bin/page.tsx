@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import { formatBusinessDate } from "@/lib/date-range";
 
 function formatDate(value: string | null) {
   if (!value) return "—";
@@ -142,7 +143,7 @@ export default function PhonchBinPage() {
                 {phonches.map((p) => (
                   <tr key={p.id} className="hover:bg-gray-50">
                     <td className="px-4 py-3 font-medium">{p.phonchNo}</td>
-                    <td className="px-4 py-3">{formatDate(p.date)}</td>
+                    <td className="px-4 py-3">{formatBusinessDate(p.date)}</td>
                     <td className="px-4 py-3">{p.transporterParty.partyName}</td>
                     <td className="px-4 py-3">{p.vehicleCount}</td>
                     <td className="px-4 py-3">
