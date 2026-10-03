@@ -230,11 +230,29 @@ interface ChallanCtx {
   transporterName: string | null;
   soleBiltyId: string | null;
   soleBiltyNo: string | null;
+  // EVERY Bilty linked to this Challan (not just "sole") - used only
+  // for vehicle display, so a multi-vehicle Challan can show all of
+  // its vehicles instead of collapsing to a single one. Bilty No
+  // display still uses soleBiltyNo above, unchanged.
+  bilties: BiltyCtx[];
 }
 
 function vehicleLabel(bilty: BiltyCtx | undefined | null): string | null {
   if (!bilty) return null;
   return bilty.vehicleModel || bilty.vehicleType || null;
+}
+
+/** Vehicle label for every Bilty in the list, comma-separated - never collapsed to just the first. */
+function vehicleLabels(bilties: BiltyCtx[]): string | null {
+  const labels = bilties.map(vehicleLabel).filter((v): v is string => !!v);
+  return labels.length > 0 ? labels.join(", ") : null;
+}
+
+/** Appends every non-null PrivatePhonchVehicle.vehicleName linked to this Private Phonch to an already-composed description, live on every read - so it applies to historical entries too, without touching the stored text or lib/private-phonch-accounting.ts. */
+function appendPhonchVehicleNames(description: string, phonchId: string, vehicleNamesById: Map<string, string[]>): string {
+  const names = vehicleNamesById.get(phonchId);
+  if (!names || names.length === 0) return description;
+  return `${description}, ${names.join(", ")}`;
 }
 
 /** Screen-only Source/Reference label - "Bilty No 66", never "Bilty #66". */
@@ -273,7 +291,8 @@ function challanDescription(
   // The SPECIFIC Bilty this line concerns, when known (e.g. a
   // per-Bilty proportional Carrier Rent slice), takes priority over
   // the Challan's own "sole Bilty" (only meaningful when the Challan
-  // has exactly one Bilty and no specific one was identified).
+  // has exactly one Bilty and no specific one was identified). Bilty
+  // No display behavior here is UNCHANGED.
   relevantBilty: BiltyCtx | undefined | null,
   amount: number,
   direction: "Received" | "Paid"
@@ -283,7 +302,12 @@ function challanDescription(
   if (biltyNoText) parts.push(biltyReference(biltyNoText));
   if (challan.carrierNumber) parts.push(`Carrier No ${challan.carrierNumber}`);
   if (challan.transporterName) parts.push(`Transporter ${challan.transporterName}`);
-  const veh = vehicleLabel(relevantBilty);
+  // Vehicle display: when a SPECIFIC Bilty is known for this line,
+  // show just that one vehicle (the amount concerns that Bilty
+  // alone). Otherwise show every vehicle linked to the Challan -
+  // never collapsed to a single "sole" vehicle - so a multi-vehicle
+  // Challan's generic/Challan-level lines still show all of them.
+  const veh = relevantBilty ? vehicleLabel(relevantBilty) : vehicleLabels(challan.bilties);
   if (veh) parts.push(veh);
   return `${parts.join(", ")}, ${direction} ${formatRs(amount)}`;
 }
@@ -459,6 +483,11 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
   // ----------------------------------------------------------
   const biltyIds = new Set<string>();
   const challanIds = new Set<string>();
+  // Every Private Phonch id a PRIVATE_PHONCH-sourced/referenced line
+  // could need a live PrivatePhonchVehicle lookup for - display-only,
+  // used solely to append vehicle names to the already pre-composed
+  // description below.
+  const privatePhonchIds = new Set<string>();
 
   for (const bucket of buckets.values()) {
     if (bucket.payment?.biltyId) biltyIds.add(bucket.payment.biltyId);
@@ -467,6 +496,8 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
   for (const line of remaining) {
     if (line.sourceType === "BILTY" && line.sourceId) biltyIds.add(line.sourceId);
     if (line.sourceType === "CHALLAN" && line.sourceId) challanIds.add(line.sourceId);
+    if (line.sourceType === "PRIVATE_PHONCH" && line.sourceId) privatePhonchIds.add(line.sourceId);
+    if (line.referenceType === "PRIVATE_PHONCH" && line.referenceId) privatePhonchIds.add(line.referenceId);
     if ((line.referenceType === "BILTY_BOOKING" || line.referenceType === "BILTY_BOOKING_CORRECTION") && line.referenceId) {
       biltyIds.add(line.referenceId);
     }
@@ -509,7 +540,7 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
     }
   }
 
-  const [biltyRows, challanRows] = await Promise.all([
+  const [biltyRows, challanRows, phonchVehicleRows] = await Promise.all([
     biltyIds.size > 0
       ? prisma.bilty.findMany({
           where: { id: { in: [...biltyIds] } },
@@ -531,6 +562,12 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
           },
         })
       : Promise.resolve([]),
+    privatePhonchIds.size > 0
+      ? prisma.privatePhonchVehicle.findMany({
+          where: { phonchId: { in: [...privatePhonchIds] } },
+          select: { phonchId: true, vehicleName: true },
+        })
+      : Promise.resolve([]),
   ]);
 
   const biltyById = new Map<string, BiltyCtx>(biltyRows.map((b) => [b.id, b]));
@@ -547,8 +584,21 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
       transporterName: c.transporterParty?.partyName || null,
       soleBiltyId: sole?.id || null,
       soleBiltyNo: sole?.biltyNo || null,
+      bilties,
     });
     challanSoleBiltyById.set(c.id, sole || null);
+  }
+
+  // Private Phonch vehicle names, live-loaded and grouped by phonchId -
+  // display-only, used purely to append vehicle names to the already
+  // pre-composed PRIVATE_PHONCH description below. Never invented:
+  // only actual, non-null PrivatePhonchVehicle.vehicleName values.
+  const phonchVehicleNamesById = new Map<string, string[]>();
+  for (const v of phonchVehicleRows) {
+    if (!v.vehicleName) continue;
+    const arr = phonchVehicleNamesById.get(v.phonchId) || [];
+    arr.push(v.vehicleName);
+    phonchVehicleNamesById.set(v.phonchId, arr);
   }
 
   const rows: DisplayLedgerRow[] = [];
@@ -576,11 +626,10 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
 
       if (p.component === "CARRIER_RENT" && p.challanId) {
         const challan = challanCtxById.get(p.challanId);
-        const veh = challan?.soleBiltyId ? biltyById.get(challan.soleBiltyId) : null;
         reference = challan ? challanReference(challan.challanNo) : "Challan";
         referenceHref = `/challan/${p.challanId}`;
         description = challan
-          ? challanDescription(challan, veh, Math.abs(net), net >= 0 ? "Received" : "Paid")
+          ? challanDescription(challan, null, Math.abs(net), net >= 0 ? "Received" : "Paid")
           : `Carrier Rent, ${net >= 0 ? "Received" : "Paid"} ${formatRs(net)}`;
         documentType = "CHALLAN";
       } else if (p.biltyId) {
@@ -722,10 +771,9 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
       documentType = "BILTY";
     } else if (line.sourceType === "CHALLAN" && line.sourceId && challanCtxById.has(line.sourceId)) {
       const challan = challanCtxById.get(line.sourceId)!;
-      const veh = challan.soleBiltyId ? biltyById.get(challan.soleBiltyId) : null;
       reference = challanReference(challan.challanNo);
       referenceHref = `/challan/${line.sourceId}`;
-      description = challanDescription(challan, veh, amount, direction);
+      description = challanDescription(challan, null, amount, direction);
       documentType = "CHALLAN";
     } else if (
       (line.referenceType === "BILTY_BOOKING" || line.referenceType === "BILTY_BOOKING_CORRECTION") &&
@@ -746,10 +794,9 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
       challanCtxById.has(line.referenceId)
     ) {
       const challan = challanCtxById.get(line.referenceId)!;
-      const veh = challan.soleBiltyId ? biltyById.get(challan.soleBiltyId) : null;
       reference = challanReference(challan.challanNo);
       referenceHref = `/challan/${line.referenceId}`;
-      description = challanDescription(challan, veh, amount, direction);
+      description = challanDescription(challan, null, amount, direction);
       documentType = "CHALLAN";
     } else if (line.referenceType === "DAILY_POSTING") {
       const alloc = allocationByLineId.get(line.id);
@@ -761,10 +808,9 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
         documentType = "BILTY";
       } else if (alloc?.targetSourceType === "CHALLAN" && challanCtxById.has(alloc.targetSourceId)) {
         const challan = challanCtxById.get(alloc.targetSourceId)!;
-        const veh = challan.soleBiltyId ? biltyById.get(challan.soleBiltyId) : null;
         reference = challanReference(challan.challanNo);
         referenceHref = `/challan/${alloc.targetSourceId}`;
-        description = challanDescription(challan, veh, amount, direction);
+        description = challanDescription(challan, null, amount, direction);
         documentType = "CHALLAN";
       } else if (line.sourceType === "PRIVATE_PHONCH" && line.sourceId) {
         // Daily Posting receipts/payments against Private Phonch never
@@ -778,7 +824,11 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
         // exactly mirroring the PHONCH/BILL branches below.
         reference = "Private Phonch";
         referenceHref = `/private-phonch/${line.sourceId}`;
-        description = line.lineDescription || line.entryDescription || "—";
+        description = appendPhonchVehicleNames(
+          line.lineDescription || line.entryDescription || "—",
+          line.sourceId,
+          phonchVehicleNamesById
+        );
         documentType = "PRIVATE_PHONCH";
       } else if (line.sourceType === "PHONCH" && line.sourceId) {
         reference = "Phonch";
@@ -811,7 +861,11 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
       // fallback with the wrong reference/link.
       reference = "Private Phonch";
       referenceHref = `/private-phonch/${line.referenceId}`;
-      description = line.lineDescription || line.entryDescription || "—";
+      description = appendPhonchVehicleNames(
+        line.lineDescription || line.entryDescription || "—",
+        line.referenceId,
+        phonchVehicleNamesById
+      );
       documentType = "PRIVATE_PHONCH";
     } else if (line.referenceType === "PHONCH" && line.referenceId) {
       // Showroom Phonch / Delivery - the description is fully
