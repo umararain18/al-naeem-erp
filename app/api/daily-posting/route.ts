@@ -325,12 +325,82 @@ export async function POST(request: NextRequest) {
     // VALIDATE LINES
     // ========================================================
 
+    // The 5 true document types - a line tagged with one of these can
+    // auto-resolve its Counter Account from the document and always
+    // requires a real Source ID/Document No. for that lookup. Every
+    // other sourceType (PARTY/ACCOUNT) never looks up a document at
+    // all (see the CHALLAN/BILTY/PHONCH/PRIVATE_PHONCH/BILL-specific
+    // filters/resolution below, none of which ever match these two),
+    // so Source ID/Document No. there only ever serves as an optional
+    // reference. Kept in sync by hand with the matching
+    // DOCUMENT_LINKED_SOURCE_TYPES set in app/daily-posting/page.tsx.
+    const DOCUMENT_LINKED_SOURCE_TYPES = new Set([
+      "CHALLAN",
+      "BILTY",
+      "PHONCH",
+      "PRIVATE_PHONCH",
+      "BILL",
+    ]);
+
+    // Early, narrow lookup (display-only category/accountType, never
+    // the full validated fetch further below) used solely to decide
+    // whether Source ID/Document No. can be skipped for a non-
+    // document sourceType (PARTY/ACCOUNT) - see
+    // isSourceDocumentExempt() below. A true document-linked line is
+    // never affected by this and keeps requiring both exactly as
+    // before.
+    const earlyCounterAccountIds = Array.from(
+      new Set(
+        data.lines
+          .map((line) => line.counterAccountId)
+          .filter((id): id is string => !!id)
+      )
+    );
+
+    const earlyCounterAccounts =
+      earlyCounterAccountIds.length > 0
+        ? await prisma.account.findMany({
+            where: { id: { in: earlyCounterAccountIds } },
+            select: { id: true, category: true, accountType: true },
+          })
+        : [];
+
+    const earlyAccountById = new Map(
+      earlyCounterAccounts.map((account) => [account.id, account])
+    );
+
+    // Source ID/Document No. is optional whenever the line's
+    // sourceType is NOT one of the true document types above AND the
+    // selected Counter Account is Booking Income, Delivery Income
+    // (covers Showroom Delivery Income/Private Phonch Delivery
+    // Income/Bill Income - all stored under this same category, see
+    // lib/gross-accounts.ts) or any Party account - confirmed by the
+    // account's own stable category/accountType field, never by its
+    // name.
+    function isSourceDocumentExempt(
+      sourceType: string | undefined,
+      counterAccountId: string | undefined
+    ): boolean {
+      if (!sourceType || DOCUMENT_LINKED_SOURCE_TYPES.has(sourceType)) {
+        return false;
+      }
+      if (!counterAccountId) return false;
+      const account = earlyAccountById.get(counterAccountId);
+      if (!account) return false;
+      return (
+        account.category === "BOOKING_INCOME" ||
+        account.category === "DELIVERY_INCOME" ||
+        account.accountType === "PARTY"
+      );
+    }
+
     for (const line of data.lines) {
       // Document-linked entry requires source ID.
       if (
         line.sourceType &&
         line.sourceType !== "DIRECT" &&
-        !line.sourceId
+        !line.sourceId &&
+        !isSourceDocumentExempt(line.sourceType, line.counterAccountId)
       ) {
         return NextResponse.json(
           {
@@ -347,7 +417,8 @@ export async function POST(request: NextRequest) {
       if (
         line.sourceType &&
         line.sourceType !== "DIRECT" &&
-        !line.sourceNumber
+        !line.sourceNumber &&
+        !isSourceDocumentExempt(line.sourceType, line.counterAccountId)
       ) {
         return NextResponse.json(
           {
