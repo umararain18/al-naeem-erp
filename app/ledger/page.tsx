@@ -47,6 +47,9 @@ type LedgerEntry = {
   isRemoved: boolean;
   history: LedgerHistoryItem[];
   documentType: LedgerEntryType;
+  // True only for the synthetic "Opening Balance" row - has no real
+  // date (date === ""), rendered as "—" instead of being formatted.
+  isOpeningBalance?: boolean;
 };
 
 type Summary = {
@@ -315,7 +318,7 @@ export default function LedgerPage() {
                     return (
                       <Fragment key={entry.id}>
                         <tr className="hover:bg-gray-50">
-                          <td className="px-4 py-3">{formatBusinessDate(entry.date)}</td>
+                          <td className="px-4 py-3">{entry.isOpeningBalance ? "—" : formatBusinessDate(entry.date)}</td>
                           <td className="px-4 py-3">
                             {entry.referenceHref ? (
                               <Link href={entry.referenceHref} className="text-blue-600 hover:underline" title="View source document">

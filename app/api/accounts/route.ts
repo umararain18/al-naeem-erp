@@ -7,8 +7,7 @@ import { AccountCategory, AccountType, Prisma } from "@prisma/client";
 import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
 import { accountSearchOr } from "@/lib/search-helpers";
 import { getOpeningBalanceEquityAccountId } from "@/lib/gross-accounts";
-import { parseISODateStart, toBusinessDateInputValue } from "@/lib/date-range";
-import { deriveOpeningBalance } from "./[id]/route";
+import { OPENING_BALANCE_SENTINEL_DATE, deriveOpeningBalance } from "@/lib/account-opening-balance";
 
 // Opening Balance is only offered for Asset/Liability/Equity accounts
 // (never Income/Expense/Party, and never the Opening Balance Equity
@@ -87,11 +86,6 @@ const createAccountSchema = z.object({
   openingBalanceType: z
     .enum(["DEBIT", "CREDIT"])
     .optional(),
-
-  openingDate: z
-    .string()
-    .optional()
-    .or(z.literal("")),
 });
 
 function isCategoryValidForType(
@@ -329,8 +323,7 @@ export async function POST(
     // believes an opening balance was recorded.
     const openingBalanceRequested =
       data.openingBalance !== undefined ||
-      data.openingBalanceType !== undefined ||
-      !!data.openingDate;
+      data.openingBalanceType !== undefined;
 
     if (
       openingBalanceRequested &&
@@ -448,10 +441,6 @@ export async function POST(
       }
     }
 
-    const openingDateStr =
-      data.openingDate || toBusinessDateInputValue(new Date());
-    const openingDate = parseISODateStart(openingDateStr);
-
     const account = await prisma.$transaction(async (tx) => {
       const created = await tx.account.create({
         data: {
@@ -501,7 +490,7 @@ export async function POST(
 
         await tx.journalEntry.create({
           data: {
-            entryDate: openingDate,
+            entryDate: OPENING_BALANCE_SENTINEL_DATE,
             referenceType: "OPENING_BALANCE",
             referenceId: created.id,
             description: `Opening balance for ${created.accountName}`,
@@ -545,7 +534,6 @@ export async function POST(
           ? {
               openingBalance: openingAmount,
               openingBalanceType: data.openingBalanceType,
-              openingDate: openingDateStr,
             }
           : {}),
       },

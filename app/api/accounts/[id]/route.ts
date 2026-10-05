@@ -6,43 +6,8 @@ import { hasPermission } from "@/lib/permissions";
 import { AccountCategory, AccountType, Prisma } from "@prisma/client";
 import { auditUpdate, auditDelete, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 import { getOpeningBalanceEquityAccountId } from "@/lib/gross-accounts";
-import { parseISODateStart, toBusinessDateInputValue } from "@/lib/date-range";
 import { ACCOUNT_TYPES_ELIGIBLE_FOR_OPENING_BALANCE } from "../route";
-
-// A line's debit/credit resolves to a signed amount (+debit, -credit)
-// and back - used both to derive the CURRENT opening balance from an
-// existing JournalEntry's lines (no stored Account field exists - see
-// the approved "Option A, no schema change" design) and to rebuild
-// the two lines when the amount/side changes.
-function signedAmount(debit: number, credit: number): number {
-  return debit - credit;
-}
-
-export interface DerivedOpeningBalance {
-  openingBalance: number;
-  openingBalanceType: "DEBIT" | "CREDIT" | null;
-  openingDate: string | null;
-}
-
-// Shared by this route's GET/PATCH and the list GET in ../route.ts -
-// the single source of truth for turning an account's existing (if
-// any) active OPENING_BALANCE JournalEntry back into display/pre-fill
-// values, since none of this is stored on Account itself.
-export function deriveOpeningBalance(
-  entry: { entryDate: Date; lines: { accountId: string; debit: Prisma.Decimal; credit: Prisma.Decimal }[] } | null,
-  accountId: string
-): DerivedOpeningBalance {
-  const line = entry?.lines.find((l) => l.accountId === accountId) || null;
-  if (!entry || !line) {
-    return { openingBalance: 0, openingBalanceType: null, openingDate: null };
-  }
-  const net = signedAmount(Number(line.debit), Number(line.credit));
-  return {
-    openingBalance: Math.abs(net),
-    openingBalanceType: net >= 0 ? "DEBIT" : "CREDIT",
-    openingDate: toBusinessDateInputValue(entry.entryDate),
-  };
-}
+import { OPENING_BALANCE_SENTINEL_DATE, deriveOpeningBalance } from "@/lib/account-opening-balance";
 
 const updateAccountSchema = z.object({
   accountName: z
@@ -122,11 +87,6 @@ const updateAccountSchema = z.object({
   openingBalanceType: z
     .enum(["DEBIT", "CREDIT"])
     .optional(),
-
-  openingDate: z
-    .string()
-    .optional()
-    .or(z.literal("")),
 });
 
 function isCategoryValidForType(
@@ -418,8 +378,7 @@ export async function PATCH(
     // enforces, see ACCOUNT_TYPES_ELIGIBLE_FOR_OPENING_BALANCE).
     const openingBalanceRequested =
       data.openingBalance !== undefined ||
-      data.openingBalanceType !== undefined ||
-      !!data.openingDate;
+      data.openingBalanceType !== undefined;
 
     const isOpeningBalanceEquityAccount =
       existingAccount.isSystem &&
@@ -542,10 +501,8 @@ export async function PATCH(
     let existingOpeningEntry: Prisma.JournalEntryGetPayload<{ include: { lines: true } }> | null = null;
     let oldOpeningAmount = 0;
     let oldOpeningType: "DEBIT" | "CREDIT" | null = null;
-    let oldOpeningDateStr: string | null = null;
     let finalOpeningAmount = 0;
     let finalOpeningType: "DEBIT" | "CREDIT" | null = null;
-    let finalOpeningDateStr = "";
 
     if (openingBalanceRequested) {
       existingOpeningEntry = await prisma.journalEntry.findFirst({
@@ -560,11 +517,9 @@ export async function PATCH(
       const derived = deriveOpeningBalance(existingOpeningEntry, id);
       oldOpeningAmount = derived.openingBalance;
       oldOpeningType = derived.openingBalanceType;
-      oldOpeningDateStr = derived.openingDate;
 
       finalOpeningAmount = data.openingBalance !== undefined ? data.openingBalance : oldOpeningAmount;
       finalOpeningType = data.openingBalanceType !== undefined ? data.openingBalanceType : oldOpeningType;
-      finalOpeningDateStr = data.openingDate ? data.openingDate : oldOpeningDateStr || toBusinessDateInputValue(new Date());
 
       if (finalOpeningAmount > 0 && !finalOpeningType) {
         return NextResponse.json(
@@ -576,8 +531,6 @@ export async function PATCH(
         );
       }
     }
-
-    const finalOpeningDate = openingBalanceRequested ? parseISODateStart(finalOpeningDateStr) : null;
 
     const { updatedAccount, openingBalanceDiff } = await prisma.$transaction(async (tx) => {
       const updated = await tx.account.update({
@@ -659,7 +612,6 @@ export async function PATCH(
 
             diff.openingBalance = { old: oldOpeningAmount, new: 0 };
             diff.openingBalanceType = { old: oldOpeningType, new: null };
-            diff.openingDate = { old: oldOpeningDateStr, new: null };
           }
         } else {
           const existingAccountLine = existingOpeningEntry?.lines.find((l) => l.accountId === id) || null;
@@ -669,12 +621,9 @@ export async function PATCH(
             // In-place update - the SAME entry/lines, never a
             // duplicate (replace-on-edit would hard-delete and
             // recreate, which the approved design explicitly rejects
-            // here, unlike Party's own existing flow).
-            await tx.journalEntry.update({
-              where: { id: existingOpeningEntry.id },
-              data: { entryDate: finalOpeningDate! },
-            });
-
+            // here, unlike Party's own existing flow). entryDate is
+            // never touched - Opening Balance has no date of its own,
+            // it is always OPENING_BALANCE_SENTINEL_DATE.
             await tx.journalLine.update({
               where: { id: existingAccountLine.id },
               data: {
@@ -700,7 +649,7 @@ export async function PATCH(
 
             await tx.journalEntry.create({
               data: {
-                entryDate: finalOpeningDate!,
+                entryDate: OPENING_BALANCE_SENTINEL_DATE,
                 referenceType: "OPENING_BALANCE",
                 referenceId: id,
                 description: `Opening balance for ${updated.accountName}`,
@@ -726,7 +675,6 @@ export async function PATCH(
 
           if (finalOpeningAmount !== oldOpeningAmount) diff.openingBalance = { old: oldOpeningAmount, new: finalOpeningAmount };
           if (finalOpeningType !== oldOpeningType) diff.openingBalanceType = { old: oldOpeningType, new: finalOpeningType };
-          if (finalOpeningDateStr !== oldOpeningDateStr) diff.openingDate = { old: oldOpeningDateStr, new: finalOpeningDateStr };
         }
       }
 

@@ -30,7 +30,7 @@ export async function GET(
     // client-facing PDF/Excel export (ledger/pdf, ledger/excel) is
     // the ONLY place that stays chronological (oldest -> newest) -
     // see getPartyLedgerData()'s own doc comment.
-    const data = await getPartyLedgerData(id, { from, to, order: "desc", documentType });
+    const data = await getPartyLedgerData(id, { from, to, order: "desc", documentType, includeOpeningBalanceRow: true });
 
     return NextResponse.json({ success: true, ...data });
   } catch (error) {

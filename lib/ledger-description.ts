@@ -980,6 +980,12 @@ export interface FinalLedgerRow {
   isRemoved: boolean;
   history: DisplayHistoryItem[];
   documentType: LedgerEntryType;
+  // True only for the single synthetic "Opening Balance" row (see
+  // AccountLedgerOptions.includeOpeningBalanceRow) - has no real date
+  // (`date` is ""), is never a real JournalLine, and callers must
+  // render its date column as empty/"—" rather than attempting to
+  // format "".
+  isOpeningBalance?: boolean;
 }
 
 export interface AccountLedgerOptions {
@@ -1023,6 +1029,18 @@ export interface AccountLedgerOptions {
    * into the real (unfiltered) account balance shown elsewhere.
    */
   documentType?: LedgerEntryType | null;
+  /**
+   * When true, prepends a single synthetic "Opening Balance" row
+   * (FinalLedgerRow.isOpeningBalance = true, date = "") representing
+   * the account's own OPENING_BALANCE JournalEntry contribution
+   * (already included in `summary.openingBalance` regardless of this
+   * flag) - always first, regardless of `order`. Opt-in and default
+   * false/omitted so every existing caller (PDF/Excel exports,
+   * Employee Ledger) keeps its exact current row list unless it asks
+   * for this row. Only set by the General Ledger and Party Ledger
+   * screen routes.
+   */
+  includeOpeningBalanceRow?: boolean;
 }
 
 export interface AccountLedgerData {
@@ -1069,6 +1087,7 @@ export async function getAccountLedgerData(
   const to = options.to || null;
   const order = options.order || "asc";
   const documentType = options.documentType || null;
+  const includeOpeningBalanceRow = !!options.includeOpeningBalanceRow;
 
   const account = await prisma.account.findUnique({ where: { id: accountId }, select: { id: true, accountName: true } });
   if (!account) {
@@ -1086,16 +1105,47 @@ export async function getAccountLedgerData(
     if (!Number.isNaN(end.getTime())) dateFilter.lt = end;
   }
 
+  // Opening Balance (referenceType "OPENING_BALANCE" - Account's own,
+  // always posted via OPENING_BALANCE_SENTINEL_DATE, or Party's own
+  // existing entry, posted at its real creation date) is excluded
+  // from this main, date-filtered fetch entirely - it never counts
+  // as a period transaction regardless of `from`/`to`, and is never
+  // mixed into the chronological row list. Its own, unconditional
+  // contribution is fetched separately below and surfaced as a
+  // dedicated row instead. See lib/account-opening-balance.ts.
   const entries = await prisma.journalLine.findMany({
     where: {
       accountId: account.id,
-      journalEntry: { is: { isDeleted: false, ...(Object.keys(dateFilter).length > 0 ? { entryDate: dateFilter } : {}) } },
+      journalEntry: {
+        is: {
+          isDeleted: false,
+          referenceType: { not: "OPENING_BALANCE" },
+          ...(Object.keys(dateFilter).length > 0 ? { entryDate: dateFilter } : {}),
+        },
+      },
     },
     include: {
       journalEntry: { select: { id: true, entryDate: true, referenceType: true, referenceId: true, description: true } },
     },
     orderBy: { journalEntry: { entryDate: "asc" } },
   });
+
+  // Opening Balance's own, always-unconditional contribution -
+  // included in `summary.openingBalance` and shown as a dedicated
+  // row regardless of any date filter, never counted in
+  // periodDebit/periodCredit. Only meaningful for the unfiltered
+  // (documentType === null) path - a type-filtered summary answers a
+  // narrower question ("what does this document type alone owe") that
+  // Opening Balance was never part of.
+  const openingBalanceLines = await prisma.journalLine.findMany({
+    where: {
+      accountId: account.id,
+      journalEntry: { is: { isDeleted: false, referenceType: "OPENING_BALANCE" } },
+    },
+    select: { debit: true, credit: true },
+  });
+  const openingBalanceFromEntry = openingBalanceLines.reduce((sum, l) => sum + Number(l.debit) - Number(l.credit), 0);
+  const hasOpeningBalanceEntry = openingBalanceLines.length > 0;
 
   const rawLines: RawLedgerLine[] = entries.map((entry) => ({
     id: entry.id,
@@ -1170,19 +1220,24 @@ export async function getAccountLedgerData(
   } else {
     // Unfiltered ("All") path - byte-for-byte the original
     // calculation (raw JournalLine sums, never the grouped/display
-    // rows), untouched.
+    // rows), untouched, except that `entries` itself now already
+    // excludes Opening Balance (see above).
     periodDebit = entries.reduce((sum, entry) => sum + Number(entry.debit), 0);
     periodCredit = entries.reduce((sum, entry) => sum + Number(entry.credit), 0);
+
+    // Opening Balance's own contribution counts here UNCONDITIONALLY -
+    // regardless of whether `from` is set at all.
+    openingBalance = openingBalanceFromEntry;
 
     if (from) {
       const openingEntries = await prisma.journalLine.findMany({
         where: {
           accountId: account.id,
-          journalEntry: { is: { isDeleted: false, entryDate: { lt: new Date(`${from}T00:00:00`) } } },
+          journalEntry: { is: { isDeleted: false, referenceType: { not: "OPENING_BALANCE" }, entryDate: { lt: new Date(`${from}T00:00:00`) } } },
         },
         select: { debit: true, credit: true },
       });
-      openingBalance = openingEntries.reduce((sum, entry) => sum + Number(entry.debit) - Number(entry.credit), 0);
+      openingBalance += openingEntries.reduce((sum, entry) => sum + Number(entry.debit) - Number(entry.credit), 0);
     }
   }
 
@@ -1215,6 +1270,31 @@ export async function getAccountLedgerData(
   // handed back in; each row's own `balance` already reflects the
   // true balance as of that transaction and needs no recomputation.
   const orderedLedger = order === "desc" ? [...ledger].reverse() : ledger;
+
+  // Opening Balance row - always first, regardless of `order`, never
+  // part of the chronological reversal above. Only injected when
+  // asked for (see includeOpeningBalanceRow's own doc comment) and
+  // only when a genuine OPENING_BALANCE entry actually exists for
+  // this account - never shown for the overwhelming majority of
+  // accounts that never set one.
+  if (includeOpeningBalanceRow && !documentType && hasOpeningBalanceEntry) {
+    orderedLedger.unshift({
+      id: `opening-balance:${account.id}`,
+      date: "",
+      reference: "Opening Balance",
+      referenceHref: null,
+      description: "Opening Balance",
+      debit: openingBalanceFromEntry > 0 ? openingBalanceFromEntry : 0,
+      credit: openingBalanceFromEntry < 0 ? Math.abs(openingBalanceFromEntry) : 0,
+      balance: Math.abs(openingBalanceFromEntry),
+      balanceType: classifyBalance(openingBalanceFromEntry),
+      isGrouped: false,
+      isRemoved: false,
+      history: [],
+      documentType: "OTHER",
+      isOpeningBalance: true,
+    });
+  }
 
   return {
     account: { id: account.id, accountName: account.accountName },

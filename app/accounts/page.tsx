@@ -6,7 +6,6 @@ import {
   useMemo,
   useState,
 } from "react";
-import { toBusinessDateInputValue } from "@/lib/date-range";
 
 type AccountType =
   | "ASSET"
@@ -68,10 +67,10 @@ type Account = {
 
   // Derived from the account's own active OPENING_BALANCE
   // JournalEntry, never a stored field - see app/api/accounts/route.ts
-  // and app/api/accounts/[id]/route.ts's deriveOpeningBalance().
+  // and app/api/accounts/[id]/route.ts's deriveOpeningBalance(). Has
+  // no date of its own - see lib/account-opening-balance.ts.
   openingBalance: number;
   openingBalanceType: "DEBIT" | "CREDIT" | null;
-  openingDate: string | null;
 
   parentId: string | null;
 
@@ -324,9 +323,6 @@ export default function AccountsPage() {
       defaultOpeningBalanceTypeForAccountType("ASSET")
     );
 
-  const [openingDate, setOpeningDate] =
-    useState(() => toBusinessDateInputValue(new Date()));
-
   function resetForm() {
     setAccountName("");
     setAccountCode("");
@@ -341,7 +337,6 @@ export default function AccountsPage() {
     setOpeningBalanceType(
       defaultOpeningBalanceTypeForAccountType("ASSET")
     );
-    setOpeningDate(toBusinessDateInputValue(new Date()));
   }
 
   async function loadAccounts() {
@@ -466,9 +461,6 @@ export default function AccountsPage() {
             openingBalanceType: openingBalance
               ? openingBalanceType
               : undefined,
-            openingDate: openingBalance
-              ? openingDate
-              : undefined,
           }
         : {};
 
@@ -584,11 +576,6 @@ export default function AccountsPage() {
     setOpeningBalanceType(
       account.openingBalanceType ||
         defaultOpeningBalanceTypeForAccountType(account.accountType)
-    );
-
-    setOpeningDate(
-      account.openingDate ||
-        toBusinessDateInputValue(new Date())
     );
 
     setError("");
@@ -1028,19 +1015,8 @@ export default function AccountsPage() {
                     </select>
                   </div>
 
-                  <input
-                    type="date"
-                    value={openingDate}
-                    onChange={(e) =>
-                      setOpeningDate(
-                        e.target.value
-                      )
-                    }
-                    className="w-full border rounded-lg px-4 py-3"
-                  />
-
                   <p className="text-xs text-gray-500">
-                    Leave amount at 0 to remove an existing opening balance.
+                    Leave amount at 0 to remove an existing opening balance. Opening Balance has no date of its own - it always applies before every other transaction.
                   </p>
                 </div>
               )}
