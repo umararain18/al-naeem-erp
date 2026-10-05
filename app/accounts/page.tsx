@@ -14,6 +14,17 @@ type AccountType =
   | "INCOME"
   | "EXPENSE";
 
+// Mirrors ACCOUNT_TYPES_ELIGIBLE_FOR_OPENING_BALANCE in
+// app/api/accounts/route.ts - Opening Balance is only offered for
+// Asset/Liability/Equity accounts, never Income/Expense/Party, and
+// never the Opening Balance Equity system account itself (checked
+// separately via its fixed accountCode below).
+const ACCOUNT_TYPES_ELIGIBLE_FOR_OPENING_BALANCE = new Set<AccountType>(["ASSET", "LIABILITY", "EQUITY"]);
+
+function defaultOpeningBalanceTypeForAccountType(type: AccountType): "DEBIT" | "CREDIT" {
+  return type === "ASSET" ? "DEBIT" : "CREDIT";
+}
+
 type AccountCategory =
   | "CASH"
   | "BANK"
@@ -53,6 +64,13 @@ type Account = {
   description: string | null;
   isSystem: boolean;
   isActive: boolean;
+
+  // Derived from the account's own active OPENING_BALANCE
+  // JournalEntry, never a stored field - see app/api/accounts/route.ts
+  // and app/api/accounts/[id]/route.ts's deriveOpeningBalance(). Has
+  // no date of its own - see lib/account-opening-balance.ts.
+  openingBalance: number;
+  openingBalanceType: "DEBIT" | "CREDIT" | null;
 
   parentId: string | null;
 
@@ -297,6 +315,14 @@ export default function AccountsPage() {
   const [partyId, setPartyId] =
     useState("");
 
+  const [openingBalance, setOpeningBalance] =
+    useState("");
+
+  const [openingBalanceType, setOpeningBalanceType] =
+    useState<"DEBIT" | "CREDIT">(
+      defaultOpeningBalanceTypeForAccountType("ASSET")
+    );
+
   function resetForm() {
     setAccountName("");
     setAccountCode("");
@@ -307,6 +333,10 @@ export default function AccountsPage() {
     setDescription("");
     setParentId("");
     setPartyId("");
+    setOpeningBalance("");
+    setOpeningBalanceType(
+      defaultOpeningBalanceTypeForAccountType("ASSET")
+    );
   }
 
   async function loadAccounts() {
@@ -372,6 +402,13 @@ export default function AccountsPage() {
     );
 
     setParentId("");
+
+    // Opening Balance's Dr/Cr default follows the newly-selected
+    // type (ASSET -> Dr, LIABILITY/EQUITY -> Cr) - a convenience
+    // default only, the user can still override it below.
+    setOpeningBalanceType(
+      defaultOpeningBalanceTypeForAccountType(value)
+    );
   }
 
   async function handleSubmit(
@@ -401,7 +438,31 @@ export default function AccountsPage() {
       // those two fields are sent, so an unrelated stale value in the
       // form (accountCode/accountType/category/parentId/partyId, all
       // disabled below) is never mistaken for an intended change.
+      // Opening Balance is NOT one of those structural fields -
+      // system accounts (e.g. Office Cash) can still have it, so it
+      // is sent on BOTH branches below - except for the Opening
+      // Balance Equity system account itself, which has no eligible
+      // counter-equity account of its own.
       const isSystemEdit = !!editingAccount?.isSystem;
+
+      const isOpeningBalanceEquityAccount =
+        !!editingAccount?.isSystem &&
+        editingAccount?.accountCode === "OPENING-BALANCE";
+
+      const canHaveOpeningBalance =
+        ACCOUNT_TYPES_ELIGIBLE_FOR_OPENING_BALANCE.has(accountType) &&
+        !isOpeningBalanceEquityAccount;
+
+      const openingBalancePayload = canHaveOpeningBalance
+        ? {
+            openingBalance: openingBalance
+              ? Number(openingBalance)
+              : 0,
+            openingBalanceType: openingBalance
+              ? openingBalanceType
+              : undefined,
+          }
+        : {};
 
       const response = await fetch(url, {
         method: editingAccount
@@ -418,6 +479,7 @@ export default function AccountsPage() {
             ? {
                 accountName: accountName.trim(),
                 description: description.trim(),
+                ...openingBalancePayload,
               }
             : {
                 accountName:
@@ -436,6 +498,8 @@ export default function AccountsPage() {
                 parentId: parentId || "",
 
                 partyId: partyId || "",
+
+                ...openingBalancePayload,
               }
         ),
       });
@@ -501,6 +565,17 @@ export default function AccountsPage() {
 
     setPartyId(
       account.partyId || ""
+    );
+
+    setOpeningBalance(
+      account.openingBalance
+        ? String(account.openingBalance)
+        : ""
+    );
+
+    setOpeningBalanceType(
+      account.openingBalanceType ||
+        defaultOpeningBalanceTypeForAccountType(account.accountType)
     );
 
     setError("");
@@ -714,6 +789,14 @@ export default function AccountsPage() {
         account.isActive
     );
 
+  const isOpeningBalanceEquityAccount =
+    !!editingAccount?.isSystem &&
+    editingAccount?.accountCode === "OPENING-BALANCE";
+
+  const canHaveOpeningBalance =
+    ACCOUNT_TYPES_ELIGIBLE_FOR_OPENING_BALANCE.has(accountType) &&
+    !isOpeningBalanceEquityAccount;
+
   return (
     <main className="min-h-screen bg-gray-50">
       <div className="max-w-7xl mx-auto p-6">
@@ -891,6 +974,52 @@ export default function AccountsPage() {
                   )
                 )}
               </select>
+
+              {/* OPENING BALANCE - Asset/Liability/Equity only, never
+                  for the Opening Balance Equity system account itself.
+                  Allowed for system accounts (e.g. Office Cash) - it is
+                  not a structural field. */}
+
+              {canHaveOpeningBalance && (
+                <div className="border rounded-lg p-4 space-y-3 bg-gray-50">
+                  <p className="text-sm font-medium text-gray-700">
+                    Opening Balance
+                  </p>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <input
+                      type="number"
+                      step="0.01"
+                      min="0"
+                      placeholder="Amount"
+                      value={openingBalance}
+                      onChange={(e) =>
+                        setOpeningBalance(
+                          e.target.value
+                        )
+                      }
+                      className="w-full border rounded-lg px-4 py-3"
+                    />
+
+                    <select
+                      value={openingBalanceType}
+                      onChange={(e) =>
+                        setOpeningBalanceType(
+                          e.target.value as "DEBIT" | "CREDIT"
+                        )
+                      }
+                      className="w-full border rounded-lg px-4 py-3 bg-white"
+                    >
+                      <option value="DEBIT">Debit</option>
+                      <option value="CREDIT">Credit</option>
+                    </select>
+                  </div>
+
+                  <p className="text-xs text-gray-500">
+                    Leave amount at 0 to remove an existing opening balance. Opening Balance has no date of its own - it always applies before every other transaction.
+                  </p>
+                </div>
+              )}
 
               <textarea
                 placeholder="Description"

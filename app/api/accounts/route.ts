@@ -6,6 +6,15 @@ import { hasPermission } from "@/lib/permissions";
 import { AccountCategory, AccountType, Prisma } from "@prisma/client";
 import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
 import { accountSearchOr } from "@/lib/search-helpers";
+import { getOpeningBalanceEquityAccountId } from "@/lib/gross-accounts";
+import { OPENING_BALANCE_SENTINEL_DATE, deriveOpeningBalance } from "@/lib/account-opening-balance";
+
+// Opening Balance is only offered for Asset/Liability/Equity accounts
+// (never Income/Expense/Party, and never the Opening Balance Equity
+// system account itself - see ACCOUNT_TYPES_ELIGIBLE_FOR_OPENING_BALANCE's
+// own doc comment in app/api/accounts/[id]/route.ts for why). Kept as
+// its own small exported set so both routes apply the exact same rule.
+export const ACCOUNT_TYPES_ELIGIBLE_FOR_OPENING_BALANCE = new Set(["ASSET", "LIABILITY", "EQUITY"]);
 
 const createAccountSchema = z.object({
   accountName: z
@@ -68,6 +77,15 @@ const createAccountSchema = z.object({
     .string()
     .optional()
     .or(z.literal("")),
+
+  openingBalance: z
+    .number()
+    .min(0, "Opening balance cannot be negative")
+    .optional(),
+
+  openingBalanceType: z
+    .enum(["DEBIT", "CREDIT"])
+    .optional(),
 });
 
 function isCategoryValidForType(
@@ -187,9 +205,34 @@ export async function GET(request: NextRequest) {
       ],
     });
 
+    // Opening Balance pre-fill for every account's own active
+    // OPENING_BALANCE JournalEntry (if any) - one batched query, not
+    // one per account. This list response is what the Accounts
+    // page's own Edit flow pre-fills its form from (see
+    // startEditing() in app/accounts/page.tsx), so the derived
+    // fields have to live here, not only on the single-account GET.
+    const accountIds = accounts.map((a) => a.id);
+    const openingEntries =
+      accountIds.length > 0
+        ? await prisma.journalEntry.findMany({
+            where: {
+              referenceType: "OPENING_BALANCE",
+              referenceId: { in: accountIds },
+              isDeleted: false,
+            },
+            include: { lines: true },
+          })
+        : [];
+    const openingEntryByAccountId = new Map(openingEntries.map((e) => [e.referenceId as string, e]));
+
+    const accountsWithOpeningBalance = accounts.map((account) => ({
+      ...account,
+      ...deriveOpeningBalance(openingEntryByAccountId.get(account.id) || null, account.id),
+    }));
+
     return NextResponse.json({
       success: true,
-      accounts,
+      accounts: accountsWithOpeningBalance,
     });
   } catch (error) {
     console.error("Get accounts error:", error);
@@ -268,6 +311,42 @@ export async function POST(
           success: false,
           message:
             "Selected category does not belong to the selected account type",
+        },
+        { status: 400 }
+      );
+    }
+
+    // Opening Balance is only offered for Asset/Liability/Equity
+    // accounts - never Income/Expense/Party. The UI never sends these
+    // fields for an ineligible type, but the API rejects it outright
+    // rather than silently ignoring it, so a caller never mistakenly
+    // believes an opening balance was recorded.
+    const openingBalanceRequested =
+      data.openingBalance !== undefined ||
+      data.openingBalanceType !== undefined;
+
+    if (
+      openingBalanceRequested &&
+      !ACCOUNT_TYPES_ELIGIBLE_FOR_OPENING_BALANCE.has(accountType)
+    ) {
+      return NextResponse.json(
+        {
+          success: false,
+          message:
+            "Opening balance is only available for Asset, Liability and Equity accounts.",
+        },
+        { status: 400 }
+      );
+    }
+
+    const openingAmount = data.openingBalance ?? 0;
+
+    if (openingAmount > 0 && !data.openingBalanceType) {
+      return NextResponse.json(
+        {
+          success: false,
+          message:
+            "Opening balance type is required when opening balance is greater than zero.",
         },
         { status: 400 }
       );
@@ -362,8 +441,8 @@ export async function POST(
       }
     }
 
-    const account =
-      await prisma.account.create({
+    const account = await prisma.$transaction(async (tx) => {
+      const created = await tx.account.create({
         data: {
           accountName: data.accountName,
 
@@ -406,6 +485,38 @@ export async function POST(
         },
       });
 
+      if (openingAmount > 0 && data.openingBalanceType) {
+        const openingEquityId = await getOpeningBalanceEquityAccountId(tx);
+
+        await tx.journalEntry.create({
+          data: {
+            entryDate: OPENING_BALANCE_SENTINEL_DATE,
+            referenceType: "OPENING_BALANCE",
+            referenceId: created.id,
+            description: `Opening balance for ${created.accountName}`,
+            lines: {
+              create: [
+                {
+                  accountId: created.id,
+                  debit: data.openingBalanceType === "DEBIT" ? openingAmount : 0,
+                  credit: data.openingBalanceType === "CREDIT" ? openingAmount : 0,
+                  description: `Opening balance - ${created.accountName}`,
+                },
+                {
+                  accountId: openingEquityId,
+                  debit: data.openingBalanceType === "CREDIT" ? openingAmount : 0,
+                  credit: data.openingBalanceType === "DEBIT" ? openingAmount : 0,
+                  description: "Opening Balance Equity",
+                },
+              ],
+            },
+          },
+        });
+      }
+
+      return created;
+    });
+
     await auditCreate(prisma, {
       actor: actorFromUser(currentUser),
       module: "ACCOUNT",
@@ -413,7 +524,19 @@ export async function POST(
       entityId: account.id,
       documentNo: account.accountName,
       description: `Created Account ${account.accountName} (${accountType}/${category})`,
-      newValues: { accountName: account.accountName, accountCode: account.accountCode, accountType, category, parentId: data.parentId || null },
+      newValues: {
+        accountName: account.accountName,
+        accountCode: account.accountCode,
+        accountType,
+        category,
+        parentId: data.parentId || null,
+        ...(openingAmount > 0 && data.openingBalanceType
+          ? {
+              openingBalance: openingAmount,
+              openingBalanceType: data.openingBalanceType,
+            }
+          : {}),
+      },
       ...requestContext(request),
     });
 

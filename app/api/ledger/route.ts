@@ -88,7 +88,7 @@ export async function GET(request: NextRequest) {
     // non-zero-net remainder - see buildUserFacingLedgerRows()'s own
     // guards.
     const documentType = parseLedgerEntryType(searchParams.get("type"));
-    const data = await getAccountLedgerData(accountId, { from, to, order: "desc", documentType });
+    const data = await getAccountLedgerData(accountId, { from, to, order: "desc", documentType, includeOpeningBalanceRow: true });
 
     // Transaction search narrows which rows are DISPLAYED only - the
     // summary (opening/period/closing balance) above is computed from

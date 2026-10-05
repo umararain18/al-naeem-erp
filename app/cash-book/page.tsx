@@ -57,6 +57,11 @@ type CashBookResponse = {
   };
   days: CashBookDay[];
   resultCount?: number | null;
+  // The account's own Opening Balance (see app/accounts/page.tsx) -
+  // null when it has never had one set. Rendered as a dedicated line
+  // above the day list, never as a day/transaction row, and never
+  // affected by the selected date range or search.
+  openingBalanceEntry?: { amount: number; direction: "DEBIT" | "CREDIT" } | null;
   capabilities?: {
     canEdit: boolean;
     canMoveToBin: boolean;
@@ -95,6 +100,9 @@ export default function CashBookPage() {
 
   const [resultCount, setResultCount] =
     useState<number | null>(null);
+
+  const [openingBalanceEntry, setOpeningBalanceEntry] =
+    useState<{ amount: number; direction: "DEBIT" | "CREDIT" } | null>(null);
 
   const [openDates, setOpenDates] =
     useState<string[]>([]);
@@ -245,6 +253,7 @@ export default function CashBookPage() {
 
       setDays(data.days || []);
       setResultCount(data.resultCount ?? null);
+      setOpeningBalanceEntry(data.openingBalanceEntry ?? null);
       setCapabilities(data.capabilities || {
         canEdit: false,
         canMoveToBin: false,
@@ -271,6 +280,7 @@ export default function CashBookPage() {
 
       setDays([]);
       setResultCount(null);
+      setOpeningBalanceEntry(null);
 
       setSummary({
         openingBalance: 0,
@@ -745,6 +755,15 @@ export default function CashBookPage() {
             </p>
 
           </div>
+
+          {selectedAccountId && openingBalanceEntry && (
+            <div className="border-b bg-gray-50 px-6 py-3 flex items-center justify-between">
+              <span className="text-sm font-medium text-gray-700">Opening Balance</span>
+              <span className="text-sm font-semibold text-gray-900">
+                Rs. {formatMoney(openingBalanceEntry.amount)} {openingBalanceEntry.direction === "DEBIT" ? "Dr" : "Cr"}
+              </span>
+            </div>
+          )}
 
           {loadingTransactions ? (
             <div className="px-6 py-12 text-center text-sm text-gray-500">

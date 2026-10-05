@@ -3,8 +3,11 @@ import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
-import { AccountCategory, AccountType } from "@prisma/client";
+import { AccountCategory, AccountType, Prisma } from "@prisma/client";
 import { auditUpdate, auditDelete, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
+import { getOpeningBalanceEquityAccountId } from "@/lib/gross-accounts";
+import { ACCOUNT_TYPES_ELIGIBLE_FOR_OPENING_BALANCE } from "../route";
+import { OPENING_BALANCE_SENTINEL_DATE, deriveOpeningBalance } from "@/lib/account-opening-balance";
 
 const updateAccountSchema = z.object({
   accountName: z
@@ -74,6 +77,15 @@ const updateAccountSchema = z.object({
 
   isActive: z
     .boolean()
+    .optional(),
+
+  openingBalance: z
+    .number()
+    .min(0, "Opening balance cannot be negative")
+    .optional(),
+
+  openingBalanceType: z
+    .enum(["DEBIT", "CREDIT"])
     .optional(),
 });
 
@@ -191,9 +203,29 @@ export async function GET(
       );
     }
 
+    // Opening Balance pre-fill - derived from the account's own
+    // active OPENING_BALANCE JournalEntry (if any), never a stored
+    // Account field. Looked up for every account (cheap, single-row
+    // lookup) rather than gating on ACCOUNT_TYPES_ELIGIBLE_FOR_OPENING_BALANCE,
+    // so an already-posted entry is never hidden merely because the
+    // account's type was changed after it was posted.
+    const openingEntryForGet = await prisma.journalEntry.findFirst({
+      where: {
+        referenceType: "OPENING_BALANCE",
+        referenceId: id,
+        isDeleted: false,
+      },
+      include: { lines: true },
+    });
+
+    const accountWithOpeningBalance = {
+      ...account,
+      ...deriveOpeningBalance(openingEntryForGet, id),
+    };
+
     return NextResponse.json({
       success: true,
-      account,
+      account: accountWithOpeningBalance,
     });
   } catch (error) {
     console.error(
@@ -339,6 +371,34 @@ export async function PATCH(
       );
     }
 
+    // Opening Balance is only offered for Asset/Liability/Equity
+    // accounts, and never for the Opening Balance Equity system
+    // account itself (it would need its own counter-equity account,
+    // which does not exist - the same scope rule the Create route
+    // enforces, see ACCOUNT_TYPES_ELIGIBLE_FOR_OPENING_BALANCE).
+    const openingBalanceRequested =
+      data.openingBalance !== undefined ||
+      data.openingBalanceType !== undefined;
+
+    const isOpeningBalanceEquityAccount =
+      existingAccount.isSystem &&
+      existingAccount.accountCode === "OPENING-BALANCE";
+
+    if (
+      openingBalanceRequested &&
+      (!ACCOUNT_TYPES_ELIGIBLE_FOR_OPENING_BALANCE.has(accountType) ||
+        isOpeningBalanceEquityAccount)
+    ) {
+      return NextResponse.json(
+        {
+          success: false,
+          message:
+            "Opening balance is only available for Asset, Liability and Equity accounts.",
+        },
+        { status: 400 }
+      );
+    }
+
     if (
       data.accountCode &&
       data.accountCode !==
@@ -429,8 +489,51 @@ export async function PATCH(
       }
     }
 
-    const updatedAccount =
-      await prisma.account.update({
+    // ------------------------------------------------------------
+    // OPENING BALANCE - resolve current (derived from the existing
+    // OPENING_BALANCE JournalEntry's own lines, since Account has no
+    // stored field for this - "Option A, no schema change") and the
+    // final values BEFORE the transaction, purely as reads, so the
+    // "type required" validation below can return a clean 400
+    // without needing to unwind a transaction.
+    // ------------------------------------------------------------
+
+    let existingOpeningEntry: Prisma.JournalEntryGetPayload<{ include: { lines: true } }> | null = null;
+    let oldOpeningAmount = 0;
+    let oldOpeningType: "DEBIT" | "CREDIT" | null = null;
+    let finalOpeningAmount = 0;
+    let finalOpeningType: "DEBIT" | "CREDIT" | null = null;
+
+    if (openingBalanceRequested) {
+      existingOpeningEntry = await prisma.journalEntry.findFirst({
+        where: {
+          referenceType: "OPENING_BALANCE",
+          referenceId: id,
+          isDeleted: false,
+        },
+        include: { lines: true },
+      });
+
+      const derived = deriveOpeningBalance(existingOpeningEntry, id);
+      oldOpeningAmount = derived.openingBalance;
+      oldOpeningType = derived.openingBalanceType;
+
+      finalOpeningAmount = data.openingBalance !== undefined ? data.openingBalance : oldOpeningAmount;
+      finalOpeningType = data.openingBalanceType !== undefined ? data.openingBalanceType : oldOpeningType;
+
+      if (finalOpeningAmount > 0 && !finalOpeningType) {
+        return NextResponse.json(
+          {
+            success: false,
+            message: "Opening balance type is required when opening balance is greater than zero.",
+          },
+          { status: 400 }
+        );
+      }
+    }
+
+    const { updatedAccount, openingBalanceDiff } = await prisma.$transaction(async (tx) => {
+      const updated = await tx.account.update({
         where: {
           id,
         },
@@ -489,11 +592,102 @@ export async function PATCH(
         },
       });
 
+      const diff: Record<string, { old: unknown; new: unknown }> = {};
+
+      if (openingBalanceRequested) {
+        if (finalOpeningAmount <= 0) {
+          // Amount set to 0 (or never had one and still doesn't) -
+          // soft-delete the existing entry per the app's own bin
+          // convention, never a hard delete. A no-op when nothing
+          // existed to begin with.
+          if (existingOpeningEntry) {
+            await tx.journalEntry.update({
+              where: { id: existingOpeningEntry.id },
+              data: {
+                isDeleted: true,
+                deletedAt: new Date(),
+                deletedById: currentUser.userId,
+              },
+            });
+
+            diff.openingBalance = { old: oldOpeningAmount, new: 0 };
+            diff.openingBalanceType = { old: oldOpeningType, new: null };
+          }
+        } else {
+          const existingAccountLine = existingOpeningEntry?.lines.find((l) => l.accountId === id) || null;
+          const existingEquityLine = existingOpeningEntry?.lines.find((l) => l.accountId !== id) || null;
+
+          if (existingOpeningEntry && existingAccountLine) {
+            // In-place update - the SAME entry/lines, never a
+            // duplicate (replace-on-edit would hard-delete and
+            // recreate, which the approved design explicitly rejects
+            // here, unlike Party's own existing flow). entryDate is
+            // never touched - Opening Balance has no date of its own,
+            // it is always OPENING_BALANCE_SENTINEL_DATE.
+            await tx.journalLine.update({
+              where: { id: existingAccountLine.id },
+              data: {
+                debit: finalOpeningType === "DEBIT" ? finalOpeningAmount : 0,
+                credit: finalOpeningType === "CREDIT" ? finalOpeningAmount : 0,
+              },
+            });
+
+            if (existingEquityLine) {
+              await tx.journalLine.update({
+                where: { id: existingEquityLine.id },
+                data: {
+                  debit: finalOpeningType === "CREDIT" ? finalOpeningAmount : 0,
+                  credit: finalOpeningType === "DEBIT" ? finalOpeningAmount : 0,
+                },
+              });
+            }
+          } else {
+            // No active entry yet (first time, or amount was
+            // previously zeroed out) - create exactly one, exactly
+            // like Create's own flow.
+            const openingEquityId = await getOpeningBalanceEquityAccountId(tx);
+
+            await tx.journalEntry.create({
+              data: {
+                entryDate: OPENING_BALANCE_SENTINEL_DATE,
+                referenceType: "OPENING_BALANCE",
+                referenceId: id,
+                description: `Opening balance for ${updated.accountName}`,
+                lines: {
+                  create: [
+                    {
+                      accountId: id,
+                      debit: finalOpeningType === "DEBIT" ? finalOpeningAmount : 0,
+                      credit: finalOpeningType === "CREDIT" ? finalOpeningAmount : 0,
+                      description: `Opening balance - ${updated.accountName}`,
+                    },
+                    {
+                      accountId: openingEquityId,
+                      debit: finalOpeningType === "CREDIT" ? finalOpeningAmount : 0,
+                      credit: finalOpeningType === "DEBIT" ? finalOpeningAmount : 0,
+                      description: "Opening Balance Equity",
+                    },
+                  ],
+                },
+              },
+            });
+          }
+
+          if (finalOpeningAmount !== oldOpeningAmount) diff.openingBalance = { old: oldOpeningAmount, new: finalOpeningAmount };
+          if (finalOpeningType !== oldOpeningType) diff.openingBalanceType = { old: oldOpeningType, new: finalOpeningType };
+        }
+      }
+
+      return { updatedAccount: updated, openingBalanceDiff: diff };
+    });
+
     const changedFields = diffFields(
       existingAccount as unknown as Record<string, unknown>,
       data as Record<string, unknown>,
       Object.keys(data) as (keyof typeof existingAccount)[]
     );
+    Object.assign(changedFields, openingBalanceDiff);
+
     if (Object.keys(changedFields).length > 0) {
       const summary = Object.entries(changedFields).map(([f, { old, new: nv }]) => `${f} ${old ?? "—"} → ${nv ?? "—"}`).join("; ");
       await auditUpdate(prisma, {

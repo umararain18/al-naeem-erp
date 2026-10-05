@@ -28,6 +28,14 @@ export const BIN_REASON_TOO_OLD =
 export const BIN_REASON_SETTLED_DOCUMENT =
   "This transaction is linked to a settled financial document and can only be moved to Bin by Super Admin.";
 
+// Opening Balance entries can only be edited/removed from the
+// Accounts page (or the Party page, for a Party's own opening
+// balance) - never from Cash Book/Daily Posting/Journal Entries,
+// and never by anyone, including Super Admin (unlike the two reasons
+// above, which Super Admin can override).
+export const BIN_REASON_OPENING_BALANCE =
+  "Opening Balance entries can only be edited or removed from the Accounts page.";
+
 export function isOlderThanBinThreshold(entryDate: Date): boolean {
   const ageMs = Date.now() - entryDate.getTime();
   const ageDays = ageMs / (1000 * 60 * 60 * 24);

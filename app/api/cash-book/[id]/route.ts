@@ -6,9 +6,11 @@ import { hasPermission } from "@/lib/permissions";
 import {
   BIN_REASON_TOO_OLD,
   BIN_REASON_SETTLED_DOCUMENT,
+  BIN_REASON_OPENING_BALANCE,
   isOlderThanBinThreshold,
   isLinkedToSettledDocument,
 } from "@/lib/cash-bank-bin-policy";
+import { isOpeningBalanceReferenceType } from "@/lib/account-opening-balance";
 import {
   DAILY_POSTING_SOURCE_TYPES,
   DailyPostingValidationError,
@@ -219,6 +221,23 @@ export async function PATCH(
           success: false,
           message:
             "This transaction does not belong to a Cash/Bank account",
+        },
+        { status: 400 }
+      );
+    }
+
+    // ============================================================
+    // OPENING BALANCE - never editable here, for anyone, with no
+    // Super Admin override (unlike the age/settled-document policy
+    // below). Edit only from the Accounts page (or the Party page,
+    // for a Party's own opening balance).
+    // ============================================================
+
+    if (isOpeningBalanceReferenceType(currentLine.journalEntry.referenceType)) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: BIN_REASON_OPENING_BALANCE,
         },
         { status: 400 }
       );
@@ -793,6 +812,22 @@ export async function DELETE(
           success: false,
           message:
             "This transaction does not belong to a Cash/Bank account.",
+        },
+        { status: 400 }
+      );
+    }
+
+    // ============================================================
+    // OPENING BALANCE - never movable to Bin here, for anyone, with
+    // no Super Admin override. Edit/remove only from the Accounts
+    // page (or the Party page, for a Party's own opening balance).
+    // ============================================================
+
+    if (isOpeningBalanceReferenceType(currentLine.journalEntry.referenceType)) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: BIN_REASON_OPENING_BALANCE,
         },
         { status: 400 }
       );

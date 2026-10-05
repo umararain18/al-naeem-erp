@@ -5,10 +5,12 @@ import { hasPermission } from "@/lib/permissions";
 import {
   BIN_REASON_TOO_OLD,
   BIN_REASON_SETTLED_DOCUMENT,
+  BIN_REASON_OPENING_BALANCE,
   isOlderThanBinThreshold,
   findSettledChallanIds,
   findSettledBiltyIds,
 } from "@/lib/cash-bank-bin-policy";
+import { isOpeningBalanceReferenceType } from "@/lib/account-opening-balance";
 
 function startOfDay(date: string) {
   return new Date(`${date}T00:00:00`);
@@ -242,6 +244,13 @@ export async function GET(request: NextRequest) {
     is: {
       isDeleted: false,
 
+      // Opening Balance (referenceType "OPENING_BALANCE") never
+      // appears as a daily transaction row here, regardless of
+      // `from`/`to` - its own, unconditional contribution is fetched
+      // separately below and surfaced as a dedicated summary field
+      // instead. See lib/account-opening-balance.ts.
+      referenceType: { not: "OPENING_BALANCE" },
+
       ...(Object.keys(dateFilter).length > 0
         ? {
             entryDate: dateFilter,
@@ -321,6 +330,13 @@ export async function GET(request: NextRequest) {
       canMoveToBin: boolean;
       binProtectedReason: string | null;
     } {
+      // Opening Balance is never movable to Bin here, for anyone -
+      // checked before the Super Admin bypass below, unlike the
+      // age/settled-document policy, which Super Admin can override.
+      if (isOpeningBalanceReferenceType(line.journalEntry.referenceType)) {
+        return { canMoveToBin: false, binProtectedReason: BIN_REASON_OPENING_BALANCE };
+      }
+
       if (!hasBinPermission) return { canMoveToBin: false, binProtectedReason: null };
       if (isSuperAdmin) return { canMoveToBin: true, binProtectedReason: null };
 
@@ -382,7 +398,8 @@ export async function GET(request: NextRequest) {
 
         canEdit:
           hasPermission(currentUser, "accounts.edit") &&
-          line.journalEntry._count.lines === 2,
+          line.journalEntry._count.lines === 2 &&
+          !isOpeningBalanceReferenceType(line.journalEntry.referenceType),
 
         isEditableStructure:
           line.journalEntry._count.lines === 2,
@@ -417,17 +434,32 @@ export async function GET(request: NextRequest) {
     // No `from` selected (or "All Time") -> 0, same as before.
     // ============================================================
 
-    let openingBalance = 0;
+    // Opening Balance's own, always-unconditional contribution -
+    // counts here regardless of whether `from` is set at all, never
+    // mixed into the "qualifying activity before `from`" sum below
+    // (which now also excludes it, to avoid double-counting once
+    // `from` is set after the account's own OPENING_BALANCE entry).
+    const openingBalanceLines = await prisma.journalLine.findMany({
+      where: {
+        accountId: selectedAccount.id,
+        journalEntry: { is: { isDeleted: false, referenceType: "OPENING_BALANCE" } },
+      },
+      select: { debit: true, credit: true },
+    });
+    const openingBalanceFromEntry = openingBalanceLines.reduce((sum, l) => sum + Number(l.debit) - Number(l.credit), 0);
+    const hasOpeningBalanceEntry = openingBalanceLines.length > 0;
+
+    let openingBalance = openingBalanceFromEntry;
 
     if (from) {
       const openingLines = await prisma.journalLine.findMany({
         where: {
           accountId: selectedAccount.id,
-          journalEntry: { is: { isDeleted: false, entryDate: { lt: startOfDay(from) } } },
+          journalEntry: { is: { isDeleted: false, referenceType: { not: "OPENING_BALANCE" }, entryDate: { lt: startOfDay(from) } } },
         },
         select: { debit: true, credit: true },
       });
-      openingBalance = openingLines.reduce((sum, l) => sum + Number(l.debit) - Number(l.credit), 0);
+      openingBalance += openingLines.reduce((sum, l) => sum + Number(l.debit) - Number(l.credit), 0);
     }
 
     // ============================================================
@@ -566,6 +598,13 @@ const resultCount = transactionSearch
 
       days,
       resultCount,
+      // Opening Balance - rendered as a dedicated line above the day
+      // list, never as a day/transaction row, and never affected by
+      // `from`/`to` or search. null when this account has never had
+      // one set (the overwhelming majority of accounts).
+      openingBalanceEntry: hasOpeningBalanceEntry
+        ? { amount: Math.abs(openingBalanceFromEntry), direction: openingBalanceFromEntry >= 0 ? "DEBIT" : "CREDIT" }
+        : null,
       filters: { from: from || null, to: to || null, search: transactionSearch || null },
       capabilities: {
         canEdit: hasPermission(currentUser, "accounts.edit"),
