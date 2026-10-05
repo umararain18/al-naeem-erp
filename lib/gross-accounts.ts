@@ -30,8 +30,8 @@ async function getOrCreateSystemAccount(
   tx: Tx,
   accountCode: string,
   accountName: string,
-  accountType: "ASSET" | "LIABILITY" | "INCOME" | "EXPENSE",
-  category: "RECEIVABLE" | "TRANSPORTER_PAYABLE" | "OTHER_LIABILITY" | "DELIVERY_INCOME" | "OTHER_INCOME" | "CARRIER_RENT",
+  accountType: "ASSET" | "LIABILITY" | "INCOME" | "EXPENSE" | "EQUITY",
+  category: "RECEIVABLE" | "TRANSPORTER_PAYABLE" | "OTHER_LIABILITY" | "DELIVERY_INCOME" | "OTHER_INCOME" | "CARRIER_RENT" | "OTHER_EQUITY",
   description: string,
   parentId?: string
 ): Promise<string> {
@@ -57,6 +57,28 @@ async function getOrCreateSystemAccount(
   });
 
   return created.id;
+}
+
+// ============================================================
+// OPENING BALANCE EQUITY - the same system account Party's own
+// opening-balance posting (app/api/parties/route.ts /
+// app/api/parties/[id]/route.ts) finds-or-creates by accountCode
+// "OPENING-BALANCE", exposed here as a shared getter so the Account
+// Opening Balance feature (app/api/accounts/route.ts /
+// app/api/accounts/[id]/route.ts) resolves the exact same account
+// without duplicating the find-or-create logic. Party's own files
+// are untouched - they keep their existing inline lookup.
+// ============================================================
+
+export async function getOpeningBalanceEquityAccountId(tx: Tx): Promise<string> {
+  return getOrCreateSystemAccount(
+    tx,
+    "OPENING-BALANCE",
+    "Opening Balance Equity",
+    "EQUITY",
+    "OTHER_EQUITY",
+    "System account used for opening balances"
+  );
 }
 
 export async function getGrossBiltyReceivableAccountId(tx: Tx): Promise<string> {
