@@ -45,6 +45,7 @@ function row(balance: number, lastActivityDate: Date | null): PartyBalanceRow {
     balance,
     lastActivityDate,
     isSystemAccount: false,
+    isActive: true,
     phone: null,
   };
 }
