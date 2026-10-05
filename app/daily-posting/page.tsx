@@ -57,6 +57,44 @@ type PostingLine = {
   eligibleParties: EligibleParty[];
 };
 
+// The 5 true document types - a line tagged with one of these can
+// auto-resolve its Counter Account from the document and always
+// requires a real Document No. for that lookup. Every other
+// sourceType (PARTY/ACCOUNT) never looks up a document at all, so a
+// Document No. there only ever serves as an optional reference. See
+// the matching DOCUMENT_LINKED_SOURCE_TYPES set in
+// app/api/daily-posting/route.ts - kept in sync by hand since one is
+// client TS and the other server TS.
+const DOCUMENT_LINKED_SOURCE_TYPES = new Set([
+  "CHALLAN",
+  "BILTY",
+  "PHONCH",
+  "PRIVATE_PHONCH",
+  "BILL",
+]);
+
+// Document No. is optional whenever the selected Counter Account is
+// Booking Income, Delivery Income (covers Showroom Delivery Income/
+// Private Phonch Delivery Income/Bill Income - all stored under this
+// same category, see lib/gross-accounts.ts) or any Party account -
+// confirmed by the account's own stable category/accountType field,
+// never by its name. Never applied to a true document-linked
+// sourceType above, whose Document No. requirement is completely
+// unchanged.
+function isDocumentNumberExemptAccount(
+  accounts: Account[],
+  counterAccountId: string
+): boolean {
+  if (!counterAccountId) return false;
+  const account = accounts.find((a) => a.id === counterAccountId);
+  if (!account) return false;
+  return (
+    account.category === "BOOKING_INCOME" ||
+    account.category === "DELIVERY_INCOME" ||
+    account.accountType === "PARTY"
+  );
+}
+
 function createLine(): PostingLine {
   return {
     id: crypto.randomUUID(),
@@ -305,7 +343,11 @@ export default function DailyPostingPage() {
 
       if (
         line.sourceType !== "DIRECT" &&
-        !line.sourceNumber.trim()
+        !line.sourceNumber.trim() &&
+        !(
+          !DOCUMENT_LINKED_SOURCE_TYPES.has(line.sourceType) &&
+          isDocumentNumberExemptAccount(accounts, line.counterAccountId)
+        )
       ) {
         setError(
           `Please enter document number in entry ${
