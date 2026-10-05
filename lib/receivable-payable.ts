@@ -70,6 +70,13 @@ export interface PartyBalanceRow {
   // Party Ledger link, since partyId is null. Always false for every
   // real Party row.
   isSystemAccount: boolean;
+  // The owning Party's own isActive flag - true for the walk-in system
+  // row (not subject to deactivation the same way a Party is). An
+  // inactive Party only ever appears in this list at all when its
+  // balance is genuinely non-zero - see getReceivablePayable() below -
+  // so a consumer can label it (e.g. "(Inactive)") rather than needing
+  // a second lookup.
+  isActive: boolean;
   // The owning Party's own phone number, for the Receivable/Payable
   // search box (Dashboard-adjacent feature) - null for the walk-in
   // system row (no Party) and for a real Party with no phone on file,
@@ -87,15 +94,23 @@ export interface ReceivablePayableResult {
 export async function getReceivablePayable(
   asOfExclusive?: Date | null
 ): Promise<ReceivablePayableResult> {
+  // Every party with an account, active or not - an inactive party can
+  // still hold a real, non-zero outstanding balance (deactivated
+  // without being settled/reversed first). Excluding it here would
+  // silently drop it from both reports and from the Dashboard's
+  // totals/Ageing buckets below, exactly like Trial Balance's own
+  // isActive-account bug. The balance>0/balance<0 checks further down
+  // already skip any party - active or inactive - with nothing owed
+  // either way, so a zero-balance inactive party still never appears.
   const parties = await prisma.party.findMany({
     where: {
-      isActive: true,
       account: { isNot: null },
     },
     select: {
       id: true,
       partyName: true,
       phone: true,
+      isActive: true,
       account: {
         select: { id: true, accountName: true, accountCode: true },
       },
@@ -160,6 +175,7 @@ export async function getReceivablePayable(
         balance,
         lastActivityDate,
         isSystemAccount: false,
+        isActive: party.isActive,
         phone: party.phone,
       });
     } else if (balance < 0) {
@@ -174,6 +190,7 @@ export async function getReceivablePayable(
         balance: Math.abs(balance),
         lastActivityDate,
         isSystemAccount: false,
+        isActive: party.isActive,
         phone: party.phone,
       });
     }
@@ -246,6 +263,7 @@ export async function getReceivablePayable(
           balance: walkinBalance,
           lastActivityDate: walkinLastActivity,
           isSystemAccount: true,
+          isActive: true,
           phone: null,
         });
       }

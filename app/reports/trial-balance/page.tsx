@@ -9,6 +9,9 @@ type TrialBalanceEntry = {
   accountCode: string | null;
   accountType: string;
   category: string;
+  // An inactive account only appears here at all when it holds a
+  // genuine non-zero balance - see app/api/reports/trial-balance/route.ts.
+  isActive: boolean;
   debit: number;
   credit: number;
 };
@@ -149,7 +152,10 @@ export default function TrialBalancePage() {
                   {trialBalance.map((entry) => (
                     <tr key={entry.id} className="hover:bg-gray-50">
                       <td className="px-4 py-3">{entry.accountCode || "—"}</td>
-                      <td className="px-4 py-3 font-medium">{entry.accountName}</td>
+                      <td className="px-4 py-3 font-medium">
+                        {entry.accountName}
+                        {!entry.isActive && <span className="ml-2 text-xs font-normal text-gray-400">(Inactive)</span>}
+                      </td>
                       <td className="px-4 py-3">{entry.accountType}</td>
                       <td className="px-4 py-3">{entry.category}</td>
                       <td className="px-4 py-3 text-right">

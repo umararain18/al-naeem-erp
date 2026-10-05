@@ -17,6 +17,9 @@ type ReceivableEntry = {
   // no Party (partyId null), so it renders as plain text instead of a
   // Party Ledger link.
   isSystemAccount?: boolean;
+  // An inactive Party only ever appears here when its balance is
+  // genuinely non-zero - see lib/receivable-payable.ts.
+  isActive: boolean;
   phone: string | null;
 };
 
@@ -194,6 +197,7 @@ export default function ReceivablePage() {
                             <span className="ml-1.5 text-xs font-normal text-gray-400">(system account)</span>
                           </span>
                         )}
+                        {!entry.isActive && <span className="ml-1.5 text-xs font-normal text-gray-400">(Inactive)</span>}
                         {entry.phone && <span className="block text-xs text-gray-400">{entry.phone}</span>}
                       </td>
                       <td className="px-4 py-3">

@@ -35,16 +35,24 @@ export async function GET(request: NextRequest) {
       }
     }
 
+    // Every account, active or not - an inactive account can still
+    // hold real, non-zero history (e.g. it was deactivated after
+    // being posted to, never reversed). Excluding it here would
+    // silently drop its balance from the Trial Balance's own
+    // fundamental Dr = Cr invariant, since the JournalLine fetch
+    // below is never filtered by account.isActive. The `.filter()`
+    // at the end of this function already hides any zero-balance
+    // account - active or inactive - exactly like before; only an
+    // inactive account with a genuine non-zero balance is newly
+    // shown now, labelled "(Inactive)" by the caller.
     const accounts = await prisma.account.findMany({
-      where: {
-        isActive: true,
-      },
       select: {
         id: true,
         accountName: true,
         accountCode: true,
         accountType: true,
         category: true,
+        isActive: true,
       },
       orderBy: {
         accountCode: "asc",
@@ -87,6 +95,7 @@ export async function GET(request: NextRequest) {
           accountCode: account.accountCode,
           accountType: account.accountType,
           category: account.category,
+          isActive: account.isActive,
           debit: net > 0 ? net : 0,
           credit: net < 0 ? Math.abs(net) : 0,
         };
