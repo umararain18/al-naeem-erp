@@ -12,6 +12,12 @@ import ReconciliationView from "./ReconciliationView";
 import StatementView from "./StatementView";
 import { presetRange } from "@/components/LedgerFilters";
 import { formatBusinessDate } from "@/lib/date-range";
+import {
+  LedgerDetailsPicker,
+  ledgerDetailChips,
+  useLedgerDetailColumns,
+  type LedgerRowDetailsLike,
+} from "@/components/LedgerDetailsPicker";
 
 type PartyType = "TRANSPORTER" | "CLEARING_AGENT" | "CUSTOMER" | "VENDOR";
 
@@ -39,6 +45,7 @@ type LedgerEntry = {
   isRemoved: boolean;
   history: LedgerHistoryItem[];
   documentType: LedgerEntryType;
+  details: LedgerRowDetailsLike;
   // True only for the synthetic "Opening Balance" row - has no real
   // date (date === ""), rendered as "—" instead of being formatted.
   isOpeningBalance?: boolean;
@@ -122,6 +129,10 @@ function LedgerTable({
 }) {
   const [search, setSearch] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+
+  // Configurable Ledger Details columns - shared with General Ledger
+  // (components/LedgerDetailsPicker.tsx), persisted per-browser.
+  const { visible: visibleDetails, toggle: toggleDetail } = useLedgerDetailColumns();
 
   function toggleExpanded(id: string) {
     setExpanded((prev) => {
@@ -216,6 +227,7 @@ function LedgerTable({
           </p>
         )}
         <div className="flex justify-end mt-3 gap-2">
+          <LedgerDetailsPicker visible={visibleDetails} onToggle={toggleDetail} />
           <a
             href={`/api/parties/${partyId}/ledger/pdf?${exportQuery}`}
             target="_blank"
@@ -249,16 +261,20 @@ function LedgerTable({
       <div className="bg-white rounded-xl shadow-sm overflow-hidden">
         {filtered.length === 0 ? (
           <div className="p-10 text-center text-gray-500">{t("noData", lang)}</div>
-        ) : (
+        ) : (() => {
+          const showDate = visibleDetails.has("date");
+          const showAmount = visibleDetails.has("amount");
+          const columnCount = (showDate ? 1 : 0) + 1 + 1 + (showAmount ? 2 : 0) + 1 + 1;
+          return (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead className="bg-gray-50 text-left text-xs uppercase text-gray-500">
                 <tr>
-                  <th className="px-4 py-3">{t("date", lang)}</th>
+                  {showDate && <th className="px-4 py-3">{t("date", lang)}</th>}
                   <th className="px-4 py-3">{t("source", lang)}</th>
                   <th className="px-4 py-3">{t("description", lang)}</th>
-                  <th className="px-4 py-3 text-right">{t("debit", lang)}</th>
-                  <th className="px-4 py-3 text-right">{t("credit", lang)}</th>
+                  {showAmount && <th className="px-4 py-3 text-right">{t("debit", lang)}</th>}
+                  {showAmount && <th className="px-4 py-3 text-right">{t("credit", lang)}</th>}
                   <th className="px-4 py-3 text-right">{t("balance", lang)}</th>
                   <th className="px-4 py-3"></th>
                 </tr>
@@ -267,11 +283,13 @@ function LedgerTable({
                 {filtered.map((entry) => {
                   const isExpanded = expanded.has(entry.id);
                   const hasHistory = entry.history.length > 1 || entry.isRemoved;
+                  const chips = ledgerDetailChips(entry.details, visibleDetails);
+                  const showDescriptionText = visibleDetails.has("description");
 
                   return (
                     <Fragment key={entry.id}>
                       <tr className="hover:bg-gray-50">
-                        <td className="px-4 py-3">{entry.isOpeningBalance ? "—" : formatBusinessDate(entry.date)}</td>
+                        {showDate && <td className="px-4 py-3">{entry.isOpeningBalance ? "—" : formatBusinessDate(entry.date)}</td>}
                         <td className="px-4 py-3">
                           {entry.referenceHref ? (
                             <Link href={entry.referenceHref} className="text-blue-600 hover:underline" title="View source document">
@@ -282,13 +300,19 @@ function LedgerTable({
                           )}
                         </td>
                         <td className="px-4 py-3">
-                          {entry.description || "—"}
+                          {showDescriptionText && (entry.description || "—")}
                           {entry.isRemoved && (
                             <span className="ml-2 text-xs text-gray-400 italic">(removed)</span>
                           )}
+                          {chips.length > 0 && (
+                            <div className={`text-xs text-gray-500 ${showDescriptionText ? "mt-1" : ""}`}>
+                              {chips.join(" · ")}
+                            </div>
+                          )}
+                          {!showDescriptionText && chips.length === 0 && "—"}
                         </td>
-                        <td className="px-4 py-3 text-right">{entry.debit > 0 ? formatCurrency(entry.debit) : "—"}</td>
-                        <td className="px-4 py-3 text-right">{entry.credit > 0 ? formatCurrency(entry.credit) : "—"}</td>
+                        {showAmount && <td className="px-4 py-3 text-right">{entry.debit > 0 ? formatCurrency(entry.debit) : "—"}</td>}
+                        {showAmount && <td className="px-4 py-3 text-right">{entry.credit > 0 ? formatCurrency(entry.credit) : "—"}</td>}
                         <td className="px-4 py-3 text-right">
                           <span
                             className={
@@ -316,7 +340,7 @@ function LedgerTable({
                       </tr>
                       {isExpanded && hasHistory && (
                         <tr className="bg-gray-50">
-                          <td colSpan={7} className="px-4 py-3">
+                          <td colSpan={columnCount} className="px-4 py-3">
                             <div className="text-xs text-gray-500 mb-2">
                               Revision history ({entry.history.length} {entry.history.length === 1 ? "entry" : "entries"}):
                             </div>
@@ -351,7 +375,8 @@ function LedgerTable({
               </tbody>
             </table>
           </div>
-        )}
+          );
+        })()}
       </div>
     </>
   );

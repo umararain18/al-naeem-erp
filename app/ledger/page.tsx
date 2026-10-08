@@ -5,6 +5,12 @@ import Link from "next/link";
 import { SearchableSelect, type SearchOption } from "@/app/daily-posting/SearchableSelect";
 import { LedgerFilters } from "@/components/LedgerFilters";
 import { formatBusinessDate } from "@/lib/date-range";
+import {
+  LedgerDetailsPicker,
+  ledgerDetailChips,
+  useLedgerDetailColumns,
+  type LedgerRowDetailsLike,
+} from "@/components/LedgerDetailsPicker";
 
 type Account = {
   id: string;
@@ -50,6 +56,7 @@ type LedgerEntry = {
   isRemoved: boolean;
   history: LedgerHistoryItem[];
   documentType: LedgerEntryType;
+  details: LedgerRowDetailsLike;
   // True only for the synthetic "Opening Balance" row - has no real
   // date (date === ""), rendered as "—" instead of being formatted.
   isOpeningBalance?: boolean;
@@ -110,6 +117,10 @@ export default function LedgerPage() {
   // before an account is selected) - independent of `search`, which
   // filters transactions once an account IS selected.
   const [summaryFilter, setSummaryFilter] = useState("");
+
+  // Configurable Ledger Details columns - shared with Party Ledger
+  // (components/LedgerDetailsPicker.tsx), persisted per-browser.
+  const { visible: visibleDetails, toggle: toggleDetail } = useLedgerDetailColumns();
 
   // Every active account is fetched ONCE (no accountId/date params) so
   // the account picker can filter instantly client-side - the same
@@ -384,16 +395,23 @@ export default function LedgerPage() {
             <div className="p-10 text-center text-gray-500">Loading ledger...</div>
           ) : entries.length === 0 ? (
             <div className="p-10 text-center text-gray-500">No accounting transactions found.</div>
-          ) : (
+          ) : (() => {
+            const showDate = visibleDetails.has("date");
+            const showAmount = visibleDetails.has("amount");
+            const columnCount = (showDate ? 1 : 0) + 1 + 1 + (showAmount ? 2 : 0) + 1 + 1;
+            return (
             <div className="overflow-x-auto">
+              <div className="flex justify-end px-4 pt-3">
+                <LedgerDetailsPicker visible={visibleDetails} onToggle={toggleDetail} />
+              </div>
               <table className="w-full text-sm">
                 <thead className="bg-gray-50 text-left text-xs uppercase text-gray-500">
                   <tr>
-                    <th className="px-4 py-3">Date</th>
+                    {showDate && <th className="px-4 py-3">Date</th>}
                     <th className="px-4 py-3">Reference</th>
                     <th className="px-4 py-3">Description</th>
-                    <th className="px-4 py-3 text-right">Debit</th>
-                    <th className="px-4 py-3 text-right">Credit</th>
+                    {showAmount && <th className="px-4 py-3 text-right">Debit</th>}
+                    {showAmount && <th className="px-4 py-3 text-right">Credit</th>}
                     <th className="px-4 py-3 text-right">Balance</th>
                     <th className="px-4 py-3"></th>
                   </tr>
@@ -402,11 +420,13 @@ export default function LedgerPage() {
                   {entries.map((entry) => {
                     const isExpanded = expanded.has(entry.id);
                     const hasHistory = entry.history.length > 1 || entry.isRemoved;
+                    const chips = ledgerDetailChips(entry.details, visibleDetails);
+                    const showDescriptionText = visibleDetails.has("description");
 
                     return (
                       <Fragment key={entry.id}>
                         <tr className="hover:bg-gray-50">
-                          <td className="px-4 py-3">{entry.isOpeningBalance ? "—" : formatBusinessDate(entry.date)}</td>
+                          {showDate && <td className="px-4 py-3">{entry.isOpeningBalance ? "—" : formatBusinessDate(entry.date)}</td>}
                           <td className="px-4 py-3">
                             {entry.referenceHref ? (
                               <Link href={entry.referenceHref} className="text-blue-600 hover:underline" title="View source document">
@@ -417,11 +437,17 @@ export default function LedgerPage() {
                             )}
                           </td>
                           <td className="px-4 py-3">
-                            {entry.description || "—"}
+                            {showDescriptionText && (entry.description || "—")}
                             {entry.isRemoved && <span className="ml-2 text-xs text-gray-400 italic">(removed)</span>}
+                            {chips.length > 0 && (
+                              <div className={`text-xs text-gray-500 ${showDescriptionText ? "mt-1" : ""}`}>
+                                {chips.join(" · ")}
+                              </div>
+                            )}
+                            {!showDescriptionText && chips.length === 0 && "—"}
                           </td>
-                          <td className="px-4 py-3 text-right">{entry.debit > 0 ? formatCurrency(entry.debit) : "—"}</td>
-                          <td className="px-4 py-3 text-right">{entry.credit > 0 ? formatCurrency(entry.credit) : "—"}</td>
+                          {showAmount && <td className="px-4 py-3 text-right">{entry.debit > 0 ? formatCurrency(entry.debit) : "—"}</td>}
+                          {showAmount && <td className="px-4 py-3 text-right">{entry.credit > 0 ? formatCurrency(entry.credit) : "—"}</td>}
                           <td className="px-4 py-3 text-right">
                             <span
                               className={
@@ -449,7 +475,7 @@ export default function LedgerPage() {
                         </tr>
                         {isExpanded && hasHistory && (
                           <tr className="bg-gray-50">
-                            <td colSpan={7} className="px-4 py-3">
+                            <td colSpan={columnCount} className="px-4 py-3">
                               <div className="text-xs text-gray-500 mb-2">
                                 Underlying accounting entries ({entry.history.length}{" "}
                                 {entry.history.length === 1 ? "entry" : "entries"}):
@@ -485,7 +511,8 @@ export default function LedgerPage() {
                 </tbody>
               </table>
             </div>
-          )}
+            );
+          })()}
         </div>
         )}
       </div>
