@@ -9,6 +9,11 @@
 // with-localStorage pattern already used by
 // app/parties/[id]/ledger/DocumentsView.tsx (a different tab), under
 // its own storage key so the two pickers never collide.
+//
+// Field list is LOCKED per the finalized Ledger Details spec - do not
+// add/remove/rename a field here without re-checking that spec.
+// "Cheque No" is deliberately absent: no cheque field exists anywhere
+// in this system yet.
 
 import { useEffect, useState } from "react";
 
@@ -18,27 +23,35 @@ export type LedgerDetailColumn =
   | "amount"
   | "biltyNo"
   | "challanNo"
+  | "privatePhonchNo"
+  | "showroomPhonchNo"
+  | "billNo"
   | "vehicle"
-  | "clearingAgent"
+  | "registrationNo"
   | "transporter"
+  | "clearingAgent"
   | "carrierNo"
-  | "from"
-  | "to"
+  | "route"
   | "paymentType";
+
+interface ColumnGroup {
+  label: string;
+  columns: LedgerDetailColumn[];
+}
+
+// Grouped for the picker's own layout only - LEDGER_DETAIL_COLUMNS
+// (the flat list other code iterates) is derived from this below, so
+// the two can never drift apart.
+const COLUMN_GROUPS: ColumnGroup[] = [
+  { label: "Documents / References", columns: ["biltyNo", "challanNo", "privatePhonchNo", "showroomPhonchNo", "billNo"] },
+  { label: "Vehicle / Parties", columns: ["vehicle", "registrationNo", "transporter", "clearingAgent", "carrierNo"] },
+  { label: "Other", columns: ["route", "paymentType", "description"] },
+];
 
 export const LEDGER_DETAIL_COLUMNS: LedgerDetailColumn[] = [
   "date",
-  "description",
   "amount",
-  "biltyNo",
-  "challanNo",
-  "vehicle",
-  "clearingAgent",
-  "transporter",
-  "carrierNo",
-  "from",
-  "to",
-  "paymentType",
+  ...COLUMN_GROUPS.flatMap((g) => g.columns),
 ];
 
 export const LEDGER_DETAIL_LABELS: Record<LedgerDetailColumn, string> = {
@@ -47,13 +60,16 @@ export const LEDGER_DETAIL_LABELS: Record<LedgerDetailColumn, string> = {
   amount: "Amount",
   biltyNo: "Bilty No",
   challanNo: "Challan No",
+  privatePhonchNo: "Private Phonch No",
+  showroomPhonchNo: "Showroom Phonch No",
+  billNo: "Bill No",
   vehicle: "Vehicle",
-  clearingAgent: "Clearing Agent",
+  registrationNo: "Registration No",
   transporter: "Transporter",
+  clearingAgent: "Clearing Agent",
   carrierNo: "Carrier No",
-  from: "From",
-  to: "To",
-  paymentType: "Payment/Receipt",
+  route: "Route",
+  paymentType: "Payment Type",
 };
 
 // Date, Description, Amount - the exact set every ledger already
@@ -116,16 +132,28 @@ export function LedgerDetailsPicker({
       {open && (
         <>
           <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
-          <div className="absolute right-0 top-full z-50 mt-1 w-64 rounded-lg border border-gray-200 bg-white shadow-xl p-3">
-            <p className="text-xs font-semibold text-gray-500 mb-2">Ledger Details</p>
-            <div className="grid grid-cols-2 gap-2">
-              {LEDGER_DETAIL_COLUMNS.map((col) => (
-                <label key={col} className="flex items-center gap-1.5 text-xs text-gray-700">
-                  <input type="checkbox" checked={visible.has(col)} onChange={() => onToggle(col)} />
-                  {LEDGER_DETAIL_LABELS[col]}
-                </label>
-              ))}
-            </div>
+          <div className="absolute right-0 top-full z-50 mt-1 w-72 rounded-lg border border-gray-200 bg-white shadow-xl p-3 max-h-96 overflow-y-auto">
+            <label className="flex items-center gap-1.5 text-xs text-gray-700 pb-2 border-b mb-2">
+              <input type="checkbox" checked={visible.has("date")} onChange={() => onToggle("date")} />
+              {LEDGER_DETAIL_LABELS.date}
+            </label>
+            <label className="flex items-center gap-1.5 text-xs text-gray-700 pb-2 border-b mb-2">
+              <input type="checkbox" checked={visible.has("amount")} onChange={() => onToggle("amount")} />
+              {LEDGER_DETAIL_LABELS.amount}
+            </label>
+            {COLUMN_GROUPS.map((group) => (
+              <div key={group.label} className="mb-3">
+                <p className="text-xs font-semibold text-gray-500 mb-1.5">{group.label}</p>
+                <div className="grid grid-cols-2 gap-2">
+                  {group.columns.map((col) => (
+                    <label key={col} className="flex items-center gap-1.5 text-xs text-gray-700">
+                      <input type="checkbox" checked={visible.has(col)} onChange={() => onToggle(col)} />
+                      {LEDGER_DETAIL_LABELS[col]}
+                    </label>
+                  ))}
+                </div>
+              </div>
+            ))}
           </div>
         </>
       )}
@@ -140,12 +168,15 @@ export function LedgerDetailsPicker({
 export interface LedgerRowDetailsLike {
   biltyNo?: string | null;
   challanNo?: string | null;
+  privatePhonchNo?: string | null;
+  showroomPhonchNo?: string | null;
+  billNo?: string | null;
   vehicle?: string | null;
+  registrationNo?: string | null;
   clearingAgent?: string | null;
   transporter?: string | null;
   carrierNo?: string | null;
-  from?: string | null;
-  to?: string | null;
+  route?: string | null;
   paymentType?: "Received" | "Paid" | null;
 }
 
@@ -155,12 +186,15 @@ export function ledgerDetailChips(details: LedgerRowDetailsLike | undefined, vis
   const chips: string[] = [];
   if (visible.has("biltyNo") && details.biltyNo) chips.push(`Bilty No ${details.biltyNo}`);
   if (visible.has("challanNo") && details.challanNo) chips.push(`Challan No ${details.challanNo}`);
+  if (visible.has("privatePhonchNo") && details.privatePhonchNo) chips.push(`Private Phonch No ${details.privatePhonchNo}`);
+  if (visible.has("showroomPhonchNo") && details.showroomPhonchNo) chips.push(`Phonch No ${details.showroomPhonchNo}`);
+  if (visible.has("billNo") && details.billNo) chips.push(`Bill No ${details.billNo}`);
   if (visible.has("vehicle") && details.vehicle) chips.push(details.vehicle);
-  if (visible.has("clearingAgent") && details.clearingAgent) chips.push(`Clearing Agent ${details.clearingAgent}`);
-  if (visible.has("transporter") && details.transporter) chips.push(`Transporter ${details.transporter}`);
-  if (visible.has("carrierNo") && details.carrierNo) chips.push(`Carrier No ${details.carrierNo}`);
-  if (visible.has("from") && details.from) chips.push(`From ${details.from}`);
-  if (visible.has("to") && details.to) chips.push(`To ${details.to}`);
+  if (visible.has("registrationNo") && details.registrationNo) chips.push(details.registrationNo);
+  if (visible.has("transporter") && details.transporter) chips.push(details.transporter);
+  if (visible.has("clearingAgent") && details.clearingAgent) chips.push(`CA: ${details.clearingAgent}`);
+  if (visible.has("carrierNo") && details.carrierNo) chips.push(`Carrier: ${details.carrierNo}`);
+  if (visible.has("route") && details.route) chips.push(details.route);
   if (visible.has("paymentType") && details.paymentType) chips.push(details.paymentType);
   return chips;
 }

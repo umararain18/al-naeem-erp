@@ -67,16 +67,20 @@ export interface DisplayHistoryItem {
 // omits it (undefined/null) rather than inventing one. `vehicle` is
 // ALWAYS the business "Vehicle Name" concept (Bilty/Challan's own
 // vehicleType field, or Phonch/Private Phonch/Bill's own vehicleName
-// field) - never registrationNumber, never vehicleModel.
+// field) - never registrationNumber, never vehicleModel. `registrationNo`
+// is a SEPARATE, independent field - never used as a Vehicle fallback.
 export interface LedgerRowDetails {
   biltyNo?: string | null;
   challanNo?: string | null;
+  privatePhonchNo?: string | null;
+  showroomPhonchNo?: string | null;
+  billNo?: string | null;
   vehicle?: string | null;
+  registrationNo?: string | null;
   clearingAgent?: string | null;
   transporter?: string | null;
   carrierNo?: string | null;
-  from?: string | null;
-  to?: string | null;
+  route?: string | null;
   paymentType?: "Received" | "Paid" | null;
 }
 
@@ -246,6 +250,9 @@ interface BiltyCtx {
   // types at booking time, not a category. Never registrationNumber,
   // never vehicleModel - see vehicleLabel() below.
   vehicleType: string | null;
+  // A separate, independent field from Vehicle Name - never used as
+  // a fallback for `vehicle` in LedgerRowDetails.
+  registrationNumber: string | null;
   chassisNumber: string | null;
   fromLocationName: string | null;
   toLocationName: string | null;
@@ -267,8 +274,8 @@ interface ChallanCtx {
 }
 
 // Vehicle Name = vehicleType, full stop - never registrationNumber
-// (a separate concept, not currently a selectable ledger detail) and
-// never vehicleModel. See BiltyCtx.vehicleType's own comment.
+// (a separate, independent ledger detail - see registrationLabel()
+// below) and never vehicleModel. See BiltyCtx.vehicleType's own comment.
 function vehicleLabel(bilty: BiltyCtx | undefined | null): string | null {
   if (!bilty) return null;
   return bilty.vehicleType || null;
@@ -277,6 +284,19 @@ function vehicleLabel(bilty: BiltyCtx | undefined | null): string | null {
 /** Vehicle label for every Bilty in the list, comma-separated - never collapsed to just the first. */
 function vehicleLabels(bilties: BiltyCtx[]): string | null {
   const labels = bilties.map(vehicleLabel).filter((v): v is string => !!v);
+  return labels.length > 0 ? labels.join(", ") : null;
+}
+
+// Registration No - a separate, independent ledger detail from
+// Vehicle (vehicleType). Never used as a fallback for `vehicle`.
+function registrationLabel(bilty: BiltyCtx | undefined | null): string | null {
+  if (!bilty) return null;
+  return bilty.registrationNumber || null;
+}
+
+/** Registration No for every Bilty in the list, comma-separated - mirrors vehicleLabels() above. */
+function registrationLabels(bilties: BiltyCtx[]): string | null {
+  const labels = bilties.map(registrationLabel).filter((v): v is string => !!v);
   return labels.length > 0 ? labels.join(", ") : null;
 }
 
@@ -289,13 +309,6 @@ function clearingAgentLabel(bilty: BiltyCtx | undefined | null): string | null {
 function clearingAgentLabels(bilties: BiltyCtx[]): string | null {
   const names = [...new Set(bilties.map(clearingAgentLabel).filter((v): v is string => !!v))];
   return names.length > 0 ? names.join(", ") : null;
-}
-
-/** Appends every non-null PrivatePhonchVehicle.vehicleName linked to this Private Phonch to an already-composed description, live on every read - so it applies to historical entries too, without touching the stored text or lib/private-phonch-accounting.ts. */
-function appendPhonchVehicleNames(description: string, phonchId: string, vehicleNamesById: Map<string, string[]>): string {
-  const names = vehicleNamesById.get(phonchId);
-  if (!names || names.length === 0) return description;
-  return `${description}, ${names.join(", ")}`;
 }
 
 /** Screen-only Source/Reference label - "Bilty No 66", never "Bilty #66". */
@@ -598,6 +611,7 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
     id: true,
     biltyNo: true,
     vehicleType: true,
+    registrationNumber: true,
     chassisNumber: true,
     fromLocation: { select: { name: true } },
     toLocation: { select: { name: true } },
@@ -608,6 +622,7 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
     id: string;
     biltyNo: string;
     vehicleType: string | null;
+    registrationNumber: string | null;
     chassisNumber: string | null;
     fromLocation: { name: string } | null;
     toLocation: { name: string } | null;
@@ -617,6 +632,7 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
       id: b.id,
       biltyNo: b.biltyNo,
       vehicleType: b.vehicleType,
+      registrationNumber: b.registrationNumber,
       chassisNumber: b.chassisNumber,
       fromLocationName: b.fromLocation?.name || null,
       toLocationName: b.toLocation?.name || null,
@@ -652,7 +668,7 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
             biltyNo: true,
             challanNo: true,
             clearingAgentParty: { select: { partyName: true } },
-            phonch: { select: { transporterParty: { select: { partyName: true } } } },
+            phonch: { select: { phonchNo: true, transporterParty: { select: { partyName: true } } } },
           },
         })
       : Promise.resolve([]),
@@ -660,14 +676,22 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
     // Phonch itself (real FK/field); Bilty No/Challan No/Vehicle Name
     // are plain manual text per vehicle line (see the Phonch model's
     // own doc comment in prisma/schema.prisma - never a foreign key).
+    // Each vehicle's own `party` relation is fetched too, to replicate
+    // buildPhonchLedgerDescription()'s per-party grouping read-time
+    // (see rewriteShowroomPhonchVehicleText() below) - never a new
+    // accounting relation, purely to locate the SAME grouping that
+    // function already produces at posting time.
     phonchIds.size > 0
       ? prisma.phonch.findMany({
           where: { id: { in: [...phonchIds] } },
           select: {
             id: true,
+            phonchNo: true,
             carrierNumber: true,
             transporterParty: { select: { partyName: true } },
-            vehicles: { select: { vehicleName: true, biltyNo: true, challanNo: true } },
+            vehicles: {
+              select: { vehicleName: true, biltyNo: true, challanNo: true, party: { select: { partyName: true } } },
+            },
           },
         })
       : Promise.resolve([]),
@@ -676,7 +700,8 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
           where: { id: { in: [...billIds] } },
           select: {
             id: true,
-            items: { select: { vehicleName: true, fromText: true, toText: true } },
+            billNo: true,
+            items: { select: { vehicleName: true, fromText: true, toText: true, regdNumber: true } },
           },
         })
       : Promise.resolve([]),
@@ -717,11 +742,12 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
   }
 
   // Private Phonch vehicle names, live-loaded and grouped by phonchId -
-  // used both to append vehicle names to the already pre-composed
-  // description below AND to populate the normalized LedgerRowDetails.
-  // Never invented: only actual, non-null PrivatePhonchVehicle values.
+  // used both to rewrite the already pre-composed description below
+  // AND to populate the normalized LedgerRowDetails. Never invented:
+  // only actual, non-null PrivatePhonchVehicle values.
   const phonchVehicleNamesById = new Map<string, string[]>();
   interface PrivatePhonchDetailCtx {
+    phonchNo: string | null;
     transporterName: string | null;
     vehicleNames: string[];
     sharedBiltyNo: string | null;
@@ -736,6 +762,7 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
       phonchVehicleNamesById.set(v.phonchId, arr);
     }
     const existing = privatePhonchCtxById.get(v.phonchId) || {
+      phonchNo: v.phonch.phonchNo,
       transporterName: v.phonch.transporterParty?.partyName || null,
       vehicleNames: [],
       sharedBiltyNo: v.biltyNo || null,
@@ -755,34 +782,104 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
     privatePhonchCtxById.set(v.phonchId, existing);
   }
 
+  interface PhonchVehicleGroup {
+    names: string[];
+  }
   interface PhonchDetailCtx {
+    phonchNo: string | null;
     transporterName: string | null;
     carrierNumber: string | null;
     vehicleNames: string[];
+    sharedBiltyNo: string | null;
+    sharedChallanNo: string | null;
+    // One entry per distinct vehicle-level Party, in first-appearance
+    // order - mirrors groupVehiclesByParty() in lib/phonch-accounting.ts
+    // exactly, recomputed read-time (see rewriteShowroomPhonchVehicleText()).
+    partyGroups: PhonchVehicleGroup[];
   }
   const phonchCtxById = new Map<string, PhonchDetailCtx>();
   for (const p of phonchRows) {
+    const groupOrder: (string | null)[] = [];
+    const groupNames = new Map<string | null, string[]>();
+    let sharedBiltyNo: string | null | undefined;
+    let sharedChallanNo: string | null | undefined;
+    for (const v of p.vehicles) {
+      const key = v.party?.partyName || null;
+      if (!groupNames.has(key)) {
+        groupNames.set(key, []);
+        groupOrder.push(key);
+      }
+      if (v.vehicleName) groupNames.get(key)!.push(v.vehicleName);
+      sharedBiltyNo = sharedBiltyNo === undefined ? v.biltyNo || null : sharedBiltyNo === (v.biltyNo || null) ? sharedBiltyNo : null;
+      sharedChallanNo = sharedChallanNo === undefined ? v.challanNo || null : sharedChallanNo === (v.challanNo || null) ? sharedChallanNo : null;
+    }
     phonchCtxById.set(p.id, {
+      phonchNo: p.phonchNo,
       transporterName: p.transporterParty?.partyName || null,
       carrierNumber: p.carrierNumber || null,
       vehicleNames: p.vehicles.map((v) => v.vehicleName).filter((v): v is string => !!v),
+      sharedBiltyNo: sharedBiltyNo ?? null,
+      sharedChallanNo: sharedChallanNo ?? null,
+      partyGroups: groupOrder.map((key) => ({ names: groupNames.get(key) || [] })),
     });
   }
 
   interface BillDetailCtx {
+    billNo: string | null;
     vehicleNames: string[];
     fromText: string | null;
     toText: string | null;
+    regdNumber: string | null;
   }
   const billCtxById = new Map<string, BillDetailCtx>();
   for (const bill of billRows) {
     const vehicleNames = bill.items.map((i) => i.vehicleName).filter((v): v is string => !!v);
     const single = bill.items.length === 1 ? bill.items[0] : null;
     billCtxById.set(bill.id, {
+      billNo: bill.billNo,
       vehicleNames,
       fromText: single?.fromText || null,
       toText: single?.toText || null,
+      regdNumber: single?.regdNumber || null,
     });
+  }
+
+  function toRoute(from: string | null, to: string | null): string | null {
+    if (from && to) return `${from} → ${to}`;
+    return from || to || null;
+  }
+
+  // Rewrites Private Phonch's pre-composed "`Nx vehicle`" placeholder
+  // segment with the real vehicle name(s), when at least one is known -
+  // a READ-TIME presentation fix only (never touches the stored
+  // JournalEntry/JournalLine.description, never lib/private-phonch-
+  // accounting.ts's posting-time composer). Leaves the text completely
+  // unchanged when no vehicle on this Private Phonch has a real name -
+  // never invents one.
+  function rewritePrivatePhonchVehicleText(description: string, vehicleNames: string[]): string {
+    if (vehicleNames.length === 0) return description;
+    return description.replace(/\d+x vehicle\b/, vehicleNames.join(", "));
+  }
+
+  // Same idea for Showroom Phonch, whose description instead groups
+  // vehicles by their vehicle-level Party ("2x vehicle of X, 1x
+  // vehicle of Y, Total 3x vehicle" - see groupVehiclesByParty() in
+  // lib/phonch-accounting.ts). Each "Nx vehicle of PartyName" segment
+  // is replaced, IN THE SAME ORDER buildPhonchLedgerDescription()
+  // produced them, with that group's own real vehicle name(s) - a
+  // group with no named vehicles is left exactly as it was, never
+  // guessed from a different group's names. The trailing "Total Nx
+  // vehicle" is replaced with the full real list only when at least
+  // one vehicle anywhere on this Phonch has a real name.
+  function rewriteShowroomPhonchVehicleText(description: string, partyGroups: PhonchVehicleGroup[], allVehicleNames: string[]): string {
+    if (allVehicleNames.length === 0) return description;
+    let i = 0;
+    let result = description.replace(/\d+x vehicle of [^,]+/g, (match) => {
+      const group = partyGroups[i++];
+      return group && group.names.length > 0 ? group.names.join(", ") : match;
+    });
+    result = result.replace(/Total \d+x vehicle\b/, `Total: ${allVehicleNames.join(", ")}`);
+    return result;
   }
 
   interface BiltyChallanLink {
@@ -811,11 +908,11 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
       biltyNo: bilty.biltyNo,
       challanNo: link?.challanNo || null,
       vehicle: vehicleLabel(bilty),
+      registrationNo: registrationLabel(bilty),
       clearingAgent: clearingAgentLabel(bilty),
       transporter: link?.transporterName || null,
       carrierNo: link?.carrierNumber || null,
-      from: bilty.fromLocationName,
-      to: bilty.toLocationName,
+      route: toRoute(bilty.fromLocationName, bilty.toLocationName),
       paymentType: direction,
     };
   }
@@ -826,11 +923,11 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
       biltyNo: relevantBilty?.biltyNo || challan.soleBiltyNo || null,
       challanNo: challan.challanNo,
       vehicle: relevantBilty ? vehicleLabel(relevantBilty) : vehicleLabels(challan.bilties),
+      registrationNo: relevantBilty ? registrationLabel(relevantBilty) : registrationLabels(challan.bilties),
       clearingAgent: relevantBilty ? clearingAgentLabel(relevantBilty) : clearingAgentLabels(challan.bilties),
       transporter: challan.transporterName,
       carrierNo: challan.carrierNumber,
-      from: bilty?.fromLocationName || null,
-      to: bilty?.toLocationName || null,
+      route: toRoute(bilty?.fromLocationName || null, bilty?.toLocationName || null),
       paymentType: direction,
     };
   }
@@ -839,6 +936,9 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
     const ctx = phonchCtxById.get(phonchId);
     if (!ctx) return { paymentType: direction };
     return {
+      biltyNo: ctx.sharedBiltyNo,
+      challanNo: ctx.sharedChallanNo,
+      showroomPhonchNo: ctx.phonchNo,
       vehicle: ctx.vehicleNames.length > 0 ? ctx.vehicleNames.join(", ") : null,
       transporter: ctx.transporterName,
       carrierNo: ctx.carrierNumber,
@@ -852,6 +952,7 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
     return {
       biltyNo: ctx.sharedBiltyNo,
       challanNo: ctx.sharedChallanNo,
+      privatePhonchNo: ctx.phonchNo,
       vehicle: ctx.vehicleNames.length > 0 ? ctx.vehicleNames.join(", ") : null,
       clearingAgent: ctx.clearingAgentNames.length > 0 ? ctx.clearingAgentNames.join(", ") : null,
       transporter: ctx.transporterName,
@@ -863,9 +964,10 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
     const ctx = billCtxById.get(billId);
     if (!ctx) return { paymentType: direction };
     return {
+      billNo: ctx.billNo,
       vehicle: ctx.vehicleNames.length > 0 ? ctx.vehicleNames.join(", ") : null,
-      from: ctx.fromText,
-      to: ctx.toText,
+      registrationNo: ctx.regdNumber,
+      route: toRoute(ctx.fromText, ctx.toText),
       paymentType: direction,
     };
   }
@@ -1109,17 +1211,23 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
         // exactly mirroring the PHONCH/BILL branches below.
         reference = "Private Phonch";
         referenceHref = `/private-phonch/${line.sourceId}`;
-        description = appendPhonchVehicleNames(
+        description = rewritePrivatePhonchVehicleText(
           line.lineDescription || line.entryDescription || "—",
-          line.sourceId,
-          phonchVehicleNamesById
+          phonchVehicleNamesById.get(line.sourceId) || []
         );
         documentType = "PRIVATE_PHONCH";
         details = privatePhonchDetails(line.sourceId, direction);
       } else if (line.sourceType === "PHONCH" && line.sourceId) {
         reference = "Phonch";
         referenceHref = `/phonch/${line.sourceId}`;
-        description = line.lineDescription || line.entryDescription || "—";
+        {
+          const phonchCtx = phonchCtxById.get(line.sourceId);
+          description = rewriteShowroomPhonchVehicleText(
+            line.lineDescription || line.entryDescription || "—",
+            phonchCtx?.partyGroups || [],
+            phonchCtx?.vehicleNames || []
+          );
+        }
         documentType = "SHOWROOM_PHONCH";
         details = phonchDetails(line.sourceId, direction);
       } else if (line.sourceType === "BILL" && line.sourceId) {
@@ -1151,24 +1259,33 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
       // fallback with the wrong reference/link.
       reference = "Private Phonch";
       referenceHref = `/private-phonch/${line.referenceId}`;
-      description = appendPhonchVehicleNames(
+      description = rewritePrivatePhonchVehicleText(
         line.lineDescription || line.entryDescription || "—",
-        line.referenceId,
-        phonchVehicleNamesById
+        phonchVehicleNamesById.get(line.referenceId) || []
       );
       documentType = "PRIVATE_PHONCH";
       details = privatePhonchDetails(line.referenceId, direction);
     } else if (line.referenceType === "PHONCH" && line.referenceId) {
-      // Showroom Phonch / Delivery - the description is fully
-      // pre-composed at creation time (lib/phonch-accounting.ts's
-      // buildPhonchLedgerDescription()) and stored directly as this
-      // line's/entry's own description, exactly like Manual Journal's
-      // narration - no live Bilty/Challan lookup is needed here since
-      // a Phonch's Bilty No./Challan No. are plain manual reference
-      // text, not real relations (see the Phonch schema doc comment).
+      // Showroom Phonch / Delivery - the description is pre-composed
+      // at creation time (lib/phonch-accounting.ts's
+      // buildPhonchLedgerDescription()) and stored as this line's/
+      // entry's own description; rewriteShowroomPhonchVehicleText()
+      // then substitutes its "Nx vehicle" placeholder(s) with the
+      // real vehicle name(s) read live from PhonchVehicle, when known -
+      // the stored text itself is never touched. No live Bilty/Challan
+      // lookup is needed here since a Phonch's Bilty No./Challan No.
+      // are plain manual reference text, not real relations (see the
+      // Phonch schema doc comment).
       reference = "Phonch";
       referenceHref = `/phonch/${line.referenceId}`;
-      description = line.lineDescription || line.entryDescription || "—";
+      {
+        const phonchCtx = phonchCtxById.get(line.referenceId);
+        description = rewriteShowroomPhonchVehicleText(
+          line.lineDescription || line.entryDescription || "—",
+          phonchCtx?.partyGroups || [],
+          phonchCtx?.vehicleNames || []
+        );
+      }
       documentType = "SHOWROOM_PHONCH";
       details = phonchDetails(line.referenceId, direction);
     } else if (line.referenceType === "BILL" && line.referenceId) {
