@@ -157,11 +157,17 @@ function LedgerTable({
     );
   }, [ledger, search]);
 
+  // `details` carries the SAME Ledger Details selection the on-screen
+  // table renders with, straight into the export - never a second,
+  // independent export-only selection. The export route re-validates
+  // this against its own whitelist (lib/ledger-detail-columns.ts) -
+  // never trusted as-is.
   const exportQuery = new URLSearchParams({
     ...(from ? { from } : {}),
     ...(to ? { to } : {}),
     ...(typeFilter !== "ALL" ? { type: typeFilter } : {}),
     ...(search.trim() ? { search: search.trim() } : {}),
+    details: [...visibleDetails].join(","),
   }).toString();
 
   return (
@@ -262,19 +268,17 @@ function LedgerTable({
         {filtered.length === 0 ? (
           <div className="p-10 text-center text-gray-500">{t("noData", lang)}</div>
         ) : (() => {
-          const showDate = visibleDetails.has("date");
-          const showAmount = visibleDetails.has("amount");
-          const columnCount = (showDate ? 1 : 0) + 1 + 1 + (showAmount ? 2 : 0) + 1 + 1;
+          const columnCount = 7;
           return (
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
               <thead className="bg-gray-50 text-left text-xs uppercase text-gray-500">
                 <tr>
-                  {showDate && <th className="px-4 py-3">{t("date", lang)}</th>}
+                  <th className="px-4 py-3">{t("date", lang)}</th>
                   <th className="px-4 py-3">{t("source", lang)}</th>
                   <th className="px-4 py-3">{t("description", lang)}</th>
-                  {showAmount && <th className="px-4 py-3 text-right">{t("debit", lang)}</th>}
-                  {showAmount && <th className="px-4 py-3 text-right">{t("credit", lang)}</th>}
+                  <th className="px-4 py-3 text-right">{t("debit", lang)}</th>
+                  <th className="px-4 py-3 text-right">{t("credit", lang)}</th>
                   <th className="px-4 py-3 text-right">{t("balance", lang)}</th>
                   <th className="px-4 py-3"></th>
                 </tr>
@@ -289,7 +293,7 @@ function LedgerTable({
                   return (
                     <Fragment key={entry.id}>
                       <tr className="hover:bg-gray-50">
-                        {showDate && <td className="px-4 py-3">{entry.isOpeningBalance ? "—" : formatBusinessDate(entry.date)}</td>}
+                        <td className="px-4 py-3">{entry.isOpeningBalance ? "—" : formatBusinessDate(entry.date)}</td>
                         <td className="px-4 py-3">
                           {entry.referenceHref ? (
                             <Link href={entry.referenceHref} className="text-blue-600 hover:underline" title="View source document">
@@ -311,8 +315,8 @@ function LedgerTable({
                           )}
                           {!showDescriptionText && chips.length === 0 && "—"}
                         </td>
-                        {showAmount && <td className="px-4 py-3 text-right">{entry.debit > 0 ? formatCurrency(entry.debit) : "—"}</td>}
-                        {showAmount && <td className="px-4 py-3 text-right">{entry.credit > 0 ? formatCurrency(entry.credit) : "—"}</td>}
+                        <td className="px-4 py-3 text-right">{entry.debit > 0 ? formatCurrency(entry.debit) : "—"}</td>
+                        <td className="px-4 py-3 text-right">{entry.credit > 0 ? formatCurrency(entry.credit) : "—"}</td>
                         <td className="px-4 py-3 text-right">
                           <span
                             className={

@@ -203,6 +203,20 @@ export default function LedgerPage() {
       .sort((a, b) => Math.abs(b.balance || 0) - Math.abs(a.balance || 0));
   }, [accounts, summaryFilter]);
 
+  // `details` carries the SAME Ledger Details selection the on-screen
+  // table renders with, straight into the export - never a second,
+  // independent export-only selection. The export route re-validates
+  // this against its own whitelist (lib/ledger-detail-columns.ts) -
+  // never trusted as-is.
+  const exportQuery = new URLSearchParams({
+    accountId,
+    ...(from ? { from } : {}),
+    ...(to ? { to } : {}),
+    ...(typeFilter !== "ALL" ? { type: typeFilter } : {}),
+    ...(search.trim() ? { search: search.trim() } : {}),
+    details: [...visibleDetails].join(","),
+  }).toString();
+
   function toggleExpanded(id: string) {
     setExpanded((prev) => {
       const next = new Set(prev);
@@ -396,22 +410,31 @@ export default function LedgerPage() {
           ) : entries.length === 0 ? (
             <div className="p-10 text-center text-gray-500">No accounting transactions found.</div>
           ) : (() => {
-            const showDate = visibleDetails.has("date");
-            const showAmount = visibleDetails.has("amount");
-            const columnCount = (showDate ? 1 : 0) + 1 + 1 + (showAmount ? 2 : 0) + 1 + 1;
+            const columnCount = 7;
             return (
             <div className="overflow-x-auto">
-              <div className="flex justify-end px-4 pt-3">
+              <div className="flex justify-end px-4 pt-3 gap-2">
+                <a
+                  href={`/api/ledger/pdf?${exportQuery}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="border rounded-lg px-3 py-2 text-sm hover:bg-gray-50 bg-blue-600 text-white border-blue-600"
+                >
+                  Export PDF
+                </a>
+                <a href={`/api/ledger/excel?${exportQuery}`} className="border rounded-lg px-3 py-2 text-sm hover:bg-gray-50">
+                  Export Excel
+                </a>
                 <LedgerDetailsPicker visible={visibleDetails} onToggle={toggleDetail} />
               </div>
               <table className="w-full text-sm">
                 <thead className="bg-gray-50 text-left text-xs uppercase text-gray-500">
                   <tr>
-                    {showDate && <th className="px-4 py-3">Date</th>}
+                    <th className="px-4 py-3">Date</th>
                     <th className="px-4 py-3">Reference</th>
                     <th className="px-4 py-3">Description</th>
-                    {showAmount && <th className="px-4 py-3 text-right">Debit</th>}
-                    {showAmount && <th className="px-4 py-3 text-right">Credit</th>}
+                    <th className="px-4 py-3 text-right">Debit</th>
+                    <th className="px-4 py-3 text-right">Credit</th>
                     <th className="px-4 py-3 text-right">Balance</th>
                     <th className="px-4 py-3"></th>
                   </tr>
@@ -426,7 +449,7 @@ export default function LedgerPage() {
                     return (
                       <Fragment key={entry.id}>
                         <tr className="hover:bg-gray-50">
-                          {showDate && <td className="px-4 py-3">{entry.isOpeningBalance ? "—" : formatBusinessDate(entry.date)}</td>}
+                          <td className="px-4 py-3">{entry.isOpeningBalance ? "—" : formatBusinessDate(entry.date)}</td>
                           <td className="px-4 py-3">
                             {entry.referenceHref ? (
                               <Link href={entry.referenceHref} className="text-blue-600 hover:underline" title="View source document">
@@ -446,8 +469,8 @@ export default function LedgerPage() {
                             )}
                             {!showDescriptionText && chips.length === 0 && "—"}
                           </td>
-                          {showAmount && <td className="px-4 py-3 text-right">{entry.debit > 0 ? formatCurrency(entry.debit) : "—"}</td>}
-                          {showAmount && <td className="px-4 py-3 text-right">{entry.credit > 0 ? formatCurrency(entry.credit) : "—"}</td>}
+                          <td className="px-4 py-3 text-right">{entry.debit > 0 ? formatCurrency(entry.debit) : "—"}</td>
+                          <td className="px-4 py-3 text-right">{entry.credit > 0 ? formatCurrency(entry.credit) : "—"}</td>
                           <td className="px-4 py-3 text-right">
                             <span
                               className={
