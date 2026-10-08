@@ -106,6 +106,37 @@ export async function POST(
     const data = result.data;
     const allocations = data.allocations || [];
 
+    // Area 2 fix: when this SAME request already includes an explicit
+    // allocation covering part/all of a Bilty's Collection or the
+    // Challan's Carrier Rent, the deterministic-default reclassification
+    // below (buildSettlementEntries) must claim only the REMAINDER, not
+    // the full component - otherwise the default posts the full amount
+    // to its default party and createSettlementPayment()'s own sync
+    // functions (syncCollectionFloorForNewEngineRows/
+    // syncCarrierRentFloorForChallan in lib/settlement-payments.ts)
+    // immediately correct it back down via a separate
+    // *_MULTI_PAYER_TRANSITION entry in the SAME transaction - three
+    // JournalLines on that party's account for what is really one
+    // economic movement. Reducing the default's own input here means
+    // it never over-attributes in the first place, so no correction is
+    // ever needed for amount a payment allocation in THIS SAME request
+    // already resolves. A later allocation (added after this
+    // settlement, via the existing /settlement-payments endpoints)
+    // still goes through the same sync functions exactly as before -
+    // this only removes the same-request double-posting.
+    const sameRequestCollectionCoveredByBiltyId = new Map<string, number>();
+    let sameRequestCarrierRentCovered = 0;
+    for (const a of allocations) {
+      if (a.component === "COLLECTION" && a.biltyId) {
+        sameRequestCollectionCoveredByBiltyId.set(
+          a.biltyId,
+          (sameRequestCollectionCoveredByBiltyId.get(a.biltyId) || 0) + a.amount
+        );
+      } else if (a.component === "CARRIER_RENT") {
+        sameRequestCarrierRentCovered += a.amount;
+      }
+    }
+
     // Recording payment allocations is a SUPER_ADMIN-only mutation,
     // exactly like every other SettlementPayment create/edit/delete
     // in this codebase (see /settlement-payments's own hardcoded role
@@ -250,7 +281,11 @@ export async function POST(
       // Collection-responsible party. A fully-Paid Bilty (toPay = 0)
       // needs no Collection party at all. See
       // lib/settlement-accounting.ts's BiltySettlementInput.collectionAmount.
-      const collectionAmount = Number(bilty.toPay);
+      // Reduced by whatever this SAME request's own COLLECTION
+      // allocation(s) for this Bilty already cover - see the Area 2
+      // comment above.
+      const sameRequestCovered = sameRequestCollectionCoveredByBiltyId.get(bilty.id) || 0;
+      const collectionAmount = Math.max(0, Number(bilty.toPay) - sameRequestCovered);
       // See the outstandingCommissionByBiltyId comment above - never
       // bilty.agentCommission directly.
       const commissionAmount = Math.max(0, outstandingCommissionByBiltyId.get(bilty.id) || 0);
@@ -297,7 +332,7 @@ export async function POST(
         biltyId: bilty.id,
         biltyNo: bilty.biltyNo,
         amount: bilty.total,
-        collectionAmount: bilty.toPay,
+        collectionAmount,
         collectionResponsibility,
         collectionPartyAccountId,
         agentCommission: commissionAmount,
@@ -334,10 +369,18 @@ export async function POST(
       verifiedAdvanceByAccountId[accountId] = net > 0 ? net : 0;
     }
 
+    // Carrier Rent's default-party resolution above (carrierRentResponsibility/
+    // carrierRentPartyAccountId) deliberately still runs against the FULL
+    // carrierRentAmount - a genuinely non-zero Carrier Rent always needs a
+    // valid responsible party configured, regardless of same-request
+    // coverage. Only the AMOUNT the deterministic default actually claims
+    // is reduced here - see the Area 2 comment above.
+    const carrierRentForDefault = Math.max(0, carrierRentAmount - sameRequestCarrierRentCovered);
+
     const settlementResult = buildSettlementEntries({
       challanId: challan.id,
       challanNo: challan.challanNo,
-      carrierRent: challan.carrierRent,
+      carrierRent: carrierRentForDefault,
       carrierRentResponsibility,
       carrierRentPartyAccountId,
       bilties: biltiesInput,
@@ -345,7 +388,19 @@ export async function POST(
       verifiedAdvanceByAccountId,
     });
 
-    if (!settlementResult.isValid) {
+    // buildSettlementEntries() rejects a result with zero lines as
+    // "nothing to settle" - correct for the old single-payer flow, but
+    // wrong here when every component this Challan actually has is
+    // fully covered by this SAME request's own allocations (so the
+    // deterministic default above was correctly reduced to nothing to
+    // claim) - createSettlementPayment() below will post the real
+    // amounts instead. Only this exact, single "lines" error is
+    // tolerated when allocations are present; any other validation
+    // failure (bad party, unbalanced, etc.) still rejects as before.
+    const nothingLeftForDefault =
+      settlementResult.errors.length === 1 && settlementResult.errors[0].field === "lines";
+
+    if (!settlementResult.isValid && !(nothingLeftForDefault && allocations.length > 0)) {
       return NextResponse.json(
         { success: false, message: settlementResult.errors.map((e) => e.message).join(", ") },
         { status: 400 }
@@ -434,7 +489,28 @@ export async function POST(
             )
           );
 
-          const primaryJournalEntryId = journalEntries[0]?.id || null;
+          let primaryJournalEntryId = journalEntries[0]?.id || null;
+
+          // Every settled Challan needs a non-null settlementJournalEntryId
+          // - createSettlementPayment()'s own resolveComponentContext()
+          // requires it (see lib/settlement-payments.ts) to even accept a
+          // COLLECTION/CARRIER_RENT allocation. When this SAME request's
+          // allocations covered every component in full, the deterministic
+          // default above correctly produced zero lines - so create a
+          // zero-line marker entry purely to hold that id. No financial
+          // effect (no lines), never queried for any balance.
+          if (!primaryJournalEntryId) {
+            const marker = await tx.journalEntry.create({
+              data: {
+                entryDate: new Date(),
+                referenceType: "SETTLEMENT",
+                referenceId: challan.id,
+                description: `Settlement - ${challan.challanNo} (fully covered by payment allocations)`,
+                createdById: currentUser.userId,
+              },
+            });
+            primaryJournalEntryId = marker.id;
+          }
 
           const settled = await tx.challan.update({
             where: { id },
@@ -508,23 +584,44 @@ export async function POST(
             });
           }
 
+          // `settled` was captured BEFORE the allocations loop above, so
+          // its own outstandingReceivable/outstandingPayable only ever
+          // reflect buildSettlementEntries()' deterministic-default
+          // contribution - correct on its own before the Area 2 fix
+          // (the default always claimed each component's FULL amount,
+          // so the running total never changed afterward), but no longer
+          // reliable now that the default can be reduced below a
+          // component's real total when this SAME request's own
+          // allocations cover the rest. Re-read the real, fully-updated
+          // totals fresh here instead of trusting that stale snapshot.
+          const finalTotals = await tx.challan.findUniqueOrThrow({
+            where: { id },
+            select: { outstandingReceivable: true, outstandingPayable: true },
+          });
+          const finalOutstandingReceivable = Number(finalTotals.outstandingReceivable);
+          const finalOutstandingPayable = Number(finalTotals.outstandingPayable);
+
           await auditSettlement(tx, {
             actor: actorFromUser(currentUser),
             module: "SETTLEMENT",
             entityType: "Challan",
             entityId: id,
             documentNo: settled.challanNo,
-            description: `Finalized Settlement for Challan ${settled.challanNo} (Receivable Rs. ${settlementResult.outstandingReceivable.toLocaleString()}, Payable Rs. ${settlementResult.outstandingPayable.toLocaleString()}, ${createdAllocations.length} payment allocation(s))`,
+            description: `Finalized Settlement for Challan ${settled.challanNo} (Receivable Rs. ${finalOutstandingReceivable.toLocaleString()}, Payable Rs. ${finalOutstandingPayable.toLocaleString()}, ${createdAllocations.length} payment allocation(s))`,
             newValues: {
               settlementNotes: data.settlementNotes || null,
-              outstandingReceivable: settlementResult.outstandingReceivable,
-              outstandingPayable: settlementResult.outstandingPayable,
+              outstandingReceivable: finalOutstandingReceivable,
+              outstandingPayable: finalOutstandingPayable,
               allocations: createdAllocations,
             },
             ...requestContext(request),
           });
 
-          return settled;
+          return {
+            ...settled,
+            outstandingReceivable: finalTotals.outstandingReceivable,
+            outstandingPayable: finalTotals.outstandingPayable,
+          };
         },
         { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
       );
@@ -537,8 +634,12 @@ export async function POST(
           entriesCreated: settlementResult.entries.length,
           totalDebit: settlementResult.totals.totalDebit,
           totalCredit: settlementResult.totals.totalCredit,
-          outstandingReceivable: settlementResult.outstandingReceivable,
-          outstandingPayable: settlementResult.outstandingPayable,
+          // The real final totals (default + this same request's own
+          // allocations combined) - see the comment above `finalTotals`
+          // inside the transaction for why settlementResult's own
+          // figures alone are no longer sufficient here.
+          outstandingReceivable: Number(updatedChallan.outstandingReceivable),
+          outstandingPayable: Number(updatedChallan.outstandingPayable),
         },
         allocationsCreated: createdAllocations,
       });

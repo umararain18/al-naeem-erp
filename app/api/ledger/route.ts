@@ -61,9 +61,35 @@ export async function GET(request: NextRequest) {
     });
 
     if (!accountId) {
+      // Account-wise summary (name + current balance) for the
+      // landing/blank state - lets the UI link straight to an
+      // account by its real id (see app/ledger/page.tsx) instead of
+      // forcing every visit through the free-text account search.
+      // Same debit-minus-credit aggregation Trial Balance already
+      // uses (app/api/reports/trial-balance/route.ts); only read
+      // here, never a new accounting calculation.
+      const lines = await prisma.journalLine.findMany({
+        where: {
+          accountId: { in: accounts.map((a) => a.id) },
+          journalEntry: { is: { isDeleted: false } },
+        },
+        select: { accountId: true, debit: true, credit: true },
+      });
+
+      const balances = new Map<string, number>();
+      for (const line of lines) {
+        const net = (balances.get(line.accountId) || 0) + Number(line.debit) - Number(line.credit);
+        balances.set(line.accountId, net);
+      }
+
+      const accountsWithBalance = accounts.map((a) => ({
+        ...a,
+        balance: balances.get(a.id) || 0,
+      }));
+
       return NextResponse.json({
         success: true,
-        accounts,
+        accounts: accountsWithBalance,
         selectedAccount: null,
         entries: [],
         summary: null,

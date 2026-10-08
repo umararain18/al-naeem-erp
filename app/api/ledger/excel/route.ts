@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
-import { getPartyLedgerData, PartyLedgerLookupError, parseLedgerEntryType, filterLedgerRowsBySearch } from "@/lib/ledger-description";
+import { getAccountLedgerData, PartyLedgerLookupError, parseLedgerEntryType, filterLedgerRowsBySearch } from "@/lib/ledger-description";
 import { formatBusinessDate } from "@/lib/date-range";
 import { parseLedgerDetailColumns, LEDGER_DETAIL_GROUPS, LEDGER_DETAIL_LABELS, type LedgerDetailColumn } from "@/lib/ledger-detail-columns";
 
@@ -17,26 +17,13 @@ const STRUCTURED_DETAIL_COLUMNS: StructuredDetailColumn[] = LEDGER_DETAIL_GROUPS
 );
 
 // ============================================================
-// GET /api/parties/[id]/ledger/excel?from=&to=
+// GET /api/ledger/excel?accountId=&from=&to=&details=
 //
-// Excel export, built from the exact same read-only
-// getPartyLedgerData() the screen ledger and PDF export use.
-//
-// No spreadsheet-generation library (xlsx/exceljs) exists anywhere
-// in this project's dependencies today, and this task is explicitly
-// display/export-only - adding a new dependency for it is out of
-// scope. Instead this emits a genuine, real spreadsheet file using
-// the well-established "HTML table saved as .xls" technique:
-// Microsoft Excel natively recognizes and opens an HTML <table>
-// served with the classic .xls MIME type, exactly like a real
-// workbook (this is the same technique many server-side "Export to
-// Excel" features use when no dedicated library is available) -
-// this is NOT a CSV/print workaround, it opens as a formatted sheet
-// with real column headers.
-//
-// Per the approved v2 spec: NO Source/Reference column here - only
-// Date, Description, Debit, Credit, Balance, matching the PDF export
-// exactly.
+// General Ledger's own Excel export - mirrors app/api/parties/[id]/
+// ledger/excel/route.ts exactly (same HTML-table-as-.xls technique,
+// same read-only getAccountLedgerData() the screen itself uses, same
+// `details` query param honoring the on-screen Ledger Details
+// selection) for ANY account, not just a Party's.
 // ============================================================
 
 function escapeHtml(value: string): string {
@@ -60,21 +47,21 @@ const DOCUMENT_TYPE_LABELS: Record<string, string> = {
   OTHER: "Other",
 };
 
-export async function GET(
-  request: NextRequest,
-  { params }: { params: Promise<{ id: string }> }
-) {
+export async function GET(request: NextRequest) {
   try {
     const currentUser = await getCurrentUser();
     if (!currentUser) {
       return NextResponse.json({ success: false, message: "Unauthorized" }, { status: 401 });
     }
-    if (!hasPermission(currentUser, "parties.view")) {
+    if (!hasPermission(currentUser, "accounts.view")) {
       return NextResponse.json({ success: false, message: "Forbidden" }, { status: 403 });
     }
 
-    const { id } = await params;
     const { searchParams } = new URL(request.url);
+    const accountId = searchParams.get("accountId");
+    if (!accountId) {
+      return NextResponse.json({ success: false, message: "Account is required" }, { status: 400 });
+    }
     const from = searchParams.get("from");
     const to = searchParams.get("to");
     const documentType = parseLedgerEntryType(searchParams.get("type"));
@@ -86,18 +73,8 @@ export async function GET(
     const showDescriptionText = visibleDetails.has("description");
     const activeDetailColumns = STRUCTURED_DETAIL_COLUMNS.filter((c) => visibleDetails.has(c));
 
-    // Client-facing formal statement: ALWAYS chronological
-    // (Opening Balance -> oldest -> newest -> Totals -> Closing
-    // Balance), regardless of how the browser Party Ledger screen
-    // orders itself. When a Type filter is active, every row AND the
-    // Opening/Closing balance below are scoped to only that type -
-    // see getPartyLedgerData()'s own doc comment.
-    const data = await getPartyLedgerData(id, { from, to, order: "asc", documentType });
+    const data = await getAccountLedgerData(accountId, { from, to, order: "asc", documentType });
 
-    // Search narrows ROWS only - Opening/Closing Balance stay as
-    // data.summary's own Type+Date-filtered figures, exactly mirroring
-    // the screen's own existing search semantics (see the PDF route's
-    // identical comment for the full reasoning).
     const exportRows = filterLedgerRowsBySearch(data.ledger, search);
 
     const rowsHtml = exportRows
@@ -137,8 +114,8 @@ th { background: #2563eb; color: #ffffff; }
 </style>
 </head>
 <body>
-<h2>AL NAEEM CAR CARRIERS SERVICE - Party Ledger</h2>
-<div>Party: ${escapeHtml(data.party.partyName)}</div>
+<h2>AL NAEEM CAR CARRIERS SERVICE - General Ledger</h2>
+<div>Account: ${escapeHtml(data.account.accountName)}</div>
 ${periodLine}
 ${typeLine}
 ${searchLine}
@@ -161,14 +138,14 @@ ${rowsHtml}
       status: 200,
       headers: {
         "Content-Type": "application/vnd.ms-excel; charset=utf-8",
-        "Content-Disposition": `attachment; filename=Ledger-${data.party.partyName.replace(/\s+/g, "-")}.xls`,
+        "Content-Disposition": `attachment; filename=Ledger-${data.account.accountName.replace(/\s+/g, "-")}.xls`,
       },
     });
   } catch (error) {
     if (error instanceof PartyLedgerLookupError) {
       return NextResponse.json({ success: false, message: error.message }, { status: 404 });
     }
-    console.error("Party ledger Excel export error:", error);
+    console.error("General ledger Excel export error:", error);
     return NextResponse.json({ success: false, message: "Unable to generate ledger Excel export" }, { status: 500 });
   }
 }

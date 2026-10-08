@@ -5,6 +5,12 @@ import Link from "next/link";
 import { SearchableSelect, type SearchOption } from "@/app/daily-posting/SearchableSelect";
 import { LedgerFilters } from "@/components/LedgerFilters";
 import { formatBusinessDate } from "@/lib/date-range";
+import {
+  LedgerDetailsPicker,
+  ledgerDetailChips,
+  useLedgerDetailColumns,
+  type LedgerRowDetailsLike,
+} from "@/components/LedgerDetailsPicker";
 
 type Account = {
   id: string;
@@ -13,6 +19,9 @@ type Account = {
   accountType: string;
   category: string;
   party: { id: string; partyName: string } | null;
+  // Only present on the landing/blank-state fetch (no accountId) -
+  // see app/api/ledger/route.ts. Positive = debit balance.
+  balance?: number;
 };
 
 type LedgerHistoryItem = {
@@ -47,6 +56,7 @@ type LedgerEntry = {
   isRemoved: boolean;
   history: LedgerHistoryItem[];
   documentType: LedgerEntryType;
+  details: LedgerRowDetailsLike;
   // True only for the synthetic "Opening Balance" row - has no real
   // date (date === ""), rendered as "—" instead of being formatted.
   isOpeningBalance?: boolean;
@@ -102,6 +112,15 @@ export default function LedgerPage() {
   const [to, setTo] = useState("");
   const [search, setSearch] = useState("");
   const [typeFilter, setTypeFilter] = useState<TxType>("ALL");
+
+  // Filters the account-wise summary list below (landing state only,
+  // before an account is selected) - independent of `search`, which
+  // filters transactions once an account IS selected.
+  const [summaryFilter, setSummaryFilter] = useState("");
+
+  // Configurable Ledger Details columns - shared with Party Ledger
+  // (components/LedgerDetailsPicker.tsx), persisted per-browser.
+  const { visible: visibleDetails, toggle: toggleDetail } = useLedgerDetailColumns();
 
   // Every active account is fetched ONCE (no accountId/date params) so
   // the account picker can filter instantly client-side - the same
@@ -163,6 +182,40 @@ export default function LedgerPage() {
       })),
     [accounts]
   );
+
+  // Area 1 fix: General Ledger's account-wise summary (below) links
+  // straight to an account by its real id - never by matching on the
+  // displayed name/amount text - so this is the ONE place that sets
+  // accountId directly instead of routing through the free-text
+  // SearchableSelect search.
+  function selectAccount(id: string) {
+    setAccountId(id);
+    const url = new URL(window.location.href);
+    url.searchParams.set("accountId", id);
+    window.history.pushState({}, "", url.toString());
+  }
+
+  const accountSummary = useMemo(() => {
+    const filter = summaryFilter.trim().toLowerCase();
+    return accounts
+      .filter((a) => Math.abs(a.balance || 0) > 0.009)
+      .filter((a) => !filter || `${a.accountName} ${a.accountCode || ""}`.toLowerCase().includes(filter))
+      .sort((a, b) => Math.abs(b.balance || 0) - Math.abs(a.balance || 0));
+  }, [accounts, summaryFilter]);
+
+  // `details` carries the SAME Ledger Details selection the on-screen
+  // table renders with, straight into the export - never a second,
+  // independent export-only selection. The export route re-validates
+  // this against its own whitelist (lib/ledger-detail-columns.ts) -
+  // never trusted as-is.
+  const exportQuery = new URLSearchParams({
+    accountId,
+    ...(from ? { from } : {}),
+    ...(to ? { to } : {}),
+    ...(typeFilter !== "ALL" ? { type: typeFilter } : {}),
+    ...(search.trim() ? { search: search.trim() } : {}),
+    details: [...visibleDetails].join(","),
+  }).toString();
 
   function toggleExpanded(id: string) {
     setExpanded((prev) => {
@@ -288,16 +341,92 @@ export default function LedgerPage() {
           </>
         )}
 
+        {/* Account-wise summary - landing state only. Clicking a
+            name or amount opens that exact account's ledger via its
+            id (selectAccount), never by matching on the text shown. */}
+        {!loading && !selectedAccount && (
+          <div className="bg-white rounded-xl shadow-sm overflow-hidden mb-6">
+            <div className="p-4 border-b">
+              <h2 className="text-sm font-semibold text-gray-700">Account Summary</h2>
+              <input
+                type="text"
+                value={summaryFilter}
+                onChange={(e) => setSummaryFilter(e.target.value)}
+                placeholder="Filter accounts by name or code..."
+                className="mt-2 w-full md:w-80 border rounded-lg px-3 py-2 text-sm"
+              />
+            </div>
+            {accountSummary.length === 0 ? (
+              <div className="p-10 text-center text-gray-500">No accounts with a balance found.</div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead className="bg-gray-50 text-left text-xs uppercase text-gray-500">
+                    <tr>
+                      <th className="px-4 py-3">Account</th>
+                      <th className="px-4 py-3 text-right">Balance</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y">
+                    {accountSummary.map((a) => {
+                      const balance = a.balance || 0;
+                      const isDebit = balance > 0;
+                      return (
+                        <tr key={a.id} className="hover:bg-gray-50">
+                          <td className="px-4 py-3">
+                            <button
+                              type="button"
+                              onClick={() => selectAccount(a.id)}
+                              className="text-blue-600 hover:underline text-left"
+                            >
+                              {a.accountName}
+                            </button>
+                            {a.accountCode && <span className="ml-2 text-xs text-gray-400">[{a.accountCode}]</span>}
+                          </td>
+                          <td className="px-4 py-3 text-right">
+                            <button
+                              type="button"
+                              onClick={() => selectAccount(a.id)}
+                              className={`hover:underline ${isDebit ? "text-green-600" : "text-red-600"}`}
+                            >
+                              {formatCurrency(Math.abs(balance))} {isDebit ? "Dr" : "Cr"}
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Ledger Table */}
+        {(loading || selectedAccount) && (
         <div className="bg-white rounded-xl shadow-sm overflow-hidden">
           {loading ? (
             <div className="p-10 text-center text-gray-500">Loading ledger...</div>
-          ) : !selectedAccount ? (
-            <div className="p-10 text-center text-gray-500">Select an account to view transactions.</div>
           ) : entries.length === 0 ? (
             <div className="p-10 text-center text-gray-500">No accounting transactions found.</div>
-          ) : (
+          ) : (() => {
+            const columnCount = 7;
+            return (
             <div className="overflow-x-auto">
+              <div className="flex justify-end px-4 pt-3 gap-2">
+                <a
+                  href={`/api/ledger/pdf?${exportQuery}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="border rounded-lg px-3 py-2 text-sm hover:bg-gray-50 bg-blue-600 text-white border-blue-600"
+                >
+                  Export PDF
+                </a>
+                <a href={`/api/ledger/excel?${exportQuery}`} className="border rounded-lg px-3 py-2 text-sm hover:bg-gray-50">
+                  Export Excel
+                </a>
+                <LedgerDetailsPicker visible={visibleDetails} onToggle={toggleDetail} />
+              </div>
               <table className="w-full text-sm">
                 <thead className="bg-gray-50 text-left text-xs uppercase text-gray-500">
                   <tr>
@@ -314,6 +443,8 @@ export default function LedgerPage() {
                   {entries.map((entry) => {
                     const isExpanded = expanded.has(entry.id);
                     const hasHistory = entry.history.length > 1 || entry.isRemoved;
+                    const chips = ledgerDetailChips(entry.details, visibleDetails);
+                    const showDescriptionText = visibleDetails.has("description");
 
                     return (
                       <Fragment key={entry.id}>
@@ -329,8 +460,14 @@ export default function LedgerPage() {
                             )}
                           </td>
                           <td className="px-4 py-3">
-                            {entry.description || "—"}
+                            {showDescriptionText && (entry.description || "—")}
                             {entry.isRemoved && <span className="ml-2 text-xs text-gray-400 italic">(removed)</span>}
+                            {chips.length > 0 && (
+                              <div className={`text-xs text-gray-500 ${showDescriptionText ? "mt-1" : ""}`}>
+                                {chips.join(" · ")}
+                              </div>
+                            )}
+                            {!showDescriptionText && chips.length === 0 && "—"}
                           </td>
                           <td className="px-4 py-3 text-right">{entry.debit > 0 ? formatCurrency(entry.debit) : "—"}</td>
                           <td className="px-4 py-3 text-right">{entry.credit > 0 ? formatCurrency(entry.credit) : "—"}</td>
@@ -361,7 +498,7 @@ export default function LedgerPage() {
                         </tr>
                         {isExpanded && hasHistory && (
                           <tr className="bg-gray-50">
-                            <td colSpan={7} className="px-4 py-3">
+                            <td colSpan={columnCount} className="px-4 py-3">
                               <div className="text-xs text-gray-500 mb-2">
                                 Underlying accounting entries ({entry.history.length}{" "}
                                 {entry.history.length === 1 ? "entry" : "entries"}):
@@ -397,8 +534,10 @@ export default function LedgerPage() {
                 </tbody>
               </table>
             </div>
-          )}
+            );
+          })()}
         </div>
+        )}
       </div>
     </main>
   );

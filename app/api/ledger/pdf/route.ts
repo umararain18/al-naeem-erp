@@ -3,31 +3,27 @@ import autoTable from "jspdf-autotable";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
-import { getPartyLedgerData, PartyLedgerLookupError, parseLedgerEntryType, filterLedgerRowsBySearch } from "@/lib/ledger-description";
+import { getAccountLedgerData, PartyLedgerLookupError, parseLedgerEntryType, filterLedgerRowsBySearch } from "@/lib/ledger-description";
 import { resolvePdfPresentation } from "@/lib/pdf-presentation";
 import { createPdfDocument, drawPdfHeader, drawPdfFooter, applyWatermark, resolveAutoTableTheme, resolveJsPdfFont } from "@/lib/pdf-render-helpers";
 import { formatBusinessDate } from "@/lib/date-range";
 import { parseLedgerDetailColumns, ledgerDetailChips } from "@/lib/ledger-detail-columns";
 
 // ============================================================
-// GET /api/parties/[id]/ledger/pdf?from=&to=
+// GET /api/ledger/pdf?accountId=&from=&to=&details=
 //
-// Real PDF export (jsPDF + jspdf-autotable, the SAME libraries
-// already used by app/api/bilty/[id]/pdf, app/api/challan/[id]/pdf,
-// and app/api/parties/[id]/statement/pdf), built from the exact
-// same read-only getPartyLedgerData() the screen ledger uses - never
-// a second calculation, never a print-to-PDF shortcut.
-//
-// Per the approved v2 spec: NO Source/Reference column here. Every
-// row's Description is already fully self-contained (Bilty No,
-// Challan No, Carrier No, Transporter, vehicle, amount, direction),
-// so dropping the Source column loses no information.
+// General Ledger's own PDF export - mirrors app/api/parties/[id]/
+// ledger/pdf/route.ts exactly (same jsPDF/autoTable libraries, same
+// read-only getAccountLedgerData() the screen itself uses, same
+// `details` query param honoring the on-screen Ledger Details
+// selection via lib/ledger-detail-columns.ts) for ANY account, not
+// just a Party's. Never a second calculation, never a print-to-PDF
+// shortcut.
 // ============================================================
 
 function formatCurrency(value: number) {
   return `Rs. ${Math.round(value).toLocaleString()}`;
 }
-
 
 const DOCUMENT_TYPE_LABELS: Record<string, string> = {
   BILTY: "Bilty",
@@ -38,21 +34,21 @@ const DOCUMENT_TYPE_LABELS: Record<string, string> = {
   OTHER: "Other",
 };
 
-export async function GET(
-  request: NextRequest,
-  { params }: { params: Promise<{ id: string }> }
-) {
+export async function GET(request: NextRequest) {
   try {
     const currentUser = await getCurrentUser();
     if (!currentUser) {
       return NextResponse.json({ success: false, message: "Unauthorized" }, { status: 401 });
     }
-    if (!hasPermission(currentUser, "parties.view")) {
+    if (!hasPermission(currentUser, "accounts.view")) {
       return NextResponse.json({ success: false, message: "Forbidden" }, { status: 403 });
     }
 
-    const { id } = await params;
     const { searchParams } = new URL(request.url);
+    const accountId = searchParams.get("accountId");
+    if (!accountId) {
+      return NextResponse.json({ success: false, message: "Account is required" }, { status: 400 });
+    }
     const from = searchParams.get("from");
     const to = searchParams.get("to");
     const documentType = parseLedgerEntryType(searchParams.get("type"));
@@ -63,44 +59,26 @@ export async function GET(
     const visibleDetails = parseLedgerDetailColumns(searchParams.get("details"));
     const showDescriptionText = visibleDetails.has("description");
 
-    // Client-facing formal statement: ALWAYS chronological
-    // (Opening Balance -> oldest -> newest -> Totals -> Closing
-    // Balance), regardless of how the browser Party Ledger screen
-    // orders itself. When a Type filter is active, every row AND the
-    // Opening/Closing balance shown below are scoped to only that
-    // type - see getPartyLedgerData()'s own doc comment - so the
-    // exported PDF always matches exactly what the filtered screen
-    // shows, never the full unfiltered account.
-    const data = await getPartyLedgerData(id, { from, to, order: "asc", documentType });
+    // Client-facing formal statement: ALWAYS chronological, exactly
+    // mirroring the Party Ledger PDF's own identical choice -
+    // regardless of how the browser General Ledger screen orders
+    // itself (newest -> oldest).
+    const data = await getAccountLedgerData(accountId, { from, to, order: "asc", documentType });
 
-    // Search narrows which ROWS appear - the exact same
-    // filterLedgerRowsBySearch() the screen/General Ledger already
-    // use, never a second matching rule. Opening/Closing Balance
-    // intentionally stay as data.summary's own figures (the full
-    // Type+Date-filtered account state) and are NEVER narrowed by
-    // search - this mirrors the screen's own existing, approved
-    // behavior (its search box only narrows the displayed table; the
-    // Summary Cards above it are untouched by search) rather than
-    // inventing a new balance rule for export.
     const exportRows = filterLedgerRowsBySearch(data.ledger, search);
 
-    // No dedicated "party ledger" SettingsDocumentType value exists in
-    // the fixed enum - PARTY_STATEMENT (the party-facing document type
-    // the enum does provide) is used for both this Ledger PDF and the
-    // separate Statement PDF, so they share one Header/Footer/Logo
-    // override rather than each getting its own.
-    const presentation = await resolvePdfPresentation(prisma, "PARTY_STATEMENT");
+    const presentation = await resolvePdfPresentation(prisma, "REPORTS");
     const bodyFont = resolveJsPdfFont(presentation.pdf.defaultFont);
 
     const doc = createPdfDocument(presentation);
     const pageWidth = doc.internal.pageSize.getWidth();
 
-    const { nextY } = await drawPdfHeader(doc, presentation, "PARTY LEDGER");
+    const { nextY } = await drawPdfHeader(doc, presentation, "GENERAL LEDGER");
     let y = nextY;
 
     doc.setFontSize(10);
     doc.setFont(bodyFont, "normal");
-    doc.text(`Party: ${data.party.partyName}`, 14, y);
+    doc.text(`Account: ${data.account.accountName}`, 14, y);
     if (from || to) {
       doc.text(`Period: ${from || "-"}  to  ${to || "-"}`, pageWidth - 14, y, { align: "right" });
     }
@@ -119,12 +97,6 @@ export async function GET(
     doc.text(`Opening Balance: ${formatCurrency(data.summary.openingBalance)}`, 14, y);
     y += 8;
 
-    // The Description cell combines the sentence (only when selected)
-    // with the selected structured detail chips, newline-separated for
-    // a clean printed look - the exact same ledgerDetailChips() the
-    // on-screen table and the Excel export both use, so the three
-    // never drift from each other. A row with neither selected shows
-    // "-", never a fabricated placeholder.
     const tableRows = exportRows.map((row) => {
       const chips = ledgerDetailChips(row.details, visibleDetails);
       const lines = [...(showDescriptionText ? [row.description] : []), ...chips];
@@ -173,7 +145,7 @@ export async function GET(
       status: 200,
       headers: {
         "Content-Type": "application/pdf",
-        "Content-Disposition": `inline; filename=Ledger-${data.party.partyName.replace(/\s+/g, "-")}.pdf`,
+        "Content-Disposition": `inline; filename=Ledger-${data.account.accountName.replace(/\s+/g, "-")}.pdf`,
         "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
       },
     });
@@ -181,7 +153,7 @@ export async function GET(
     if (error instanceof PartyLedgerLookupError) {
       return NextResponse.json({ success: false, message: error.message }, { status: 404 });
     }
-    console.error("Party ledger PDF error:", error);
+    console.error("General ledger PDF error:", error);
     return NextResponse.json({ success: false, message: "Unable to generate ledger PDF" }, { status: 500 });
   }
 }
