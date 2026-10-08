@@ -334,9 +334,9 @@ async function getBookingIncomeAccountId(tx: Tx): Promise<string | null> {
   return BOOKING_INCOME_CACHE.id;
 }
 
-function vehicleLabel(bilty: { vehicleModel: string | null; vehicleType: string | null } | null | undefined): string | null {
+function vehicleLabel(bilty: { registrationNumber: string | null; vehicleType: string | null } | null | undefined): string | null {
   if (!bilty) return null;
-  return bilty.vehicleModel || bilty.vehicleType || null;
+  return bilty.registrationNumber || bilty.vehicleType || null;
 }
 
 // ============================================================
@@ -1382,7 +1382,7 @@ export async function getPartyOutstandingDocuments(tx: Tx, partyAccountId: strin
   const biltyContexts = biltyCandidateIds.size
     ? await tx.bilty.findMany({
         where: { id: { in: [...biltyCandidateIds] } },
-        select: { id: true, vehicleType: true, vehicleModel: true, chassisNumber: true },
+        select: { id: true, vehicleType: true, registrationNumber: true, chassisNumber: true },
       })
     : [];
   const biltyCtxById = new Map(biltyContexts.map((b) => [b.id, b]));
@@ -1433,7 +1433,7 @@ export async function getPartyOutstandingDocuments(tx: Tx, partyAccountId: strin
   const commissionCtxRows = commissionCandidateIds.size
     ? await tx.bilty.findMany({
         where: { id: { in: [...commissionCandidateIds] } },
-        select: { id: true, vehicleType: true, vehicleModel: true, chassisNumber: true },
+        select: { id: true, vehicleType: true, registrationNumber: true, chassisNumber: true },
       })
     : [];
   const commissionCtxById = new Map(commissionCtxRows.map((b) => [b.id, b]));
@@ -1487,7 +1487,7 @@ export async function getPartyOutstandingDocuments(tx: Tx, partyAccountId: strin
           carrierNumber: true,
           bilties: {
             where: { bilty: { isDeleted: false } },
-            select: { bilty: { select: { id: true, vehicleType: true, vehicleModel: true, chassisNumber: true } } },
+            select: { bilty: { select: { id: true, vehicleType: true, registrationNumber: true, chassisNumber: true } } },
           },
         },
       })

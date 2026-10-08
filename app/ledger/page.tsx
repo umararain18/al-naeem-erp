@@ -13,6 +13,9 @@ type Account = {
   accountType: string;
   category: string;
   party: { id: string; partyName: string } | null;
+  // Only present on the landing/blank-state fetch (no accountId) -
+  // see app/api/ledger/route.ts. Positive = debit balance.
+  balance?: number;
 };
 
 type LedgerHistoryItem = {
@@ -103,6 +106,11 @@ export default function LedgerPage() {
   const [search, setSearch] = useState("");
   const [typeFilter, setTypeFilter] = useState<TxType>("ALL");
 
+  // Filters the account-wise summary list below (landing state only,
+  // before an account is selected) - independent of `search`, which
+  // filters transactions once an account IS selected.
+  const [summaryFilter, setSummaryFilter] = useState("");
+
   // Every active account is fetched ONCE (no accountId/date params) so
   // the account picker can filter instantly client-side - the same
   // dataset the dropdown always loaded, just no longer re-fetched from
@@ -163,6 +171,26 @@ export default function LedgerPage() {
       })),
     [accounts]
   );
+
+  // Area 1 fix: General Ledger's account-wise summary (below) links
+  // straight to an account by its real id - never by matching on the
+  // displayed name/amount text - so this is the ONE place that sets
+  // accountId directly instead of routing through the free-text
+  // SearchableSelect search.
+  function selectAccount(id: string) {
+    setAccountId(id);
+    const url = new URL(window.location.href);
+    url.searchParams.set("accountId", id);
+    window.history.pushState({}, "", url.toString());
+  }
+
+  const accountSummary = useMemo(() => {
+    const filter = summaryFilter.trim().toLowerCase();
+    return accounts
+      .filter((a) => Math.abs(a.balance || 0) > 0.009)
+      .filter((a) => !filter || `${a.accountName} ${a.accountCode || ""}`.toLowerCase().includes(filter))
+      .sort((a, b) => Math.abs(b.balance || 0) - Math.abs(a.balance || 0));
+  }, [accounts, summaryFilter]);
 
   function toggleExpanded(id: string) {
     setExpanded((prev) => {
@@ -288,12 +316,72 @@ export default function LedgerPage() {
           </>
         )}
 
+        {/* Account-wise summary - landing state only. Clicking a
+            name or amount opens that exact account's ledger via its
+            id (selectAccount), never by matching on the text shown. */}
+        {!loading && !selectedAccount && (
+          <div className="bg-white rounded-xl shadow-sm overflow-hidden mb-6">
+            <div className="p-4 border-b">
+              <h2 className="text-sm font-semibold text-gray-700">Account Summary</h2>
+              <input
+                type="text"
+                value={summaryFilter}
+                onChange={(e) => setSummaryFilter(e.target.value)}
+                placeholder="Filter accounts by name or code..."
+                className="mt-2 w-full md:w-80 border rounded-lg px-3 py-2 text-sm"
+              />
+            </div>
+            {accountSummary.length === 0 ? (
+              <div className="p-10 text-center text-gray-500">No accounts with a balance found.</div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead className="bg-gray-50 text-left text-xs uppercase text-gray-500">
+                    <tr>
+                      <th className="px-4 py-3">Account</th>
+                      <th className="px-4 py-3 text-right">Balance</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y">
+                    {accountSummary.map((a) => {
+                      const balance = a.balance || 0;
+                      const isDebit = balance > 0;
+                      return (
+                        <tr key={a.id} className="hover:bg-gray-50">
+                          <td className="px-4 py-3">
+                            <button
+                              type="button"
+                              onClick={() => selectAccount(a.id)}
+                              className="text-blue-600 hover:underline text-left"
+                            >
+                              {a.accountName}
+                            </button>
+                            {a.accountCode && <span className="ml-2 text-xs text-gray-400">[{a.accountCode}]</span>}
+                          </td>
+                          <td className="px-4 py-3 text-right">
+                            <button
+                              type="button"
+                              onClick={() => selectAccount(a.id)}
+                              className={`hover:underline ${isDebit ? "text-green-600" : "text-red-600"}`}
+                            >
+                              {formatCurrency(Math.abs(balance))} {isDebit ? "Dr" : "Cr"}
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* Ledger Table */}
+        {(loading || selectedAccount) && (
         <div className="bg-white rounded-xl shadow-sm overflow-hidden">
           {loading ? (
             <div className="p-10 text-center text-gray-500">Loading ledger...</div>
-          ) : !selectedAccount ? (
-            <div className="p-10 text-center text-gray-500">Select an account to view transactions.</div>
           ) : entries.length === 0 ? (
             <div className="p-10 text-center text-gray-500">No accounting transactions found.</div>
           ) : (
@@ -399,6 +487,7 @@ export default function LedgerPage() {
             </div>
           )}
         </div>
+        )}
       </div>
     </main>
   );

@@ -219,7 +219,11 @@ interface BiltyCtx {
   id: string;
   biltyNo: string;
   vehicleType: string | null;
-  vehicleModel: string | null;
+  // The vehicle's own identifying "name" (its registration number,
+  // e.g. "ABC-123") - shown in ledger-facing descriptions instead of
+  // vehicleModel, which is deliberately never shown here (Area 3:
+  // "Vehicle NAME must be shown, Vehicle MODEL must NOT be shown").
+  registrationNumber: string | null;
   chassisNumber: string | null;
 }
 
@@ -239,7 +243,7 @@ interface ChallanCtx {
 
 function vehicleLabel(bilty: BiltyCtx | undefined | null): string | null {
   if (!bilty) return null;
-  return bilty.vehicleModel || bilty.vehicleType || null;
+  return bilty.registrationNumber || bilty.vehicleType || null;
 }
 
 /** Vehicle label for every Bilty in the list, comma-separated - never collapsed to just the first. */
@@ -544,7 +548,7 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
     biltyIds.size > 0
       ? prisma.bilty.findMany({
           where: { id: { in: [...biltyIds] } },
-          select: { id: true, biltyNo: true, vehicleType: true, vehicleModel: true, chassisNumber: true },
+          select: { id: true, biltyNo: true, vehicleType: true, registrationNumber: true, chassisNumber: true },
         })
       : Promise.resolve([]),
     challanIds.size > 0
@@ -557,7 +561,7 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
             transporterParty: { select: { partyName: true } },
             bilties: {
               where: { bilty: { isDeleted: false } },
-              select: { bilty: { select: { id: true, biltyNo: true, vehicleType: true, vehicleModel: true, chassisNumber: true } } },
+              select: { bilty: { select: { id: true, biltyNo: true, vehicleType: true, registrationNumber: true, chassisNumber: true } } },
             },
           },
         })
@@ -1271,14 +1275,24 @@ export async function getAccountLedgerData(
   // true balance as of that transaction and needs no recomputation.
   const orderedLedger = order === "desc" ? [...ledger].reverse() : ledger;
 
-  // Opening Balance row - always first, regardless of `order`, never
-  // part of the chronological reversal above. Only injected when
-  // asked for (see includeOpeningBalanceRow's own doc comment) and
-  // only when a genuine OPENING_BALANCE entry actually exists for
-  // this account - never shown for the overwhelming majority of
-  // accounts that never set one.
+  // Opening Balance row - never part of the chronological reversal
+  // above (it has no real date of its own). Only injected when asked
+  // for (see includeOpeningBalanceRow's own doc comment) and only
+  // when a genuine OPENING_BALANCE entry actually exists for this
+  // account - never shown for the overwhelming majority of accounts
+  // that never set one.
+  //
+  // Position depends on `order`: this ledger's own transaction order
+  // is NEWEST -> OLDEST (order: "desc", the only mode any current
+  // caller pairs with includeOpeningBalanceRow) - Opening Balance,
+  // being the OLDEST possible contribution to the account, belongs at
+  // the END of that list, not the top. For the (currently unused by
+  // any caller) chronological "asc" order, it stays at the START,
+  // its natural chronological position. Either way this is placement
+  // only - every row's own `balance` was already computed correctly
+  // above, in true chronological order, before this reversal/injection.
   if (includeOpeningBalanceRow && !documentType && hasOpeningBalanceEntry) {
-    orderedLedger.unshift({
+    const openingBalanceRow: FinalLedgerRow = {
       id: `opening-balance:${account.id}`,
       date: "",
       reference: "Opening Balance",
@@ -1293,7 +1307,12 @@ export async function getAccountLedgerData(
       history: [],
       documentType: "OTHER",
       isOpeningBalance: true,
-    });
+    };
+    if (order === "desc") {
+      orderedLedger.push(openingBalanceRow);
+    } else {
+      orderedLedger.unshift(openingBalanceRow);
+    }
   }
 
   return {
