@@ -4,7 +4,12 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
-import { getGrossBiltyReceivableAccountId } from "@/lib/gross-accounts";
+import {
+  getGrossBiltyReceivableAccountId,
+  getBillWalkInReceivableAccountId,
+  getGrossCommissionPayableAccountId,
+  getGrossCarrierRentPayableAccountId,
+} from "@/lib/gross-accounts";
 import {
   getBiltyLegitimatePartyAccountIds,
   getChallanEligiblePartyAccountIds,
@@ -928,17 +933,37 @@ export async function POST(request: NextRequest) {
     }
 
     // ========================================================
-    // PARTY <-> CASH/BANK RESTRICTION (CHALLAN/BILTY lines only)
+    // PARTY <-> CASH/BANK RESTRICTION (CHALLAN/BILTY/PHONCH/PRIVATE_
+    // PHONCH/BILL lines)
     //
-    // Restricted to PARTY <-> CASH/BANK movement only, so Income/
-    // Expense accounts can't be touched through a document-linked
-    // line. Settlement already owns revenue/expense accruals for
-    // these documents. Uses the RESOLVED counter account, so an
-    // auto-resolved party is checked exactly like a manually
-    // selected one.
+    // Restricted to PARTY <-> CASH/BANK movement, so Income/Expense
+    // accounts can't be touched through a document-linked line.
+    // Settlement already owns revenue/expense accruals for these
+    // documents. Uses the RESOLVED counter account, so an auto-
+    // resolved party is checked exactly like a manually selected one.
     //
-    // Lines with sourceType DIRECT (or any other existing source
-    // type such as PARTY/PHONCH/BILL) are entirely unaffected.
+    // Narrow, per-document exception: a handful of shared "Unallocated"
+    // system accounts (never a Party) are the ONLY other legitimate
+    // destination - but ONLY when THIS EXACT document's own party
+    // resolution (resolveDocumentPartyAccount(), the same single
+    // source of truth used everywhere else) genuinely points there.
+    // A manually-supplied counter account that happens to match one of
+    // these account ids for an UNRELATED document is still rejected -
+    // this never becomes "any Unallocated account is fine for any
+    // document". Identified by stable accountCode (via each account's
+    // own getter in lib/gross-accounts.ts), never by name:
+    //  - GROSS-BILTY-RECEIVABLE (BILTY RECEIPT - already reachable via
+    //    resolveBiltyParty()'s own resolveUnclaimedGrossBiltyReceivable()
+    //    candidate, kept here too for documentation/future-proofing).
+    //  - BILL-WALKIN-RECEIVABLE (BILL with no linked Client Party -
+    //    resolveBillParty() returns this exact account; this was the
+    //    reported bug - a walk-in Bill's own receipt was rejected).
+    //  - GROSS-COMMISSION-PAYABLE / GROSS-CARRIER-RENT-PAYABLE - listed
+    //    for completeness, but neither resolveBiltyParty() nor
+    //    resolveChallanParty() ever resolves to them today (pure
+    //    Settlement-time clearing accounts), so the match check below
+    //    will correctly keep rejecting them unless/until a real
+    //    resolution path to them is ever added.
     // ========================================================
 
     const categoryMap: Record<string, string> = {};
@@ -947,12 +972,30 @@ export async function POST(request: NextRequest) {
 
     const isCashBank = (cat: string) => cat === "CASH" || cat === "BANK";
 
-    // Narrow exception: BILTY + RECEIPT + the exact existing Gross
-    // Bilty Receivable system account is the ONLY non-PARTY
-    // destination this restriction ever admits - see
-    // resolveUnclaimedGrossBiltyReceivable() in lib/document-party-
-    // resolution.ts. Fetched once, outside the loop below.
     const grossBiltyReceivableId = await getGrossBiltyReceivableAccountId(prisma);
+    const approvedUnallocatedAccountIds = new Set([
+      grossBiltyReceivableId,
+      await getBillWalkInReceivableAccountId(prisma),
+      await getGrossCommissionPayableAccountId(prisma),
+      await getGrossCarrierRentPayableAccountId(prisma),
+    ]);
+
+    // True only when `accountId` is one of the approved Unallocated
+    // accounts above AND it is genuinely where THIS line's own
+    // document resolves its responsible party to - never a blanket
+    // "any Unallocated account" allowance.
+    async function isApprovedUnallocatedMatch(
+      accountId: string,
+      line: (typeof preparedChallanBiltyLines)[number]["line"]
+    ): Promise<boolean> {
+      if (!approvedUnallocatedAccountIds.has(accountId)) return false;
+      const resolved = await resolveDocumentPartyAccount(
+        line.sourceType as "CHALLAN" | "BILTY" | "PHONCH" | "PRIVATE_PHONCH" | "BILL",
+        line.sourceId!,
+        line.direction
+      );
+      return !!resolved && resolved.accountId === accountId;
+    }
 
     const preparedChallanBiltyLines = preparedLines
       .map((line, index) => ({ line, index }))
@@ -969,13 +1012,21 @@ export async function POST(request: NextRequest) {
       const mainCat = mainAccount ? categoryMap[mainAccount.id] : "";
       const counterCat = categoryMap[line.counterAccountId] || "";
 
-      const valid =
+      let valid =
         (mainCat === "PARTY" && isCashBank(counterCat)) ||
         (counterCat === "PARTY" && isCashBank(mainCat)) ||
         (line.sourceType === "BILTY" &&
           line.direction === "DEBIT" &&
           isCashBank(mainCat) &&
           line.counterAccountId === grossBiltyReceivableId);
+
+      if (!valid && isCashBank(mainCat)) {
+        valid = await isApprovedUnallocatedMatch(line.counterAccountId, line);
+      }
+
+      if (!valid && mainAccount && isCashBank(counterCat)) {
+        valid = await isApprovedUnallocatedMatch(mainAccount.id, line);
+      }
 
       if (!valid) {
         return NextResponse.json(
