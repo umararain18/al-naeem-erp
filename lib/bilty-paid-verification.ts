@@ -1,6 +1,6 @@
 import type { Prisma, PrismaClient } from "@prisma/client";
 import { resolveBiltyPaidResponsibleParty } from "@/lib/document-party-resolution";
-import { getGrossBiltyReceivableAccountId, getUnclaimedGrossBiltyReceivableAmount } from "@/lib/gross-accounts";
+import { getGrossBiltyReceivableAccountId, getUnclaimedGrossBiltyReceivableTotalAmount } from "@/lib/gross-accounts";
 
 // ============================================================
 // BILTY PAID -> VERIFIED ANC RECEIPT (derived, no new stored state)
@@ -162,13 +162,21 @@ export async function getBiltyPaidVerification(
   // A receipt posted directly to Gross Bilty Receivable (never a
   // PARTY account, so never included in relevantAccountIds above) is
   // just as real a verification as one posted to a Paid-responsible
-  // Party - see resolveUnclaimedGrossBiltyReceivable() in
-  // lib/document-party-resolution.ts, which is what makes that
-  // destination eligible in the first place. Scoped to the exact same
-  // account/sourceType/sourceId/referenceType/isDeleted shape as the
-  // Party-account query above, so it can never double-count a line
-  // already counted there (the two account sets are disjoint - Gross
-  // is never a PARTY-category account).
+  // Party - see getUnclaimedGrossBiltyReceivableAmount() in
+  // lib/gross-accounts.ts, which is what makes that destination
+  // eligible for the PAID component in the first place. Scoped to the
+  // exact same account/sourceType/sourceId/referenceType/isDeleted
+  // shape as the Party-account query above, so it can never double-
+  // count a line already counted there (the two account sets are
+  // disjoint - Gross is never a PARTY-category account).
+  //
+  // A Gross-credited receipt may ALSO represent the Collection/To-Pay
+  // component now (see getUnclaimedGrossBiltyReceivableAmountForCollection()
+  // in lib/gross-accounts.ts) - a Daily Posting line carries no tag
+  // distinguishing which component it was for, so this PAID-only
+  // verification must never count more of it than the Paid amount
+  // itself allows, or a large Collection receipt credited to the same
+  // account would wrongly appear to over-verify Paid.
   const grossAccountId = await getGrossBiltyReceivableAccountId(tx);
   const grossLines = await tx.journalLine.findMany({
     where: {
@@ -184,7 +192,7 @@ export async function getBiltyPaidVerification(
     select: { debit: true, credit: true },
   });
   const grossVerifiedAmount = round2(
-    Math.max(0, grossLines.reduce((s, l) => s + Number(l.credit) - Number(l.debit), 0))
+    Math.min(paidAmount, Math.max(0, grossLines.reduce((s, l) => s + Number(l.credit) - Number(l.debit), 0)))
   );
   verifiedReceivedAmount = round2(verifiedReceivedAmount + grossVerifiedAmount);
 
@@ -232,19 +240,23 @@ export async function assertPaidVerificationNotExceeded(
 
   // Gross Bilty Receivable is not a Party account, so it can never
   // match state.responsiblePartyAccountId below - it needs its own
-  // cap, mirroring resolveUnclaimedGrossBiltyReceivable()'s own
-  // eligibility calculation exactly (lib/gross-accounts.ts), so the
-  // two can never disagree about how much is genuinely claimable.
-  // Never Bilty.advance alone (that ignores what is already posted)
-  // and never Bilty.total (that would also admit the To-Pay portion,
-  // which is Settlement's business alone).
+  // cap. A receipt credited here may represent EITHER the Paid or the
+  // Collection/To-Pay component (a Daily Posting line carries no
+  // separate tag distinguishing which), so the ceiling is the Bilty's
+  // full total genuinely unclaimed balance - see
+  // getUnclaimedGrossBiltyReceivableTotalAmount() in
+  // lib/gross-accounts.ts, which both the Paid-side and the
+  // Collection-side auto-resolve candidates in lib/document-party-
+  // resolution.ts individually cap below (at advance / at toPay
+  // respectively), so this combined ceiling can never disagree with
+  // either of them about how much is genuinely still sitting there.
   const grossAccountId = await getGrossBiltyReceivableAccountId(tx);
   if (counterAccountId === grossAccountId) {
-    const unclaimed = await getUnclaimedGrossBiltyReceivableAmount(tx, biltyId, excludeJournalEntryId);
+    const unclaimed = await getUnclaimedGrossBiltyReceivableTotalAmount(tx, biltyId, excludeJournalEntryId);
     if (round2(amount) > unclaimed + EPS) {
       throw new BiltyPaidVerificationError(
         "GROSS_RECEIVABLE_OVER_RECEIPT",
-        `This receipt of ${round2(amount)} would exceed this Bilty's genuinely unclaimed Paid-side Gross Bilty Receivable balance (${unclaimed}).`
+        `This receipt of ${round2(amount)} would exceed this Bilty's genuinely unclaimed Gross Bilty Receivable balance (${unclaimed}).`
       );
     }
     return;

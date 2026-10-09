@@ -3,7 +3,11 @@ import { prisma } from "@/lib/prisma";
 import { findSettledPartyAccountId } from "@/lib/settlement-correction";
 import { getActiveSettlementPayers } from "@/lib/settlement-payments";
 import { computeChallanSettlementSummary } from "@/lib/challan-settlement-summary";
-import { getGrossBiltyReceivableAccountId, getUnclaimedGrossBiltyReceivableAmount } from "@/lib/gross-accounts";
+import {
+  getGrossBiltyReceivableAccountId,
+  getUnclaimedGrossBiltyReceivableAmount,
+  getUnclaimedGrossBiltyReceivableAmountForCollection,
+} from "@/lib/gross-accounts";
 import { resolveBillClientAccountId } from "@/lib/bill-accounting";
 
 type Tx = PrismaClient | Prisma.TransactionClient;
@@ -46,13 +50,6 @@ async function resolveBiltyParty(
   const bilty = await prisma.bilty.findUnique({
     where: { id: biltyId },
     select: {
-      toPay: true,
-      clearingAgentParty: {
-        select: {
-          partyName: true,
-          account: { select: { id: true, isActive: true } },
-        },
-      },
       challanBilties: {
         where: { challan: { isDeleted: false, status: { not: "CANCELLED" } } },
         select: {
@@ -137,43 +134,39 @@ async function resolveBiltyParty(
     }
   }
 
-  // clearingAgentPartyId is a descriptive/planned field set at Bilty
-  // booking time - it is NOT itself a Collection accounting fact.
-  // Only treat it as a legitimate Collection-side destination once
-  // the Bilty has actually been added to a real Challan (activeChallan)
-  // - i.e. there is at least a live shipment this Clearing Agent is
-  // actually attached to. A Bilty never added to any Challan has no
-  // Collection responsibility established at all yet, so this
-  // fallback must not manufacture one merely because the field is
-  // populated (this previously caused a false ambiguity against a
-  // real, established Paid attribution - see the Step 2 hotfix audit).
-  //
-  // ALSO requires Bilty.toPay > 0 - a fully (or now fully) Paid
-  // Bilty has nothing left to collect, so the Clearing Agent is not
-  // a real Collection destination for it either, regardless of the
-  // Challan being active. Without this check, a Paid Bilty on an
-  // active Challan manufactured a false Collection destination that
-  // collided with the genuinely-resolved Paid-responsible party
-  // below and forced an unnecessary manual Counter Account selection.
+  // No real Collection destination established yet (no multi-payer
+  // rows, no historical settled-party lookup) - per the LOCKED rule,
+  // the Counter Account must trace to whatever account was ACTUALLY
+  // debited in this Bilty's own original booking entry (app/api/
+  // bilty/route.ts: "Dr Gross Bilty Receivable / Cr Booking Income"
+  // for the FULL total, before any Party is known), never a guess at
+  // the Transporter/Clearing Agent merely because they are named on
+  // the Challan. Until a real Settlement reclassification moves this
+  // Bilty's Collection/To-Pay amount out of Gross Bilty Receivable
+  // into a real Party's account (the collectionResultIsPosted===true
+  // branches above), the money is still genuinely sitting there - so
+  // that is the correct Counter Account, RECEIPT (DEBIT) only, exactly
+  // mirroring the Paid-side's own Gross candidate below. See
+  // getUnclaimedGrossBiltyReceivableAmountForCollection() in
+  // lib/gross-accounts.ts for the exact same Bilty.toPay cap the
+  // ceiling check (assertPaidVerificationNotExceeded) re-enforces at
+  // write time.
   //
   // NOTE: this candidate is deliberately left with
-  // collectionResultIsPosted === false - it is a prediction, never an
-  // actual posted SettlementPayment row or settled JournalLine (see
-  // the comment above), so it must not be allowed to block a
-  // genuinely-established, different candidate below that represents
-  // a separate, non-overlapping amount of the same Bilty (the still-
-  // unclaimed Paid slice vs. this Bilty's own outstanding To-Pay).
-  if (
-    !collectionResult &&
-    activeChallan &&
-    Number(bilty.toPay) > 0 &&
-    bilty.clearingAgentParty?.account?.id &&
-    bilty.clearingAgentParty.account.isActive
-  ) {
-    collectionResult = {
-      accountId: bilty.clearingAgentParty.account.id,
-      partyName: bilty.clearingAgentParty.partyName,
-    };
+  // collectionResultIsPosted === false - it reflects where the money
+  // CURRENTLY sits, not a prediction of who will eventually be
+  // responsible, but it must still defer to a genuinely-established,
+  // different candidate below that represents a separate, non-
+  // overlapping amount of the same Bilty (the still-unclaimed Paid
+  // slice vs. this Bilty's own outstanding To-Pay).
+  if (!collectionResult && direction === "DEBIT") {
+    const unclaimedForCollection = await getUnclaimedGrossBiltyReceivableAmountForCollection(prisma, biltyId);
+    if (unclaimedForCollection > 0.01) {
+      collectionResult = {
+        accountId: await getGrossBiltyReceivableAccountId(prisma),
+        partyName: "Gross Bilty Receivable (Unallocated)",
+      };
+    }
   }
 
   // Paid-responsible side - a DIFFERENT accounting component (see
@@ -786,8 +779,19 @@ export async function getBiltyLegitimatePartyAccountIds(
     }
   }
 
-  if (result.size === 0 && bilty.clearingAgentParty?.account?.id && bilty.clearingAgentParty.account.isActive) {
-    result.add(bilty.clearingAgentParty.account.id);
+  // No real Collection destination established yet - mirrors
+  // resolveBiltyParty()'s own replacement of the old Clearing Agent
+  // guess (see that function's own comment for the full reasoning):
+  // the money is still genuinely sitting in Gross Bilty Receivable
+  // until a real Settlement reclassification moves it out, so THAT
+  // is the legitimate manually-selectable destination here too -
+  // RECEIPT (DEBIT) only, capped at Bilty.toPay exactly like the
+  // write-time ceiling check.
+  if (result.size === 0 && direction === "DEBIT") {
+    const unclaimedForCollection = await getUnclaimedGrossBiltyReceivableAmountForCollection(prisma, biltyId);
+    if (unclaimedForCollection > 0.01) {
+      result.add(await getGrossBiltyReceivableAccountId(prisma));
+    }
   }
 
   const paidResponsible = await resolveBiltyPaidResponsibleParty(biltyId);
