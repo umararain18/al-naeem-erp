@@ -161,6 +161,19 @@ export async function GET(
 //     whole update is rejected with a clear message - identical in
 //     spirit to the existing "Gap A" ceiling check PATCH
 //     /api/cash-book/[id] already enforces for the simple 2-line case.
+//   - Counter Account is NOT locked on an existing line. The user may
+//     reassign it (or leave it blank to auto-resolve from the
+//     document) and it is re-validated through the exact same
+//     resolveDailyPostingLine() pipeline a brand-new line goes
+//     through - Bilty/Challan/Private Phonch legitimacy against the
+//     document's own eligible parties, active-account check, PARTY
+//     <-> CASH/BANK restriction - never silently coerced back to its
+//     old value. The ONE exception: a line that already carries a
+//     PaymentAllocation can never have its Counter Account changed
+//     (only its amount may still move, down to the allocated floor),
+//     since the allocation represents a specific Party having been
+//     connected to a specific Bilty/Challan - changing the account
+//     out from under it would silently misrepresent that relationship.
 //   - The Main Account side is safely collapsed to exactly ONE net
 //     line (sum of all counter credits -> main debit; sum of all
 //     counter debits -> main credit) on every save, since nothing
@@ -316,16 +329,19 @@ export async function PATCH(
           }
 
           // ----------------------------------------------------------
-          // RESOLVE EVERY SUBMITTED LINE - same per-line pipeline the
-          // existing simple-edit PATCH already uses for CHALLAN/BILTY
-          // (resolveDailyPostingLine, with Counter Account locked
-          // unless the document itself changed), extended here to also
-          // cover PHONCH/PRIVATE_PHONCH/BILL for a genuinely NEW line
-          // (no existing restriction to preserve there). An EXISTING
-          // DIRECT/PARTY/PHONCH/PRIVATE_PHONCH/BILL line keeps its
-          // Counter Account locked, identical to today's simple-edit
-          // behavior - Counter Account reassignment on an already-
-          // posted non-document-linked line has never been supported.
+          // RESOLVE EVERY SUBMITTED LINE - ONE uniform pipeline for
+          // both a brand-new line and an existing one. Counter Account
+          // is NOT locked on an existing line: resolveDailyPostingLine()
+          // treats whatever the user submits as a manually-supplied
+          // Counter Account and re-validates it exactly as Create
+          // does (existence/active, Bilty/Challan/Private Phonch
+          // legitimacy against the document's own eligible parties,
+          // PARTY<->CASH/BANK restriction) - a change that would
+          // violate any of those rules is rejected with the same clear
+          // message Create itself gives, never silently coerced. The
+          // PaymentAllocation-safety guard for an account change on an
+          // already-allocated line lives below, in CEILING CHECKS,
+          // once every line's final Counter Account is known.
           // ----------------------------------------------------------
           const resolvedLines: {
             id: string | null;
@@ -353,81 +369,26 @@ export async function PATCH(
             const existing = line.id ? existingCounterLineById.get(line.id) : undefined;
             const finalSourceType = requestedSourceType as DailyPostingSourceType;
 
-            let finalCounterAccountId: string;
-            let finalSourceId: string | null = null;
-            let finalSourceNumber: string | null = null;
-
-            if (!existing) {
-              // Brand-new line - full freedom, same resolution power
-              // Create itself has.
-              if (!line.counterAccountId && finalSourceType === "DIRECT") {
-                throw new DailyPostingValidationError(`Please select a counter account for the new line "${line.description}"`);
-              }
-              if (finalSourceType === "DIRECT") {
-                finalCounterAccountId = line.counterAccountId as string;
-                finalSourceId = null;
-                finalSourceNumber = null;
-              } else {
-                const resolved = await resolveDailyPostingLine({
-                  tx,
-                  mainAccountId,
-                  mainCategory: mainAccount.category,
-                  sourceType: finalSourceType,
-                  sourceId: line.sourceId,
-                  sourceNumber: line.sourceNumber,
-                  counterAccountId: line.counterAccountId,
-                  direction: line.direction,
-                });
-                finalCounterAccountId = resolved.counterAccountId;
-                finalSourceId = resolved.sourceId;
-                finalSourceNumber = resolved.sourceNumber;
-              }
-            } else if (finalSourceType === "DIRECT") {
-              // Counter account reassignment is not supported on an
-              // already-posted line - identical to the simple-edit
-              // PATCH's own DIRECT branch.
-              finalCounterAccountId = existing.accountId;
-              finalSourceId = null;
-              finalSourceNumber = null;
-            } else if (finalSourceType === "CHALLAN" || finalSourceType === "BILTY") {
-              const requestedId = line.sourceId?.trim() || undefined;
-              const effectiveSourceId =
-                requestedId || (finalSourceType === existing.sourceType ? existing.sourceId || undefined : undefined);
-              if (!effectiveSourceId) {
-                throw new DailyPostingValidationError(`Source ID is required for the document-linked line "${line.description}"`);
-              }
-              const documentUnchanged = finalSourceType === existing.sourceType && effectiveSourceId === existing.sourceId;
-              const resolved = await resolveDailyPostingLine({
-                tx,
-                mainAccountId,
-                mainCategory: mainAccount.category,
-                sourceType: finalSourceType,
-                sourceId: effectiveSourceId,
-                sourceNumber: line.sourceNumber,
-                counterAccountId: documentUnchanged ? existing.accountId : undefined,
-                direction: line.direction,
-              });
-              finalCounterAccountId = resolved.counterAccountId;
-              finalSourceId = resolved.sourceId;
-              finalSourceNumber = resolved.sourceNumber;
-            } else {
-              // PARTY / PHONCH / PRIVATE_PHONCH / BILL - free text,
-              // Counter Account not reassigned, identical to the
-              // simple-edit PATCH's own "else" branch.
-              finalCounterAccountId = existing.accountId;
-              finalSourceId = null;
-              finalSourceNumber = line.sourceNumber?.trim() || null;
-            }
+            const resolved = await resolveDailyPostingLine({
+              tx,
+              mainAccountId,
+              mainCategory: mainAccount.category,
+              sourceType: finalSourceType,
+              sourceId: line.sourceId,
+              sourceNumber: line.sourceNumber,
+              counterAccountId: line.counterAccountId,
+              direction: line.direction,
+            });
 
             resolvedLines.push({
               id: existing?.id || null,
-              counterAccountId: finalCounterAccountId,
+              counterAccountId: resolved.counterAccountId,
               description: line.description.trim(),
               amount: line.amount,
               direction: line.direction,
-              sourceType: finalSourceType,
-              sourceId: finalSourceId,
-              sourceNumber: finalSourceNumber,
+              sourceType: resolved.sourceType,
+              sourceId: resolved.sourceId,
+              sourceNumber: resolved.sourceNumber,
             });
           }
 
@@ -447,14 +408,24 @@ export async function PATCH(
             if (line.sourceType === "PRIVATE_PHONCH" && line.sourceId) {
               await assertPrivatePhonchPaymentNotExceeded(tx, line.sourceId, line.counterAccountId, line.amount, line.direction, entry.id);
             }
-            // PAYMENT ALLOCATION CEILING - an existing line being
-            // reduced below what is already allocated from it is
-            // rejected, exactly mirroring the simple-edit PATCH's own
-            // "Gap A" guard.
+            // PAYMENT ALLOCATION SAFETY - an existing line that
+            // already has a PaymentAllocation against it can neither
+            // be reduced below the allocated amount nor have its
+            // Counter Account changed, in either case because doing
+            // so would silently misrepresent which Party the
+            // allocation was actually made against - exactly mirroring
+            // the simple-edit PATCH's own "Gap A" guard, now extended
+            // to cover an account-change the simple-edit PATCH never
+            // allowed in the first place.
             if (line.id) {
               const existingLine = existingCounterLineById.get(line.id)!;
               if (existingLine.account.category === "PARTY") {
                 const allocated = await getAllocatedAmountForPayment(tx, line.id);
+                if (allocated > 0.009 && line.counterAccountId !== existingLine.accountId) {
+                  throw new DailyPostingValidationError(
+                    `Cannot change the Counter Account for "${line.description}" - Rs. ${allocated} has already been allocated from it to a Bilty/Challan. Remove or reduce the relevant allocation(s) first.`
+                  );
+                }
                 if (allocated > line.amount + 0.009) {
                   throw new DailyPostingValidationError(
                     `Cannot reduce "${line.description}" to ${line.amount} - ${allocated} has already been allocated from it to a Bilty/Challan. Remove or reduce the relevant allocation(s) first.`

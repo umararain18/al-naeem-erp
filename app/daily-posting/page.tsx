@@ -369,23 +369,23 @@ function formatMoney(value: number) {
 // SHARED ROW FIELDS - Counter Account / Document Type / Document No. /
 // Description / Direction / Amount - the EXACT SAME cells, rendered
 // identically for a brand-new line (New Transactions) and an existing
-// posted line being edited (Existing Transactions). `locked` is the
-// ONLY behavioral difference: an existing row's Counter Account
-// cannot be freely reassigned except through changing its linked
-// document (see Area 8) - a brand-new line has no such restriction.
+// posted line being edited (Existing Transactions). Counter Account is
+// never locked here for either case - the server independently
+// re-validates whatever is submitted (document legitimacy, active
+// account, PARTY<->CASH/BANK restriction, PaymentAllocation safety)
+// and rejects an illegitimate change with a clear message rather than
+// the UI trying to predict every rule client-side.
 // ============================================================
 function LineFieldsCells({
   line,
   accounts,
   mainAccountId,
-  locked = false,
   onUpdate,
   onEligibleParties,
 }: {
   line: PostingLine;
   accounts: Account[];
   mainAccountId: string;
-  locked?: boolean;
   onUpdate: (field: keyof PostingLine, value: string) => void;
   onEligibleParties: (parties: EligibleParty[]) => void;
 }) {
@@ -447,51 +447,38 @@ function LineFieldsCells({
   return (
     <>
       <td className="px-4 py-4">
-        {locked && !isDocumentType ? (
-          <div>
-            <p className="rounded-lg border bg-gray-50 px-3 py-2 text-sm text-gray-700">
-              {line.resolvedPartyLabel || "—"}
-            </p>
-            <p className="mt-1 text-xs text-gray-500">
-              Counter Account reassignment is not supported when editing a posted transaction.
-            </p>
-          </div>
-        ) : (
-          <>
-            <SearchableSelect
-              value={line.counterAccountId}
-              options={options}
-              placeholder={placeholder}
-              onChange={(value) => {
-                onUpdate("counterAccountId", value);
-                const eligibleMatch = line.eligibleParties.find(
-                  (party) => party.accountId === value
-                );
-                onUpdate("resolvedPartyLabel", eligibleMatch ? eligibleMatch.partyName : "");
-              }}
-              className="w-72"
-            />
-            {isDocumentType && line.sourceId && line.resolvedPartyLabel && (
-              <p className="mt-1 text-xs text-green-600">
-                Resolved Party: {line.resolvedPartyLabel}
-              </p>
-            )}
-            {isAmbiguousChallan && (
-              <p className="mt-1 text-xs text-blue-600">
-                Multiple eligible {eligibleLabel} parties found - select the correct one above.
-              </p>
-            )}
-            {isDocumentType &&
-              line.sourceId &&
-              !line.resolvedPartyLabel &&
-              !line.counterAccountId &&
-              !isAmbiguousChallan && (
-                <p className="mt-1 text-xs text-amber-600">
-                  No party could be auto-resolved - please select a Counter Account.
-                </p>
-              )}
-          </>
+        <SearchableSelect
+          value={line.counterAccountId}
+          options={options}
+          placeholder={placeholder}
+          onChange={(value) => {
+            onUpdate("counterAccountId", value);
+            const eligibleMatch = line.eligibleParties.find(
+              (party) => party.accountId === value
+            );
+            onUpdate("resolvedPartyLabel", eligibleMatch ? eligibleMatch.partyName : "");
+          }}
+          className="w-72"
+        />
+        {isDocumentType && line.sourceId && line.resolvedPartyLabel && (
+          <p className="mt-1 text-xs text-green-600">
+            Resolved Party: {line.resolvedPartyLabel}
+          </p>
         )}
+        {isAmbiguousChallan && (
+          <p className="mt-1 text-xs text-blue-600">
+            Multiple eligible {eligibleLabel} parties found - select the correct one above.
+          </p>
+        )}
+        {isDocumentType &&
+          line.sourceId &&
+          !line.resolvedPartyLabel &&
+          !line.counterAccountId &&
+          !isAmbiguousChallan && (
+            <p className="mt-1 text-xs text-amber-600">
+              No party could be auto-resolved - please select a Counter Account.
+            </p>
+          )}
       </td>
 
       <td className="px-4 py-4">
@@ -1490,7 +1477,6 @@ export default function DailyPostingPage() {
                                   line={line}
                                   accounts={accounts}
                                   mainAccountId={row.mainAccountId || ""}
-                                  locked={!!line.journalLineId}
                                   onUpdate={(field, value) => updateDraftLine(row.journalEntryId, lineIndex, field, value)}
                                   onEligibleParties={(parties) => setDraftEligibleParties(row.journalEntryId, lineIndex, parties)}
                                 />
