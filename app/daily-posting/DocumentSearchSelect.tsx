@@ -130,7 +130,16 @@ export function DocumentSearchSelect({
         const match = (data.results || []).find(
           (r: DocumentSearchResult) => r.type === sourceType && r.id === sourceId
         );
-        if (match) onSelect(match);
+        // Only overwrite the Counter Account/eligible-party state when
+        // this re-resolution actually found something for the new
+        // direction - a null result here means nothing could be
+        // auto-resolved for this (unchanged) document, which must
+        // leave whatever Counter Account is already set (e.g. an
+        // already-posted line's own saved value, or a value the user
+        // manually picked) untouched rather than silently clearing it.
+        if (match && (match.resolvedParty || (match.eligibleParties && match.eligibleParties.length > 0))) {
+          onSelect(match);
+        }
       } catch {
         // silent - identical failure handling to the search above.
       }

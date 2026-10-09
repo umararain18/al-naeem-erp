@@ -420,7 +420,7 @@ export default function CashBookPage() {
    */
   function openDailyPostingRegister(entry: CashBookEntry) {
     const params = new URLSearchParams({ date: entry.date, highlight: entry.journalEntryId });
-    router.push(`/daily-posting/register?${params.toString()}`);
+    router.push(`/daily-posting?${params.toString()}`);
   }
 
   async function handleDelete(entry: CashBookEntry) {

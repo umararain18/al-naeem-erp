@@ -422,11 +422,11 @@ export default function OutstandingView({ partyId, lang }: { partyId: string; la
                                     <td className="px-3 py-2 text-right">{d.credit > 0 ? formatCurrency(d.credit) : "—"}</td>
                                     <td className="px-3 py-2 text-right">
                                       <Link
-                                        href={`/daily-posting/register?date=${documentDateKey(d.date)}&highlight=${d.journalEntryId}`}
+                                        href={`/daily-posting?date=${documentDateKey(d.date)}&highlight=${d.journalEntryId}`}
                                         target="_blank"
                                         className="text-blue-600 hover:underline"
                                       >
-                                        View in Register →
+                                        View in Daily Posting →
                                       </Link>
                                     </td>
                                   </tr>
