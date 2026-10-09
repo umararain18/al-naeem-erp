@@ -23,10 +23,18 @@ type Tx = PrismaClient | Prisma.TransactionClient;
 // risk misattributing money to the wrong Party Ledger.
 //
 // Resolution is intentionally conservative:
-//  - BILTY: prefer the established Settlement responsibility for
-//    that Bilty's own Collection component (reusing the same
-//    ledger lookup Settlement corrections already rely on);
-//    fall back to the Bilty's directly-assigned Clearing Agent.
+//  - BILTY: prefer the Paid component's own resolved destination (a
+//    real Paid-responsible Party, or the still-unclaimed Gross Bilty
+//    Receivable balance earmarked for Paid) - a plain Daily Posting
+//    receipt against a Bilty No. is that component's own primary
+//    recording mechanism. Only once nothing resolves for Paid does
+//    the Collection/To-Pay side's own destination apply: the
+//    established Settlement responsibility (reusing the same ledger
+//    lookup Settlement corrections already rely on) if a real payer
+//    exists, otherwise the still-unclaimed Gross Bilty Receivable
+//    balance earmarked for Collection - NEVER a guess at the
+//    Transporter/Clearing Agent merely because they are named on the
+//    Challan.
 //  - CHALLAN: prefer a single distinct PARTY account across the
 //    Challan's entire settlement (covers the common case where
 //    one party - e.g. the Clearing Agent - is responsible for
@@ -69,12 +77,6 @@ async function resolveBiltyParty(
   // chain, just no longer returning early so it can be combined with
   // the Paid-responsible side below (see the precedence rule there).
   let collectionResult: ResolvedDocumentParty | null = null;
-  // Tracks whether collectionResult (once set) represents an actual
-  // POSTED accounting fact (a real SettlementPayment row, or a real
-  // settled JournalLine) versus only the speculative, not-yet-posted
-  // direct Clearing Agent fallback below - see its use just before
-  // the final candidates check for why this distinction matters.
-  let collectionResultIsPosted = false;
 
   // Prefer the new multi-payer engine's own explicit rows (lib/
   // settlement-payments.ts) when this Bilty has any Collection
@@ -94,7 +96,6 @@ async function resolveBiltyParty(
         select: { party: { select: { partyName: true } } },
       });
       collectionResult = { accountId: payers[0].payerAccountId, partyName: account?.party?.partyName || "Party" };
-      collectionResultIsPosted = true;
     } else if (payers.length > 1) {
       // Several distinct payers already established for this Bilty's
       // Collection - which one a Daily Posting is really for cannot
@@ -129,7 +130,6 @@ async function resolveBiltyParty(
         });
 
         collectionResult = { accountId: partyAccountId, partyName: account?.party?.partyName || "Party" };
-        collectionResultIsPosted = true;
       }
     }
   }
@@ -143,7 +143,7 @@ async function resolveBiltyParty(
   // the Transporter/Clearing Agent merely because they are named on
   // the Challan. Until a real Settlement reclassification moves this
   // Bilty's Collection/To-Pay amount out of Gross Bilty Receivable
-  // into a real Party's account (the collectionResultIsPosted===true
+  // into a real Party's account (the two "payers"/"settled party"
   // branches above), the money is still genuinely sitting there - so
   // that is the correct Counter Account, RECEIPT (DEBIT) only, exactly
   // mirroring the Paid-side's own Gross candidate below. See
@@ -152,13 +152,12 @@ async function resolveBiltyParty(
   // ceiling check (assertPaidVerificationNotExceeded) re-enforces at
   // write time.
   //
-  // NOTE: this candidate is deliberately left with
-  // collectionResultIsPosted === false - it reflects where the money
-  // CURRENTLY sits, not a prediction of who will eventually be
-  // responsible, but it must still defer to a genuinely-established,
-  // different candidate below that represents a separate, non-
-  // overlapping amount of the same Bilty (the still-unclaimed Paid
-  // slice vs. this Bilty's own outstanding To-Pay).
+  // NOTE: whether this candidate (or the real posted payer above) is
+  // genuinely established, it must still defer to a genuinely-
+  // established, different candidate below that represents a
+  // separate, non-overlapping amount of the same Bilty (the Paid
+  // slice vs. this Bilty's own outstanding To-Pay) - see the
+  // precedence rule just below.
   if (!collectionResult && direction === "DEBIT") {
     const unclaimedForCollection = await getUnclaimedGrossBiltyReceivableAmountForCollection(prisma, biltyId);
     if (unclaimedForCollection > 0.01) {
@@ -185,18 +184,27 @@ async function resolveBiltyParty(
     grossReceivableResult = await resolveUnclaimedGrossBiltyReceivable(biltyId);
   }
 
-  // A speculative, not-yet-posted Collection candidate (the direct
-  // Clearing Agent fallback above) must never block a genuinely
-  // established candidate for a DIFFERENT component of the same
-  // Bilty - the Paid-responsible Party, or the genuinely unclaimed
-  // Gross Bilty Receivable balance. Both represent the Paid slice,
-  // which is economically separate from the (still merely predicted)
-  // outstanding To-Pay Collection responsibility - so there is no
-  // real conflict to guess between here, only two independent facts
-  // about two different amounts. `paidResult` and
+  // The Collection/To-Pay side's own resolved destination - whether a
+  // real posted settlement payer or the still-unclaimed-Gross
+  // prediction above - must NEVER block a genuinely established
+  // candidate for the Paid component: the Paid-responsible Party, or
+  // the genuinely unclaimed Gross Bilty Receivable balance
+  // specifically earmarked for Paid (capped at Bilty.advance). These
+  // represent two economically SEPARATE, non-overlapping slices of
+  // the same Bilty's total - a real, settled Collection payer
+  // existing for the To-Pay slice says nothing about where the Paid
+  // slice currently sits, so it is never a genuine conflict to
+  // resolve between, only two independent facts about two different
+  // amounts. A plain "select this Bilty No. and record a receipt" in
+  // Daily Posting is the Paid component's own primary recording
+  // mechanism (the Collection/To-Pay side has its own dedicated
+  // Settlement Payment flow - lib/settlement-payments.ts), so the
+  // Paid-side candidate always wins here when it exists, regardless
+  // of whether the Collection side is a real posted payer or merely
+  // the still-unclaimed-Gross prediction. `paidResult` and
   // `grossReceivableResult` can never both be set (the latter is
   // gated on `!paidResult` above), so at most one of them is present.
-  if (collectionResult && !collectionResultIsPosted && (paidResult || grossReceivableResult)) {
+  if (collectionResult && (paidResult || grossReceivableResult)) {
     return paidResult || grossReceivableResult;
   }
 
