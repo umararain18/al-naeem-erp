@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { DocumentSearchSelect } from "./DocumentSearchSelect";
 import { SearchableSelect, sourceOptions } from "./SearchableSelect";
 import { toBusinessDateInputValue } from "@/lib/date-range";
@@ -220,111 +220,140 @@ function partyLabel(account: ExistingAccount): string {
   return account.party?.partyName || account.accountName;
 }
 
+// ONE counter (Party/other) JournalLine of a Daily Posting
+// JournalEntry - a genuinely multi-line entry has N of these sharing
+// one Main (Cash/Bank) leg. Debit/credit are kept as the line's own
+// stored values (never translated into the "direction relative to
+// Main Account" convention here) so read-only display always matches
+// the ledger exactly; that translation only happens once, in
+// startEdit(), when building an editable draft line.
+type ExistingCounterLine = {
+  id: string; // the real JournalLine id - the PATCH target / PaymentAllocation anchor
+  counterAccountId: string;
+  counterLabel: string;
+  description: string;
+  debit: number;
+  credit: number;
+  sourceType: string;
+  sourceId: string | null;
+  sourceNumber: string;
+};
+
 // ONE row = ONE Daily Posting JournalEntry (one logical transaction),
-// built from its Main (Cash/Bank) leg + Counter (Party) leg - never
-// one row per JournalLine.
+// built from its Main (Cash/Bank) leg(s) + its own N counter lines -
+// never one row per JournalLine.
 type ExistingRow = {
   journalEntryId: string;
   sortKey: number; // entryDate ms, for oldest->newest ordering
-  document: string; // business-readable, for DISPLAY ONLY
-  documentRaw: string; // authoritative JournalLine.sourceType - the ONLY value ever sent to PATCH
-  documentNo: string;
-  sourceId: string | null; // authoritative JournalLine.sourceId
-  mainAccountId: string; // Main Cash/Bank account id - fixed, never reassigned (see Area 8)
+  mainAccountId: string | null; // null only for a structurally unsupported entry (see below)
   mainAccountName: string;
-  counterAccountId: string | null; // Counter account id - display only (see Area 8)
-  counterLabel: string; // Counter account/party display name
-  description: string;
-  mainDebit: number; // the MAIN account leg's own debit
-  mainCredit: number; // the MAIN account leg's own credit
+  mainLineId: string | null; // one of the entry's own Main Cash/Bank JournalLine ids - the Bin-eligibility lookup key
+  anyLineId: string; // ANY line id belonging to this entry - the DELETE (Bin) target, works regardless of structure
+  counterLines: ExistingCounterLine[];
+  mainDebit: number; // the Main account leg(s)' combined debit
+  mainCredit: number; // the Main account leg(s)' combined credit
   balance: number; // per (main) account running balance for THIS day only
-  cashBankLineId: string | null; // the entry's own Cash/Bank leg id - the PATCH/DELETE target
-  isComplex: boolean; // true when the entry isn't a clean 1 Cash/Bank + 1 counter pair
   canEdit: boolean;
   canMoveToBin: boolean;
   binProtectedReason: string | null;
   editBlockedReason: string | null;
 };
 
-// Combines ONE Daily Posting JournalEntry's lines into ONE row. The
-// common, expected shape is exactly 2 lines: one Cash/Bank leg and one
-// counter leg. A structurally different entry still yields exactly
-// ONE row, with reduced detail and Edit/Bin disabled.
+// Combines ONE Daily Posting JournalEntry's lines into ONE row,
+// carrying its complete set of counter lines. A Daily Posting entry
+// always shares exactly ONE Main (Cash/Bank) account across every one
+// of its own "main leg" lines (see buildLinePair() in
+// app/api/daily-posting/route.ts); a structurally different entry -
+// zero or more-than-one distinct Cash/Bank accounts, or no counter
+// lines at all - is something Daily Posting's own create flow never
+// actually produces. Such an entry still yields exactly ONE row, with
+// Edit/Bin both disabled (there is no safe, authoritative way to
+// resolve Bin eligibility for a line outside any Cash/Bank account).
 function buildExistingRow(entry: ExistingJournalEntry): ExistingRow {
   const cbLines = entry.lines.filter((l) => isCashOrBank(l.account));
-  const counterLines = entry.lines.filter((l) => !isCashOrBank(l.account));
+  const counterRaw = entry.lines.filter((l) => !isCashOrBank(l.account));
   const sortKey = new Date(entry.entryDate).getTime();
-  const clean = entry.lines.length === 2 && cbLines.length === 1 && counterLines.length === 1;
+  const distinctMainIds = [...new Set(cbLines.map((l) => l.account.id))];
+  const anyLineId = entry.lines[0]?.id || entry.id;
 
-  if (clean) {
-    const main = cbLines[0];
-    const counter = counterLines[0];
+  if (distinctMainIds.length !== 1 || counterRaw.length === 0) {
+    const accountNames = [...new Set(entry.lines.map((l) => l.account.accountName))];
+    const debit = entry.lines.reduce((s, l) => s + Number(l.debit), 0);
+    const credit = entry.lines.reduce((s, l) => s + Number(l.credit), 0);
+    const reason =
+      distinctMainIds.length === 0
+        ? "No Cash/Bank leg on this entry."
+        : distinctMainIds.length > 1
+        ? "Multiple Cash/Bank legs on this entry."
+        : "This entry has no counter lines.";
+
     return {
       journalEntryId: entry.id,
       sortKey,
-      document: formatDocument(main.sourceType),
-      documentRaw: main.sourceType || "DIRECT",
-      documentNo: main.sourceNumber || "",
-      sourceId: main.sourceId,
-      mainAccountId: main.account.id,
-      mainAccountName: main.account.accountName,
-      counterAccountId: counter.account.id,
-      counterLabel: partyLabel(counter.account),
-      description: main.description || entry.description || "",
-      mainDebit: Number(main.debit),
-      mainCredit: Number(main.credit),
+      mainAccountId: null,
+      mainAccountName: accountNames.join(", ") || "—",
+      mainLineId: null,
+      anyLineId,
+      counterLines: [],
+      mainDebit: debit,
+      mainCredit: credit,
       balance: 0,
-      cashBankLineId: main.id,
-      isComplex: false,
-      canEdit: false, // set by caller once capabilities are known
+      canEdit: false,
       canMoveToBin: false,
-      binProtectedReason: null,
-      editBlockedReason: null,
+      binProtectedReason: reason,
+      editBlockedReason: reason,
     };
   }
 
-  // Complex/unusual shape - still exactly ONE row, degraded detail,
-  // never guessed, never actionable.
-  const mainLines = cbLines.length > 0 ? cbLines : entry.lines;
-  const accountNames = [...new Set(mainLines.map((l) => l.account.accountName))];
-  const partyNames = [...new Set((counterLines.length > 0 ? counterLines : entry.lines.filter((l) => !mainLines.includes(l))).map((l) => partyLabel(l.account)))];
-  const debit = mainLines.reduce((s, l) => s + Number(l.debit), 0);
-  const credit = mainLines.reduce((s, l) => s + Number(l.credit), 0);
-  const reason = cbLines.length === 0 ? "No Cash/Bank leg on this entry." : cbLines.length > 1 ? "Multiple Cash/Bank legs on this entry." : "Multi-line entry.";
+  const mainAccount = cbLines[0].account;
+  const mainDebit = cbLines.reduce((s, l) => s + Number(l.debit), 0);
+  const mainCredit = cbLines.reduce((s, l) => s + Number(l.credit), 0);
+
+  const counterLines: ExistingCounterLine[] = counterRaw.map((l) => ({
+    id: l.id,
+    counterAccountId: l.account.id,
+    counterLabel: partyLabel(l.account),
+    description: l.description || entry.description || "",
+    debit: Number(l.debit),
+    credit: Number(l.credit),
+    sourceType: l.sourceType || "DIRECT",
+    sourceId: l.sourceId,
+    sourceNumber: l.sourceNumber || "",
+  }));
 
   return {
     journalEntryId: entry.id,
     sortKey,
-    document: formatDocument(mainLines[0]?.sourceType ?? null),
-    documentRaw: mainLines[0]?.sourceType || "DIRECT",
-    documentNo: mainLines[0]?.sourceNumber || "",
-    sourceId: mainLines[0]?.sourceId || null,
-    mainAccountId: mainLines[0]?.account.id || entry.id,
-    mainAccountName: accountNames.join(", ") || "—",
-    counterAccountId: null,
-    counterLabel: partyNames.join(", ") || "—",
-    description: entry.description || mainLines[0]?.description || "",
-    mainDebit: debit,
-    mainCredit: credit,
+    mainAccountId: mainAccount.id,
+    mainAccountName: mainAccount.accountName,
+    mainLineId: cbLines[0].id,
+    anyLineId: cbLines[0].id,
+    counterLines,
+    mainDebit,
+    mainCredit,
     balance: 0,
-    cashBankLineId: null,
-    isComplex: true,
-    canEdit: false,
+    canEdit: false, // set by caller once capabilities are known
     canMoveToBin: false,
-    binProtectedReason: reason,
-    editBlockedReason: reason,
+    binProtectedReason: null,
+    editBlockedReason: null,
   };
 }
 
-// A row currently in inline-edit mode carries its own draft, shaped
-// EXACTLY like a New Transaction's PostingLine (plus its own Date,
-// which New Transactions share as one page-level field but an
-// existing posted row edits independently, exactly like the former
-// edit modal already allowed) - so the SAME field components/update
-// functions render both, via <LineFieldsCells> below.
+// An editable counter line - EXACTLY a PostingLine (so the SAME
+// <LineFieldsCells> renders it) plus `journalLineId`: the real,
+// existing JournalLine id when this line already existed on the
+// entry, or null for a line the user just added in edit mode (sent to
+// PATCH /api/daily-posting/[id] as a brand-new counter line).
+type EditableLine = PostingLine & { journalLineId: string | null };
+
+// A transaction currently in inline-edit mode carries its own draft:
+// its own Date (New Transactions share one page-level date, but an
+// existing posted entry edits independently, exactly like the former
+// edit modal already allowed) plus the COMPLETE set of its counter
+// lines, each editable, addable, and removable independently.
 type ExistingDraft = {
   date: string;
-  line: PostingLine;
+  lines: EditableLine[];
   saving: boolean;
   error: string;
 };
@@ -677,8 +706,8 @@ export default function DailyPostingPage() {
 
       const built = entries.map(buildExistingRow);
       for (const row of built) {
-        if (row.isComplex || !row.cashBankLineId) continue;
-        const eligibility = eligibilityByLineId.get(row.cashBankLineId);
+        if (!row.mainLineId) continue;
+        const eligibility = eligibilityByLineId.get(row.mainLineId);
         row.canEdit = capabilities.canEdit;
         row.canMoveToBin = capabilities.canMoveToBin && !!eligibility?.canMoveToBin;
         row.binProtectedReason = eligibility?.binProtectedReason ?? null;
@@ -688,6 +717,7 @@ export default function DailyPostingPage() {
       built.sort((a, b) => a.sortKey - b.sortKey || a.journalEntryId.localeCompare(b.journalEntryId));
       const runningByAccount = new Map<string, number>();
       for (const row of built) {
+        if (!row.mainAccountId) continue;
         const prev = runningByAccount.get(row.mainAccountId) || 0;
         const next = prev + row.mainDebit - row.mainCredit;
         runningByAccount.set(row.mainAccountId, next);
@@ -900,24 +930,30 @@ export default function DailyPostingPage() {
   // ---- Existing Transactions: inline edit/delete ----
 
   function startEdit(row: ExistingRow) {
-    if (!row.cashBankLineId || !row.canEdit) return;
+    if (!row.mainAccountId || !row.canEdit || row.counterLines.length === 0) return;
     setEditingIds((prev) => new Set(prev).add(row.journalEntryId));
     setDrafts((prev) => {
       const next = new Map(prev);
       next.set(row.journalEntryId, {
         date: postingDate,
-        line: {
-          id: row.journalEntryId,
-          counterAccountId: row.counterAccountId || "",
-          description: row.description,
-          amount: String(row.mainDebit > 0 ? row.mainDebit : row.mainCredit),
-          direction: row.mainDebit > 0 ? "DEBIT" : "CREDIT",
-          sourceType: row.documentRaw,
-          sourceId: row.sourceId || "",
-          sourceNumber: row.documentNo,
-          resolvedPartyLabel: row.counterLabel,
+        lines: row.counterLines.map((cl) => ({
+          id: crypto.randomUUID(),
+          journalLineId: cl.id,
+          counterAccountId: cl.counterAccountId,
+          description: cl.description,
+          // A counter line's OWN debit/credit are the opposite sense
+          // of "direction relative to the Main account" (see
+          // buildLinePair() in app/api/daily-posting/route.ts:
+          // counterDebit = direction==='CREDIT'?amount:0) - so a
+          // counter line with debit>0 means direction===CREDIT.
+          amount: String(cl.debit > 0 ? cl.debit : cl.credit),
+          direction: cl.debit > 0 ? "CREDIT" : "DEBIT",
+          sourceType: cl.sourceType,
+          sourceId: cl.sourceId || "",
+          sourceNumber: cl.sourceNumber,
+          resolvedPartyLabel: cl.counterLabel,
           eligibleParties: [],
-        },
+        })),
         saving: false,
         error: "",
       });
@@ -938,12 +974,15 @@ export default function DailyPostingPage() {
     });
   }
 
-  function updateDraftLine(journalEntryId: string, field: keyof PostingLine, value: string) {
+  function updateDraftLine(journalEntryId: string, lineIndex: number, field: keyof PostingLine, value: string) {
     setDrafts((prev) => {
       const current = prev.get(journalEntryId);
       if (!current) return prev;
       const next = new Map(prev);
-      next.set(journalEntryId, { ...current, line: { ...current.line, [field]: value } });
+      next.set(journalEntryId, {
+        ...current,
+        lines: current.lines.map((line, idx) => (idx === lineIndex ? { ...line, [field]: value } : line)),
+      });
       return next;
     });
   }
@@ -958,28 +997,62 @@ export default function DailyPostingPage() {
     });
   }
 
-  function setDraftEligibleParties(journalEntryId: string, parties: EligibleParty[]) {
+  function setDraftEligibleParties(journalEntryId: string, lineIndex: number, parties: EligibleParty[]) {
     setDrafts((prev) => {
       const current = prev.get(journalEntryId);
       if (!current) return prev;
       const next = new Map(prev);
-      next.set(journalEntryId, { ...current, line: { ...current.line, eligibleParties: parties } });
+      next.set(journalEntryId, {
+        ...current,
+        lines: current.lines.map((line, idx) => (idx === lineIndex ? { ...line, eligibleParties: parties } : line)),
+      });
+      return next;
+    });
+  }
+
+  // Scoped entirely to ONE transaction's own draft - mirrors the New
+  // Transactions form's own addLine()/removeLine(), just keyed by
+  // journalEntryId instead of being page-global.
+  function addDraftLine(journalEntryId: string) {
+    setDrafts((prev) => {
+      const current = prev.get(journalEntryId);
+      if (!current) return prev;
+      const next = new Map(prev);
+      next.set(journalEntryId, {
+        ...current,
+        lines: [...current.lines, { ...createLine(), journalLineId: null }],
+      });
+      return next;
+    });
+  }
+
+  function removeDraftLine(journalEntryId: string, lineIndex: number) {
+    setDrafts((prev) => {
+      const current = prev.get(journalEntryId);
+      if (!current || current.lines.length === 1) return prev;
+      const next = new Map(prev);
+      next.set(journalEntryId, {
+        ...current,
+        lines: current.lines.filter((_, idx) => idx !== lineIndex),
+      });
       return next;
     });
   }
 
   async function saveEdit(row: ExistingRow) {
     const draft = drafts.get(row.journalEntryId);
-    if (!draft || !row.cashBankLineId) return;
+    if (!draft) return;
 
-    const lineError = validatePostingLine(draft.line, accounts);
-    if (lineError) {
-      setDrafts((prev) => {
-        const next = new Map(prev);
-        next.set(row.journalEntryId, { ...draft, error: lineError });
-        return next;
-      });
-      return;
+    for (const [index, line] of draft.lines.entries()) {
+      const lineError = validatePostingLine(line, accounts);
+      if (lineError) {
+        setDrafts((prev) => {
+          const next = new Map(prev);
+          next.set(row.journalEntryId, { ...draft, error: `${lineError} (line ${index + 1})` });
+          return next;
+        });
+        return;
+      }
     }
 
     setDrafts((prev) => {
@@ -989,18 +1062,30 @@ export default function DailyPostingPage() {
     });
 
     try {
-      const amount = Number(draft.line.amount);
-      const response = await fetch(`/api/cash-book/${row.cashBankLineId}`, {
+      // PATCH /api/daily-posting/[id] - the dedicated multi-line edit
+      // endpoint. Unlike the simple 2-line PATCH /api/cash-book/[id]
+      // (still used by Cash Book's own editing, untouched), this
+      // accepts the COMPLETE set of counter lines and edits the entry
+      // atomically: an existing line (journalLineId present) is
+      // updated in place, preserving its id and any PaymentAllocation
+      // against it; a line added here (journalLineId null) is created
+      // fresh; a line removed from this draft is deleted server-side
+      // only after confirming it carries no PaymentAllocation.
+      const response = await fetch(`/api/daily-posting/${row.journalEntryId}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           date: draft.date,
-          document: draft.line.sourceType,
-          documentNo: draft.line.sourceNumber,
-          sourceId: draft.line.sourceId,
-          description: draft.line.description,
-          debit: draft.line.direction === "DEBIT" ? amount : 0,
-          credit: draft.line.direction === "CREDIT" ? amount : 0,
+          lines: draft.lines.map((line) => ({
+            id: line.journalLineId || undefined,
+            counterAccountId: line.counterAccountId || undefined,
+            description: line.description.trim(),
+            amount: Number(line.amount),
+            direction: line.direction,
+            sourceType: line.sourceType,
+            sourceId: line.sourceId.trim() || undefined,
+            sourceNumber: line.sourceNumber.trim() || undefined,
+          })),
         }),
       });
       const data = await response.json();
@@ -1027,14 +1112,18 @@ export default function DailyPostingPage() {
   }
 
   async function handleDeleteExisting(row: ExistingRow) {
-    if (!row.cashBankLineId) return;
     const confirmed = window.confirm(
       "Move this complete Journal Entry to Bin?\n\nAll of its journal lines will be excluded from normal accounting. This is not permanent deletion."
     );
     if (!confirmed) return;
     try {
       setExistingError("");
-      const response = await fetch(`/api/cash-book/${row.cashBankLineId}`, { method: "DELETE" });
+      // DELETE /api/cash-book/[id] resolves the WHOLE JournalEntry
+      // from whichever line id it's given (via that line's own
+      // journalEntryId) and bins every one of its lines regardless of
+      // how many there are - any line id on this entry is a valid
+      // target, not specifically a Cash/Bank one.
+      const response = await fetch(`/api/cash-book/${row.anyLineId}`, { method: "DELETE" });
       const data = await response.json();
       if (!response.ok || !data.success) {
         throw new Error(data.message || "Unable to move transaction to Bin.");
@@ -1275,128 +1364,178 @@ export default function DailyPostingPage() {
           ) : existingRows.length === 0 ? (
             <div className="px-6 py-12 text-center text-sm text-gray-500">No Daily Posting transactions for this date.</div>
           ) : (
-            <div className="overflow-x-auto">
-              <table className="min-w-[1250px] w-full text-sm">
-                <thead className="bg-gray-50 text-left text-xs font-semibold uppercase text-gray-500">
-                  <tr>
-                    <th className="px-4 py-3">#</th>
-                    <th className="px-4 py-3">Main Account</th>
-                    <th className="px-4 py-3">Counter Account</th>
-                    <th className="px-4 py-3">Document</th>
-                    <th className="px-4 py-3">Document No.</th>
-                    <th className="px-4 py-3">Description</th>
-                    <th className="px-4 py-3 text-right">Debit</th>
-                    <th className="px-4 py-3 text-right">Credit</th>
-                    <th className="px-4 py-3">Action</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y">
-                  {[...existingRows].reverse().map((row, index) => {
-                    const isEditing = editingIds.has(row.journalEntryId);
-                    const draft = drafts.get(row.journalEntryId);
-                    const isHighlighted = !!highlightId && row.journalEntryId === highlightId;
+            <div className="divide-y">
+              {[...existingRows].reverse().map((row, index) => {
+                const isEditing = editingIds.has(row.journalEntryId);
+                const draft = drafts.get(row.journalEntryId);
+                const isHighlighted = !!highlightId && row.journalEntryId === highlightId;
+                const transactionNo = existingRows.length - index;
 
-                    if (isEditing && draft) {
-                      return (
-                        <Fragment key={row.journalEntryId}>
-                          <tr className="bg-blue-50/40">
-                            <td className="px-4 py-4 text-sm text-gray-500">{index + 1}</td>
-                            <td className="px-4 py-4">
-                              <p className="rounded-lg border bg-gray-50 px-3 py-2 text-sm text-gray-700">{row.mainAccountName}</p>
-                              <p className="mt-1 text-xs text-gray-500">Main Account cannot be reassigned.</p>
-                              <div className="mt-2">
-                                <label className="mb-1 block text-xs font-medium text-gray-600">Date</label>
-                                <input
-                                  type="date"
-                                  value={draft.date}
-                                  onChange={(e) => updateDraftDate(row.journalEntryId, e.target.value)}
-                                  className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
-                                />
-                              </div>
-                            </td>
+                return (
+                  <div key={row.journalEntryId} className={`px-6 py-5 ${isHighlighted ? "bg-yellow-50" : ""}`}>
+                    {/* TRANSACTION HEADER */}
+                    <div className="flex flex-wrap items-start justify-between gap-4">
+                      <div>
+                        <p className="text-xs font-semibold uppercase text-gray-500">
+                          Transaction #{transactionNo}
+                          {row.counterLines.length > 1 && (
+                            <span className="ml-2 rounded-full bg-blue-100 px-2 py-0.5 text-blue-700">
+                              {row.counterLines.length} lines
+                            </span>
+                          )}
+                        </p>
+                        <p className="text-base font-semibold text-gray-900">{row.mainAccountName}</p>
 
-                            <LineFieldsCells
-                              line={draft.line}
-                              accounts={accounts}
-                              mainAccountId={row.mainAccountId}
-                              locked
-                              onUpdate={(field, value) => updateDraftLine(row.journalEntryId, field, value)}
-                              onEligibleParties={(parties) => setDraftEligibleParties(row.journalEntryId, parties)}
+                        {isEditing && draft ? (
+                          <div className="mt-2 flex items-center gap-2">
+                            <label className="text-xs font-medium text-gray-600">Date</label>
+                            <input
+                              type="date"
+                              value={draft.date}
+                              onChange={(e) => updateDraftDate(row.journalEntryId, e.target.value)}
+                              className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm outline-none focus:border-blue-500"
                             />
-
-                            <td className="px-4 py-4">
-                              <div className="flex flex-col gap-2">
-                                {draft.error && <p className="text-xs text-red-600">{draft.error}</p>}
-                                <div className="flex gap-2">
-                                  <button
-                                    type="button"
-                                    onClick={() => saveEdit(row)}
-                                    disabled={draft.saving}
-                                    className="rounded-md bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
-                                  >
-                                    {draft.saving ? "Saving..." : "Save"}
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => cancelEdit(row.journalEntryId)}
-                                    disabled={draft.saving}
-                                    className="rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-gray-50 disabled:opacity-50"
-                                  >
-                                    Cancel
-                                  </button>
-                                </div>
-                              </div>
-                            </td>
-                          </tr>
-                        </Fragment>
-                      );
-                    }
-
-                    return (
-                      <tr key={row.journalEntryId} className={isHighlighted ? "bg-yellow-50" : "hover:bg-gray-50"}>
-                        <td className="px-4 py-4 text-gray-500">{index + 1}</td>
-                        <td className="px-4 py-4 font-medium text-gray-900">{row.mainAccountName}</td>
-                        <td className="px-4 py-4 text-gray-900">{row.counterLabel}</td>
-                        <td className="px-4 py-4 text-gray-900">{row.document}</td>
-                        <td className="px-4 py-4 text-gray-600">{row.documentNo || "—"}</td>
-                        <td className="px-4 py-4 text-gray-600">{row.description || "—"}</td>
-                        <td className="px-4 py-4 text-right">{row.mainDebit > 0 ? `Rs. ${formatMoney(row.mainDebit)}` : "—"}</td>
-                        <td className="px-4 py-4 text-right">{row.mainCredit > 0 ? `Rs. ${formatMoney(row.mainCredit)}` : "—"}</td>
-                        <td className="px-4 py-4">
-                          <div className="flex flex-wrap gap-2">
-                            {row.canEdit ? (
-                              <button
-                                type="button"
-                                onClick={() => startEdit(row)}
-                                className="rounded-md border border-blue-200 px-3 py-1.5 text-xs font-medium text-blue-600 hover:bg-blue-50"
-                              >
-                                Edit
-                              </button>
-                            ) : row.editBlockedReason ? (
-                              <span className="px-1 py-1.5 text-xs text-gray-500" title={row.editBlockedReason}>
-                                {row.editBlockedReason}
-                              </span>
-                            ) : null}
-                            {row.canMoveToBin ? (
-                              <button
-                                type="button"
-                                onClick={() => handleDeleteExisting(row)}
-                                className="rounded-md border border-red-200 px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50"
-                              >
-                                Delete
-                              </button>
-                            ) : row.binProtectedReason ? (
-                              <span className="px-1 py-1.5 text-xs text-gray-500" title={row.binProtectedReason}>
-                                {row.binProtectedReason}
-                              </span>
-                            ) : null}
+                            <span className="text-xs text-gray-500">Main Account cannot be reassigned.</span>
                           </div>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+                        ) : null}
+                      </div>
+
+                      <div className="flex items-center gap-4">
+                        <div className="text-right text-sm">
+                          <p className="text-gray-500">
+                            Debit <span className="font-semibold text-gray-900">{row.mainDebit > 0 ? `Rs. ${formatMoney(row.mainDebit)}` : "—"}</span>
+                          </p>
+                          <p className="text-gray-500">
+                            Credit <span className="font-semibold text-gray-900">{row.mainCredit > 0 ? `Rs. ${formatMoney(row.mainCredit)}` : "—"}</span>
+                          </p>
+                        </div>
+
+                        <div className="flex flex-wrap gap-2">
+                          {isEditing && draft ? (
+                            <>
+                              <button
+                                type="button"
+                                onClick={() => saveEdit(row)}
+                                disabled={draft.saving}
+                                className="rounded-md bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
+                              >
+                                {draft.saving ? "Saving..." : "Save"}
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => cancelEdit(row.journalEntryId)}
+                                disabled={draft.saving}
+                                className="rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-gray-50 disabled:opacity-50"
+                              >
+                                Cancel
+                              </button>
+                            </>
+                          ) : (
+                            <>
+                              {row.canEdit ? (
+                                <button
+                                  type="button"
+                                  onClick={() => startEdit(row)}
+                                  className="rounded-md border border-blue-200 px-3 py-1.5 text-xs font-medium text-blue-600 hover:bg-blue-50"
+                                >
+                                  Edit
+                                </button>
+                              ) : row.editBlockedReason ? (
+                                <span className="px-1 py-1.5 text-xs text-gray-500" title={row.editBlockedReason}>
+                                  {row.editBlockedReason}
+                                </span>
+                              ) : null}
+                              {row.canMoveToBin ? (
+                                <button
+                                  type="button"
+                                  onClick={() => handleDeleteExisting(row)}
+                                  className="rounded-md border border-red-200 px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50"
+                                >
+                                  Delete
+                                </button>
+                              ) : row.binProtectedReason ? (
+                                <span className="px-1 py-1.5 text-xs text-gray-500" title={row.binProtectedReason}>
+                                  {row.binProtectedReason}
+                                </span>
+                              ) : null}
+                            </>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    {isEditing && draft?.error && (
+                      <p className="mt-2 text-xs text-red-600">{draft.error}</p>
+                    )}
+
+                    {/* COUNTER LINES */}
+                    <div className="mt-4 overflow-x-auto rounded-lg border">
+                      <table className="min-w-[1100px] w-full text-sm">
+                        <thead className="bg-gray-50 text-left text-xs font-semibold uppercase text-gray-500">
+                          <tr>
+                            <th className="px-4 py-2">Counter Account</th>
+                            <th className="px-4 py-2">Document</th>
+                            <th className="px-4 py-2">Document No.</th>
+                            <th className="px-4 py-2">Description</th>
+                            <th className="px-4 py-2 text-right">Debit</th>
+                            <th className="px-4 py-2 text-right">Credit</th>
+                            {isEditing && <th className="px-4 py-2">Action</th>}
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y">
+                          {isEditing && draft ? (
+                            draft.lines.map((line, lineIndex) => (
+                              <tr key={line.id}>
+                                <LineFieldsCells
+                                  line={line}
+                                  accounts={accounts}
+                                  mainAccountId={row.mainAccountId || ""}
+                                  locked={!!line.journalLineId}
+                                  onUpdate={(field, value) => updateDraftLine(row.journalEntryId, lineIndex, field, value)}
+                                  onEligibleParties={(parties) => setDraftEligibleParties(row.journalEntryId, lineIndex, parties)}
+                                />
+                                <td className="px-4 py-4">
+                                  <button
+                                    type="button"
+                                    onClick={() => removeDraftLine(row.journalEntryId, lineIndex)}
+                                    disabled={draft.lines.length === 1}
+                                    className="rounded-lg border border-red-200 px-3 py-2 text-xs text-red-600 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-40"
+                                  >
+                                    Remove
+                                  </button>
+                                </td>
+                              </tr>
+                            ))
+                          ) : (
+                            row.counterLines.map((cl) => (
+                              <tr key={cl.id}>
+                                <td className="px-4 py-3 text-gray-900">{cl.counterLabel}</td>
+                                <td className="px-4 py-3 text-gray-900">{formatDocument(cl.sourceType)}</td>
+                                <td className="px-4 py-3 text-gray-600">{cl.sourceNumber || "—"}</td>
+                                <td className="px-4 py-3 text-gray-600">{cl.description || "—"}</td>
+                                <td className="px-4 py-3 text-right text-gray-900">{cl.debit > 0 ? `Rs. ${formatMoney(cl.debit)}` : "—"}</td>
+                                <td className="px-4 py-3 text-right text-gray-900">{cl.credit > 0 ? `Rs. ${formatMoney(cl.credit)}` : "—"}</td>
+                              </tr>
+                            ))
+                          )}
+                        </tbody>
+                      </table>
+
+                      {isEditing && (
+                        <div className="border-t bg-gray-50 px-4 py-3">
+                          <button
+                            type="button"
+                            onClick={() => addDraftLine(row.journalEntryId)}
+                            className="rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700"
+                          >
+                            + Add Line
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
             </div>
           )}
 
