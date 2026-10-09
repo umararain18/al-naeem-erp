@@ -130,20 +130,49 @@ export async function getGrossCommissionPayableAccountId(tx: Tx): Promise<string
 // ============================================================
 
 // ============================================================
-// GROSS BILTY RECEIVABLE - GENUINELY UNCLAIMED PAID-SIDE BALANCE
+// GROSS BILTY RECEIVABLE - GENUINELY UNCLAIMED BALANCE
 //
 // Shared by lib/document-party-resolution.ts (resolving whether Gross
 // Bilty Receivable is an eligible auto-resolve/manual destination at
-// all) and lib/bilty-paid-verification.ts (capping how much a Daily
-// Posting receipt may claim through it) - a single source of truth so
-// the two can never disagree. Never more than Bilty.advance (the
-// Paid amount) - the To-Pay portion is Settlement's business alone,
-// per the LOCKED rule - and never more than what is actually still
-// sitting in the account for this specific Bilty
-// (JournalLine.sourceType="BILTY"/sourceId=biltyId), so it naturally
-// shrinks to 0 once a real receipt or reclassification consumes it.
+// all, for EITHER the Paid or the Collection/To-Pay component) and
+// lib/bilty-paid-verification.ts (capping how much a Daily Posting
+// receipt may claim through it) - a single source of truth so the
+// two can never disagree. Every variant below reads the exact same
+// underlying ledger fact - what is actually still sitting in the
+// account for this specific Bilty (JournalLine.sourceType="BILTY"/
+// sourceId=biltyId) - capped differently depending on which
+// component is asking, so it naturally shrinks to 0 once a real
+// receipt or Settlement reclassification consumes it.
 // ============================================================
 
+async function getGrossBiltyReceivableNetBalance(
+  tx: Tx,
+  biltyId: string,
+  excludeJournalEntryId?: string
+): Promise<number> {
+  const grossAccountId = await getGrossBiltyReceivableAccountId(tx);
+
+  const lines = await tx.journalLine.findMany({
+    where: {
+      accountId: grossAccountId,
+      sourceType: "BILTY",
+      sourceId: biltyId,
+      journalEntry: {
+        isDeleted: false,
+        ...(excludeJournalEntryId ? { id: { not: excludeJournalEntryId } } : {}),
+      },
+    },
+    select: { debit: true, credit: true },
+  });
+  return lines.reduce((sum, line) => sum + Number(line.debit) - Number(line.credit), 0);
+}
+
+// Never more than the Bilty's own Paid amount - a positive net here
+// before Settlement ever runs also includes the To-Pay portion, which
+// this specific getter must never admit (see
+// getUnclaimedGrossBiltyReceivableAmountForCollection() below for that
+// side). Used to decide whether Gross is a legitimate PAID-component
+// destination specifically.
 export async function getUnclaimedGrossBiltyReceivableAmount(
   tx: Tx,
   biltyId: string,
@@ -160,26 +189,60 @@ export async function getUnclaimedGrossBiltyReceivableAmount(
   const advance = Number(bilty.advance);
   if (advance <= 0) return 0;
 
-  const grossAccountId = await getGrossBiltyReceivableAccountId(tx);
-
-  const lines = await tx.journalLine.findMany({
-    where: {
-      accountId: grossAccountId,
-      sourceType: "BILTY",
-      sourceId: biltyId,
-      journalEntry: {
-        isDeleted: false,
-        ...(excludeJournalEntryId ? { id: { not: excludeJournalEntryId } } : {}),
-      },
-    },
-    select: { debit: true, credit: true },
-  });
-  const net = lines.reduce((sum, line) => sum + Number(line.debit) - Number(line.credit), 0);
-
-  // Never more than the Bilty's own Paid amount - a positive net here
-  // before Settlement ever runs also includes the To-Pay portion,
-  // which must never be claimed through this path.
+  const net = await getGrossBiltyReceivableNetBalance(tx, biltyId, excludeJournalEntryId);
   return Math.max(0, Math.min(advance, net));
+}
+
+// The Collection/To-Pay-side counterpart of the getter above - never
+// more than the Bilty's own To-Pay amount. Per the LOCKED rule traced
+// to app/api/bilty/route.ts's own booking entry ("Dr Gross Bilty
+// Receivable / Cr Booking Income" for the FULL total, before any
+// Party is known), the To-Pay/Collection portion sits in this exact
+// account until a real Settlement reclassification moves it to a
+// Party - so a receipt against the Bilty's Collection component is
+// just as legitimately claimable through Gross as a Paid-side one,
+// whenever no such reclassification has actually happened yet. Used
+// to decide whether Gross is a legitimate COLLECTION-component
+// destination specifically - deliberately never a guess at the
+// Transporter/Clearing Agent merely because they are named on the
+// Challan.
+export async function getUnclaimedGrossBiltyReceivableAmountForCollection(
+  tx: Tx,
+  biltyId: string,
+  excludeJournalEntryId?: string
+): Promise<number> {
+  const bilty = await tx.bilty.findUnique({ where: { id: biltyId }, select: { toPay: true } });
+  if (!bilty) return 0;
+
+  const toPay = Number(bilty.toPay);
+  if (toPay <= 0) return 0;
+
+  const net = await getGrossBiltyReceivableNetBalance(tx, biltyId, excludeJournalEntryId);
+  return Math.max(0, Math.min(toPay, net));
+}
+
+// The COMBINED ceiling used by the write-time safety check
+// (assertPaidVerificationNotExceeded in lib/bilty-paid-verification.ts):
+// a Daily Posting receipt credited to Gross Bilty Receivable may
+// represent EITHER the Paid or the Collection component (the write
+// path has no separate tag distinguishing which), so the only
+// ledger-correct limit is the Bilty's own full total, never more than
+// what is actually still sitting in the account. This is NOT more
+// permissive than the two capped getters above individually - it is
+// the same underlying net balance, just not pre-split by component,
+// since a single receipt amount cannot be definitively attributed to
+// one split or the other at write time.
+export async function getUnclaimedGrossBiltyReceivableTotalAmount(
+  tx: Tx,
+  biltyId: string,
+  excludeJournalEntryId?: string
+): Promise<number> {
+  const bilty = await tx.bilty.findUnique({ where: { id: biltyId }, select: { total: true } });
+  if (!bilty) return 0;
+
+  const total = Number(bilty.total);
+  const net = await getGrossBiltyReceivableNetBalance(tx, biltyId, excludeJournalEntryId);
+  return Math.max(0, Math.min(total, net));
 }
 
 export async function getShowroomDeliveryIncomeAccountId(tx: Tx): Promise<string> {
