@@ -480,13 +480,35 @@ export async function PATCH(
           // ----------------------------------------------------------
           const existingVehicleRows = await tx.privatePhonchVehicle.findMany({
             where: { phonchId: id },
-            select: { id: true, lineNo: true, billSourceLinks: { select: { id: true } } },
+            select: { id: true, lineNo: true, totalRent: true, deliveryCharges: true, billSourceLinks: { select: { id: true } } },
           });
           const billedLineNos = new Set(existingVehicleRows.filter((v) => v.billSourceLinks.length > 0).map((v) => v.lineNo));
           for (const lineNo of billedLineNos) {
-            if (!resolved.vehicles.some((v) => v.lineNo === lineNo)) {
+            const newVehicle = resolved.vehicles.find((v) => v.lineNo === lineNo);
+            if (!newVehicle) {
               throw new PrivatePhonchValidationError(
                 `Vehicle line ${lineNo} has already been billed and cannot be removed. Edit its other fields instead of removing it.`
+              );
+            }
+            // Bill Book auto-populates BillItem.rent/delivery from the
+            // source vehicle ONLY at the moment the Bill is created -
+            // from then on they are independently stored, raw inputs
+            // (see BillItem's own schema doc comment) that never
+            // re-sync with this vehicle. Changing Total Rent/Delivery
+            // Charges here after billing would silently leave the Bill
+            // showing stale figures with no way to tell - confirmed
+            // live (edited a billed vehicle's rent 6000 -> 8500, the
+            // linked Bill item stayed at 6000). Reject instead; Carrier
+            // Payable and Clearing Agent are Private-Phonch-only
+            // concepts BillItem has no field for at all, so they are
+            // never blocked here.
+            const existingRow = existingVehicleRows.find((ev) => ev.lineNo === lineNo)!;
+            if (
+              Math.abs(Number(existingRow.totalRent) - newVehicle.totalRent) > 0.009 ||
+              Math.abs(Number(existingRow.deliveryCharges) - newVehicle.deliveryCharges) > 0.009
+            ) {
+              throw new PrivatePhonchValidationError(
+                "Is gaadi ka Bill ban chuka hai - pehle Bill edit karein."
               );
             }
           }
