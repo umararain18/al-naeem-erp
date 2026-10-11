@@ -260,52 +260,69 @@ type ExistingRow = {
 };
 
 // Combines ONE Daily Posting JournalEntry's lines into ONE row,
-// carrying its complete set of counter lines. A Daily Posting entry
-// always shares exactly ONE Main (Cash/Bank) account across every one
-// of its own "main leg" lines (see buildLinePair() in
-// app/api/daily-posting/route.ts); a structurally different entry -
-// zero or more-than-one distinct Cash/Bank accounts, or no counter
-// lines at all - is something Daily Posting's own create flow never
-// actually produces. Such an entry still yields exactly ONE row, with
-// Edit/Bin both disabled (there is no safe, authoritative way to
-// resolve Bin eligibility for a line outside any Cash/Bank account).
+// carrying its complete set of counter lines. The Main account is
+// identified via the entry's own referenceId - set once at Create
+// time to the user-selected Main Account (see buildLinePair() in
+// app/api/daily-posting/route.ts: referenceId: data.accountId) and
+// never touched by any edit since. This is the ONLY reliable signal:
+// counting distinct Cash/Bank-category lines can NOT tell "the
+// selected Main Account" apart from "a Cash/Bank counter account" - a
+// legitimate transfer (e.g. Office Cash -> Umar Bank) has exactly
+// that shape, two distinct Cash/Bank accounts in one entry, and must
+// render and edit exactly like any other Daily Posting transaction.
+// Only a genuinely stale/missing referenceId (not matching any line
+// in the entry at all) still yields a degraded, Edit-disabled row.
 function buildExistingRow(entry: ExistingJournalEntry): ExistingRow {
-  const cbLines = entry.lines.filter((l) => isCashOrBank(l.account));
-  const counterRaw = entry.lines.filter((l) => !isCashOrBank(l.account));
   const sortKey = new Date(entry.entryDate).getTime();
-  const distinctMainIds = [...new Set(cbLines.map((l) => l.account.id))];
-  const anyLineId = entry.lines[0]?.id || entry.id;
+  // Prefer a genuine Cash/Bank line (if the entry has one) as the
+  // fallback/Bin target over entry.lines[0], which could just as
+  // easily be a non-Cash/Bank counter line - Bin (DELETE
+  // /api/cash-book/[id]) only accepts a Cash/Bank line's id.
+  const cashBankLine = entry.lines.find((l) => isCashOrBank(l.account));
+  const anyLineId = cashBankLine?.id || entry.lines[0]?.id || entry.id;
+  const mainLine = entry.referenceId ? entry.lines.find((l) => l.account.id === entry.referenceId) : undefined;
 
-  if (distinctMainIds.length !== 1 || counterRaw.length === 0) {
+  if (!mainLine || !isCashOrBank(mainLine.account) || entry.lines.length < 2) {
     const accountNames = [...new Set(entry.lines.map((l) => l.account.accountName))];
     const debit = entry.lines.reduce((s, l) => s + Number(l.debit), 0);
     const credit = entry.lines.reduce((s, l) => s + Number(l.credit), 0);
-    const reason =
-      distinctMainIds.length === 0
-        ? "No Cash/Bank leg on this entry."
-        : distinctMainIds.length > 1
-        ? "Multiple Cash/Bank legs on this entry."
-        : "This entry has no counter lines.";
+    const reason = !mainLine
+      ? "This transaction's Main Account could not be reliably identified (missing or stale reference)."
+      : !isCashOrBank(mainLine.account)
+      ? "This transaction's recorded Main Account is not a Cash/Bank account."
+      : "This entry has no counter lines.";
 
     return {
       journalEntryId: entry.id,
       sortKey,
       mainAccountId: null,
       mainAccountName: accountNames.join(", ") || "—",
-      mainLineId: null,
+      // A real Cash/Bank line's id, when this entry has one at all -
+      // NOT a claim about which account is "the" Main account (that's
+      // exactly what's unreliable here). Lets the caller below still
+      // look up this line's REAL Bin eligibility (age/settlement
+      // policy, same as any other transaction) so Bin stays available
+      // for a truly ambiguous entry - only Edit is unconditionally
+      // blocked, via canEdit/editBlockedReason, which the caller never
+      // touches for an ambiguous row (see the `row.mainAccountId`
+      // guard below).
+      mainLineId: cashBankLine?.id || null,
       anyLineId,
       counterLines: [],
       mainDebit: debit,
       mainCredit: credit,
       balance: 0,
       canEdit: false,
-      canMoveToBin: false,
+      canMoveToBin: false, // overwritten by the caller below once real eligibility is known, when mainLineId is non-null
       binProtectedReason: reason,
       editBlockedReason: reason,
     };
   }
 
-  const mainAccount = cbLines[0].account;
+  const mainAccountId = mainLine.account.id;
+  const cbLines = entry.lines.filter((l) => l.account.id === mainAccountId);
+  const counterRaw = entry.lines.filter((l) => l.account.id !== mainAccountId);
+  const mainAccount = mainLine.account;
   const mainDebit = cbLines.reduce((s, l) => s + Number(l.debit), 0);
   const mainCredit = cbLines.reduce((s, l) => s + Number(l.credit), 0);
 
@@ -602,6 +619,8 @@ export default function DailyPostingPage() {
   const [existingError, setExistingError] = useState("");
   const [editingIds, setEditingIds] = useState<Set<string>>(new Set());
   const [drafts, setDrafts] = useState<Map<string, ExistingDraft>>(new Map());
+  const [savingDay, setSavingDay] = useState(false);
+  const [dayError, setDayError] = useState("");
 
   async function loadAccounts() {
     try {
@@ -634,8 +653,10 @@ export default function DailyPostingPage() {
 
   // Arriving from elsewhere in the ERP (Cash Book, Party Ledger
   // Outstanding, or this page's own "View Daily Register" link of old)
-  // with ?date=YYYY-MM-DD&highlight=<journalEntryId> starts the form
-  // on that date and highlights the selected transaction below - a
+  // with ?date=YYYY-MM-DD&highlight=<journalEntryId>&account=<mainAccountId>
+  // starts the form on that date, highlights the selected transaction
+  // below, and pre-fills New Transactions' own Main Account with the
+  // same account the user was just viewing (e.g. in Cash Book) - a
   // pure convenience default, never required. Read directly from the
   // URL (not next/navigation's useSearchParams), matching the same
   // one-time-on-mount pattern already used elsewhere, to avoid that
@@ -647,6 +668,8 @@ export default function DailyPostingPage() {
       setPostingDate(urlDate);
     }
     setHighlightId(params.get("highlight"));
+    const urlAccount = params.get("account");
+    if (urlAccount) setAccountId(urlAccount);
   }, []);
 
   async function loadExisting(forDate: string) {
@@ -693,11 +716,23 @@ export default function DailyPostingPage() {
 
       const built = entries.map(buildExistingRow);
       for (const row of built) {
+        // Edit only ever becomes available for a row whose Main
+        // account was reliably identified (mainAccountId !== null) -
+        // an ambiguous row's canEdit/editBlockedReason, set at
+        // construction, must never be overwritten here regardless of
+        // the user's real permissions.
+        if (row.mainAccountId) {
+          row.canEdit = capabilities.canEdit;
+        }
+        // Bin eligibility (age/settlement policy), in contrast, is
+        // independent of whether the Main account was identifiable -
+        // it applies to whichever real Cash/Bank line mainLineId
+        // points at, so even a truly ambiguous entry keeps a working
+        // Bin button once eligible.
         if (!row.mainLineId) continue;
         const eligibility = eligibilityByLineId.get(row.mainLineId);
-        row.canEdit = capabilities.canEdit;
         row.canMoveToBin = capabilities.canMoveToBin && !!eligibility?.canMoveToBin;
-        row.binProtectedReason = eligibility?.binProtectedReason ?? null;
+        row.binProtectedReason = eligibility?.binProtectedReason ?? (row.mainAccountId ? null : row.binProtectedReason);
       }
 
       // Oldest -> newest for the running-balance computation.
@@ -1013,10 +1048,17 @@ export default function DailyPostingPage() {
     });
   }
 
+  // Removing the LAST counter line is allowed here - it's how you
+  // delete a whole transaction from inline edit, not a client-side
+  // validation gap. saveEdit() below detects the 0-lines case and
+  // routes to the existing Bin (DELETE /api/cash-book/[id]) endpoint
+  // instead of PATCH, reusing all of its eligibility/permission/
+  // settled-document checks rather than relaxing PATCH's own
+  // "at least one line" requirement.
   function removeDraftLine(journalEntryId: string, lineIndex: number) {
     setDrafts((prev) => {
       const current = prev.get(journalEntryId);
-      if (!current || current.lines.length === 1) return prev;
+      if (!current) return prev;
       const next = new Map(prev);
       next.set(journalEntryId, {
         ...current,
@@ -1026,9 +1068,66 @@ export default function DailyPostingPage() {
     });
   }
 
+  // The wire shape PATCH /api/daily-posting/[id] and PATCH
+  // /api/daily-posting/day both expect for one entry's lines - shared
+  // so a single-row Save and a batched Save Day send identically
+  // shaped lines for identically shaped drafts.
+  function buildLinePayload(lines: EditableLine[]) {
+    return lines.map((line) => ({
+      id: line.journalLineId || undefined,
+      counterAccountId: line.counterAccountId || undefined,
+      description: line.description.trim(),
+      amount: Number(line.amount),
+      direction: line.direction,
+      sourceType: line.sourceType,
+      sourceId: line.sourceId.trim() || undefined,
+      sourceNumber: line.sourceNumber.trim() || undefined,
+    }));
+  }
+
   async function saveEdit(row: ExistingRow) {
     const draft = drafts.get(row.journalEntryId);
     if (!draft) return;
+
+    // The draft was emptied out (every counter line removed) - that
+    // means "delete this whole transaction", not "save an empty
+    // entry". Route to the same Bin endpoint the Bin button itself
+    // uses, with the same confirmation, instead of sending PATCH an
+    // empty lines array it would reject anyway.
+    if (draft.lines.length === 0) {
+      const confirmed = window.confirm(
+        "This removes the last remaining line, so there is nothing left to save.\n\nMove this complete Journal Entry to Bin instead?\n\nAll of its journal lines will be excluded from normal accounting. This is not permanent deletion."
+      );
+      if (!confirmed) return;
+      setDrafts((prev) => {
+        const next = new Map(prev);
+        next.set(row.journalEntryId, { ...draft, saving: true, error: "" });
+        return next;
+      });
+      try {
+        const response = await fetch(`/api/cash-book/${row.anyLineId}`, { method: "DELETE" });
+        const data = await response.json();
+        if (!response.ok || !data.success) {
+          throw new Error(data.message || "Unable to move transaction to Bin.");
+        }
+        cancelEdit(row.journalEntryId);
+        await loadExisting(postingDate);
+      } catch (err) {
+        setDrafts((prev) => {
+          const next = new Map(prev);
+          const current = next.get(row.journalEntryId);
+          if (current) {
+            next.set(row.journalEntryId, {
+              ...current,
+              saving: false,
+              error: err instanceof Error ? err.message : "Unable to move transaction to Bin.",
+            });
+          }
+          return next;
+        });
+      }
+      return;
+    }
 
     for (const [index, line] of draft.lines.entries()) {
       const lineError = validatePostingLine(line, accounts);
@@ -1063,16 +1162,7 @@ export default function DailyPostingPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           date: draft.date,
-          lines: draft.lines.map((line) => ({
-            id: line.journalLineId || undefined,
-            counterAccountId: line.counterAccountId || undefined,
-            description: line.description.trim(),
-            amount: Number(line.amount),
-            direction: line.direction,
-            sourceType: line.sourceType,
-            sourceId: line.sourceId.trim() || undefined,
-            sourceNumber: line.sourceNumber.trim() || undefined,
-          })),
+          lines: buildLinePayload(draft.lines),
         }),
       });
       const data = await response.json();
@@ -1118,6 +1208,84 @@ export default function DailyPostingPage() {
       await loadExisting(postingDate);
     } catch (err) {
       setExistingError(err instanceof Error ? err.message : "Unable to move transaction to Bin.");
+    }
+  }
+
+  // "Edit Day": a convenience that opens every still-editable row at
+  // once (each becomes its own independent draft, exactly as if Edit
+  // had been clicked on it individually) so the whole date can be
+  // reviewed and corrected together, then committed in one shot via
+  // saveDay() below. Rows already being edited, or not editable at
+  // all (ambiguous/locked), are left untouched.
+  function startEditAll() {
+    setDayError("");
+    for (const row of existingRows) {
+      if (row.canEdit && !editingIds.has(row.journalEntryId)) {
+        startEdit(row);
+      }
+    }
+  }
+
+  // "Save Day": commits every row currently open for edit in ONE
+  // atomic request to PATCH /api/daily-posting/day, which itself runs
+  // every one of these JournalEntries through the exact same
+  // updateDailyPostingEntry() core as a single-row Save - just inside
+  // one DB transaction, so either all of them land or (on any single
+  // failure) none do. A draft that's been emptied down to zero lines
+  // is excluded here - that's a delete-via-Bin, a different action
+  // with no PATCH equivalent, and submitting it alongside a normal
+  // batch would risk half-applying the day's edits non-atomically.
+  async function saveDay() {
+    const entries: { id: string; date: string; lines: ReturnType<typeof buildLinePayload> }[] = [];
+    const emptyIds: string[] = [];
+
+    for (const row of existingRows) {
+      if (!editingIds.has(row.journalEntryId)) continue;
+      const draft = drafts.get(row.journalEntryId);
+      if (!draft) continue;
+
+      if (draft.lines.length === 0) {
+        emptyIds.push(row.journalEntryId);
+        continue;
+      }
+
+      for (const [index, line] of draft.lines.entries()) {
+        const lineError = validatePostingLine(line, accounts);
+        if (lineError) {
+          setDayError(`${lineError} (line ${index + 1} of a transaction open for edit below)`);
+          return;
+        }
+      }
+
+      entries.push({ id: row.journalEntryId, date: draft.date, lines: buildLinePayload(draft.lines) });
+    }
+
+    if (emptyIds.length > 0) {
+      setDayError(
+        "One or more transactions open for edit have had every line removed - Save (which Bins it) or Cancel those individually first, then Save Day for the rest."
+      );
+      return;
+    }
+    if (entries.length === 0) return;
+
+    setSavingDay(true);
+    setDayError("");
+    try {
+      const response = await fetch("/api/daily-posting/day", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ entries }),
+      });
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        throw new Error(data.message || "Unable to save the day's changes");
+      }
+      for (const entry of entries) cancelEdit(entry.id);
+      await loadExisting(postingDate);
+    } catch (err) {
+      setDayError(err instanceof Error ? err.message : "Unable to save the day's changes");
+    } finally {
+      setSavingDay(false);
     }
   }
 
@@ -1333,14 +1501,42 @@ export default function DailyPostingPage() {
 
         {/* EXISTING TRANSACTIONS */}
         <div className="mt-6 rounded-xl border bg-white shadow-sm">
-          <div className="border-b px-6 py-4">
-            <h2 className="font-semibold text-gray-900">
-              Existing Transactions for {postingDate || "—"}
-            </h2>
-            <p className="text-xs text-gray-500">
-              Every Daily Posting transaction already posted on this date. Click Edit to change one in place, or Delete to move it to Bin.
-            </p>
+          <div className="flex flex-col gap-3 border-b px-6 py-4 md:flex-row md:items-start md:justify-between">
+            <div>
+              <h2 className="font-semibold text-gray-900">
+                Existing Transactions for {postingDate || "—"}
+              </h2>
+              <p className="text-xs text-gray-500">
+                Every Daily Posting transaction already posted on this date, however many separate times it was posted. Click Edit to change one in place, or Delete to move it to Bin - or Edit Day to open all of them together and Save Day once.
+              </p>
+            </div>
+            {existingRows.length > 0 && (
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={startEditAll}
+                  disabled={savingDay}
+                  className="whitespace-nowrap rounded-md border border-blue-200 px-3 py-1.5 text-xs font-medium text-blue-600 hover:bg-blue-50 disabled:cursor-not-allowed disabled:opacity-40"
+                >
+                  Edit Day
+                </button>
+                {editingIds.size > 0 && (
+                  <button
+                    type="button"
+                    onClick={saveDay}
+                    disabled={savingDay}
+                    className="whitespace-nowrap rounded-md bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {savingDay ? "Saving Day..." : `Save Day (${editingIds.size})`}
+                  </button>
+                )}
+              </div>
+            )}
           </div>
+
+          {dayError && (
+            <div className="mx-6 mt-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{dayError}</div>
+          )}
 
           {existingError && (
             <div className="mx-6 mt-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{existingError}</div>
@@ -1403,7 +1599,7 @@ export default function DailyPostingPage() {
                               <button
                                 type="button"
                                 onClick={() => saveEdit(row)}
-                                disabled={draft.saving}
+                                disabled={draft.saving || savingDay}
                                 className="rounded-md bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
                               >
                                 {draft.saving ? "Saving..." : "Save"}
@@ -1411,7 +1607,7 @@ export default function DailyPostingPage() {
                               <button
                                 type="button"
                                 onClick={() => cancelEdit(row.journalEntryId)}
-                                disabled={draft.saving}
+                                disabled={draft.saving || savingDay}
                                 className="rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-gray-50 disabled:opacity-50"
                               >
                                 Cancel
@@ -1423,7 +1619,8 @@ export default function DailyPostingPage() {
                                 <button
                                   type="button"
                                   onClick={() => startEdit(row)}
-                                  className="rounded-md border border-blue-200 px-3 py-1.5 text-xs font-medium text-blue-600 hover:bg-blue-50"
+                                  disabled={savingDay}
+                                  className="rounded-md border border-blue-200 px-3 py-1.5 text-xs font-medium text-blue-600 hover:bg-blue-50 disabled:cursor-not-allowed disabled:opacity-40"
                                 >
                                   Edit
                                 </button>
@@ -1436,7 +1633,8 @@ export default function DailyPostingPage() {
                                 <button
                                   type="button"
                                   onClick={() => handleDeleteExisting(row)}
-                                  className="rounded-md border border-red-200 px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50"
+                                  disabled={savingDay}
+                                  className="rounded-md border border-red-200 px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-40"
                                 >
                                   Delete
                                 </button>
@@ -1470,7 +1668,13 @@ export default function DailyPostingPage() {
                           </tr>
                         </thead>
                         <tbody className="divide-y">
-                          {isEditing && draft ? (
+                          {isEditing && draft && draft.lines.length === 0 ? (
+                            <tr>
+                              <td colSpan={7} className="px-4 py-4 text-center text-xs text-gray-500">
+                                No lines left - Save will move this whole transaction to Bin instead.
+                              </td>
+                            </tr>
+                          ) : isEditing && draft ? (
                             draft.lines.map((line, lineIndex) => (
                               <tr key={line.id}>
                                 <LineFieldsCells
@@ -1484,14 +1688,19 @@ export default function DailyPostingPage() {
                                   <button
                                     type="button"
                                     onClick={() => removeDraftLine(row.journalEntryId, lineIndex)}
-                                    disabled={draft.lines.length === 1}
-                                    className="rounded-lg border border-red-200 px-3 py-2 text-xs text-red-600 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-40"
+                                    className="rounded-lg border border-red-200 px-3 py-2 text-xs text-red-600 hover:bg-red-50"
                                   >
                                     Remove
                                   </button>
                                 </td>
                               </tr>
                             ))
+                          ) : row.counterLines.length === 0 ? (
+                            <tr>
+                              <td colSpan={6} className="px-4 py-4 text-center text-xs text-gray-500">
+                                No counter lines left on this transaction.
+                              </td>
+                            </tr>
                           ) : (
                             row.counterLines.map((cl) => (
                               <tr key={cl.id}>

@@ -53,21 +53,71 @@ export class DailyPostingValidationError extends Error {
   }
 }
 
+// Source ID/Document No. is optional whenever the sourceType is NOT
+// one of the true document types (CHALLAN/BILTY/PHONCH/PRIVATE_PHONCH)
+// AND the Counter Account is Booking Income, Delivery Income (covers
+// Showroom Delivery Income/Private Phonch Delivery Income/Bill Income
+// - all stored under this same category, see lib/gross-accounts.ts)
+// or any Party account - mirrors isSourceDocumentExempt() in
+// app/api/daily-posting/route.ts (Create) EXACTLY, so an entry Create
+// allows without a Source ID can still be edited afterwards instead
+// of becoming permanently stuck. Confirmed by the account's own
+// stable category/accountType field, never by its name.
+async function isSourceDocumentExempt(
+  tx: Tx,
+  sourceType: string | undefined,
+  counterAccountId: string | undefined
+): Promise<boolean> {
+  if (
+    !sourceType ||
+    sourceType === "CHALLAN" ||
+    sourceType === "BILTY" ||
+    sourceType === "PHONCH" ||
+    sourceType === "PRIVATE_PHONCH" ||
+    sourceType === "DIRECT"
+  ) {
+    return false;
+  }
+  if (!counterAccountId) return false;
+  const account = await tx.account.findUnique({
+    where: { id: counterAccountId },
+    select: { category: true, accountType: true },
+  });
+  if (!account) return false;
+  return (
+    account.category === "BOOKING_INCOME" ||
+    account.category === "DELIVERY_INCOME" ||
+    account.accountType === "PARTY"
+  );
+}
+
 // ------------------------------------------------------------
-// STEP 1 - shape validation (no DB). Mirrors the "VALIDATE LINES"
-// loop in POST /api/daily-posting exactly.
+// STEP 1 - shape validation. Mirrors the "VALIDATE LINES" loop in
+// POST /api/daily-posting exactly, including its Source ID/Document
+// No. exemption above - only hits the DB when that exemption could
+// actually apply (sourceId or sourceNumber missing on a non-document
+// line), so the common case stays a pure in-memory check.
 // ------------------------------------------------------------
-export function validateDailyPostingLineShape(input: {
-  sourceType?: string;
-  sourceId?: string;
-  sourceNumber?: string;
-  counterAccountId?: string;
-}): void {
-  if (input.sourceType && input.sourceType !== "DIRECT" && !input.sourceId) {
+export async function validateDailyPostingLineShape(
+  tx: Tx,
+  input: {
+    sourceType?: string;
+    sourceId?: string;
+    sourceNumber?: string;
+    counterAccountId?: string;
+  }
+): Promise<void> {
+  const needsExemptionCheck =
+    !!input.sourceType && input.sourceType !== "DIRECT" && (!input.sourceId || !input.sourceNumber);
+  const exempt = needsExemptionCheck
+    ? await isSourceDocumentExempt(tx, input.sourceType, input.counterAccountId)
+    : false;
+
+  if (input.sourceType && input.sourceType !== "DIRECT" && !input.sourceId && !exempt) {
     throw new DailyPostingValidationError("Source ID is required for document-linked entries");
   }
 
-  if (input.sourceType && input.sourceType !== "DIRECT" && !input.sourceNumber) {
+  if (input.sourceType && input.sourceType !== "DIRECT" && !input.sourceNumber && !exempt) {
     throw new DailyPostingValidationError("Document number is required for document-linked entries");
   }
 
@@ -76,6 +126,7 @@ export function validateDailyPostingLineShape(input: {
     input.sourceType !== "BILTY" &&
     input.sourceType !== "PHONCH" &&
     input.sourceType !== "PRIVATE_PHONCH" &&
+    input.sourceType !== "BILL" &&
     !input.counterAccountId
   ) {
     throw new DailyPostingValidationError("Counter account is required");
@@ -89,7 +140,7 @@ export function validateDailyPostingLineShape(input: {
 // ------------------------------------------------------------
 export async function verifyDailyPostingDocument(
   tx: Tx,
-  sourceType: "CHALLAN" | "BILTY" | "PHONCH" | "PRIVATE_PHONCH",
+  sourceType: "CHALLAN" | "BILTY" | "PHONCH" | "PRIVATE_PHONCH" | "BILL",
   sourceId: string
 ): Promise<{ canonicalNumber: string }> {
   if (sourceType === "CHALLAN") {
@@ -101,6 +152,17 @@ export async function verifyDailyPostingDocument(
       throw new DailyPostingValidationError("Selected Challan was not found");
     }
     return { canonicalNumber: challan.challanNo };
+  }
+
+  if (sourceType === "BILL") {
+    const bill = await tx.bill.findFirst({
+      where: { id: sourceId, isDeleted: false },
+      select: { billNo: true },
+    });
+    if (!bill) {
+      throw new DailyPostingValidationError("Selected Bill was not found");
+    }
+    return { canonicalNumber: bill.billNo };
   }
 
   if (sourceType === "PHONCH") {
@@ -154,9 +216,10 @@ export async function resolveCounterAccountForDailyPostingLine(
   }
 
   // validateDailyPostingLineShape already guarantees only CHALLAN/BILTY/
-  // PHONCH/PRIVATE_PHONCH lines can reach here without a counterAccountId.
+  // PHONCH/PRIVATE_PHONCH/BILL lines can reach here without a
+  // counterAccountId.
   const resolved = await resolveDocumentPartyAccount(
-    sourceType as "CHALLAN" | "BILTY" | "PHONCH" | "PRIVATE_PHONCH",
+    sourceType as "CHALLAN" | "BILTY" | "PHONCH" | "PRIVATE_PHONCH" | "BILL",
     sourceId!,
     direction
   );
@@ -373,10 +436,10 @@ export async function resolveDailyPostingLine(
 ): Promise<ResolvedDailyPostingLine> {
   const { tx, mainAccountId, mainCategory, sourceType, sourceId, sourceNumber, counterAccountId, direction } = params;
 
-  validateDailyPostingLineShape({ sourceType, sourceId, sourceNumber, counterAccountId });
+  await validateDailyPostingLineShape(tx, { sourceType, sourceId, sourceNumber, counterAccountId });
 
   let canonicalNumber: string | null = sourceNumber || null;
-  if ((sourceType === "CHALLAN" || sourceType === "BILTY" || sourceType === "PHONCH" || sourceType === "PRIVATE_PHONCH") && sourceId) {
+  if ((sourceType === "CHALLAN" || sourceType === "BILTY" || sourceType === "PHONCH" || sourceType === "PRIVATE_PHONCH" || sourceType === "BILL") && sourceId) {
     const doc = await verifyDailyPostingDocument(tx, sourceType, sourceId);
     canonicalNumber = doc.canonicalNumber;
   }
@@ -407,7 +470,7 @@ export async function resolveDailyPostingLine(
     counterAccount,
     sourceType,
     sourceId:
-      (sourceType === "CHALLAN" || sourceType === "BILTY" || sourceType === "PHONCH" || sourceType === "PRIVATE_PHONCH")
+      (sourceType === "CHALLAN" || sourceType === "BILTY" || sourceType === "PHONCH" || sourceType === "PRIVATE_PHONCH" || sourceType === "BILL")
         ? sourceId || null
         : null,
     sourceNumber: canonicalNumber,
