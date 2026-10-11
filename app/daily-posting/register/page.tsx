@@ -15,8 +15,10 @@ export default async function DailyPostingRegisterRedirect({
   const query = new URLSearchParams();
   const date = params.date;
   const highlight = params.highlight;
+  const account = params.account;
   if (typeof date === "string" && date) query.set("date", date);
   if (typeof highlight === "string" && highlight) query.set("highlight", highlight);
+  if (typeof account === "string" && account) query.set("account", account);
   const qs = query.toString();
   redirect(`/daily-posting${qs ? `?${qs}` : ""}`);
 }

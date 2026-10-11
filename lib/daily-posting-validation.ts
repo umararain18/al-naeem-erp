@@ -53,21 +53,71 @@ export class DailyPostingValidationError extends Error {
   }
 }
 
+// Source ID/Document No. is optional whenever the sourceType is NOT
+// one of the true document types (CHALLAN/BILTY/PHONCH/PRIVATE_PHONCH)
+// AND the Counter Account is Booking Income, Delivery Income (covers
+// Showroom Delivery Income/Private Phonch Delivery Income/Bill Income
+// - all stored under this same category, see lib/gross-accounts.ts)
+// or any Party account - mirrors isSourceDocumentExempt() in
+// app/api/daily-posting/route.ts (Create) EXACTLY, so an entry Create
+// allows without a Source ID can still be edited afterwards instead
+// of becoming permanently stuck. Confirmed by the account's own
+// stable category/accountType field, never by its name.
+async function isSourceDocumentExempt(
+  tx: Tx,
+  sourceType: string | undefined,
+  counterAccountId: string | undefined
+): Promise<boolean> {
+  if (
+    !sourceType ||
+    sourceType === "CHALLAN" ||
+    sourceType === "BILTY" ||
+    sourceType === "PHONCH" ||
+    sourceType === "PRIVATE_PHONCH" ||
+    sourceType === "DIRECT"
+  ) {
+    return false;
+  }
+  if (!counterAccountId) return false;
+  const account = await tx.account.findUnique({
+    where: { id: counterAccountId },
+    select: { category: true, accountType: true },
+  });
+  if (!account) return false;
+  return (
+    account.category === "BOOKING_INCOME" ||
+    account.category === "DELIVERY_INCOME" ||
+    account.accountType === "PARTY"
+  );
+}
+
 // ------------------------------------------------------------
-// STEP 1 - shape validation (no DB). Mirrors the "VALIDATE LINES"
-// loop in POST /api/daily-posting exactly.
+// STEP 1 - shape validation. Mirrors the "VALIDATE LINES" loop in
+// POST /api/daily-posting exactly, including its Source ID/Document
+// No. exemption above - only hits the DB when that exemption could
+// actually apply (sourceId or sourceNumber missing on a non-document
+// line), so the common case stays a pure in-memory check.
 // ------------------------------------------------------------
-export function validateDailyPostingLineShape(input: {
-  sourceType?: string;
-  sourceId?: string;
-  sourceNumber?: string;
-  counterAccountId?: string;
-}): void {
-  if (input.sourceType && input.sourceType !== "DIRECT" && !input.sourceId) {
+export async function validateDailyPostingLineShape(
+  tx: Tx,
+  input: {
+    sourceType?: string;
+    sourceId?: string;
+    sourceNumber?: string;
+    counterAccountId?: string;
+  }
+): Promise<void> {
+  const needsExemptionCheck =
+    !!input.sourceType && input.sourceType !== "DIRECT" && (!input.sourceId || !input.sourceNumber);
+  const exempt = needsExemptionCheck
+    ? await isSourceDocumentExempt(tx, input.sourceType, input.counterAccountId)
+    : false;
+
+  if (input.sourceType && input.sourceType !== "DIRECT" && !input.sourceId && !exempt) {
     throw new DailyPostingValidationError("Source ID is required for document-linked entries");
   }
 
-  if (input.sourceType && input.sourceType !== "DIRECT" && !input.sourceNumber) {
+  if (input.sourceType && input.sourceType !== "DIRECT" && !input.sourceNumber && !exempt) {
     throw new DailyPostingValidationError("Document number is required for document-linked entries");
   }
 
@@ -373,7 +423,7 @@ export async function resolveDailyPostingLine(
 ): Promise<ResolvedDailyPostingLine> {
   const { tx, mainAccountId, mainCategory, sourceType, sourceId, sourceNumber, counterAccountId, direction } = params;
 
-  validateDailyPostingLineShape({ sourceType, sourceId, sourceNumber, counterAccountId });
+  await validateDailyPostingLineShape(tx, { sourceType, sourceId, sourceNumber, counterAccountId });
 
   let canonicalNumber: string | null = sourceNumber || null;
   if ((sourceType === "CHALLAN" || sourceType === "BILTY" || sourceType === "PHONCH" || sourceType === "PRIVATE_PHONCH") && sourceId) {
