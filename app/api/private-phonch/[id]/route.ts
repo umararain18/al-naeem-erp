@@ -349,8 +349,8 @@ export async function PATCH(
     const current = await prisma.privatePhonch.findUnique({
       where: { id },
       include: {
-        vehicles: { select: { totalRent: true, deliveryCharges: true, carrierPayable: true, clearingAgentPartyId: true } },
-        transporterParty: { select: { account: { select: { id: true } } } },
+        vehicles: { select: { lineNo: true, totalRent: true, deliveryCharges: true, carrierPayable: true, clearingAgentPartyId: true } },
+        transporterParty: { select: { partyName: true, account: { select: { id: true } } } },
       },
     });
     if (!current) {
@@ -403,19 +403,43 @@ export async function PATCH(
           }
           const caById = new Map(caParties.map((ca) => [ca.id, ca]));
 
+          // ----------------------------------------------------------
+          // IDENTITY CHANGE DETECTION - a Transporter or a vehicle's
+          // own Clearing Agent being reassigned to a DIFFERENT real
+          // Party (never a vehicle simply being added/removed, nor
+          // any amount changing on its own) takes the dedicated
+          // surgical reassignment path below: the entry's EXISTING
+          // JournalLines are matched to the new desired state by
+          // stable semantic role and updated/created/removed
+          // individually - never a delete-and-recreate of the whole
+          // entry. An edit that changes no party identity at all
+          // keeps today's exact replace-on-edit behavior (soft-delete
+          // the old JournalEntry, post a fresh one), byte-for-byte
+          // unchanged.
+          // ----------------------------------------------------------
+          const transporterChanged = resolved.transporterPartyId !== current.transporterPartyId;
+          const currentVehiclesByLineNo = new Map(current.vehicles.map((v) => [v.lineNo, v]));
+          const caChanges: { lineNo: number; oldPartyId: string | null; newPartyId: string | null }[] = [];
+          for (const v of resolved.vehicles) {
+            const old = currentVehiclesByLineNo.get(v.lineNo);
+            if (old && (old.clearingAgentPartyId || null) !== (v.clearingAgentPartyId || null)) {
+              caChanges.push({ lineNo: v.lineNo, oldPartyId: old.clearingAgentPartyId, newPartyId: v.clearingAgentPartyId });
+            }
+          }
+          const identityChanged = transporterChanged || caChanges.length > 0;
+
           // Changing the Transporter PARTY itself while the CURRENT
           // Transporter already has a settled amount is rejected -
           // reassigning would misattribute (or orphan) that Daily
           // Posting history onto a different party's account. An
           // amount-only edit to the SAME Transporter is validated
-          // below instead, per this task's own "not below already
-          // settled" rule.
-          if (currentTransporterAccountId && resolved.transporterPartyId !== current.transporterPartyId) {
+          // below instead, via assertPrivatePhonchEditNotBelowSettled().
+          if (transporterChanged && currentTransporterAccountId) {
             const carrierAlreadyPaid = await getPrivatePhonchAlreadySettledAmount(tx, id, currentTransporterAccountId, "CARRIER_PAYABLE");
             const recoveryAlreadyReceived = await getPrivatePhonchAlreadySettledAmount(tx, id, currentTransporterAccountId, "DELIVERY_RECOVERY");
             if (carrierAlreadyPaid > 0.009 || recoveryAlreadyReceived > 0.009) {
               throw new PrivatePhonchValidationError(
-                "Cannot change the Transporter - a Daily Posting payment/receipt has already been recorded against the current Transporter."
+                `${current.transporterParty.partyName} ko is phonch ki payment ho chuki hai - pehle wo payment Daily Posting se hatayein, phir agent badlein.`
               );
             }
           }
@@ -425,10 +449,10 @@ export async function PATCH(
           // is still >= what has already been paid/received against
           // it via Daily Posting (never netted against each other) -
           // read live, inside this Serializable transaction, so a
-          // concurrent Daily Posting can never be missed (replaces the
-          // old blanket "any payment exists" edit lock entirely).
-          // Non-financial fields (vehicle name, chassis, engine, Bilty
-          // No., Challan No.) are never gated by this check.
+          // concurrent Daily Posting can never be missed. Also catches
+          // a Clearing Agent reassignment away from an already-paid CA
+          // (its new effective amount becomes 0) - see that function's
+          // own messaging for the reassignment-specific wording.
           const caAccountIdByPartyId = new Map(caParties.filter((ca) => ca.account).map((ca) => [ca.id, ca.account!.id]));
           await assertPrivatePhonchEditNotBelowSettled(tx, id, currentTransporterAccountId, resolved, caAccountIdByPartyId);
 
@@ -442,10 +466,56 @@ export async function PATCH(
             },
           });
 
-          await tx.privatePhonchVehicle.deleteMany({ where: { phonchId: id } });
-          await tx.privatePhonchVehicle.createMany({
-            data: resolved.vehicles.map((v) => ({
-              phonchId: id,
+          // ----------------------------------------------------------
+          // VEHICLES - a row that has ever been linked to a Bill can
+          // never be deleted (schema: BillSourceLink.
+          // privatePhonchVehicleId is onDelete: Restrict) - update
+          // those rows in place instead of the previous blanket
+          // deleteMany()+createMany(), which threw an unhandled P2003
+          // on EVERY edit of a billed Private Phonch (the confirmed
+          // root cause of the reported generic-error bug - reproduced
+          // live even for an amount-only edit, independent of any
+          // party change). Every other vehicle keeps the exact same
+          // delete-and-recreate behavior as before.
+          // ----------------------------------------------------------
+          const existingVehicleRows = await tx.privatePhonchVehicle.findMany({
+            where: { phonchId: id },
+            select: { id: true, lineNo: true, totalRent: true, deliveryCharges: true, billSourceLinks: { select: { id: true } } },
+          });
+          const billedLineNos = new Set(existingVehicleRows.filter((v) => v.billSourceLinks.length > 0).map((v) => v.lineNo));
+          for (const lineNo of billedLineNos) {
+            const newVehicle = resolved.vehicles.find((v) => v.lineNo === lineNo);
+            if (!newVehicle) {
+              throw new PrivatePhonchValidationError(
+                `Vehicle line ${lineNo} has already been billed and cannot be removed. Edit its other fields instead of removing it.`
+              );
+            }
+            // Bill Book auto-populates BillItem.rent/delivery from the
+            // source vehicle ONLY at the moment the Bill is created -
+            // from then on they are independently stored, raw inputs
+            // (see BillItem's own schema doc comment) that never
+            // re-sync with this vehicle. Changing Total Rent/Delivery
+            // Charges here after billing would silently leave the Bill
+            // showing stale figures with no way to tell - confirmed
+            // live (edited a billed vehicle's rent 6000 -> 8500, the
+            // linked Bill item stayed at 6000). Reject instead; Carrier
+            // Payable and Clearing Agent are Private-Phonch-only
+            // concepts BillItem has no field for at all, so they are
+            // never blocked here.
+            const existingRow = existingVehicleRows.find((ev) => ev.lineNo === lineNo)!;
+            if (
+              Math.abs(Number(existingRow.totalRent) - newVehicle.totalRent) > 0.009 ||
+              Math.abs(Number(existingRow.deliveryCharges) - newVehicle.deliveryCharges) > 0.009
+            ) {
+              throw new PrivatePhonchValidationError(
+                "Is gaadi ka Bill ban chuka hai - pehle Bill edit karein."
+              );
+            }
+          }
+
+          await tx.privatePhonchVehicle.deleteMany({ where: { phonchId: id, billSourceLinks: { none: {} } } });
+          for (const v of resolved.vehicles) {
+            const vehicleData = {
               lineNo: v.lineNo,
               biltyNo: v.biltyNo,
               challanNo: v.challanNo,
@@ -458,87 +528,21 @@ export async function PATCH(
               carrierPayable: v.carrierPayable,
               deliveryRecoveryParty: v.deliveryRecoveryParty,
               note: v.note,
-            })),
-          });
-
-          // Replace-on-edit: soft-delete the old JournalEntry, post a
-          // fresh one with the new totals - never mutate history in
-          // place, mirroring Showroom Phonch's own edit behavior.
-          await tx.journalEntry.updateMany({
-            where: { referenceType: "PRIVATE_PHONCH", referenceId: id, isDeleted: false },
-            data: { isDeleted: true, deletedAt: new Date(), deletedById: currentUser.userId },
-          });
+            };
+            const billedRow = billedLineNos.has(v.lineNo) ? existingVehicleRows.find((ev) => ev.lineNo === v.lineNo) : undefined;
+            if (billedRow) {
+              await tx.privatePhonchVehicle.update({ where: { id: billedRow.id }, data: vehicleData });
+            } else {
+              await tx.privatePhonchVehicle.create({ data: { phonchId: id, ...vehicleData } });
+            }
+          }
 
           const carrierRentExpenseId = await getPrivatePhonchCarrierRentExpenseAccountId(tx);
-
-          const lines: {
-            accountId: string;
-            debit: number;
-            credit: number;
-            description: string;
-            sourceType: string;
-            sourceId: string;
-            sourceNumber: string;
-          }[] = [];
-
           const transporterDescription = buildPrivatePhonchTransporterDescription(
             { phonchNo: resolved.phonchNo },
             resolved.vehicles,
             resolved.totalCarrierPayable
           );
-
-          // See the identical guard's comment in
-          // app/api/private-phonch/route.ts (POST).
-          if (resolved.totalRent > 0) {
-            lines.push({
-              accountId: carrierRentExpenseId,
-              debit: resolved.totalRent,
-              credit: 0,
-              description: transporterDescription,
-              sourceType: "PRIVATE_PHONCH",
-              sourceId: id,
-              sourceNumber: resolved.phonchNo,
-            });
-          }
-
-          if (resolved.totalCarrierPayable > 0) {
-            lines.push({
-              accountId: transporterParty.account.id,
-              debit: 0,
-              credit: resolved.totalCarrierPayable,
-              description: transporterDescription,
-              sourceType: "PRIVATE_PHONCH",
-              sourceId: id,
-              sourceNumber: resolved.phonchNo,
-            });
-          }
-
-          // Delivery Recovery - see the identical block's comment in
-          // app/api/private-phonch/route.ts (POST).
-          if (resolved.totalTransporterDeliveryRecovery > 0) {
-            lines.push({
-              accountId: transporterParty.account.id,
-              debit: resolved.totalTransporterDeliveryRecovery,
-              credit: 0,
-              description: `Private Phonch ${resolved.phonchNo} - Transporter Delivery Recovery`,
-              sourceType: "PRIVATE_PHONCH",
-              sourceId: id,
-              sourceNumber: resolved.phonchNo,
-            });
-          }
-          for (const [caPartyId, amount] of resolved.caDeliveryRecoveryByPartyId) {
-            if (amount <= 0) continue;
-            const ca = caById.get(caPartyId)!;
-            lines.push({
-              accountId: ca.account!.id,
-              debit: amount,
-              credit: 0,
-              description: `Private Phonch ${resolved.phonchNo} - Clearing Agent Delivery Recovery (${ca.partyName})`,
-              sourceType: "PRIVATE_PHONCH",
-              sourceId: id,
-              sourceNumber: resolved.phonchNo,
-            });
-          }
 
           const caPayableByPartyId = new Map<string, number>();
           for (const v of resolved.vehicles) {
@@ -548,48 +552,183 @@ export async function PATCH(
               Math.round(((caPayableByPartyId.get(v.clearingAgentPartyId) || 0) + v.caPayable) * 100) / 100
             );
           }
-          for (const [caPartyId, amount] of caPayableByPartyId) {
-            const ca = caById.get(caPartyId)!;
-            const description = buildPrivatePhonchClearingAgentDescription(
-              { phonchNo: resolved.phonchNo },
-              resolved.vehicles.filter((v) => v.clearingAgentPartyId === caPartyId),
-              ca.partyName,
-              amount
-            );
-            lines.push({
-              accountId: ca.account!.id,
-              debit: 0,
-              credit: amount,
-              description,
-              sourceType: "PRIVATE_PHONCH",
-              sourceId: id,
-              sourceNumber: resolved.phonchNo,
-            });
-          }
 
-          if (resolved.totalDeliveryCharges > 0) {
-            const deliveryIncomeId = await getPrivatePhonchDeliveryIncomeAccountId(tx);
-            lines.push({
-              accountId: deliveryIncomeId,
-              debit: 0,
-              credit: resolved.totalDeliveryCharges,
-              description: `Private Phonch ${resolved.phonchNo} - Delivery Charges`,
-              sourceType: "PRIVATE_PHONCH",
-              sourceId: id,
-              sourceNumber: resolved.phonchNo,
+          if (!identityChanged) {
+            // --------------------------------------------------------
+            // NO PARTY IDENTITY CHANGED - existing replace-on-edit
+            // behavior, byte-for-byte unchanged: soft-delete the old
+            // JournalEntry, post a fresh one with the new totals.
+            // --------------------------------------------------------
+            await tx.journalEntry.updateMany({
+              where: { referenceType: "PRIVATE_PHONCH", referenceId: id, isDeleted: false },
+              data: { isDeleted: true, deletedAt: new Date(), deletedById: currentUser.userId },
             });
-          }
 
-          await tx.journalEntry.create({
-            data: {
-              entryDate: resolved.date,
-              referenceType: "PRIVATE_PHONCH",
-              referenceId: id,
-              description: transporterDescription,
-              createdById: currentUser.userId,
-              lines: { create: lines },
-            },
-          });
+            const lines: {
+              accountId: string;
+              debit: number;
+              credit: number;
+              description: string;
+              sourceType: string;
+              sourceId: string;
+              sourceNumber: string;
+            }[] = [];
+
+            if (resolved.totalRent > 0) {
+              lines.push({ accountId: carrierRentExpenseId, debit: resolved.totalRent, credit: 0, description: transporterDescription, sourceType: "PRIVATE_PHONCH", sourceId: id, sourceNumber: resolved.phonchNo });
+            }
+            if (resolved.totalCarrierPayable > 0) {
+              lines.push({ accountId: transporterParty.account.id, debit: 0, credit: resolved.totalCarrierPayable, description: transporterDescription, sourceType: "PRIVATE_PHONCH", sourceId: id, sourceNumber: resolved.phonchNo });
+            }
+            if (resolved.totalTransporterDeliveryRecovery > 0) {
+              lines.push({ accountId: transporterParty.account.id, debit: resolved.totalTransporterDeliveryRecovery, credit: 0, description: `Private Phonch ${resolved.phonchNo} - Transporter Delivery Recovery`, sourceType: "PRIVATE_PHONCH", sourceId: id, sourceNumber: resolved.phonchNo });
+            }
+            for (const [caPartyId, amount] of resolved.caDeliveryRecoveryByPartyId) {
+              if (amount <= 0) continue;
+              const ca = caById.get(caPartyId)!;
+              lines.push({ accountId: ca.account!.id, debit: amount, credit: 0, description: `Private Phonch ${resolved.phonchNo} - Clearing Agent Delivery Recovery (${ca.partyName})`, sourceType: "PRIVATE_PHONCH", sourceId: id, sourceNumber: resolved.phonchNo });
+            }
+            for (const [caPartyId, amount] of caPayableByPartyId) {
+              const ca = caById.get(caPartyId)!;
+              const description = buildPrivatePhonchClearingAgentDescription({ phonchNo: resolved.phonchNo }, resolved.vehicles.filter((v) => v.clearingAgentPartyId === caPartyId), ca.partyName, amount);
+              lines.push({ accountId: ca.account!.id, debit: 0, credit: amount, description, sourceType: "PRIVATE_PHONCH", sourceId: id, sourceNumber: resolved.phonchNo });
+            }
+            if (resolved.totalDeliveryCharges > 0) {
+              const deliveryIncomeId = await getPrivatePhonchDeliveryIncomeAccountId(tx);
+              lines.push({ accountId: deliveryIncomeId, debit: 0, credit: resolved.totalDeliveryCharges, description: `Private Phonch ${resolved.phonchNo} - Delivery Charges`, sourceType: "PRIVATE_PHONCH", sourceId: id, sourceNumber: resolved.phonchNo });
+            }
+
+            await tx.journalEntry.create({
+              data: {
+                entryDate: resolved.date,
+                referenceType: "PRIVATE_PHONCH",
+                referenceId: id,
+                description: transporterDescription,
+                createdById: currentUser.userId,
+                lines: { create: lines },
+              },
+            });
+          } else {
+            // --------------------------------------------------------
+            // PARTY IDENTITY CHANGED - surgical reconciliation. The
+            // entry's EXISTING active JournalLines are matched against
+            // the new desired line set by stable semantic ROLE (never
+            // by array position), and only updated/created/removed
+            // where the role itself actually differs. A role whose
+            // party/amount is unchanged keeps its exact JournalLine id
+            // untouched. A role that disappears (its party fully
+            // reassigned away, or its amount zeroed) is deleted only
+            // after re-confirming nothing is settled against it
+            // (assertPrivatePhonchEditNotBelowSettled above already
+            // guarantees this - this is a defensive re-check
+            // immediately before the destructive write, mirroring the
+            // same safety principle the Daily Posting multi-line edit
+            // endpoint already established for PaymentAllocation). A
+            // role that newly appears is created fresh. The resulting
+            // line SET is identical to what the branch above would
+            // have created wholesale (same formulas), so Dr = Cr is
+            // preserved by construction either way.
+            // --------------------------------------------------------
+            const deliveryIncomeId = resolved.totalDeliveryCharges > 0 ? await getPrivatePhonchDeliveryIncomeAccountId(tx) : null;
+
+            const desired = new Map<string, { accountId: string; debit: number; credit: number; description: string }>();
+            if (resolved.totalRent > 0) {
+              desired.set("CARRIER_RENT_EXPENSE", { accountId: carrierRentExpenseId, debit: resolved.totalRent, credit: 0, description: transporterDescription });
+            }
+            if (resolved.totalCarrierPayable > 0) {
+              desired.set("TRANSPORTER_PAYABLE", { accountId: transporterParty.account.id, debit: 0, credit: resolved.totalCarrierPayable, description: transporterDescription });
+            }
+            if (resolved.totalTransporterDeliveryRecovery > 0) {
+              desired.set("TRANSPORTER_RECOVERY", { accountId: transporterParty.account.id, debit: resolved.totalTransporterDeliveryRecovery, credit: 0, description: `Private Phonch ${resolved.phonchNo} - Transporter Delivery Recovery` });
+            }
+            for (const [caPartyId, amount] of resolved.caDeliveryRecoveryByPartyId) {
+              if (amount <= 0) continue;
+              const ca = caById.get(caPartyId)!;
+              desired.set(`CA_RECOVERY:${ca.account!.id}`, { accountId: ca.account!.id, debit: amount, credit: 0, description: `Private Phonch ${resolved.phonchNo} - Clearing Agent Delivery Recovery (${ca.partyName})` });
+            }
+            for (const [caPartyId, amount] of caPayableByPartyId) {
+              const ca = caById.get(caPartyId)!;
+              const description = buildPrivatePhonchClearingAgentDescription({ phonchNo: resolved.phonchNo }, resolved.vehicles.filter((v) => v.clearingAgentPartyId === caPartyId), ca.partyName, amount);
+              desired.set(`CA_PAYABLE:${ca.account!.id}`, { accountId: ca.account!.id, debit: 0, credit: amount, description });
+            }
+            if (deliveryIncomeId) {
+              desired.set("DELIVERY_INCOME", { accountId: deliveryIncomeId, debit: 0, credit: resolved.totalDeliveryCharges, description: `Private Phonch ${resolved.phonchNo} - Delivery Charges` });
+            }
+
+            let activeEntry = await tx.journalEntry.findFirst({
+              where: { referenceType: "PRIVATE_PHONCH", referenceId: id, isDeleted: false },
+              include: { lines: true },
+            });
+            if (!activeEntry) {
+              activeEntry = await tx.journalEntry.create({
+                data: { entryDate: resolved.date, referenceType: "PRIVATE_PHONCH", referenceId: id, description: transporterDescription, createdById: currentUser.userId },
+                include: { lines: true },
+              });
+            } else {
+              await tx.journalEntry.update({ where: { id: activeEntry.id }, data: { entryDate: resolved.date, description: transporterDescription } });
+            }
+
+            const existingByRole = new Map<string, (typeof activeEntry.lines)[number]>();
+            for (const line of activeEntry.lines) {
+              let role: string;
+              if (line.accountId === carrierRentExpenseId) role = "CARRIER_RENT_EXPENSE";
+              else if (deliveryIncomeId && line.accountId === deliveryIncomeId) role = "DELIVERY_INCOME";
+              else if (currentTransporterAccountId && line.accountId === currentTransporterAccountId) {
+                role = Number(line.credit) > 0 ? "TRANSPORTER_PAYABLE" : "TRANSPORTER_RECOVERY";
+              } else {
+                role = Number(line.credit) > 0 ? `CA_PAYABLE:${line.accountId}` : `CA_RECOVERY:${line.accountId}`;
+              }
+              existingByRole.set(role, line);
+            }
+
+            const allRoles = new Set<string>([...existingByRole.keys(), ...desired.keys()]);
+            for (const role of allRoles) {
+              const existingLine = existingByRole.get(role);
+              const target = desired.get(role);
+
+              if (existingLine && target) {
+                if (
+                  existingLine.accountId !== target.accountId ||
+                  Number(existingLine.debit) !== target.debit ||
+                  Number(existingLine.credit) !== target.credit ||
+                  existingLine.description !== target.description
+                ) {
+                  await tx.journalLine.update({
+                    where: { id: existingLine.id },
+                    data: { accountId: target.accountId, debit: target.debit, credit: target.credit, description: target.description },
+                  });
+                }
+              } else if (existingLine && !target) {
+                const isPayableRole = role === "TRANSPORTER_PAYABLE" || role.startsWith("CA_PAYABLE:");
+                const isRecoveryRole = role === "TRANSPORTER_RECOVERY" || role.startsWith("CA_RECOVERY:");
+                if (isPayableRole) {
+                  const settled = await getPrivatePhonchAlreadySettledAmount(tx, id, existingLine.accountId, role === "TRANSPORTER_PAYABLE" ? "CARRIER_PAYABLE" : "CA_PAYABLE");
+                  if (settled > 0.009) {
+                    throw new PrivatePhonchValidationError("A Daily Posting payment already exists against this line - it cannot be removed this way.");
+                  }
+                } else if (isRecoveryRole) {
+                  const settled = await getPrivatePhonchAlreadySettledAmount(tx, id, existingLine.accountId, "DELIVERY_RECOVERY");
+                  if (settled > 0.009) {
+                    throw new PrivatePhonchValidationError("A Daily Posting receipt already exists against this line - it cannot be removed this way.");
+                  }
+                }
+                await tx.journalLine.delete({ where: { id: existingLine.id } });
+              } else if (!existingLine && target) {
+                await tx.journalLine.create({
+                  data: {
+                    journalEntryId: activeEntry.id,
+                    accountId: target.accountId,
+                    debit: target.debit,
+                    credit: target.credit,
+                    description: target.description,
+                    sourceType: "PRIVATE_PHONCH",
+                    sourceId: id,
+                    sourceNumber: resolved.phonchNo,
+                  },
+                });
+              }
+            }
+          }
 
           const currentTotals = {
             phonchNo: current.phonchNo,
@@ -605,8 +744,28 @@ export async function PATCH(
             totalDeliveryCharges: resolved.totalDeliveryCharges,
             totalCarrierPayable: resolved.totalCarrierPayable,
           }, ["phonchNo", "transporterPartyId", "totalRent", "totalDeliveryCharges", "totalCarrierPayable"]);
-          if (Object.keys(changedFields).length > 0) {
-            const summary = Object.entries(changedFields).map(([f, { old, new: nv }]) => `${f} ${old ?? "—"} → ${nv ?? "—"}`).join("; ");
+          let caChangeSummary = "";
+          if (caChanges.length > 0) {
+            const oldCaPartyIds = [...new Set(caChanges.map((c) => c.oldPartyId).filter((pid): pid is string => !!pid))];
+            const oldCaParties = oldCaPartyIds.length
+              ? await tx.party.findMany({ where: { id: { in: oldCaPartyIds } }, select: { id: true, partyName: true } })
+              : [];
+            const oldCaNameById = new Map(oldCaParties.map((p) => [p.id, p.partyName]));
+            caChangeSummary = caChanges
+              .map((c) => {
+                const oldName = c.oldPartyId ? oldCaNameById.get(c.oldPartyId) || c.oldPartyId : "—";
+                const newName = c.newPartyId ? caById.get(c.newPartyId)?.partyName || c.newPartyId : "—";
+                return `Vehicle line ${c.lineNo} Clearing Agent ${oldName} → ${newName}`;
+              })
+              .join("; ");
+          }
+          if (Object.keys(changedFields).length > 0 || caChangeSummary) {
+            const summary = [
+              Object.entries(changedFields).map(([f, { old, new: nv }]) => `${f} ${old ?? "—"} → ${nv ?? "—"}`).join("; "),
+              caChangeSummary,
+            ]
+              .filter(Boolean)
+              .join("; ");
             await auditUpdate(tx, {
               actor: actorFromUser(currentUser),
               module: "PRIVATE_PHONCH",
