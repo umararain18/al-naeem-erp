@@ -673,16 +673,25 @@ export async function assertPrivatePhonchEditNotBelowSettled(
       account: { partyId: { not: null } },
       journalEntry: { referenceType: "DAILY_POSTING", isDeleted: false },
     },
-    select: { accountId: true },
+    select: { accountId: true, account: { select: { party: { select: { partyName: true } } } } },
     distinct: ["accountId"],
   });
 
-  for (const { accountId } of historicalPayeeAccounts) {
+  for (const { accountId, account } of historicalPayeeAccounts) {
+    const partyName = account.party?.partyName || "This Clearing Agent";
     const alreadyPaid = await getPrivatePhonchAlreadySettledAmount(tx, phonchId, accountId, "CA_PAYABLE");
     const newPayableAmount = newCaPayableByAccountId.get(accountId) || 0;
     if (round2(newPayableAmount) < alreadyPaid - EPS) {
+      // Fully reassigned away (no vehicle attributes anything to this
+      // account anymore) reads as a party-change rejection in plain
+      // language; still reduced-but-present reads as the existing,
+      // more generic amount-reduction message - same underlying rule
+      // either way, just the clearer wording for the reassignment case
+      // this task specifically asked for.
       throw new PrivatePhonchValidationError(
-        `Cannot reduce Clearing Agent Payable below the amount already paid. ${formatRs(alreadyPaid)} has already been paid.`
+        newPayableAmount <= EPS
+          ? `${partyName} ko is phonch ki payment ho chuki hai - pehle wo payment Daily Posting se hatayein, phir agent badlein.`
+          : `Cannot reduce Clearing Agent Payable below the amount already paid. ${formatRs(alreadyPaid)} has already been paid.`
       );
     }
 
@@ -690,7 +699,9 @@ export async function assertPrivatePhonchEditNotBelowSettled(
     const newRecoveryAmount = newCaRecoveryByAccountId.get(accountId) || 0;
     if (round2(newRecoveryAmount) < alreadyRecovered - EPS) {
       throw new PrivatePhonchValidationError(
-        `Cannot reduce Delivery Recovery below the amount already received. ${formatRs(alreadyRecovered)} has already been received.`
+        newRecoveryAmount <= EPS
+          ? `${partyName} ko is phonch ki payment ho chuki hai - pehle wo payment Daily Posting se hatayein, phir agent badlein.`
+          : `Cannot reduce Delivery Recovery below the amount already received. ${formatRs(alreadyRecovered)} has already been received.`
       );
     }
   }

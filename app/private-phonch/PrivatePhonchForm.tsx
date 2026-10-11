@@ -23,20 +23,34 @@ function SearchableSelect({
   placeholder,
   disabled = false,
   onChange,
+  onMismatchChange,
 }: {
   value: string;
   options: SearchOption[];
   placeholder: string;
   disabled?: boolean;
   onChange: (value: string) => void;
+  // Fires true when the field is left with TYPED text that does not
+  // match any actually-selected option (the user typed a name but
+  // never clicked a dropdown result) - the underlying `value` is left
+  // completely untouched in that case (never silently coerced to the
+  // typed text, never silently kept as the old selection without
+  // telling the caller), so the caller can block submission and show
+  // its own "select from the list" message instead of saving a change
+  // that only happened visually.
+  onMismatchChange?: (mismatch: boolean) => void;
 }) {
   const [query, setQuery] = useState("");
   const [open, setOpen] = useState(false);
+  const [mismatch, setMismatch] = useState(false);
 
   const selected = options.find((o) => o.value === value);
 
   useEffect(() => {
     setQuery(selected?.label || "");
+    setMismatch(false);
+    onMismatchChange?.(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [value, selected?.label]);
 
   const filtered = useMemo(() => {
@@ -62,9 +76,20 @@ function SearchableSelect({
           setQuery(e.target.value);
           setOpen(true);
         }}
-        onBlur={() => window.setTimeout(() => setOpen(false), 150)}
-        className="w-full rounded-lg border border-gray-300 px-2 py-1.5 text-sm outline-none focus:border-blue-500 disabled:bg-gray-100"
+        onBlur={() => {
+          window.setTimeout(() => {
+            setOpen(false);
+            const trimmed = query.trim();
+            const isMismatch = trimmed.length > 0 && trimmed !== (selected?.label || "").trim();
+            setMismatch(isMismatch);
+            onMismatchChange?.(isMismatch);
+          }, 150);
+        }}
+        className={`w-full rounded-lg border px-2 py-1.5 text-sm outline-none focus:border-blue-500 disabled:bg-gray-100 ${
+          mismatch ? "border-red-400" : "border-gray-300"
+        }`}
       />
+      {mismatch && <p className="mt-1 text-xs text-red-600">List se party select karein.</p>}
       {open && !disabled && (
         <div className="absolute left-0 top-full z-50 mt-1 max-h-56 w-full overflow-y-auto rounded-lg border border-gray-200 bg-white shadow-xl">
           {filtered.length > 0 ? (
@@ -183,6 +208,20 @@ export default function PrivatePhonchForm({
     initialData?.date ? toBusinessDateInputValue(initialData.date) : toBusinessDateInputValue(new Date())
   );
   const [transporterPartyId, setTransporterPartyId] = useState(initialData?.transporterParty.id || "");
+  const [transporterMismatch, setTransporterMismatch] = useState(false);
+  // Vehicle rows whose Clearing Agent field currently holds typed-but-
+  // unselected text - keyed by the row's own stable `key`, since that
+  // survives add/remove line operations unlike an array index.
+  const [caMismatchKeys, setCaMismatchKeys] = useState<Set<number>>(new Set());
+  function setCaMismatch(key: number, isMismatch: boolean) {
+    setCaMismatchKeys((prev) => {
+      if (isMismatch === prev.has(key)) return prev;
+      const next = new Set(prev);
+      if (isMismatch) next.add(key);
+      else next.delete(key);
+      return next;
+    });
+  }
 
   const initialVehicles: VehicleRow[] = initialData?.vehicles.length
     ? initialData.vehicles.map((v, index) => ({
@@ -240,6 +279,7 @@ export default function PrivatePhonchForm({
 
   function removeLine(key: number) {
     setVehicles((rows) => (rows.length > 1 ? rows.filter((r) => r.key !== key) : rows));
+    setCaMismatch(key, false);
   }
 
   // Net Rent = Total Rent - Delivery Charges; CA Payable = Net Rent -
@@ -303,13 +343,26 @@ export default function PrivatePhonchForm({
     setPhonchNo("");
     setDate(toBusinessDateInputValue(new Date()));
     setTransporterPartyId("");
+    setTransporterMismatch(false);
     setVehicles([emptyVehicleRow(0)]);
+    setCaMismatchKeys(new Set());
     setNextKey(1);
   }
 
   async function handleSubmit(event: React.FormEvent) {
     event.preventDefault();
     setError("");
+
+    if (transporterMismatch) {
+      setError("Transporter: List se party select karein.");
+      return;
+    }
+    if (caMismatchKeys.size > 0) {
+      const firstKey = [...caMismatchKeys][0];
+      const rowIndex = vehicles.findIndex((v) => v.key === firstKey);
+      setError(`Vehicle line ${rowIndex + 1}: Clearing Agent - List se party select karein.`);
+      return;
+    }
 
     const invalidRow = rowsWithDerived.findIndex(
       (v) =>
@@ -401,6 +454,7 @@ export default function PrivatePhonchForm({
             options={transporterOptions}
             placeholder="Search transporter..."
             onChange={setTransporterPartyId}
+            onMismatchChange={setTransporterMismatch}
           />
         </label>
         <label className="block text-sm">
@@ -483,6 +537,7 @@ export default function PrivatePhonchForm({
                       options={clearingAgentOptions}
                       placeholder="Clearing Agent..."
                       onChange={(val) => updateVehicle(v.key, "clearingAgentPartyId", val)}
+                      onMismatchChange={(isMismatch) => setCaMismatch(v.key, isMismatch)}
                     />
                   </div>
                   {v.caPartyMissing && <p className="mt-1 text-xs text-red-600">Required - CA Payable &gt; 0</p>}
