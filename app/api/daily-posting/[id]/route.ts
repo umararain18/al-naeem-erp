@@ -8,6 +8,7 @@ import { DailyPostingValidationError } from "@/lib/daily-posting-validation";
 import { BiltyPaidVerificationError } from "@/lib/bilty-paid-verification";
 import { PhonchAccountingError } from "@/lib/phonch-accounting";
 import { PrivatePhonchAccountingError } from "@/lib/private-phonch-accounting";
+import { BillAccountingError } from "@/lib/bill-accounting";
 import { requestContext } from "@/lib/audit-log";
 import { updateDailyPostingEntry } from "@/lib/daily-posting-edit";
 
@@ -211,6 +212,9 @@ export async function PATCH(
         return NextResponse.json({ success: false, code: error.code, message: error.message }, { status: 400 });
       }
       if (error instanceof PrivatePhonchAccountingError) {
+        return NextResponse.json({ success: false, code: error.code, message: error.message }, { status: 400 });
+      }
+      if (error instanceof BillAccountingError) {
         return NextResponse.json({ success: false, code: error.code, message: error.message }, { status: 400 });
       }
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2034") {

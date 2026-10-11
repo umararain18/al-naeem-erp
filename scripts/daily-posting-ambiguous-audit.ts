@@ -51,7 +51,8 @@ async function main() {
   });
 
   const multiCashBank: typeof entries = [];
-  const emptyRender: typeof entries = [];
+  type Reason = "NO_REFERENCE_ID" | "REFERENCE_ID_NOT_ON_ENTRY" | "REFERENCE_NOT_CASH_BANK" | "FEWER_THAN_2_LINES";
+  const emptyRender: { entry: (typeof entries)[number]; reason: Reason }[] = [];
 
   for (const entry of entries) {
     const cashBankAccountIds = new Set(
@@ -62,11 +63,22 @@ async function main() {
     }
 
     // Mirrors buildExistingRow()'s own "ambiguous" condition exactly -
-    // see app/daily-posting/page.tsx.
+    // see app/daily-posting/page.tsx - broken out by reason so the
+    // referenceId-specific cases (what a legacy/pre-referenceId or
+    // otherwise corrupted record looks like) can be counted on their
+    // own, separately from the unrelated "no counter lines" case.
     const mainLine = entry.referenceId ? entry.lines.find((l) => l.accountId === entry.referenceId) : undefined;
-    const wouldRenderEmpty = !mainLine || !isCashOrBank(mainLine.account.category) || entry.lines.length < 2;
-    if (wouldRenderEmpty) {
-      emptyRender.push(entry);
+    const reason: Reason | null = !entry.referenceId
+      ? "NO_REFERENCE_ID"
+      : !mainLine
+      ? "REFERENCE_ID_NOT_ON_ENTRY"
+      : !isCashOrBank(mainLine.account.category)
+      ? "REFERENCE_NOT_CASH_BANK"
+      : entry.lines.length < 2
+      ? "FEWER_THAN_2_LINES"
+      : null;
+    if (reason) {
+      emptyRender.push({ entry, reason });
     }
   }
 
@@ -80,11 +92,21 @@ async function main() {
   }
 
   console.log(`\n=== Part 2: Entries that would render with an EMPTY lines table (${emptyRender.length}) ===`);
-  console.log("These are genuinely ambiguous under the new referenceId-based detection and need a human look.\n");
-  for (const entry of emptyRender) {
+  console.log("These are genuinely ambiguous under the new referenceId-based detection and need a human look.");
+  const reasonCounts: Record<Reason, number> = {
+    NO_REFERENCE_ID: 0,
+    REFERENCE_ID_NOT_ON_ENTRY: 0,
+    REFERENCE_NOT_CASH_BANK: 0,
+    FEWER_THAN_2_LINES: 0,
+  };
+  for (const { reason } of emptyRender) reasonCounts[reason]++;
+  console.log(
+    `  by reason: referenceId missing=${reasonCounts.NO_REFERENCE_ID}, referenceId stale (not on this entry)=${reasonCounts.REFERENCE_ID_NOT_ON_ENTRY}, referenceId not Cash/Bank=${reasonCounts.REFERENCE_NOT_CASH_BANK}, fewer than 2 lines=${reasonCounts.FEWER_THAN_2_LINES}\n`
+  );
+  for (const { entry, reason } of emptyRender) {
     const accounts = [...new Set(entry.lines.map((l) => l.account.accountName))].join(", ");
     console.log(
-      `id=${entry.id}  date=${formatDate(entry.entryDate)}  accounts=[${accounts}]  referenceId=${entry.referenceId ?? "null"}  createdAt=${entry.createdAt.toISOString()}  createdBy=${entry.createdBy?.username ?? "?"} (${entry.createdBy?.fullName ?? "unknown"})`
+      `id=${entry.id}  date=${formatDate(entry.entryDate)}  reason=${reason}  accounts=[${accounts}]  referenceId=${entry.referenceId ?? "null"}  createdAt=${entry.createdAt.toISOString()}  createdBy=${entry.createdBy?.username ?? "?"} (${entry.createdBy?.fullName ?? "unknown"})`
     );
   }
 

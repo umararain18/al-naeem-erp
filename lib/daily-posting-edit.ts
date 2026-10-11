@@ -8,6 +8,7 @@ import {
 import { assertPaidVerificationNotExceeded } from "@/lib/bilty-paid-verification";
 import { assertPhonchReceiptNotExceeded } from "@/lib/phonch-accounting";
 import { assertPrivatePhonchPaymentNotExceeded } from "@/lib/private-phonch-accounting";
+import { assertBillReceiptNotExceeded } from "@/lib/bill-accounting";
 import { getAllocatedAmountForPayment } from "@/lib/payment-allocation";
 import { auditUpdate, actorFromUser, diffFields, type AuditActor } from "@/lib/audit-log";
 import type { Permission } from "@/lib/permissions";
@@ -225,6 +226,9 @@ export async function updateDailyPostingEntry({
     if (line.sourceType === "PRIVATE_PHONCH" && line.sourceId) {
       await assertPrivatePhonchPaymentNotExceeded(tx, line.sourceId, line.counterAccountId, line.amount, line.direction, entry.id);
     }
+    if (line.sourceType === "BILL" && line.sourceId) {
+      await assertBillReceiptNotExceeded(tx, line.sourceId, line.counterAccountId, line.amount, line.direction, entry.id);
+    }
     // PAYMENT ALLOCATION SAFETY - an existing line that already has a
     // PaymentAllocation against it can neither be reduced below the
     // allocated amount nor have its Counter Account changed, in either
@@ -250,8 +254,16 @@ export async function updateDailyPostingEntry({
 
   // --------------------------------------------------------------
   // WRITE - counter lines are updated/created/deleted individually
-  // (never deleted-and-recreated wholesale); the Main Account side is
-  // safely collapsed to one net line.
+  // (never deleted-and-recreated wholesale). The Main Account side is
+  // fully rebuilt every save - safe because it is derived and never
+  // referenced by PaymentAllocation or anything else by line id - but
+  // rebuilt as ONE paired leg PER counter line, mirroring
+  // buildLinePair() in app/api/daily-posting/route.ts (Create)
+  // exactly: same description/sourceType/sourceId/sourceNumber as its
+  // counter line, same mainDebit/mainCredit-from-direction formula.
+  // This keeps Edit/Save Day producing the identical entry shape
+  // Create does, so e.g. Cash Book's per-account ledger still shows
+  // one row per counter line instead of a single collapsed net line.
   // --------------------------------------------------------------
   for (const removed of removedLines) {
     await tx.journalLine.delete({ where: { id: removed.id } });
@@ -289,32 +301,18 @@ export async function updateDailyPostingEntry({
     }
   }
 
-  // Main Account side: derived, never referenced by PaymentAllocation
-  // or anything else by line id - safe to collapse to exactly one net
-  // line every save.
-  const netMainDebit = resolvedLines.reduce((s, l) => s + (l.direction === "DEBIT" ? l.amount : 0), 0);
-  const netMainCredit = resolvedLines.reduce((s, l) => s + (l.direction === "CREDIT" ? l.amount : 0), 0);
-
-  // A single shared document across every final line is still
-  // reflected on the collapsed Main line (preserves its own
-  // document-linkage display); a genuinely mixed-document multi-line
-  // entry collapses the Main leg to plain DIRECT, never misattributed
-  // to any one of its several documents.
-  const distinctDocKeys = new Set(resolvedLines.map((l) => `${l.sourceType}:${l.sourceId || ""}:${l.sourceNumber || ""}`));
-  const sharedDoc = distinctDocKeys.size === 1 ? resolvedLines[0] : null;
-
   await tx.journalLine.deleteMany({ where: { journalEntryId: entry.id, accountId: mainAccountId } });
-  await tx.journalLine.create({
-    data: {
+  await tx.journalLine.createMany({
+    data: resolvedLines.map((line) => ({
       journalEntryId: entry.id,
       accountId: mainAccountId,
-      description: resolvedLines.length === 1 ? resolvedLines[0].description : entry.description,
-      debit: netMainDebit,
-      credit: netMainCredit,
-      sourceType: sharedDoc ? sharedDoc.sourceType : "DIRECT",
-      sourceId: sharedDoc ? sharedDoc.sourceId : null,
-      sourceNumber: sharedDoc ? sharedDoc.sourceNumber : null,
-    },
+      description: line.description,
+      debit: line.direction === "DEBIT" ? line.amount : 0,
+      credit: line.direction === "CREDIT" ? line.amount : 0,
+      sourceType: line.sourceType,
+      sourceId: line.sourceId,
+      sourceNumber: line.sourceNumber,
+    })),
   });
 
   const updatedEntry = await tx.journalEntry.update({
@@ -327,7 +325,7 @@ export async function updateDailyPostingEntry({
 
   const changedFields = diffFields(
     { date: entry.entryDate, lineCount: entry.lines.length },
-    { date: updatedEntry.entryDate, lineCount: resolvedLines.length + 1 },
+    { date: updatedEntry.entryDate, lineCount: resolvedLines.length * 2 },
     ["date", "lineCount"]
   );
   const actor: AuditActor = actorFromUser(currentUser);

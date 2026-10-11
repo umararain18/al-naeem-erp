@@ -274,7 +274,12 @@ type ExistingRow = {
 // in the entry at all) still yields a degraded, Edit-disabled row.
 function buildExistingRow(entry: ExistingJournalEntry): ExistingRow {
   const sortKey = new Date(entry.entryDate).getTime();
-  const anyLineId = entry.lines[0]?.id || entry.id;
+  // Prefer a genuine Cash/Bank line (if the entry has one) as the
+  // fallback/Bin target over entry.lines[0], which could just as
+  // easily be a non-Cash/Bank counter line - Bin (DELETE
+  // /api/cash-book/[id]) only accepts a Cash/Bank line's id.
+  const cashBankLine = entry.lines.find((l) => isCashOrBank(l.account));
+  const anyLineId = cashBankLine?.id || entry.lines[0]?.id || entry.id;
   const mainLine = entry.referenceId ? entry.lines.find((l) => l.account.id === entry.referenceId) : undefined;
 
   if (!mainLine || !isCashOrBank(mainLine.account) || entry.lines.length < 2) {
@@ -292,14 +297,23 @@ function buildExistingRow(entry: ExistingJournalEntry): ExistingRow {
       sortKey,
       mainAccountId: null,
       mainAccountName: accountNames.join(", ") || "—",
-      mainLineId: null,
+      // A real Cash/Bank line's id, when this entry has one at all -
+      // NOT a claim about which account is "the" Main account (that's
+      // exactly what's unreliable here). Lets the caller below still
+      // look up this line's REAL Bin eligibility (age/settlement
+      // policy, same as any other transaction) so Bin stays available
+      // for a truly ambiguous entry - only Edit is unconditionally
+      // blocked, via canEdit/editBlockedReason, which the caller never
+      // touches for an ambiguous row (see the `row.mainAccountId`
+      // guard below).
+      mainLineId: cashBankLine?.id || null,
       anyLineId,
       counterLines: [],
       mainDebit: debit,
       mainCredit: credit,
       balance: 0,
       canEdit: false,
-      canMoveToBin: false,
+      canMoveToBin: false, // overwritten by the caller below once real eligibility is known, when mainLineId is non-null
       binProtectedReason: reason,
       editBlockedReason: reason,
     };
@@ -702,11 +716,23 @@ export default function DailyPostingPage() {
 
       const built = entries.map(buildExistingRow);
       for (const row of built) {
+        // Edit only ever becomes available for a row whose Main
+        // account was reliably identified (mainAccountId !== null) -
+        // an ambiguous row's canEdit/editBlockedReason, set at
+        // construction, must never be overwritten here regardless of
+        // the user's real permissions.
+        if (row.mainAccountId) {
+          row.canEdit = capabilities.canEdit;
+        }
+        // Bin eligibility (age/settlement policy), in contrast, is
+        // independent of whether the Main account was identifiable -
+        // it applies to whichever real Cash/Bank line mainLineId
+        // points at, so even a truly ambiguous entry keeps a working
+        // Bin button once eligible.
         if (!row.mainLineId) continue;
         const eligibility = eligibilityByLineId.get(row.mainLineId);
-        row.canEdit = capabilities.canEdit;
         row.canMoveToBin = capabilities.canMoveToBin && !!eligibility?.canMoveToBin;
-        row.binProtectedReason = eligibility?.binProtectedReason ?? null;
+        row.binProtectedReason = eligibility?.binProtectedReason ?? (row.mainAccountId ? null : row.binProtectedReason);
       }
 
       // Oldest -> newest for the running-balance computation.
