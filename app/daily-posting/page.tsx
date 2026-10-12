@@ -664,12 +664,19 @@ export default function DailyPostingPage() {
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const urlDate = params.get("date");
-    if (urlDate && /^\d{4}-\d{2}-\d{2}$/.test(urlDate)) {
+    const hasValidUrlDate = !!urlDate && /^\d{4}-\d{2}-\d{2}$/.test(urlDate);
+    if (hasValidUrlDate) {
       setPostingDate(urlDate);
     }
     setHighlightId(params.get("highlight"));
     const urlAccount = params.get("account");
     if (urlAccount) setAccountId(urlAccount);
+
+    // Load Existing Transactions for the PAGE'S ACTUAL starting date
+    // directly, once, here - never for `today` first and then again
+    // for the URL's date once state catches up.
+    void loadExisting(hasValidUrlDate ? urlDate : postingDate);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   async function loadExisting(forDate: string) {
@@ -760,10 +767,6 @@ export default function DailyPostingPage() {
       setLoadingExisting(false);
     }
   }
-
-  useEffect(() => {
-    if (postingDate) void loadExisting(postingDate);
-  }, [postingDate]);
 
   function updateLine(
     id: string,
@@ -1336,9 +1339,22 @@ export default function DailyPostingPage() {
               <input
                 type="date"
                 value={postingDate}
-                onChange={(e) =>
-                  setPostingDate(e.target.value)
-                }
+                onChange={(e) => {
+                  const newDate = e.target.value;
+                  setPostingDate(newDate);
+                  // Fetched explicitly here, not via a reactive
+                  // useEffect([postingDate]) - that pattern's own
+                  // unavoidable first run (always seeing postingDate's
+                  // stale initial value, before the mount effect's own
+                  // ?date= correction lands) previously caused a
+                  // visible flash of the WRONG date's Existing
+                  // Transactions when arriving from Cash Book/Party
+                  // Ledger with ?date=... set. Loading only from the
+                  // two real causes - mount (see the effect above) and
+                  // this explicit user action - never fires for a
+                  // stale/intermediate value.
+                  void loadExisting(newDate);
+                }}
                 className="w-full rounded-lg border border-gray-300 px-3 py-2.5 outline-none focus:border-blue-500"
               />
             </div>
