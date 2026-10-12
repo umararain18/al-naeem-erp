@@ -434,15 +434,18 @@ export default function CashBookPage() {
   // A multi-line Daily Posting row (the collapse fix gives each
   // counter line its own paired Cash/Bank leg, so Cash Book shows one
   // row per line) only ever removes THIS one line, not the whole
-  // transaction - and that removal is NOT recoverable via Bin, unlike
-  // every other case here, which bins the complete JournalEntry and
-  // can be restored. The confirmation must say which one is about to
-  // happen - see the matching server-side branch in
-  // app/api/cash-book/[id]/route.ts's DELETE handler.
+  // transaction - the server splits that line's own Dr/Cr pair into
+  // its own new JournalEntry and Bins just that, so it stays fully
+  // restorable from Bin like any other transaction, same as the
+  // whole-entry case below. The confirmation still differs because
+  // the SCOPE differs (one line vs. the complete transaction) - see
+  // the matching server-side branch in app/api/cash-book/[id]/route.ts's
+  // DELETE handler and updateDailyPostingEntry()'s own WRITE section
+  // in lib/daily-posting-edit.ts.
   const isMultiLineDailyPostingRow = entry.referenceType === "DAILY_POSTING" && !entry.isEditableStructure;
   const confirmed = window.confirm(
     isMultiLineDailyPostingRow
-      ? "Remove just this line from the transaction?\n\nThis specific line is NOT recoverable via Bin - the transaction's other lines are unaffected. To remove the whole transaction instead, use Daily Posting's own Delete."
+      ? "Ye line Bin me jayegi, wahan se restore ho sakti hai.\n\nOnly this one line is affected - the transaction's other lines are unaffected."
       : "Move this complete Journal Entry to Bin?\n\nAll of its journal lines will be excluded from normal accounting. This is not permanent deletion."
   );
 

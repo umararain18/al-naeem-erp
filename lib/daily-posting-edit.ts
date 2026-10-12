@@ -10,7 +10,7 @@ import { assertPhonchReceiptNotExceeded } from "@/lib/phonch-accounting";
 import { assertPrivatePhonchPaymentNotExceeded } from "@/lib/private-phonch-accounting";
 import { assertBillReceiptNotExceeded } from "@/lib/bill-accounting";
 import { getAllocatedAmountForPayment } from "@/lib/payment-allocation";
-import { auditUpdate, actorFromUser, diffFields, type AuditActor } from "@/lib/audit-log";
+import { auditUpdate, auditDelete, actorFromUser, diffFields, type AuditActor } from "@/lib/audit-log";
 import type { Permission } from "@/lib/permissions";
 
 type Tx = PrismaClient | Prisma.TransactionClient;
@@ -133,19 +133,12 @@ export async function updateDailyPostingEntry({
   const submittedIds = new Set(lines.filter((l) => l.id).map((l) => l.id as string));
   const removedLines = existingCounterLines.filter((l) => !submittedIds.has(l.id));
 
-  // --------------------------------------------------------------
-  // REMOVED LINES - blocked when any PaymentAllocation exists, exactly
-  // mirroring PATCH /api/cash-book/[id]'s own "Gap A" guard (never
-  // silently orphan an allocation that references this line).
-  // --------------------------------------------------------------
-  for (const removed of removedLines) {
-    const allocated = await getAllocatedAmountForPayment(tx, removed.id);
-    if (allocated > 0.009) {
-      throw new DailyPostingValidationError(
-        `Cannot remove the line for "${removed.description || removed.account.accountName}" - Rs. ${allocated} has already been allocated from it to a Bilty/Challan. Remove or reduce the relevant allocation(s) first.`
-      );
-    }
-  }
+  // A removed line is never destroyed and never blocked by an existing
+  // PaymentAllocation - see the WRITE section below, which splits it
+  // (reparented, keeping its own id, so any PaymentAllocation.
+  // journalLineId pointing at it stays valid) into its own new,
+  // immediately-Binned JournalEntry instead of deleting it. Nothing to
+  // guard against here.
 
   // --------------------------------------------------------------
   // RESOLVE EVERY SUBMITTED LINE - ONE uniform pipeline for both a
@@ -265,8 +258,64 @@ export async function updateDailyPostingEntry({
   // Create does, so e.g. Cash Book's per-account ledger still shows
   // one row per counter line instead of a single collapsed net line.
   // --------------------------------------------------------------
+  // A removed line's Dr/Cr pair is split into its own new JournalEntry
+  // (same date, same referenceType/referenceId as the original) and
+  // that new entry is immediately Binned - never a hard delete. The
+  // counter line itself is REPARENTED (its own id preserved, only
+  // journalEntryId changes), not deleted-and-recreated, so any
+  // PaymentAllocation already pointing at it by id stays valid and
+  // automatically stops counting toward any active financial view the
+  // moment this entry is Binned (JournalEntry.isDeleted is already the
+  // single source of truth every such view filters on - see e.g.
+  // fetchAllocationBackedLines() in lib/party-outstanding.ts), then
+  // automatically resumes counting if the split entry is later
+  // restored. Its own new paired main leg is created fresh, mirroring
+  // buildLinePair()'s mainDebit/mainCredit-from-direction formula
+  // exactly, the same way every other main leg below is. The original
+  // entry's remaining lines are completely unaffected and stay
+  // balanced on their own.
   for (const removed of removedLines) {
-    await tx.journalLine.delete({ where: { id: removed.id } });
+    const splitEntry = await tx.journalEntry.create({
+      data: {
+        entryDate: entry.entryDate,
+        referenceType: "DAILY_POSTING",
+        referenceId: mainAccountId,
+        description: removed.description || entry.description,
+        createdById: currentUser.userId,
+        isDeleted: true,
+        deletedAt: new Date(),
+        deletedById: currentUser.userId,
+      },
+    });
+
+    await tx.journalLine.update({
+      where: { id: removed.id },
+      data: { journalEntryId: splitEntry.id },
+    });
+
+    await tx.journalLine.create({
+      data: {
+        journalEntryId: splitEntry.id,
+        accountId: mainAccountId,
+        description: removed.description,
+        debit: Number(removed.credit) > 0 ? Number(removed.credit) : 0,
+        credit: Number(removed.debit) > 0 ? Number(removed.debit) : 0,
+        sourceType: removed.sourceType,
+        sourceId: removed.sourceId,
+        sourceNumber: removed.sourceNumber,
+      },
+    });
+
+    await auditDelete(tx, {
+      actor: actorFromUser(currentUser),
+      module: "CASH_BOOK",
+      entityType: "JournalLine",
+      entityId: removed.id,
+      documentNo: mainAccount.accountName,
+      description: `Removed line "${removed.description || removed.account.accountName}" (Rs. ${Number(removed.debit) || Number(removed.credit)}) from Daily Posting transaction on ${mainAccount.accountName} (entry ${entry.id}) - moved to Bin as entry ${splitEntry.id}, restorable from there`,
+      ipAddress: requestCtx.ipAddress,
+      userAgent: requestCtx.userAgent,
+    });
   }
 
   for (const line of resolvedLines) {
@@ -342,4 +391,51 @@ export async function updateDailyPostingEntry({
   });
 
   return updatedEntry;
+}
+
+// ============================================================
+// RESTORE-TIME CEILING RE-CHECK - a Bin'd Daily Posting entry's
+// document-linked lines (BILTY/PHONCH/PRIVATE_PHONCH/BILL) are already
+// excluded from that document's own received/paid total by every
+// read path (each filters on JournalEntry.isDeleted: false - see e.g.
+// lib/phonch-accounting.ts, lib/bill-accounting.ts,
+// lib/bilty-paid-verification.ts). Restoring un-excludes them, so if
+// something else was posted against the SAME document while this
+// entry sat in Bin, bringing it back could silently push that
+// document over its ceiling (an over-receipt/over-payment the normal
+// create/edit path would have rejected outright). Called by the
+// generic JournalEntry restore route (app/api/accounting-transactions/
+// [id]/restore) before it flips isDeleted back - a no-op for anything
+// that isn't a DAILY_POSTING entry, or has no document-linked lines.
+// ============================================================
+export async function assertRestoreDoesNotExceedCeilings(tx: Tx, entryId: string): Promise<void> {
+  const entry = await tx.journalEntry.findUnique({
+    where: { id: entryId },
+    include: { lines: true },
+  });
+  if (!entry || entry.referenceType !== "DAILY_POSTING" || !entry.referenceId) return;
+
+  const mainAccountId = entry.referenceId;
+  for (const line of entry.lines) {
+    if (line.accountId === mainAccountId) continue; // the main Cash/Bank leg itself - not the document-linked counter line
+    if (!line.sourceId) continue;
+
+    const amount = Number(line.debit) > 0 ? Number(line.debit) : Number(line.credit);
+    // direction here must be the MAIN account's own direction (the
+    // convention every assert*NotExceeded function expects) - the
+    // OPPOSITE sense of this counter line's own debit/credit, exactly
+    // mirroring how startEdit()/the WRITE section above convert
+    // between the two.
+    const direction: "DEBIT" | "CREDIT" = Number(line.debit) > 0 ? "CREDIT" : "DEBIT";
+
+    if (line.sourceType === "BILTY") {
+      await assertPaidVerificationNotExceeded(tx, line.sourceId, line.accountId, amount, direction, entry.id);
+    } else if (line.sourceType === "PHONCH") {
+      await assertPhonchReceiptNotExceeded(tx, line.sourceId, line.accountId, amount, direction, entry.id);
+    } else if (line.sourceType === "PRIVATE_PHONCH") {
+      await assertPrivatePhonchPaymentNotExceeded(tx, line.sourceId, line.accountId, amount, direction, entry.id);
+    } else if (line.sourceType === "BILL") {
+      await assertBillReceiptNotExceeded(tx, line.sourceId, line.accountId, amount, direction, entry.id);
+    }
+  }
 }

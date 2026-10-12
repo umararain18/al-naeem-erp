@@ -895,10 +895,11 @@ export async function DELETE(
     // removal mechanism Daily Posting's own "remove line + Save"
     // already uses (updateDailyPostingEntry - same PaymentAllocation
     // safety, same main-leg rebuild) rather than inventing a second,
-    // parallel implementation. This is NOT recoverable via Bin - the
-    // frontend confirmation for this specific case must say so
-    // honestly, unlike the whole-entry Bin below (which is
-    // recoverable).
+    // parallel implementation. That mechanism splits the removed
+    // line's own Dr/Cr pair into its own new JournalEntry and Bins
+    // just that - fully recoverable from Bin, same as the whole-entry
+    // case below, just scoped to this one line instead of the
+    // complete transaction.
     //
     // A single-counter-line Daily Posting entry (exactly 2 lines
     // total) falls through to the normal whole-entry Bin below
@@ -990,7 +991,7 @@ export async function DELETE(
         return NextResponse.json({
           success: true,
           message:
-            "Line removed from the transaction. This specific line is not recoverable via Bin - the transaction's other lines are unaffected.",
+            "This line has been moved to Bin and can be restored from there. The transaction's other lines are unaffected.",
           journalEntryId: updated.id,
         });
       } catch (error) {
