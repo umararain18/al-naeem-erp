@@ -33,6 +33,12 @@ type CashBookEntry = {
   // Manager see WHY the action is unavailable for this specific row.
   binProtectedReason: string | null;
   isEditableStructure: boolean;
+  // Set only for a row that is itself a system-generated posting from
+  // another module (Bilty/Challan/Phonch/Private Phonch/Bill, or a
+  // Challan settlement) - an "Open <Document No>" target instead of a
+  // dead-end message, since that is genuinely the only place it can
+  // be edited or reversed from.
+  sourceDocument: { label: string; href: string } | null;
 };
 
 type CashBookDay = {
@@ -425,8 +431,22 @@ export default function CashBookPage() {
   }
 
   async function handleDelete(entry: CashBookEntry) {
+  // A multi-line Daily Posting row (the collapse fix gives each
+  // counter line its own paired Cash/Bank leg, so Cash Book shows one
+  // row per line) only ever removes THIS one line, not the whole
+  // transaction - the server splits that line's own Dr/Cr pair into
+  // its own new JournalEntry and Bins just that, so it stays fully
+  // restorable from Bin like any other transaction, same as the
+  // whole-entry case below. The confirmation still differs because
+  // the SCOPE differs (one line vs. the complete transaction) - see
+  // the matching server-side branch in app/api/cash-book/[id]/route.ts's
+  // DELETE handler and updateDailyPostingEntry()'s own WRITE section
+  // in lib/daily-posting-edit.ts.
+  const isMultiLineDailyPostingRow = entry.referenceType === "DAILY_POSTING" && !entry.isEditableStructure;
   const confirmed = window.confirm(
-    "Move this complete Journal Entry to Bin?\n\nAll of its journal lines will be excluded from normal accounting. This is not permanent deletion."
+    isMultiLineDailyPostingRow
+      ? "Ye line Bin me jayegi, wahan se restore ho sakti hai.\n\nOnly this one line is affected - the transaction's other lines are unaffected."
+      : "Move this complete Journal Entry to Bin?\n\nAll of its journal lines will be excluded from normal accounting. This is not permanent deletion."
   );
 
   if (!confirmed) {
@@ -758,11 +778,25 @@ export default function CashBookPage() {
           </div>
 
           {selectedAccountId && openingBalanceEntry && (
-            <div className="border-b bg-gray-50 px-6 py-3 flex items-center justify-between">
+            <div className="border-b bg-gray-50 px-6 py-3 flex items-center justify-between gap-3">
               <span className="text-sm font-medium text-gray-700">Opening Balance</span>
-              <span className="text-sm font-semibold text-gray-900">
-                Rs. {formatMoney(openingBalanceEntry.amount)} {openingBalanceEntry.direction === "DEBIT" ? "Dr" : "Cr"}
-              </span>
+              <div className="flex items-center gap-3">
+                <span className="text-sm font-semibold text-gray-900">
+                  Rs. {formatMoney(openingBalanceEntry.amount)} {openingBalanceEntry.direction === "DEBIT" ? "Dr" : "Cr"}
+                </span>
+                {/* Opening Balance is never a day/transaction row (see
+                    the GET /api/cash-book route's own filter) and has
+                    no Bin here - it can only be edited or removed from
+                    the Accounts page itself (or the Party page, for a
+                    Party's own opening balance). */}
+                <button
+                  type="button"
+                  onClick={() => router.push("/accounts")}
+                  className="rounded-md border border-blue-200 px-3 py-1 text-xs font-medium text-blue-600 hover:bg-blue-50"
+                >
+                  Edit in Accounts
+                </button>
+              </div>
             </div>
           )}
 
@@ -1001,53 +1035,77 @@ export default function CashBookPage() {
 
                                       <div className="flex gap-2">
 
-                                        <button
-  type="button"
-  onClick={() => {
-    if (entry.referenceType === "DAILY_POSTING") {
-      openDailyPostingRegister(entry);
-      return;
-    }
-    setSelectedEntry(entry);
-  }}
-  className="rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-gray-50"
->
-  View
-</button>
-
-                                        {entry.canEdit ? (
-                                        <button
-  type="button"
-  onClick={() => {
-    if (entry.referenceType === "DAILY_POSTING") {
-      openDailyPostingRegister(entry);
-      return;
-    }
-    setEditEntry(entry);
-  }}
-  className="rounded-md border border-blue-200 px-3 py-1.5 text-xs font-medium text-blue-600 hover:bg-blue-50"
->
-                                          Edit
-                                        </button>
-                                        ) : capabilities.canEdit && !entry.isEditableStructure ? (
-                                          <span
-                                            className="px-1 py-1.5 text-xs text-gray-500"
-                                            title="This is a multi-line posting generated by another part of the system (not a simple 2-line entry) - it can only be edited or reversed from where it was created, not from Cash Book directly."
+                                        {entry.referenceType === "DAILY_POSTING" ? (
+                                          // Daily Posting's own page can edit (or view) ANY
+                                          // Daily Posting transaction regardless of how many
+                                          // lines it has - the old canEdit/isEditableStructure
+                                          // 2-line restriction below exists for the OLD inline
+                                          // Cash Book editor, which Daily Posting rows never
+                                          // use. One button, same link either way; the label
+                                          // just reflects whether this user can actually edit
+                                          // once there.
+                                          <button
+                                            type="button"
+                                            onClick={() => openDailyPostingRegister(entry)}
+                                            className="rounded-md border border-blue-200 px-3 py-1.5 text-xs font-medium text-blue-600 hover:bg-blue-50"
                                           >
-                                            Multi-line posting - edit from its source document.
-                                          </span>
-                                        ) : null}
+                                            {capabilities.canEdit ? "Edit" : "View"}
+                                          </button>
+                                        ) : (
+                                          // Opening Balance never reaches here - GET
+                                          // /api/cash-book excludes referenceType
+                                          // OPENING_BALANCE from this day/transaction list
+                                          // entirely and surfaces it as its own dedicated
+                                          // summary row above instead (with its own "Edit in
+                                          // Accounts" link).
+                                          <>
+                                            <button
+                                              type="button"
+                                              onClick={() => setSelectedEntry(entry)}
+                                              className="rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-gray-50"
+                                            >
+                                              View
+                                            </button>
+
+                                            {entry.sourceDocument ? (
+                                              // Takes priority over the plain 2-line canEdit
+                                              // check below, even when this row happens to be
+                                              // exactly 2 lines (canEdit: true) - the generic
+                                              // old editor knows nothing about this document's
+                                              // own business rules (ceiling checks, paid-
+                                              // verification, etc), so a line traced back to a
+                                              // real source document is always routed to that
+                                              // document's own page instead.
+                                              <button
+                                                type="button"
+                                                onClick={() => router.push(entry.sourceDocument!.href)}
+                                                className="rounded-md border border-blue-200 px-3 py-1.5 text-xs font-medium text-blue-600 hover:bg-blue-50"
+                                              >
+                                                {entry.sourceDocument.label}
+                                              </button>
+                                            ) : entry.canEdit ? (
+                                              <button
+                                                type="button"
+                                                onClick={() => setEditEntry(entry)}
+                                                className="rounded-md border border-blue-200 px-3 py-1.5 text-xs font-medium text-blue-600 hover:bg-blue-50"
+                                              >
+                                                Edit
+                                              </button>
+                                            ) : capabilities.canEdit && !entry.isEditableStructure ? (
+                                              <span
+                                                className="px-1 py-1.5 text-xs text-gray-500"
+                                                title="This is a multi-line posting generated by another part of the system (not a simple 2-line entry) - it can only be edited or reversed from where it was created, not from Cash Book directly."
+                                              >
+                                                Multi-line posting - edit from its source document.
+                                              </span>
+                                            ) : null}
+                                          </>
+                                        )}
 
                                         {entry.canMoveToBin ? (
                                         <button
   type="button"
-  onClick={() => {
-  if (entry.referenceType === "DAILY_POSTING") {
-    openDailyPostingRegister(entry);
-    return;
-  }
-  handleDelete(entry);
-}}
+  onClick={() => handleDelete(entry)}
   className="rounded-md border border-red-200 px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50"
 >
                                           Move to Bin

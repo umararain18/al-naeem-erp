@@ -326,6 +326,97 @@ export async function GET(request: NextRequest) {
       ]);
     }
 
+    // ============================================================
+    // SOURCE DOCUMENT LINKS - for a row that is itself a system-
+    // generated posting from another module (not Daily Posting, not
+    // Opening Balance), resolve a real "Open <Document No>" target
+    // instead of leaving the frontend to show a dead-end message.
+    // referenceId's MEANING depends entirely on referenceType (there
+    // is no single polymorphic documents table), so only the
+    // UNAMBIGUOUS cases are resolved here - each of these
+    // referenceTypes' own creation code sets referenceId to exactly
+    // one real document's id, every time:
+    //   BILTY_BOOKING  -> Bilty.id
+    //   CHALLAN_DISPATCH, SETTLEMENT -> Challan.id
+    //   PHONCH         -> Phonch.id
+    //   PRIVATE_PHONCH -> PrivatePhonch.id
+    //   BILL           -> Bill.id
+    // SETTLEMENT_PAYMENT and its _CORRECTION/_REVERSAL variants are
+    // deliberately NOT resolved here - their referenceId is EITHER a
+    // Challan or a Bilty id depending on context (see
+    // lib/settlement-payments.ts), genuinely ambiguous without an
+    // extra disambiguating lookup, and were not part of what was
+    // asked for.
+    // ============================================================
+
+    const biltyBookingIds = new Set<string>();
+    const challanDocIds = new Set<string>();
+    const phonchIds = new Set<string>();
+    const privatePhonchIds = new Set<string>();
+    const billIds = new Set<string>();
+
+    for (const line of journalLines) {
+      const rt = line.journalEntry.referenceType;
+      const refId = line.journalEntry.referenceId;
+      if (!refId) continue;
+      if (rt === "BILTY_BOOKING") biltyBookingIds.add(refId);
+      else if (rt === "CHALLAN_DISPATCH" || rt === "SETTLEMENT") challanDocIds.add(refId);
+      else if (rt === "PHONCH") phonchIds.add(refId);
+      else if (rt === "PRIVATE_PHONCH") privatePhonchIds.add(refId);
+      else if (rt === "BILL") billIds.add(refId);
+    }
+
+    const [biltyDocs, challanDocs, phonchDocs, privatePhonchDocs, billDocs] = await Promise.all([
+      biltyBookingIds.size > 0
+        ? prisma.bilty.findMany({ where: { id: { in: [...biltyBookingIds] } }, select: { id: true, biltyNo: true } })
+        : [],
+      challanDocIds.size > 0
+        ? prisma.challan.findMany({ where: { id: { in: [...challanDocIds] } }, select: { id: true, challanNo: true } })
+        : [],
+      phonchIds.size > 0
+        ? prisma.phonch.findMany({ where: { id: { in: [...phonchIds] } }, select: { id: true, phonchNo: true } })
+        : [],
+      privatePhonchIds.size > 0
+        ? prisma.privatePhonch.findMany({ where: { id: { in: [...privatePhonchIds] } }, select: { id: true, phonchNo: true } })
+        : [],
+      billIds.size > 0
+        ? prisma.bill.findMany({ where: { id: { in: [...billIds] } }, select: { id: true, billNo: true } })
+        : [],
+    ]);
+
+    const biltyNoById = new Map(biltyDocs.map((d) => [d.id, d.biltyNo]));
+    const challanNoById = new Map(challanDocs.map((d) => [d.id, d.challanNo]));
+    const phonchNoById = new Map(phonchDocs.map((d) => [d.id, d.phonchNo]));
+    const privatePhonchNoById = new Map(privatePhonchDocs.map((d) => [d.id, d.phonchNo]));
+    const billNoById = new Map(billDocs.map((d) => [d.id, d.billNo]));
+
+    function sourceDocumentLink(line: (typeof journalLines)[number]): { label: string; href: string } | null {
+      const rt = line.journalEntry.referenceType;
+      const refId = line.journalEntry.referenceId;
+      if (!refId) return null;
+      if (rt === "BILTY_BOOKING") {
+        const no = biltyNoById.get(refId);
+        return no ? { label: `Open Bilty ${no}`, href: `/bilty/${refId}` } : null;
+      }
+      if (rt === "CHALLAN_DISPATCH" || rt === "SETTLEMENT") {
+        const no = challanNoById.get(refId);
+        return no ? { label: `Open Challan ${no}`, href: `/challan/${refId}` } : null;
+      }
+      if (rt === "PHONCH") {
+        const no = phonchNoById.get(refId);
+        return no ? { label: `Open Phonch ${no}`, href: `/phonch/${refId}` } : null;
+      }
+      if (rt === "PRIVATE_PHONCH") {
+        const no = privatePhonchNoById.get(refId);
+        return no ? { label: `Open Private Phonch ${no}`, href: `/private-phonch/${refId}` } : null;
+      }
+      if (rt === "BILL") {
+        const no = billNoById.get(refId);
+        return no ? { label: `Open Bill ${no}`, href: `/bill/${refId}` } : null;
+      }
+      return null;
+    }
+
     function binEligibility(line: (typeof journalLines)[number]): {
       canMoveToBin: boolean;
       binProtectedReason: string | null;
@@ -403,6 +494,8 @@ export async function GET(request: NextRequest) {
 
         isEditableStructure:
           line.journalEntry._count.lines === 2,
+
+        sourceDocument: sourceDocumentLink(line),
 
         ...binEligibility(line),
       })

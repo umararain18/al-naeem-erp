@@ -29,8 +29,11 @@ import {
   assertPrivatePhonchPaymentNotExceeded,
   PrivatePhonchAccountingError,
 } from "@/lib/private-phonch-accounting";
+import { BillAccountingError } from "@/lib/bill-accounting";
 import { getAllocatedAmountForPayment } from "@/lib/payment-allocation";
 import { auditUpdate, auditDelete, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
+import { updateDailyPostingEntry, type DailyPostingLineInput } from "@/lib/daily-posting-edit";
+import { toISODate } from "@/lib/date-range";
 
 function isValidDate(value: string) {
   const date = new Date(`${value}T00:00:00`);
@@ -876,6 +879,144 @@ export async function DELETE(
           { success: false, message: BIN_REASON_SETTLED_DOCUMENT },
           { status: 403 }
         );
+      }
+    }
+
+    // ============================================================
+    // MULTI-LINE DAILY POSTING ROW - remove just THIS counter line's
+    // Dr/Cr pair instead of Binning the whole JournalEntry.
+    //
+    // Since the collapse fix, a Daily Posting entry with N counter
+    // lines has N separate Cash/Bank legs - Cash Book shows one row
+    // per leg. Binning the WHOLE entry because one row was clicked
+    // would wrongly remove every other, unrelated line too. There is
+    // no per-line soft-delete (JournalLine has no isDeleted flag, only
+    // JournalEntry does), so this path reuses the exact same line-
+    // removal mechanism Daily Posting's own "remove line + Save"
+    // already uses (updateDailyPostingEntry - same PaymentAllocation
+    // safety, same main-leg rebuild) rather than inventing a second,
+    // parallel implementation. That mechanism splits the removed
+    // line's own Dr/Cr pair into its own new JournalEntry and Bins
+    // just that - fully recoverable from Bin, same as the whole-entry
+    // case below, just scoped to this one line instead of the
+    // complete transaction.
+    //
+    // A single-counter-line Daily Posting entry (exactly 2 lines
+    // total) falls through to the normal whole-entry Bin below
+    // instead - removing its only line is equivalent to binning the
+    // whole (one-line) entry anyway, and matches Daily Posting's own
+    // "last line -> Bin the whole transaction" rule.
+    // ============================================================
+
+    const mainAccountId = currentLine.journalEntry.referenceId;
+    const counterLines =
+      currentLine.journalEntry.referenceType === "DAILY_POSTING" && mainAccountId
+        ? currentLine.journalEntry.lines.filter((l) => l.accountId !== mainAccountId)
+        : [];
+
+    if (currentLine.journalEntry.referenceType === "DAILY_POSTING" && counterLines.length > 1) {
+      // Pair this Cash/Bank line back to the ONE counter line it was
+      // created alongside - there is no stored explicit link, so this
+      // matches on the same description/sourceType/sourceId/
+      // sourceNumber + opposite-direction amount buildLinePair() gives
+      // both lines of a pair. If that is not uniquely identifiable
+      // (e.g. two counter lines happen to share an identical
+      // description and amount), refuse rather than guess wrong.
+      const matches = counterLines.filter((l) => {
+        const sameDoc =
+          l.description === currentLine.description &&
+          l.sourceType === currentLine.sourceType &&
+          l.sourceId === currentLine.sourceId &&
+          l.sourceNumber === currentLine.sourceNumber;
+        if (!sameDoc) return false;
+        const mainDebit = Number(currentLine.debit);
+        const mainCredit = Number(currentLine.credit);
+        return (
+          (mainDebit > 0 && Number(l.credit) === mainDebit) ||
+          (mainCredit > 0 && Number(l.debit) === mainCredit)
+        );
+      });
+
+      if (matches.length !== 1) {
+        return NextResponse.json(
+          {
+            success: false,
+            message:
+              "Unable to uniquely identify which line this row pairs with - edit this transaction from Daily Posting instead, where each line can be removed individually.",
+          },
+          { status: 400 }
+        );
+      }
+
+      // Removing one line from a multi-line transaction is an edit,
+      // not merely a Bin action - require the same permission Daily
+      // Posting's own edit endpoint requires, in addition to the
+      // accountingTransactions.bin permission already checked above.
+      if (!hasPermission(currentUser, "accounts.edit")) {
+        return NextResponse.json(
+          { success: false, message: "Forbidden" },
+          { status: 403 }
+        );
+      }
+
+      const matched = matches[0];
+      const remainingLines: DailyPostingLineInput[] = counterLines
+        .filter((l) => l.id !== matched.id)
+        .map((l) => ({
+          id: l.id,
+          counterAccountId: l.accountId,
+          description: l.description || "",
+          amount: Number(l.debit) > 0 ? Number(l.debit) : Number(l.credit),
+          direction: Number(l.debit) > 0 ? "CREDIT" : "DEBIT",
+          sourceType: l.sourceType || "DIRECT",
+          sourceId: l.sourceId || undefined,
+          sourceNumber: l.sourceNumber || undefined,
+        }));
+
+      try {
+        const updated = await prisma.$transaction(
+          (tx) =>
+            updateDailyPostingEntry({
+              tx,
+              id: currentLine.journalEntryId,
+              date: toISODate(currentLine.journalEntry.entryDate),
+              lines: remainingLines,
+              currentUser,
+              hasPermission: (permission) => hasPermission(currentUser, permission),
+              requestCtx: requestContext(request),
+            }),
+          { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+        );
+
+        return NextResponse.json({
+          success: true,
+          message:
+            "This line has been moved to Bin and can be restored from there. The transaction's other lines are unaffected.",
+          journalEntryId: updated.id,
+        });
+      } catch (error) {
+        if (error instanceof DailyPostingValidationError) {
+          return NextResponse.json({ success: false, message: error.message }, { status: error.status });
+        }
+        if (error instanceof BiltyPaidVerificationError) {
+          return NextResponse.json({ success: false, code: error.code, message: error.message }, { status: 400 });
+        }
+        if (error instanceof PhonchAccountingError) {
+          return NextResponse.json({ success: false, code: error.code, message: error.message }, { status: 400 });
+        }
+        if (error instanceof PrivatePhonchAccountingError) {
+          return NextResponse.json({ success: false, code: error.code, message: error.message }, { status: 400 });
+        }
+        if (error instanceof BillAccountingError) {
+          return NextResponse.json({ success: false, code: error.code, message: error.message }, { status: 400 });
+        }
+        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2034") {
+          return NextResponse.json(
+            { success: false, message: "Another change to this transaction happened at the same time. Please retry." },
+            { status: 409 }
+          );
+        }
+        throw error;
       }
     }
 
