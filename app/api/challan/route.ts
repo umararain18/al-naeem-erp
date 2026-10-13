@@ -9,6 +9,7 @@ import { getGrossCarrierRentPayableAccountId } from "@/lib/gross-accounts";
 import { getChallanResponsiblePartiesBatch } from "@/lib/document-party-resolution";
 import { computeChallanSettlementSummaryBatch } from "@/lib/challan-settlement-summary";
 import { SettlementPaymentError } from "@/lib/settlement-payments";
+import { recognizeBiltyBookingIncome, BiltyRevenueRecognitionError } from "@/lib/bilty-revenue-recognition";
 import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
 
 // Re-check status codes for the in-transaction Bilty-availability
@@ -510,6 +511,23 @@ export async function POST(request: NextRequest) {
         },
       });
 
+      // REVENUE RECOGNITION - each dispatched Bilty's own rent, sitting
+      // in Unearned Revenue since booking, is reclassified into real
+      // Booking Income now - exactly once per Bilty, for exactly the
+      // amount originally recognized (see
+      // lib/bilty-revenue-recognition.ts). freshBilties (re-fetched
+      // above, inside this transaction) is used rather than the
+      // pre-transaction `bilties` so this reads the SAME race-checked
+      // `total` the PENDING/already-assigned re-validation above just
+      // confirmed.
+      for (const bilty of freshBilties) {
+        await recognizeBiltyBookingIncome(tx, bilty, {
+          entryDate: loadingDate,
+          challanNo: createdChallan.challanNo,
+          createdById: currentUser.userId,
+        });
+      }
+
       if (carrierRentAmount > 0 && carrierRentExpenseAccountId) {
         const grossCarrierRentPayableId = await getGrossCarrierRentPayableAccountId(tx);
 
@@ -569,6 +587,12 @@ export async function POST(request: NextRequest) {
         return NextResponse.json(
           { success: false, message: txError.message },
           { status: biltyRecheckStatus(txError.code) }
+        );
+      }
+      if (txError instanceof BiltyRevenueRecognitionError) {
+        return NextResponse.json(
+          { success: false, message: txError.message },
+          { status: 400 }
         );
       }
       if (txError instanceof Prisma.PrismaClientKnownRequestError && txError.code === "P2034") {

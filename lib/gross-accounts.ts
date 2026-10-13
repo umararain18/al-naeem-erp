@@ -115,6 +115,36 @@ export async function getGrossCommissionPayableAccountId(tx: Tx): Promise<string
 }
 
 // ============================================================
+// UNEARNED REVENUE - a DIFFERENT kind of deferral than the three
+// gross/suspense accounts above. Those defer only WHICH PARTY is
+// responsible (the income itself is already earned at booking time).
+// Unearned Revenue defers WHETHER the income has been earned AT ALL:
+// a booked Bilty has not yet actually moved, so its rent is not yet
+// Booking Income - only once it is first dispatched (added to a
+// Challan) has ANC actually performed the carriage. Bilty creation now
+// credits this LIABILITY account for the full `total` instead of
+// Booking Income directly; Challan dispatch (creation, and an edit
+// that adds a Bilty to an existing Challan) then recognizes exactly
+// that same amount by debiting this account and crediting Booking
+// Income - never more than once per Bilty, since a Bilty can only
+// ever be dispatched once (BiltyStatus must be PENDING to be added to
+// a Challan, and flips to IN_TRANSIT the moment it is). See
+// app/api/bilty/route.ts and app/api/challan/route.ts /
+// app/api/challan/[id]/route.ts's own "REVENUE RECOGNITION" sections.
+// ============================================================
+
+export async function getUnearnedRevenueAccountId(tx: Tx): Promise<string> {
+  return getOrCreateSystemAccount(
+    tx,
+    "UNEARNED-REVENUE",
+    "Unearned Revenue",
+    "LIABILITY",
+    "OTHER_LIABILITY",
+    "System account: a Bilty's full rent is recognized here (not yet as Booking Income) at booking time, since the carriage has not yet happened - reclassified into Booking Income for the same amount the moment the Bilty is first dispatched via a Challan."
+  );
+}
+
+// ============================================================
 // SHOWROOM PHONCH / DELIVERY income accounts
 //
 // Not clearing/suspense accounts (Phonch never reclassifies later,

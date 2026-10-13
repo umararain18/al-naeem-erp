@@ -4,7 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { PartyType, Prisma, BiltyStatus } from "@prisma/client";
-import { getGrossBiltyReceivableAccountId } from "@/lib/gross-accounts";
+import { getGrossBiltyReceivableAccountId, getUnearnedRevenueAccountId } from "@/lib/gross-accounts";
 import { resolveBiltyPaidResponsibleParty } from "@/lib/document-party-resolution";
 import { createSettlementPayment, SettlementPaymentError } from "@/lib/settlement-payments";
 import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
@@ -846,37 +846,22 @@ export async function POST(
     }
 
     // ------------------------------------------------
-    // 11. RESOLVE ACCOUNTING (Booking Income / Commission)
+    // 11. RESOLVE ACCOUNTING (Unearned Revenue / Commission)
     //
-    // Full Booking Income (and, if present, the full Booking
-    // Agent Commission expense) is recognized NOW, at booking
-    // time - not later at Settlement. The responsible PARTY for
-    // each is not yet known, so the offsetting side is a gross
-    // clearing account that Settlement will later reclassify into
-    // the real party. See lib/gross-accounts.ts.
+    // The full Bilty amount is recognized NOW, at booking time, but as
+    // Unearned Revenue (a liability), NOT Booking Income - the
+    // carriage has not actually happened yet. It is reclassified into
+    // real Booking Income later, for the same amount, exactly once,
+    // the moment this Bilty is first DISPATCHED via a Challan (see
+    // lib/bilty-revenue-recognition.ts, called from
+    // app/api/challan/route.ts and app/api/challan/[id]/route.ts) -
+    // never here. The Booking Agent Commission expense (if present)
+    // is unaffected by this change and is still recognized NOW, at
+    // booking time, against its own gross clearing account - the
+    // responsible PARTY for it is not yet known, so the offsetting
+    // side is a gross clearing account that Settlement will later
+    // reclassify into the real party. See lib/gross-accounts.ts.
     // ------------------------------------------------
-
-    let bookingIncomeAccountId: string | null = null;
-
-    if (total > 0) {
-      const bookingIncomeAccount = await prisma.account.findFirst({
-        where: { category: "BOOKING_INCOME", isActive: true },
-        select: { id: true },
-      });
-
-      if (!bookingIncomeAccount) {
-        return NextResponse.json(
-          {
-            success: false,
-            message:
-              "Required account is not configured. Please configure a BOOKING_INCOME account.",
-          },
-          { status: 400 }
-        );
-      }
-
-      bookingIncomeAccountId = bookingIncomeAccount.id;
-    }
 
     let commissionExpenseAccountId: string | null = null;
 
@@ -1079,12 +1064,19 @@ export async function POST(
       // --------------------------------------------------
       // BOOKING ACCOUNTING - recognized once, now.
       //
-      // Dr Gross Bilty Receivable / Cr Booking Income
+      // Dr Gross Bilty Receivable / Cr Unearned Revenue
       // Dr Booking Agent Commission (expense) / Cr Gross Commission Payable
       //
-      // Settlement will later reclassify these gross balances
-      // into whichever real party is responsible - it must never
-      // touch Booking Income or Commission expense again.
+      // The debit side (Gross Bilty Receivable) and the amount are
+      // completely unchanged from before - only the credit side
+      // changed, from Booking Income directly to Unearned Revenue (a
+      // liability), since the carriage has not actually happened yet.
+      // Settlement will later reclassify the Gross Bilty Receivable
+      // balance into whichever real party is responsible, exactly as
+      // before - it must never touch Unearned Revenue, Booking Income,
+      // or Commission expense. Unearned Revenue is itself reclassified
+      // into real Booking Income separately, once, at dispatch time
+      // (see lib/bilty-revenue-recognition.ts) - never here.
       // --------------------------------------------------
 
       const journalLines: {
@@ -1097,8 +1089,9 @@ export async function POST(
         sourceNumber: string;
       }[] = [];
 
-      if (total > 0 && bookingIncomeAccountId) {
+      if (total > 0) {
         const grossBiltyReceivableId = await getGrossBiltyReceivableAccountId(tx);
+        const unearnedRevenueAccountId = await getUnearnedRevenueAccountId(tx);
 
         journalLines.push(
           {
@@ -1111,7 +1104,7 @@ export async function POST(
             sourceNumber: createdBilty.biltyNo,
           },
           {
-            accountId: bookingIncomeAccountId,
+            accountId: unearnedRevenueAccountId,
             debit: 0,
             credit: total,
             description: `Booking - ${createdBilty.biltyNo} - Bilty Rent`,

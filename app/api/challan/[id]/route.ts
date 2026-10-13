@@ -14,6 +14,7 @@ import { getChallanResponsibleParties } from "@/lib/document-party-resolution";
 import { assertComponentTotalNotBelowActiveRows, SettlementPaymentError } from "@/lib/settlement-payments";
 import { getBiltyPaidVerification } from "@/lib/bilty-paid-verification";
 import { computeChallanSettlementSummary } from "@/lib/challan-settlement-summary";
+import { recognizeBiltyBookingIncome, reverseBiltyBookingIncome, BiltyRevenueRecognitionError } from "@/lib/bilty-revenue-recognition";
 import { auditUpdate, auditDelete, auditRestore, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 
 function round2(value: number): number {
@@ -654,9 +655,23 @@ export async function PATCH(
           });
 
           if (!otherActiveChallan) {
-            await tx.bilty.update({
+            const revertedBilty = await tx.bilty.update({
               where: { id: biltyId },
               data: { status: "PENDING" },
+            });
+
+            // REVERSAL - this Bilty is genuinely un-dispatched now (no
+            // other active Challan references it), so any Booking
+            // Income already recognized for it (app/api/challan/
+            // route.ts or the addBiltyIds branch above, at an earlier
+            // dispatch) must move back into Unearned Revenue - it was
+            // never actually carried. No-op if nothing was recognized
+            // in the first place (e.g. a legacy Bilty - see
+            // lib/bilty-revenue-recognition.ts's isUnreclassifiedLegacyBilty()).
+            await reverseBiltyBookingIncome(tx, revertedBilty, {
+              entryDate: new Date(),
+              reason: `removed from Challan ${existingChallan.challanNo}`,
+              createdById: currentUser.userId,
             });
           }
         }
@@ -671,6 +686,25 @@ export async function PATCH(
           where: { id: { in: addBiltyIds } },
           data: { status: "IN_TRANSIT" },
         });
+
+        // REVENUE RECOGNITION - a Bilty added to an ALREADY-EXISTING
+        // Challan is just as genuinely dispatched as one included at
+        // Challan creation time (app/api/challan/route.ts's own
+        // identical loop) - its rent moves from Unearned Revenue into
+        // real Booking Income here too, exactly once. Re-fetched
+        // inside this transaction (never the pre-transaction
+        // `biltiesToAdd` above) so the amount recognized is always the
+        // one actually being committed.
+        const addedBilties = await tx.bilty.findMany({
+          where: { id: { in: addBiltyIds } },
+        });
+        for (const bilty of addedBilties) {
+          await recognizeBiltyBookingIncome(tx, bilty, {
+            entryDate: new Date(),
+            challanNo: existingChallan.challanNo,
+            createdById: currentUser.userId,
+          });
+        }
       }
 
       const updatedChallanRow = await tx.challan.update({
@@ -741,6 +775,12 @@ export async function PATCH(
       if (correctionError instanceof SettlementPaymentError) {
         return NextResponse.json(
           { success: false, code: correctionError.code, message: correctionError.message },
+          { status: 400 }
+        );
+      }
+      if (correctionError instanceof BiltyRevenueRecognitionError) {
+        return NextResponse.json(
+          { success: false, message: correctionError.message },
           { status: 400 }
         );
       }
