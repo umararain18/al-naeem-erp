@@ -14,6 +14,7 @@ import {
   updateSettlementPaymentAmount,
 } from "@/lib/settlement-payments";
 import { BiltyPaidVerificationError, getBiltyPaidVerification } from "@/lib/bilty-paid-verification";
+import { getUnearnedRevenueAccountId } from "@/lib/gross-accounts";
 import { auditUpdate, auditDelete, auditRestore, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 import { parseISODateStart } from "@/lib/date-range";
 
@@ -740,11 +741,11 @@ export async function PATCH(
     // ========================================================
     // ACCOUNTING-SAFE CORRECTION
     //
-    // Booking Income (and Commission expense, if any) was already
-    // recognized in full when the Bilty was created (or by a prior
-    // correction). Changing rent/insurance/expense (=> total) or
-    // agentCommission must post a balanced correction for the
-    // delta only - never overwrite history. See
+    // Booking Income/Unearned Revenue (and Commission expense, if
+    // any) was already recognized in full when the Bilty was created
+    // (or by a prior correction). Changing rent/insurance/expense
+    // (=> total) or agentCommission must post a balanced correction
+    // for the delta only - never overwrite history. See
     // lib/settlement-correction.ts.
     // ========================================================
 
@@ -753,25 +754,7 @@ export async function PATCH(
     const totalDelta = Number((total - oldTotal).toFixed(2));
     const commissionDelta = Number((agentCommission - oldCommission).toFixed(2));
 
-    let bookingIncomeAccountId: string | undefined;
     let commissionExpenseAccountId: string | undefined;
-
-    if (totalDelta !== 0) {
-      const bookingIncomeAccount = await prisma.account.findFirst({
-        where: { category: "BOOKING_INCOME", isActive: true },
-        select: { id: true },
-      });
-      if (!bookingIncomeAccount) {
-        return NextResponse.json(
-          {
-            success: false,
-            message: "Required account is not configured. Please configure a BOOKING_INCOME account.",
-          },
-          { status: 400 }
-        );
-      }
-      bookingIncomeAccountId = bookingIncomeAccount.id;
-    }
 
     if (commissionDelta !== 0) {
       const otherExpenseAccount = await prisma.account.findFirst({
@@ -823,6 +806,40 @@ export async function PATCH(
           settlementJournalEntryId: activeLink.challan.settlementJournalEntryId,
         };
       }
+    }
+
+    // The COLLECTION correction's non-gross side depends on whether
+    // THIS Bilty has actually been dispatched yet (activeChallanContext
+    // truthy - an active Challan link exists, regardless of whether it
+    // is settled), never on settlement status alone: dispatch is what
+    // moves this Bilty's value out of Unearned Revenue and into real
+    // Booking Income (see lib/bilty-revenue-recognition.ts), so a
+    // rent/insurance/expense correction must target whichever one
+    // actually holds that value right now. The dispatched case is
+    // resolved here (read-only, matching the existing pattern exactly
+    // - a dispatched Bilty's Booking Income account must already
+    // exist, since dispatch itself requires it); the undispatched case
+    // is deferred to inside the transaction below, where Unearned
+    // Revenue can be safely self-provisioned via
+    // getUnearnedRevenueAccountId(tx) if this genuinely is the very
+    // first non-zero-total Bilty ever touched.
+    let dispatchedBookingIncomeAccountId: string | undefined;
+
+    if (totalDelta !== 0 && activeChallanContext) {
+      const bookingIncomeAccount = await prisma.account.findFirst({
+        where: { category: "BOOKING_INCOME", isActive: true },
+        select: { id: true },
+      });
+      if (!bookingIncomeAccount) {
+        return NextResponse.json(
+          {
+            success: false,
+            message: "Required account is not configured. Please configure a BOOKING_INCOME account.",
+          },
+          { status: 400 }
+        );
+      }
+      dispatchedBookingIncomeAccountId = bookingIncomeAccount.id;
     }
 
     // ========================================================
@@ -951,6 +968,13 @@ export async function PATCH(
       }
 
       if (totalDelta !== 0) {
+        // Dispatched -> correct against real Booking Income (resolved
+        // above, read-only). Not yet dispatched -> correct against
+        // Unearned Revenue, self-provisioned here if this is genuinely
+        // the first non-zero-total Bilty ever touched.
+        const collectionCorrectionAccountId = dispatchedBookingIncomeAccountId
+          ?? (await getUnearnedRevenueAccountId(tx));
+
         await applySettlementCorrection({
           tx,
           component: "COLLECTION",
@@ -959,7 +983,7 @@ export async function PATCH(
           challanNo: activeChallanContext?.challanNo || "",
           biltyId: id,
           biltyNo: data.biltyNo ?? existingBilty.biltyNo,
-          incomeOrExpenseAccountId: bookingIncomeAccountId!,
+          incomeOrExpenseAccountId: collectionCorrectionAccountId,
           isSettled: activeChallanContext?.isSettled ?? false,
           settlementJournalEntryId: activeChallanContext?.settlementJournalEntryId ?? null,
           createdById: currentUser.userId,
