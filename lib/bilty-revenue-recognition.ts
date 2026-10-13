@@ -37,10 +37,70 @@ export class BiltyRevenueRecognitionError extends Error {
 
 export const BILTY_REVENUE_RECOGNITION_REFERENCE_TYPE = "BILTY_REVENUE_RECOGNITION";
 
+// Written by scripts/reclass-legacy-bilty-revenue.ts (Dr Booking
+// Income / Cr Unearned Revenue) for a Bilty that was booked BEFORE
+// this feature existed and therefore credited Booking Income directly
+// at booking time instead of Unearned Revenue. Checked below so a
+// legacy Bilty that gets dispatched is never double-recognized AND
+// never debits Unearned Revenue for an amount it was never credited.
+export const BILTY_REVENUE_DEFERRAL_REFERENCE_TYPE = "BILTY_REVENUE_DEFERRAL";
+
+// Written when a dispatched Bilty is un-dispatched again (removed from
+// its Challan - see app/api/challan/[id]/route.ts's removeBiltyIds
+// handling) - the exact reverse of BILTY_REVENUE_RECOGNITION, Dr
+// Booking Income / Cr Unearned Revenue, putting the Bilty's value back
+// where it belongs now that it is no longer actually dispatched.
+export const BILTY_REVENUE_RECOGNITION_REVERSAL_REFERENCE_TYPE = "BILTY_REVENUE_RECOGNITION_REVERSAL";
+
+async function getActiveBookingIncomeAccountId(tx: Tx): Promise<string> {
+  const bookingIncomeAccount = await tx.account.findFirst({
+    where: { category: "BOOKING_INCOME", isActive: true },
+    select: { id: true },
+  });
+  if (!bookingIncomeAccount) {
+    throw new BiltyRevenueRecognitionError(
+      "Required account is not configured. Please configure a BOOKING_INCOME account."
+    );
+  }
+  return bookingIncomeAccount.id;
+}
+
+// True only for a Bilty whose OWN booking entry (BILTY_BOOKING,
+// app/api/bilty/route.ts) credited Booking Income DIRECTLY - i.e. one
+// booked before this feature existed - AND that has not since been
+// corrected by scripts/reclass-legacy-bilty-revenue.ts. For such a
+// Bilty, Booking Income already holds its full value from that
+// original entry; Unearned Revenue was never credited for it at all.
+// Dispatching it now must NEVER also run the normal Unearned-Revenue-
+// to-Booking-Income recognition below - that would debit Unearned
+// Revenue for an amount it never received (pushing it toward a
+// negative/incorrect balance) and credit Booking Income a SECOND time
+// for the same Bilty. A Bilty booked under the current rule (credits
+// Unearned Revenue directly) or one already reclassified by the
+// script always returns false here and proceeds normally.
+async function isUnreclassifiedLegacyBilty(tx: Tx, biltyId: string): Promise<boolean> {
+  const bookingEntry = await tx.journalEntry.findFirst({
+    where: { referenceType: "BILTY_BOOKING", referenceId: biltyId, isDeleted: false },
+    include: { lines: { include: { account: { select: { category: true } } } } },
+  });
+  const creditedBookingIncomeDirectly = bookingEntry?.lines.some(
+    (l) => l.account.category === "BOOKING_INCOME" && Number(l.credit) > 0
+  );
+  if (!creditedBookingIncomeDirectly) return false;
+
+  const alreadyReclassified = await tx.journalEntry.findFirst({
+    where: { referenceType: BILTY_REVENUE_DEFERRAL_REFERENCE_TYPE, referenceId: biltyId, isDeleted: false },
+    select: { id: true },
+  });
+  return !alreadyReclassified;
+}
+
 /**
  * Returns true if this Bilty's revenue was newly recognized by this
- * call, false if it was a no-op (already recognized, or nothing to
- * recognize because `total` is 0).
+ * call, false if it was a no-op (already recognized, nothing to
+ * recognize because `total` is 0, or a not-yet-reclassified legacy
+ * Bilty whose Booking Income is already correctly sitting in its
+ * original booking entry - see isUnreclassifiedLegacyBilty() above).
  */
 export async function recognizeBiltyBookingIncome(
   tx: Tx,
@@ -60,16 +120,9 @@ export async function recognizeBiltyBookingIncome(
   });
   if (alreadyRecognized) return false;
 
-  const bookingIncomeAccount = await tx.account.findFirst({
-    where: { category: "BOOKING_INCOME", isActive: true },
-    select: { id: true },
-  });
-  if (!bookingIncomeAccount) {
-    throw new BiltyRevenueRecognitionError(
-      "Required account is not configured. Please configure a BOOKING_INCOME account."
-    );
-  }
+  if (await isUnreclassifiedLegacyBilty(tx, bilty.id)) return false;
 
+  const bookingIncomeAccountId = await getActiveBookingIncomeAccountId(tx);
   const unearnedRevenueAccountId = await getUnearnedRevenueAccountId(tx);
   const description = `Revenue Recognition - ${bilty.biltyNo} - dispatched via Challan ${params.challanNo}`;
 
@@ -92,9 +145,86 @@ export async function recognizeBiltyBookingIncome(
             sourceNumber: bilty.biltyNo,
           },
           {
-            accountId: bookingIncomeAccount.id,
+            accountId: bookingIncomeAccountId,
             debit: 0,
             credit: total,
+            description,
+            sourceType: "BILTY",
+            sourceId: bilty.id,
+            sourceNumber: bilty.biltyNo,
+          },
+        ],
+      },
+    },
+  });
+
+  return true;
+}
+
+/**
+ * The exact reverse of recognizeBiltyBookingIncome() - called when a
+ * previously-dispatched Bilty is un-dispatched (removed from its
+ * Challan). A no-op (returns false) if this Bilty's revenue was never
+ * actually recognized at dispatch in the first place (e.g. a legacy
+ * Bilty recognizeBiltyBookingIncome() itself skipped - nothing to put
+ * back), or if it was already reversed once (idempotent, via its own
+ * dedicated referenceType, the same pattern as the forward direction).
+ */
+export async function reverseBiltyBookingIncome(
+  tx: Tx,
+  bilty: { id: string; biltyNo: string },
+  params: { entryDate: Date; reason: string; createdById: string }
+): Promise<boolean> {
+  const recognitionEntry = await tx.journalEntry.findFirst({
+    where: {
+      referenceType: BILTY_REVENUE_RECOGNITION_REFERENCE_TYPE,
+      referenceId: bilty.id,
+      isDeleted: false,
+    },
+    include: { lines: true },
+  });
+  if (!recognitionEntry) return false;
+
+  const alreadyReversed = await tx.journalEntry.findFirst({
+    where: {
+      referenceType: BILTY_REVENUE_RECOGNITION_REVERSAL_REFERENCE_TYPE,
+      referenceId: bilty.id,
+      isDeleted: false,
+    },
+    select: { id: true },
+  });
+  if (alreadyReversed) return false;
+
+  const bookingIncomeLine = recognitionEntry.lines.find((l) => Number(l.credit) > 0);
+  const amount = Number(bookingIncomeLine?.credit ?? 0);
+  if (amount <= 0) return false;
+
+  const bookingIncomeAccountId = await getActiveBookingIncomeAccountId(tx);
+  const unearnedRevenueAccountId = await getUnearnedRevenueAccountId(tx);
+  const description = `Revenue Recognition Reversal - ${bilty.biltyNo} - ${params.reason}`;
+
+  await tx.journalEntry.create({
+    data: {
+      entryDate: params.entryDate,
+      referenceType: BILTY_REVENUE_RECOGNITION_REVERSAL_REFERENCE_TYPE,
+      referenceId: bilty.id,
+      description,
+      createdById: params.createdById,
+      lines: {
+        create: [
+          {
+            accountId: bookingIncomeAccountId,
+            debit: amount,
+            credit: 0,
+            description,
+            sourceType: "BILTY",
+            sourceId: bilty.id,
+            sourceNumber: bilty.biltyNo,
+          },
+          {
+            accountId: unearnedRevenueAccountId,
+            debit: 0,
+            credit: amount,
             description,
             sourceType: "BILTY",
             sourceId: bilty.id,

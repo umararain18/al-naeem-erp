@@ -14,7 +14,7 @@ import { getChallanResponsibleParties } from "@/lib/document-party-resolution";
 import { assertComponentTotalNotBelowActiveRows, SettlementPaymentError } from "@/lib/settlement-payments";
 import { getBiltyPaidVerification } from "@/lib/bilty-paid-verification";
 import { computeChallanSettlementSummary } from "@/lib/challan-settlement-summary";
-import { recognizeBiltyBookingIncome, BiltyRevenueRecognitionError } from "@/lib/bilty-revenue-recognition";
+import { recognizeBiltyBookingIncome, reverseBiltyBookingIncome, BiltyRevenueRecognitionError } from "@/lib/bilty-revenue-recognition";
 import { auditUpdate, auditDelete, auditRestore, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 
 function round2(value: number): number {
@@ -655,9 +655,23 @@ export async function PATCH(
           });
 
           if (!otherActiveChallan) {
-            await tx.bilty.update({
+            const revertedBilty = await tx.bilty.update({
               where: { id: biltyId },
               data: { status: "PENDING" },
+            });
+
+            // REVERSAL - this Bilty is genuinely un-dispatched now (no
+            // other active Challan references it), so any Booking
+            // Income already recognized for it (app/api/challan/
+            // route.ts or the addBiltyIds branch above, at an earlier
+            // dispatch) must move back into Unearned Revenue - it was
+            // never actually carried. No-op if nothing was recognized
+            // in the first place (e.g. a legacy Bilty - see
+            // lib/bilty-revenue-recognition.ts's isUnreclassifiedLegacyBilty()).
+            await reverseBiltyBookingIncome(tx, revertedBilty, {
+              entryDate: new Date(),
+              reason: `removed from Challan ${existingChallan.challanNo}`,
+              createdById: currentUser.userId,
             });
           }
         }
