@@ -422,11 +422,42 @@ async function syncCollectionFloorForNewEngineRows(
  * ensureOldAttributionWithinFloor's own live-ledger recomputation)
  * every time a PAID row is created, updated, or removed.
  */
-async function syncCollectionFloorForBilty(
+/**
+ * The pure floor formula syncCollectionFloorForBilty() targets: how
+ * much of the OLD single-payer Collection default is still correctly
+ * left attributed to its original party, once BOTH the Paid slice
+ * AND whatever active new-engine COLLECTION rows already independently
+ * cover are carved out. Exported only so it can be unit-tested without
+ * a database - never call this from outside this module.
+ */
+export function computeCollectionFloorForBilty(
+  biltyTotal: number,
+  paidAmount: number,
+  activeCollectionTotal: number
+): number {
+  return Math.max(0, round2(biltyTotal - paidAmount - activeCollectionTotal));
+}
+
+interface CollectionFloorContextResult {
+  context: ComponentContext;
+  explicitFloor: number;
+  biltyTotal: number;
+  paidAmount: number;
+  activeCollectionTotal: number;
+}
+
+/**
+ * Shared read-only resolution behind both syncCollectionFloorForBilty()
+ * (the real sync, called from the PAID row's own create/update/delete)
+ * and previewCollectionFloorForBilty() (the dry-run report) - the exact
+ * same floor the real sync would target, computed once here so the two
+ * can never drift apart. Returns null when this Bilty has no settled
+ * Challan yet (nothing for the OLD mechanism to have claimed).
+ */
+async function resolveCollectionFloorContext(
   tx: Tx,
-  biltyId: string,
-  createdById: string | null
-): Promise<void> {
+  biltyId: string
+): Promise<CollectionFloorContextResult | null> {
   const link = await tx.challanBilty.findFirst({
     where: { biltyId, challan: { isDeleted: false, status: { not: "CANCELLED" } } },
     select: {
@@ -436,7 +467,7 @@ async function syncCollectionFloorForBilty(
   });
 
   if (!link || !link.challan.isSettled || !link.challan.settlementJournalEntryId) {
-    return;
+    return null;
   }
 
   const grossAccountId = await getGrossBiltyReceivableAccountId(tx);
@@ -445,10 +476,25 @@ async function syncCollectionFloorForBilty(
     where: { component: "PAID", biltyId },
     select: { amount: true },
   });
-  const explicitFloor = currentPaidRow
-    ? Math.max(0, round2(biltyTotal - round2(Number(currentPaidRow.amount))))
-    : biltyTotal;
-  const collectionContext: ComponentContext = {
+  const paidAmount = currentPaidRow ? round2(Number(currentPaidRow.amount)) : 0;
+  // Must also subtract whatever active new-engine COLLECTION rows
+  // already independently claim for this Bilty (the same activeTotal
+  // syncCollectionFloorForNewEngineRows() itself nets against) - a
+  // PAID row's own floor is otherwise computed in total ignorance of
+  // those rows, so creating/raising a PAID row AFTER explicit
+  // COLLECTION allocations already exist re-restores the OLD party's
+  // claim over a slice those allocations already cover, double-
+  // counting the same Rupee against both the OLD default and the new
+  // rows (RH International Goods forensic report: floor was
+  // biltyTotal - Paid alone, 100,000 stayed wrongly re-attributed to
+  // the OLD party on top of 100,000 already explicitly collected).
+  const activeCollectionRows = await getActiveSettlementPayments(tx, "COLLECTION", {
+    challanId: link.challan.id,
+    biltyId: link.bilty.id,
+  });
+  const activeCollectionTotal = round2(activeCollectionRows.reduce((s, r) => s + r.amount, 0));
+  const explicitFloor = computeCollectionFloorForBilty(biltyTotal, paidAmount, activeCollectionTotal);
+  const context: ComponentContext = {
     challanId: link.challan.id,
     challanNo: link.challan.challanNo,
     settlementJournalEntryId: link.challan.settlementJournalEntryId,
@@ -463,7 +509,57 @@ async function syncCollectionFloorForBilty(
     documentLabel: `Bilty ${link.bilty.biltyNo} To-Pay`,
   };
 
-  await ensureOldAttributionWithinFloor(tx, "COLLECTION", collectionContext, createdById, explicitFloor);
+  return { context, explicitFloor, biltyTotal, paidAmount, activeCollectionTotal };
+}
+
+async function syncCollectionFloorForBilty(
+  tx: Tx,
+  biltyId: string,
+  createdById: string | null
+): Promise<void> {
+  const resolved = await resolveCollectionFloorContext(tx, biltyId);
+  if (!resolved) return;
+  await ensureOldAttributionWithinFloor(tx, "COLLECTION", resolved.context, createdById, resolved.explicitFloor);
+}
+
+/**
+ * READ-ONLY dry-run counterpart to syncCollectionFloorForBilty() -
+ * reports exactly what that sync would currently do for this Bilty
+ * (current attribution, target floor, the release/restore delta it
+ * would post) WITHOUT writing anything. See
+ * scripts/reconcile-collection-floor-dry-run.ts. Returns null when
+ * this Bilty has no settled Challan, or the old single-payer
+ * mechanism never established a Collection party for it to begin
+ * with (nothing to preview).
+ */
+export interface CollectionFloorPreview extends OldAttributionPreview {
+  challanId: string;
+  challanNo: string;
+  biltyId: string;
+  biltyNo: string;
+  biltyTotal: number;
+  paidAmount: number;
+  activeCollectionTotal: number;
+}
+
+export async function previewCollectionFloorForBilty(
+  tx: Tx,
+  biltyId: string
+): Promise<CollectionFloorPreview | null> {
+  const resolved = await resolveCollectionFloorContext(tx, biltyId);
+  if (!resolved) return null;
+  const preview = await previewOldAttributionAdjustment(tx, "COLLECTION", resolved.context, resolved.explicitFloor);
+  if (!preview) return null;
+  return {
+    ...preview,
+    challanId: resolved.context.challanId as string,
+    challanNo: resolved.context.challanNo as string,
+    biltyId: resolved.context.biltyId as string,
+    biltyNo: resolved.context.biltyNo as string,
+    biltyTotal: resolved.biltyTotal,
+    paidAmount: resolved.paidAmount,
+    activeCollectionTotal: resolved.activeCollectionTotal,
+  };
 }
 
 /**
@@ -600,13 +696,71 @@ async function syncCarrierRentFloorForChallan(
   await ensureOldAttributionWithinFloor(tx, "CARRIER_RENT", context, createdById, explicitFloor);
 }
 
-async function ensureOldAttributionWithinFloor(
+/**
+ * READ-ONLY dry-run counterpart to syncCarrierRentFloorForChallan() -
+ * Carrier Rent's own sync was never part of the RH International Goods
+ * bug (it already nets against active CARRIER_RENT rows correctly),
+ * so this is included in the diagnostic purely to report the OTHER
+ * half of a party's full net payable alongside the Collection-side
+ * preview above. Returns null when this Challan has no settled
+ * Carrier Rent, or no party was ever established for it.
+ */
+export interface CarrierRentFloorPreview extends OldAttributionPreview {
+  challanId: string;
+  challanNo: string;
+  carrierRentTotal: number;
+  activeCarrierRentTotal: number;
+}
+
+export async function previewCarrierRentFloorForChallan(
+  tx: Tx,
+  challanId: string
+): Promise<CarrierRentFloorPreview | null> {
+  const context = await resolveComponentContext(tx, "CARRIER_RENT", { challanId });
+  const activeRows = await getActiveSettlementPayments(tx, "CARRIER_RENT", { challanId });
+  const activeCarrierRentTotal = round2(activeRows.reduce((s, r) => s + r.amount, 0));
+  const explicitFloor = Math.max(0, round2(context.componentTotal - activeCarrierRentTotal));
+
+  const preview = await previewOldAttributionAdjustment(tx, "CARRIER_RENT", context, explicitFloor);
+  if (!preview) return null;
+  return {
+    ...preview,
+    challanId: context.challanId as string,
+    challanNo: context.challanNo as string,
+    carrierRentTotal: context.componentTotal,
+    activeCarrierRentTotal,
+  };
+}
+
+/**
+ * A fully-read-only preview of what ensureOldAttributionWithinFloor()
+ * below would do - every step up to (never including) the actual
+ * JournalEntry write. Exported so a dry-run diagnostic (see
+ * previewCollectionFloorForBilty()/scripts/reconcile-collection-floor-
+ * dry-run.ts) can report the EXACT same figures the real sync would
+ * act on, without writing anything and without a second, divergence-
+ * prone reimplementation of this calculation. Returns null when there
+ * is no old-mechanism attribution to even consider (no matching
+ * expense/income account configured, or the old single-payer
+ * mechanism never established a party for this component at all).
+ */
+export interface OldAttributionPreview {
+  component: "COLLECTION" | "CARRIER_RENT";
+  oldPartyAccountId: string;
+  originalAttributed: number;
+  currentlyAttributed: number;
+  floor: number;
+  delta: number;
+  isRestore: boolean;
+  adjustAmount: number;
+}
+
+async function previewOldAttributionAdjustment(
   tx: Tx,
   component: "COLLECTION" | "CARRIER_RENT",
   context: ComponentContext,
-  createdById: string | null,
   explicitFloor?: number
-): Promise<void> {
+): Promise<OldAttributionPreview | null> {
   // The "incomeOrExpenseAccountId" findSettledPartyAccountId()/
   // getComponentNetAmount() need to recognize this component's
   // reclassification group is the SAME account the original
@@ -626,7 +780,7 @@ async function ensureOldAttributionWithinFloor(
     // against, so there cannot be an old-mechanism attribution to
     // release either. Not an error: this only means the old
     // mechanism itself could never have run for this component.
-    return;
+    return null;
   }
 
   const biltyIdForLookup = component === "CARRIER_RENT" ? null : context.biltyId;
@@ -644,7 +798,7 @@ async function ensureOldAttributionWithinFloor(
     // The old single-payer mechanism never established a party for
     // this component (e.g. the amount was 0 at original settlement
     // time) - nothing to release.
-    return;
+    return null;
   }
 
   const oldNet = await getComponentNetAmount(
@@ -669,9 +823,7 @@ async function ensureOldAttributionWithinFloor(
   // "currently attributed" magnitude before comparing to the floor.
   const originalAttributed = component === "COLLECTION" ? oldNet : -oldNet;
 
-  const sourceType = component === "CARRIER_RENT" ? "CHALLAN" : "BILTY";
   const sourceId = component === "CARRIER_RENT" ? (context.challanId as string) : (context.biltyId as string);
-  const sourceNumber = component === "CARRIER_RENT" ? (context.challanNo as string) : (context.biltyNo as string);
   const releaseReferenceType =
     component === "COLLECTION" ? "COLLECTION_MULTI_PAYER_TRANSITION" : "CARRIER_RENT_MULTI_PAYER_TRANSITION";
 
@@ -710,12 +862,37 @@ async function ensureOldAttributionWithinFloor(
   const currentlyAttributed = round2(originalAttributed - netReleased);
   const delta = round2(floor - currentlyAttributed);
 
-  if (Math.abs(delta) <= EPS) {
+  return {
+    component,
+    oldPartyAccountId,
+    originalAttributed,
+    currentlyAttributed,
+    floor,
+    delta,
+    isRestore: delta > 0,
+    adjustAmount: Math.abs(delta),
+  };
+}
+
+async function ensureOldAttributionWithinFloor(
+  tx: Tx,
+  component: "COLLECTION" | "CARRIER_RENT",
+  context: ComponentContext,
+  createdById: string | null,
+  explicitFloor?: number
+): Promise<void> {
+  const preview = await previewOldAttributionAdjustment(tx, component, context, explicitFloor);
+  if (!preview || Math.abs(preview.delta) <= EPS) {
     return;
   }
+  const { oldPartyAccountId, isRestore, adjustAmount, floor } = preview;
 
-  const isRestore = delta > 0;
-  const adjustAmount = Math.abs(delta);
+  const sourceType = component === "CARRIER_RENT" ? "CHALLAN" : "BILTY";
+  const sourceId = component === "CARRIER_RENT" ? (context.challanId as string) : (context.biltyId as string);
+  const sourceNumber = component === "CARRIER_RENT" ? (context.challanNo as string) : (context.biltyNo as string);
+  const releaseReferenceType =
+    component === "COLLECTION" ? "COLLECTION_MULTI_PAYER_TRANSITION" : "CARRIER_RENT_MULTI_PAYER_TRANSITION";
+
   const lines = isRestore
     ? buildLines(component, adjustAmount, oldPartyAccountId, context.grossAccountId)
     : buildReverseLines(component, adjustAmount, oldPartyAccountId, context.grossAccountId);
