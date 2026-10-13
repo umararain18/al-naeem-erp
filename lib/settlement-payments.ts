@@ -422,6 +422,22 @@ async function syncCollectionFloorForNewEngineRows(
  * ensureOldAttributionWithinFloor's own live-ledger recomputation)
  * every time a PAID row is created, updated, or removed.
  */
+/**
+ * The pure floor formula syncCollectionFloorForBilty() targets: how
+ * much of the OLD single-payer Collection default is still correctly
+ * left attributed to its original party, once BOTH the Paid slice
+ * AND whatever active new-engine COLLECTION rows already independently
+ * cover are carved out. Exported only so it can be unit-tested without
+ * a database - never call this from outside this module.
+ */
+export function computeCollectionFloorForBilty(
+  biltyTotal: number,
+  paidAmount: number,
+  activeCollectionTotal: number
+): number {
+  return Math.max(0, round2(biltyTotal - paidAmount - activeCollectionTotal));
+}
+
 async function syncCollectionFloorForBilty(
   tx: Tx,
   biltyId: string,
@@ -445,9 +461,27 @@ async function syncCollectionFloorForBilty(
     where: { component: "PAID", biltyId },
     select: { amount: true },
   });
-  const explicitFloor = currentPaidRow
-    ? Math.max(0, round2(biltyTotal - round2(Number(currentPaidRow.amount))))
-    : biltyTotal;
+  // Must also subtract whatever active new-engine COLLECTION rows
+  // already independently claim for this Bilty (the same activeTotal
+  // syncCollectionFloorForNewEngineRows() itself nets against) - a
+  // PAID row's own floor is otherwise computed in total ignorance of
+  // those rows, so creating/raising a PAID row AFTER explicit
+  // COLLECTION allocations already exist re-restores the OLD party's
+  // claim over a slice those allocations already cover, double-
+  // counting the same Rupee against both the OLD default and the new
+  // rows (RH International Goods forensic report: floor was
+  // biltyTotal - Paid alone, 100,000 stayed wrongly re-attributed to
+  // the OLD party on top of 100,000 already explicitly collected).
+  const activeCollectionRows = await getActiveSettlementPayments(tx, "COLLECTION", {
+    challanId: link.challan.id,
+    biltyId: link.bilty.id,
+  });
+  const activeCollectionTotal = round2(activeCollectionRows.reduce((s, r) => s + r.amount, 0));
+  const explicitFloor = computeCollectionFloorForBilty(
+    biltyTotal,
+    currentPaidRow ? round2(Number(currentPaidRow.amount)) : 0,
+    activeCollectionTotal
+  );
   const collectionContext: ComponentContext = {
     challanId: link.challan.id,
     challanNo: link.challan.challanNo,
