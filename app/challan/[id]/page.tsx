@@ -455,6 +455,15 @@ export default function ChallanDetailPage({
   const [challan, setChallan] = useState<Challan | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  // Separate from `error` above - `error` drives the page-level
+  // "Challan not found" fallback render (see the `if (error || !challan)`
+  // early return below), so reusing it for an edit-form validation
+  // failure (e.g. a duplicate Challan No.) would replace the entire
+  // page with that fallback instead of showing the message inline in
+  // the still-open Edit form. Scoped to submitEdit() only - deliberately
+  // not applied to deliver/cancel/download's own pre-existing shared
+  // use of `error`, which is out of scope for this change.
+  const [editError, setEditError] = useState("");
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const presentation = useDocumentPresentation("CHALLAN");
 
@@ -462,6 +471,7 @@ export default function ChallanDetailPage({
   // EDIT
   // ------------------------------------------------------------
   const [showEditForm, setShowEditForm] = useState(false);
+  const [editChallanNo, setEditChallanNo] = useState("");
   const [editLoadingDate, setEditLoadingDate] = useState("");
   const [editTransporterPartyId, setEditTransporterPartyId] = useState("");
   const [editDriverName, setEditDriverName] = useState("");
@@ -579,6 +589,7 @@ export default function ChallanDetailPage({
 
   function openEditForm() {
     if (!challan) return;
+    setEditChallanNo(challan.challanNo);
     setEditLoadingDate(toBusinessDateInputValue(challan.loadingDate));
     setEditTransporterPartyId(challan.transporterParty?.id || "");
     setEditDriverName(challan.driverName || "");
@@ -594,6 +605,7 @@ export default function ChallanDetailPage({
     setEditCarrierRentRespChoice("CLEARING_AGENT");
     setEditCarrierRentThirdPartyAccountId("");
     setError("");
+    setEditError("");
     setShowEditForm(true);
     loadTransporters();
     loadPartyAccountOptions();
@@ -645,13 +657,14 @@ export default function ChallanDetailPage({
   async function submitEdit() {
     if (!challan) return;
     setActionLoading("edit");
-    setError("");
+    setEditError("");
 
     try {
       const response = await fetch(`/api/challan/${challan.id}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          challanNo: editChallanNo,
           loadingDate: editLoadingDate,
           transporterPartyId: editTransporterPartyId || "",
           driverName: editDriverName || "",
@@ -678,19 +691,19 @@ export default function ChallanDetailPage({
       if (!response.ok || !data.success) {
         if (data.requiresCarrierRentResponsibility) {
           setNeedsCarrierRentResponsibility(true);
-          setError(
+          setEditError(
             "This Challan is already settled and has no established party for Carrier Rent yet. Please choose who is responsible below, then save again."
           );
           return;
         }
 
-        setError(data.message || "Unable to update challan");
+        setEditError(data.message || "Unable to update challan");
         return;
       }
       setShowEditForm(false);
       await loadChallan();
     } catch {
-      setError("Unable to connect to the server");
+      setEditError("Unable to connect to the server");
     } finally {
       setActionLoading(null);
     }
@@ -1057,6 +1070,16 @@ export default function ChallanDetailPage({
             )}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
               <div>
+                <label className="block text-sm font-medium mb-1">Challan No *</label>
+                <input
+                  type="text"
+                  value={editChallanNo}
+                  onChange={(e) => setEditChallanNo(e.target.value)}
+                  className="w-full border rounded-lg px-3 py-2"
+                  required
+                />
+              </div>
+              <div>
                 <label className="block text-sm font-medium mb-1">Loading Date</label>
                 <input
                   type="date"
@@ -1279,7 +1302,7 @@ export default function ChallanDetailPage({
               )}
             </div>
 
-            {error && <p className="text-sm text-red-600 mt-4">{error}</p>}
+            {editError && <p className="text-sm text-red-600 mt-4">{editError}</p>}
 
             <div className="flex gap-3 mt-4">
               <button
@@ -1294,7 +1317,7 @@ export default function ChallanDetailPage({
                 type="button"
                 onClick={() => {
                   setShowEditForm(false);
-                  setError("");
+                  setEditError("");
                 }}
                 className="border px-6 py-2 rounded-lg text-sm hover:bg-gray-50"
               >
