@@ -21,6 +21,16 @@ function round2(value: number): number {
   return Math.round(value * 100) / 100;
 }
 
+// Thrown only from inside the PATCH transaction's own in-tx duplicate
+// re-check (see "CHALLAN NO." below) - caught in that same handler's
+// outer catch to return a clean 409 instead of an unhandled 500.
+class ChallanNoConflictError extends Error {
+  constructor() {
+    super("Ye Challan No. pehle se maujood hai.");
+    this.name = "ChallanNoConflictError";
+  }
+}
+
 type ResponsibilityChoice = {
   responsibility: "CLEARING_AGENT" | "TRANSPORTER" | "ANC" | "THIRD_PARTY";
   thirdPartyAccountId: string | null;
@@ -499,6 +509,39 @@ export async function PATCH(
     }
 
     // ========================================================
+    // CHALLAN NO. (now editable) - same format rule as creation
+    // (app/api/challan/route.ts's own createChallanSchema: trimmed,
+    // non-empty), unique among ACTIVE Challans only (a binned
+    // Challan's old number may be reused, mirroring the create
+    // route's own `existingChallan && !existingChallan.isDeleted`
+    // check). A no-op when the trimmed value is unchanged - never
+    // touches updateData/history for a same-value submit.
+    // ========================================================
+    let newChallanNoTrimmed: string | undefined;
+    if (body.challanNo !== undefined) {
+      const trimmed = typeof body.challanNo === "string" ? body.challanNo.trim() : "";
+      if (!trimmed) {
+        return NextResponse.json(
+          { success: false, message: "Challan number is required" },
+          { status: 400 }
+        );
+      }
+      if (trimmed !== existingChallan.challanNo) {
+        const duplicate = await prisma.challan.findFirst({
+          where: { challanNo: trimmed, isDeleted: false, id: { not: id } },
+        });
+        if (duplicate) {
+          return NextResponse.json(
+            { success: false, message: "Ye Challan No. pehle se maujood hai." },
+            { status: 409 }
+          );
+        }
+        newChallanNoTrimmed = trimmed;
+        updateData.challanNo = trimmed;
+      }
+    }
+
+    // ========================================================
     // CARRIER RENT CORRECTION (accounting-safe edit)
     //
     // Carrier Rent expense was already recognized in full at
@@ -707,6 +750,23 @@ export async function PATCH(
         }
       }
 
+      if (newChallanNoTrimmed) {
+        // Re-checked inside the SAME Serializable transaction, on the
+        // same connection/snapshot the write below will use - the
+        // pre-transaction check above only protects against a
+        // conflict that already existed at request time; this catches
+        // a genuinely concurrent rename/creation racing this one. The
+        // table's own @unique(challanNo) constraint is the final
+        // backstop (caught as P2002 below) if this still somehow slips
+        // through.
+        const duplicateInTx = await tx.challan.findFirst({
+          where: { challanNo: newChallanNoTrimmed, isDeleted: false, id: { not: id } },
+        });
+        if (duplicateInTx) {
+          throw new ChallanNoConflictError();
+        }
+      }
+
       const updatedChallanRow = await tx.challan.update({
         where: { id },
         data: {
@@ -737,6 +797,26 @@ export async function PATCH(
           },
         },
       });
+
+      if (newChallanNoTrimmed) {
+        // JournalLine.sourceNumber is a denormalized DISPLAY copy only
+        // (sourceId is the real reference every lookup actually uses -
+        // see JournalLine's own schema comment) - every line this
+        // Challan's own number was ever stamped onto (dispatch,
+        // Settlement, SettlementPayment, every *_CORRECTION/
+        // *_MULTI_PAYER_TRANSITION entry - anything tagged sourceType
+        // "CHALLAN", sourceId = this Challan) must now show the
+        // renamed number too, or Daily Posting/Cash Book/Ledger would
+        // keep displaying the stale one forever. JournalEntry.description
+        // (a historical narrative snapshot, e.g. "Settlement - 6423 -
+        // ...") is deliberately NOT rewritten - same append-only
+        // principle this codebase applies to every other historical
+        // entry; only this structured, display-only field is kept live.
+        await tx.journalLine.updateMany({
+          where: { sourceType: "CHALLAN", sourceId: id },
+          data: { sourceNumber: newChallanNoTrimmed },
+        });
+      }
 
       const changedFields = diffFields(existingChallan, updateData as Record<string, unknown>, Object.keys(updateData) as (keyof typeof existingChallan)[]);
       if (Object.keys(changedFields).length > 0 || removeBiltyIds.length > 0 || addBiltyIds.length > 0) {
@@ -782,6 +862,24 @@ export async function PATCH(
         return NextResponse.json(
           { success: false, message: correctionError.message },
           { status: 400 }
+        );
+      }
+      if (correctionError instanceof ChallanNoConflictError) {
+        return NextResponse.json(
+          { success: false, message: correctionError.message },
+          { status: 409 }
+        );
+      }
+      if (correctionError instanceof Prisma.PrismaClientKnownRequestError && correctionError.code === "P2002") {
+        // Final backstop - the table's own @unique(challanNo) constraint,
+        // for the one case the application-level checks above cannot
+        // see: the new number collides with a BINNED Challan's number
+        // (deliberately still allowed to exist, mirroring the create
+        // route's own `existingChallan && !existingChallan.isDeleted`
+        // policy) rather than an active one.
+        return NextResponse.json(
+          { success: false, message: "Ye Challan No. pehle se maujood hai." },
+          { status: 409 }
         );
       }
       if (correctionError instanceof Prisma.PrismaClientKnownRequestError && correctionError.code === "P2034") {
