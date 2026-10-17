@@ -27,6 +27,7 @@ import {
   Receipt,
   Settings,
   History,
+  Car,
 } from "lucide-react";
 import GlobalSearch from "@/components/layout/GlobalSearch";
 import ThemeToggle from "@/components/theme/ThemeToggle";
@@ -93,6 +94,13 @@ const navigation: { section: string; items: NavItem[] }[] = [
         icon: Receipt,
         permission: "bill.view",
         match: (pathname) => pathname === "/bill" || pathname.startsWith("/bill/"),
+      },
+      {
+        label: "Own Carrier Register",
+        href: "/own-carrier",
+        icon: Car,
+        permission: "ownCarrier.view",
+        match: (pathname) => pathname === "/own-carrier" || pathname.startsWith("/own-carrier/"),
       },
       {
         label: "Location Master",

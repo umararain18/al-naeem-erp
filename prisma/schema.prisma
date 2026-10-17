@@ -42,6 +42,12 @@ model User {
   updatedBills              Bill[]              @relation("BillUpdatedBy")
   deletedBills              Bill[]              @relation("BillDeletedBy")
   updatedBusinessSettings   BusinessSettings[]  @relation("BusinessSettingsUpdatedBy")
+  createdOwnCarriers        OwnCarrier[]        @relation("OwnCarrierCreatedBy")
+  updatedOwnCarriers        OwnCarrier[]        @relation("OwnCarrierUpdatedBy")
+  deletedOwnCarriers        OwnCarrier[]        @relation("OwnCarrierDeletedBy")
+  createdCarrierSlips       CarrierSlip[]       @relation("CarrierSlipCreatedBy")
+  updatedCarrierSlips       CarrierSlip[]       @relation("CarrierSlipUpdatedBy")
+  deletedCarrierSlips       CarrierSlip[]       @relation("CarrierSlipDeletedBy")
 }
 
 model Party {
@@ -73,6 +79,8 @@ model Party {
   privatePhonchVehicleClearingAgentLines PrivatePhonchVehicle[] @relation("PrivatePhonchVehicleClearingAgent")
 
   bills Bill[] @relation("BillClientParty")
+
+  carrierSlipExpenseVendorLines CarrierSlipExpense[] @relation("CarrierSlipExpenseVendor")
 }
 
 // ============================================================
@@ -162,14 +170,17 @@ model Account {
   parentId           String?
   partyId            String?             @unique
   employeeId         String?             @unique
+  ownCarrierId       String?             @unique
   createdAt          DateTime            @default(now())
   updatedAt          DateTime            @updatedAt
   parent             Account?            @relation("AccountHierarchy", fields: [parentId], references: [id], onDelete: Restrict)
   children           Account[]           @relation("AccountHierarchy")
   party              Party?              @relation(fields: [partyId], references: [id])
   employee           Employee?           @relation(fields: [employeeId], references: [id])
+  ownCarrier         OwnCarrier?         @relation(fields: [ownCarrierId], references: [id])
   ledgerEntries      JournalLine[]
   settlementPayments SettlementPayment[]
+  carrierSlipExpenseLines CarrierSlipExpense[]
 
   @@index([accountType])
   @@index([category])
@@ -270,6 +281,7 @@ model Bilty {
   updatedAt          DateTime            @updatedAt
   challanBilties     ChallanBilty[]
   settlementPayments SettlementPayment[]
+  carrierSlip        CarrierSlip?        @relation("CarrierSlipBilty")
 
   @@index([date])
   @@index([status])
@@ -540,6 +552,7 @@ model Challan {
   // Relations
   bilties            ChallanBilty[]
   settlementPayments SettlementPayment[]
+  carrierSlip        CarrierSlip?        @relation("CarrierSlipChallan")
 
   @@index([loadingDate])
   @@index([status])
@@ -1203,4 +1216,206 @@ model AuditLog {
   @@index([module])
   @@index([entityType, entityId])
   @@index([documentNo])
+}
+
+// ============================================================
+// OWN CARRIER REGISTER (Phase 1 of 3 - see PR description)
+//
+// A first-class master entity for ANC's OWN fleet vehicles - distinct
+// from Party/Challan.transporterPartyId, which represents an EXTERNAL
+// third-party Transporter hired for a trip (and who may be owed real
+// Carrier Rent through Settlement, e.g. lib/settlement-payments.ts).
+// No such master record existed anywhere before this - carrierNumber
+// was only ever a free-text tag on Challan/Bilty.
+//
+// Each OwnCarrier gets exactly one dedicated "Driver Cash" Account
+// (ASSET/CASH, isSystem: false) at creation, mirroring the EXACT same
+// 1:1 pattern Party/Employee already use (Account.partyId/employeeId)
+// - see Account.ownCarrierId above. This account is the single
+// authoritative source for that carrier's running driver-cash balance
+// - never a stored/cached number on the carrier or a slip, per this
+// codebase's own established rule (Payslip/PrivatePhonch/Bill all
+// derive their running totals from the real ledger, tagged by
+// sourceType/sourceId, rather than storing an independently-editable
+// balance that could drift from it). Phase 1 does not yet post real
+// driver-cash JournalEntries (that is Phase 2) - CarrierSlipCollection/
+// CarrierSlipExpense below are Phase 1's own operational record of
+// what happened on a trip, not yet GL-authoritative. See each model's
+// own comment.
+// ============================================================
+
+model OwnCarrier {
+  id            String  @id @default(cuid())
+  carrierNumber String  @unique
+  driverName    String?
+  driverPhone   String?
+  notes         String?
+  isActive      Boolean @default(true)
+
+  driverCashAccount Account?
+
+  // Bin
+  isDeleted   Boolean   @default(false)
+  deletedAt   DateTime?
+  deletedById String?
+  deletedBy   User?     @relation("OwnCarrierDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+
+  // Audit
+  createdById String?
+  createdBy   User?   @relation("OwnCarrierCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?
+  updatedBy   User?   @relation("OwnCarrierUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  slips CarrierSlip[]
+
+  @@index([isActive])
+  @@index([isDeleted])
+}
+
+enum CarrierSlipStatus {
+  IN_PROGRESS
+  TRIP_COMPLETED
+  RETURNED
+}
+
+model CarrierSlip {
+  id        String     @id @default(cuid())
+  carrierId String
+  carrier   OwnCarrier @relation(fields: [carrierId], references: [id], onDelete: Restrict)
+
+  // User-typed, like every other document number in this app
+  // (biltyNo/challanNo) - uniqueness enforced per-carrier (not
+  // globally) by the composite unique index below, exactly mirroring
+  // Payslip's own @@unique([employeeId, payrollMonth]) scoping
+  // pattern. There is no precedent anywhere in this app for a
+  // server-generated auto-sequence; a route-level helper may suggest
+  // the next number (count + 1, same convenience-only pattern as
+  // lib/payroll-accounting.ts's nextEmployeeCode()) but the @@unique
+  // constraint below is the actual concurrency guarantee, caught as a
+  // Prisma P2002 by the creation route exactly like every other
+  // numbered document in this app.
+  slipNo String
+
+  departureDate DateTime
+  returnDate    DateTime?
+  route         String?
+  driverName    String?
+  driverPhone   String?
+  status        CarrierSlipStatus @default(IN_PROGRESS)
+
+  // Optional link to a REAL existing Bilty/Challan - a genuine FK,
+  // fetched live (Total Bilty Rent, Carrier Rent, existing Paid/
+  // To-Pay) rather than re-entered. Each is @unique: a Bilty/Challan
+  // can be the basis of at most one Carrier Slip. The application
+  // layer (not the schema - Challan.transporterPartyId is always
+  // optional) MUST reject linking a Challan that already has an
+  // external transporterPartyId set, before this is ever written -
+  // that Challan's Carrier Rent already belongs to a real external
+  // Transporter payable (see lib/settlement-payments.ts); an own
+  // vehicle's trip must never also claim it as its own profit input,
+  // or the same Carrier Rent would be double-counted as both an
+  // external payable and an own-carrier profit figure.
+  linkedChallanId String? @unique
+  linkedChallan   Challan? @relation("CarrierSlipChallan", fields: [linkedChallanId], references: [id], onDelete: SetNull)
+  linkedBiltyId   String? @unique
+  linkedBilty     Bilty?   @relation("CarrierSlipBilty", fields: [linkedBiltyId], references: [id], onDelete: SetNull)
+
+  // ONLY meaningful when linkedChallanId/linkedBiltyId are both null
+  // (a standalone own-carrier trip with no ANC Bilty at all) - when a
+  // Challan/Bilty IS linked, Total Bilty Rent/Carrier Rent are NEVER
+  // read from these columns, always re-fetched live from the real
+  // Bilty.total/Challan.carrierRent, exactly like every other derived
+  // figure in this app. Kept nullable Decimal (not defaulted to 0) so
+  // "not applicable" and "genuinely zero" are never confused.
+  manualTotalBiltyRent Decimal? @db.Decimal(15, 2)
+  manualCarrierRent    Decimal? @db.Decimal(15, 2)
+
+  notes String?
+
+  // Bin
+  isDeleted   Boolean   @default(false)
+  deletedAt   DateTime?
+  deletedById String?
+  deletedBy   User?     @relation("CarrierSlipDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+
+  // Audit
+  createdById String?
+  createdBy   User?   @relation("CarrierSlipCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?
+  updatedBy   User?   @relation("CarrierSlipUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  collections CarrierSlipCollection[]
+  expenses    CarrierSlipExpense[]
+
+  @@unique([carrierId, slipNo])
+  @@index([carrierId])
+  @@index([isDeleted])
+  @@index([departureDate])
+}
+
+enum CollectionCollectedBy {
+  DRIVER
+  OFFICE
+}
+
+enum CollectionMethod {
+  CASH
+  BANK_ONLINE
+}
+
+// Phase 1: a plain operational record of a wasooli/collection entered
+// on a slip - amount, who collected it, and how. NOT yet a real
+// JournalEntry/driver-cash ledger movement (Phase 2 adds that,
+// following this exact same "only DRIVER + CASH increases physical
+// driver cash" rule the Phase 1 UI/API already enforce on this data).
+model CarrierSlipCollection {
+  id          String                @id @default(cuid())
+  slipId      String
+  slip        CarrierSlip           @relation(fields: [slipId], references: [id], onDelete: Cascade)
+  date        DateTime
+  amount      Decimal               @db.Decimal(15, 2)
+  collectedBy CollectionCollectedBy
+  method      CollectionMethod
+  note        String?
+  createdAt   DateTime              @default(now())
+
+  @@index([slipId])
+}
+
+enum CarrierExpensePaymentType {
+  NAQAD
+  KHATA
+  OFFICE_PAID
+}
+
+// Phase 1: a plain operational record of a trip expense - date,
+// EXISTING expense Account (never a new account-management feature -
+// see app/api/accounts/route.ts, already reused as-is), amount, and
+// payment treatment. NOT yet a real JournalEntry (Phase 2/3 add the
+// actual Dr Expense / Cr Vendor-or-Driver-Cash posting) - this is
+// Phase 1's own operational record of what happened on the trip.
+model CarrierSlipExpense {
+  id            String                    @id @default(cuid())
+  slipId        String
+  slip          CarrierSlip               @relation(fields: [slipId], references: [id], onDelete: Cascade)
+  date          DateTime
+  accountId     String
+  account       Account                   @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  description   String?
+  amount        Decimal                   @db.Decimal(15, 2)
+  paymentType   CarrierExpensePaymentType
+  // Only meaningful for KHATA - the existing VENDOR Party this amount
+  // is owed to. Never required for NAQAD/OFFICE_PAID.
+  vendorPartyId String?
+  vendorParty   Party?                    @relation("CarrierSlipExpenseVendor", fields: [vendorPartyId], references: [id], onDelete: SetNull)
+  createdAt     DateTime                  @default(now())
+
+  @@index([slipId])
+  @@index([accountId])
 }

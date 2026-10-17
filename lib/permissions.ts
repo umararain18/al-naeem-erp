@@ -63,6 +63,13 @@ export type Permission =
   | "bill.binView"
   | "bill.restore"
   | "bill.permanentlyDelete"
+  | "ownCarrier.view"
+  | "ownCarrier.create"
+  | "ownCarrier.edit"
+  | "ownCarrier.bin"
+  | "ownCarrier.binView"
+  | "ownCarrier.restore"
+  | "ownCarrier.permanentlyDelete"
   | "audit.view";
 
 const permissions: Record<AuthUser["role"], Permission[]> = {
@@ -142,6 +149,14 @@ const permissions: Record<AuthUser["role"], Permission[]> = {
     "bill.restore",
     "bill.permanentlyDelete",
 
+    "ownCarrier.view",
+    "ownCarrier.create",
+    "ownCarrier.edit",
+    "ownCarrier.bin",
+    "ownCarrier.binView",
+    "ownCarrier.restore",
+    "ownCarrier.permanentlyDelete",
+
     "audit.view",
   ],
 
@@ -205,6 +220,13 @@ const permissions: Record<AuthUser["role"], Permission[]> = {
     "bill.bin",
     "bill.binView",
     "bill.restore",
+
+    "ownCarrier.view",
+    "ownCarrier.create",
+    "ownCarrier.edit",
+    "ownCarrier.bin",
+    "ownCarrier.binView",
+    "ownCarrier.restore",
   ],
 
   VIEWER: [
@@ -221,6 +243,7 @@ const permissions: Record<AuthUser["role"], Permission[]> = {
     "phonch.view",
     "privatePhonch.view",
     "bill.view",
+    "ownCarrier.view",
   ],
 };
 
