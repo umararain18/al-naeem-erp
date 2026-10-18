@@ -4,6 +4,12 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import BillForm from "./BillForm";
 import { formatBusinessDate } from "@/lib/date-range";
+import { getSavedListFilters, saveListFilters, useListScrollRestore, LIST_HIGHLIGHT_CLASS } from "@/components/useListScrollRestore";
+
+const BILL_LIST_KEY = "bill-list";
+interface BillListFilters {
+  search: string;
+}
 
 // ============================================================
 // BILL BOOK - list + create
@@ -36,10 +42,11 @@ export default function BillPage() {
   const [items, setItems] = useState<BillListItem[]>([]);
   const [capabilities, setCapabilities] = useState({ canEdit: false, canBin: false });
   const [loading, setLoading] = useState(true);
-  const [search, setSearch] = useState("");
+  const [search, setSearch] = useState(() => getSavedListFilters<BillListFilters>(BILL_LIST_KEY)?.search ?? "");
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [actionId, setActionId] = useState<string | null>(null);
+  const { highlightId, onOpenRecord } = useListScrollRestore(BILL_LIST_KEY, !loading);
 
   async function loadList() {
     try {
@@ -61,6 +68,10 @@ export default function BillPage() {
     }, 250);
     return () => window.clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search]);
+
+  useEffect(() => {
+    saveListFilters(BILL_LIST_KEY, { search });
   }, [search]);
 
   async function handleBin(id: string) {
@@ -151,9 +162,16 @@ export default function BillPage() {
                   {items.map((b) => {
                     const isUnpaid = b.receivedAmount <= 0.009;
                     return (
-                      <tr key={b.id} className="hover:bg-gray-50">
+                      <tr
+                        key={b.id}
+                        className={`hover:bg-gray-50 ${highlightId === b.id ? LIST_HIGHLIGHT_CLASS : ""}`}
+                      >
                         <td className="px-4 py-3">
-                          <Link href={`/bill/${b.id}`} className="font-medium text-blue-600 hover:underline">
+                          <Link
+                            href={`/bill/${b.id}`}
+                            onClick={() => onOpenRecord(b.id)}
+                            className="font-medium text-blue-600 hover:underline"
+                          >
                             {b.billNo}
                           </Link>
                         </td>
@@ -191,11 +209,19 @@ export default function BillPage() {
                         </td>
                         <td className="px-4 py-3">
                           <div className="flex gap-2">
-                            <Link href={`/bill/${b.id}`} className="rounded border px-2 py-1 text-xs hover:bg-gray-50">
+                            <Link
+                              href={`/bill/${b.id}`}
+                              onClick={() => onOpenRecord(b.id)}
+                              className="rounded border px-2 py-1 text-xs hover:bg-gray-50"
+                            >
                               View
                             </Link>
                             {capabilities.canEdit && (
-                              <Link href={`/bill/${b.id}?edit=1`} className="rounded border px-2 py-1 text-xs hover:bg-gray-50">
+                              <Link
+                                href={`/bill/${b.id}?edit=1`}
+                                onClick={() => onOpenRecord(b.id)}
+                                className="rounded border px-2 py-1 text-xs hover:bg-gray-50"
+                              >
                                 Edit
                               </Link>
                             )}

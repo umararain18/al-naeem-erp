@@ -2,6 +2,12 @@
 
 import { FormEvent, useEffect, useState } from "react";
 import Link from "next/link";
+import { getSavedListFilters, saveListFilters, useListScrollRestore, LIST_HIGHLIGHT_CLASS } from "@/components/useListScrollRestore";
+
+const PARTIES_LIST_KEY = "parties-list";
+interface PartiesListFilters {
+  search: string;
+}
 
 type PartyType =
   | "TRANSPORTER"
@@ -72,7 +78,7 @@ export default function PartiesPage() {
     useState("");
 
   const [search, setSearch] =
-    useState("");
+    useState(() => getSavedListFilters<PartiesListFilters>(PARTIES_LIST_KEY)?.search ?? "");
 
   const [partyName, setPartyName] =
     useState("");
@@ -156,6 +162,12 @@ export default function PartiesPage() {
   useEffect(() => {
     loadParties();
   }, []);
+
+  useEffect(() => {
+    saveListFilters(PARTIES_LIST_KEY, { search });
+  }, [search]);
+
+  const { highlightId, onOpenRecord } = useListScrollRestore(PARTIES_LIST_KEY, !loading);
 
   async function handleCreateParty(
     event: FormEvent
@@ -811,7 +823,7 @@ export default function PartiesPage() {
 
                         <tr
                           key={party.id}
-                          className="border-b"
+                          className={`border-b ${highlightId === party.id ? LIST_HIGHLIGHT_CLASS : ""}`}
                         >
 
                           <td className="py-3 pr-4">
@@ -921,6 +933,7 @@ export default function PartiesPage() {
 
                               <Link
                                 href={`/parties/${party.id}/ledger`}
+                                onClick={() => onOpenRecord(party.id)}
                                 className="border rounded-lg px-3 py-1 text-sm hover:bg-gray-50"
                               >
                                 Ledger

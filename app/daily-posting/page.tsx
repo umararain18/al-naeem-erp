@@ -4,6 +4,20 @@ import { useEffect, useMemo, useState } from "react";
 import { DocumentSearchSelect } from "./DocumentSearchSelect";
 import { SearchableSelect, sourceOptions } from "./SearchableSelect";
 import { toBusinessDateInputValue } from "@/lib/date-range";
+import { getSavedListFilters, saveListFilters, useListScrollRestore } from "@/components/useListScrollRestore";
+
+// No "open record + highlight on return" wiring here - unlike every
+// other list page, Daily Posting has no outbound navigation of its
+// own to a separate detail page (editing happens entirely inline on
+// this same page), so there is nothing to highlight on a return visit.
+// Only the scroll position and the selected date/account are
+// restored - still the two things a Back navigation to this page
+// should preserve.
+const DAILY_POSTING_LIST_KEY = "daily-posting-list";
+interface DailyPostingListFilters {
+  postingDate: string;
+  accountId: string;
+}
 
 type Account = {
   id: string;
@@ -665,19 +679,33 @@ export default function DailyPostingPage() {
     const params = new URLSearchParams(window.location.search);
     const urlDate = params.get("date");
     const hasValidUrlDate = !!urlDate && /^\d{4}-\d{2}-\d{2}$/.test(urlDate);
-    if (hasValidUrlDate) {
-      setPostingDate(urlDate);
-    }
-    setHighlightId(params.get("highlight"));
     const urlAccount = params.get("account");
-    if (urlAccount) setAccountId(urlAccount);
+
+    // An explicit URL param (arriving from Cash Book/Party Ledger/etc.)
+    // always wins - a fresh, intentional navigation beats "where I
+    // was". Only when the URL carries neither does a restored date/
+    // account (see useListScrollRestore) apply, so a plain Back to
+    // this page lands on the same day/account it was last viewing.
+    const saved = getSavedListFilters<DailyPostingListFilters>(DAILY_POSTING_LIST_KEY);
+    const startDate = hasValidUrlDate ? urlDate : saved?.postingDate || postingDate;
+    const startAccount = urlAccount || saved?.accountId || "";
+
+    if (startDate !== postingDate) setPostingDate(startDate);
+    setHighlightId(params.get("highlight"));
+    if (startAccount) setAccountId(startAccount);
 
     // Load Existing Transactions for the PAGE'S ACTUAL starting date
     // directly, once, here - never for `today` first and then again
     // for the URL's date once state catches up.
-    void loadExisting(hasValidUrlDate ? urlDate : postingDate);
+    void loadExisting(startDate);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    saveListFilters(DAILY_POSTING_LIST_KEY, { postingDate, accountId });
+  }, [postingDate, accountId]);
+
+  useListScrollRestore(DAILY_POSTING_LIST_KEY, !loadingExisting);
 
   async function loadExisting(forDate: string) {
     if (!forDate) return;

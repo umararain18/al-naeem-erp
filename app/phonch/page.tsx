@@ -4,6 +4,12 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import PhonchForm from "./PhonchForm";
 import { formatBusinessDate } from "@/lib/date-range";
+import { getSavedListFilters, saveListFilters, useListScrollRestore, LIST_HIGHLIGHT_CLASS } from "@/components/useListScrollRestore";
+
+const PHONCH_LIST_KEY = "phonch-list";
+interface PhonchListFilters {
+  search: string;
+}
 
 // ============================================================
 // SHOWROOM PHONCH / DELIVERY - list + create
@@ -39,10 +45,11 @@ export default function PhonchPage() {
   const [items, setItems] = useState<PhonchListItem[]>([]);
   const [capabilities, setCapabilities] = useState({ canEdit: false, canBin: false });
   const [loading, setLoading] = useState(true);
-  const [search, setSearch] = useState("");
+  const [search, setSearch] = useState(() => getSavedListFilters<PhonchListFilters>(PHONCH_LIST_KEY)?.search ?? "");
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [actionId, setActionId] = useState<string | null>(null);
+  const { highlightId, onOpenRecord } = useListScrollRestore(PHONCH_LIST_KEY, !loading);
 
   async function loadList() {
     try {
@@ -64,6 +71,10 @@ export default function PhonchPage() {
     }, 250);
     return () => window.clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [search]);
+
+  useEffect(() => {
+    saveListFilters(PHONCH_LIST_KEY, { search });
   }, [search]);
 
   async function handleBin(id: string) {
@@ -154,9 +165,16 @@ export default function PhonchPage() {
                     // amount rather than blocking outright).
                     const isUnpaid = p.receivedAmount <= 0.009;
                     return (
-                      <tr key={p.id} className="hover:bg-gray-50">
+                      <tr
+                        key={p.id}
+                        className={`hover:bg-gray-50 ${highlightId === p.id ? LIST_HIGHLIGHT_CLASS : ""}`}
+                      >
                         <td className="px-4 py-3">
-                          <Link href={`/phonch/${p.id}`} className="font-medium text-blue-600 hover:underline">
+                          <Link
+                            href={`/phonch/${p.id}`}
+                            onClick={() => onOpenRecord(p.id)}
+                            className="font-medium text-blue-600 hover:underline"
+                          >
                             {p.phonchNo}
                           </Link>
                         </td>
@@ -179,12 +197,17 @@ export default function PhonchPage() {
                         </td>
                         <td className="px-4 py-3">
                           <div className="flex gap-2">
-                            <Link href={`/phonch/${p.id}`} className="rounded border px-2 py-1 text-xs hover:bg-gray-50">
+                            <Link
+                              href={`/phonch/${p.id}`}
+                              onClick={() => onOpenRecord(p.id)}
+                              className="rounded border px-2 py-1 text-xs hover:bg-gray-50"
+                            >
                               View
                             </Link>
                             {capabilities.canEdit && (
                               <Link
                                 href={`/phonch/${p.id}?edit=1`}
+                                onClick={() => onOpenRecord(p.id)}
                                 className="rounded border px-2 py-1 text-xs hover:bg-gray-50"
                               >
                                 Edit

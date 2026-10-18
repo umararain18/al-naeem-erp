@@ -1,8 +1,16 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { formatBusinessDate, toBusinessDateInputValue } from "@/lib/date-range";
+import { getSavedListFilters, saveListFilters, useListScrollRestore, LIST_HIGHLIGHT_CLASS } from "@/components/useListScrollRestore";
+
+const BILTY_LIST_KEY = "bilty-list";
+interface BiltyListFilters {
+  search: string;
+  statusFilter: BiltyStatus | "ALL";
+  page: number;
+}
 
 type BiltyStatus = "PENDING" | "IN_TRANSIT" | "DELIVERED" | "CANCELLED";
 
@@ -171,12 +179,14 @@ export default function BiltyPage() {
 
   const [message, setMessage] = useState("");
 
-  const [search, setSearch] = useState("");
+  const savedBiltyFilters = useMemo(() => getSavedListFilters<BiltyListFilters>(BILTY_LIST_KEY), []);
+
+  const [search, setSearch] = useState(() => savedBiltyFilters?.search ?? "");
   // Debounced so typing doesn't fire a server request per keystroke
   // now that search runs server-side (P2-3).
-  const [debouncedSearch, setDebouncedSearch] = useState("");
+  const [debouncedSearch, setDebouncedSearch] = useState(() => savedBiltyFilters?.search ?? "");
 
-  const [page, setPage] = useState(1);
+  const [page, setPage] = useState(() => savedBiltyFilters?.page ?? 1);
   const [pagination, setPagination] = useState({
     page: 1,
     pageSize: 25,
@@ -185,11 +195,13 @@ export default function BiltyPage() {
   });
 
   // A drill-down link (e.g. Dashboard's Bilty status counts) may
-  // deep-link straight to a status filter via ?status=PENDING.
+  // deep-link straight to a status filter via ?status=PENDING - takes
+  // priority over a restored filter (a fresh, intentional navigation
+  // beats "where I was").
   const [statusFilter, setStatusFilter] = useState<BiltyStatus | "ALL">(() => {
     if (typeof window === "undefined") return "ALL";
     const urlStatus = new URLSearchParams(window.location.search).get("status");
-    return (urlStatus as BiltyStatus | null) || "ALL";
+    return (urlStatus as BiltyStatus | null) || savedBiltyFilters?.statusFilter || "ALL";
   });
 
   const [biltyNo, setBiltyNo] = useState("");
@@ -477,8 +489,17 @@ export default function BiltyPage() {
   // Debounce search input before it reaches the server (P2-3). Also
   // resets to page 1 in the same update, so the reload effect below
   // fires once with the final (search, page) pair instead of once
-  // with a stale page and again once it resets.
+  // with a stale page and again once it resets. Skipped on the very
+  // first run (mount) - search/page may have just been restored from
+  // a saved list view (see useListScrollRestore), and resetting page
+  // back to 1 there would silently undo that restore a moment later.
+  const isFirstSearchRun = useRef(true);
   useEffect(() => {
+    if (isFirstSearchRun.current) {
+      isFirstSearchRun.current = false;
+      setDebouncedSearch(search.trim());
+      return;
+    }
     const timeout = setTimeout(() => {
       setDebouncedSearch(search.trim());
       setPage(1);
@@ -490,6 +511,15 @@ export default function BiltyPage() {
     loadBilties();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [debouncedSearch, statusFilter, page]);
+
+  // Persist filters/search/page whenever any of them change, so a
+  // Back navigation to this list (see useListScrollRestore) restores
+  // the exact same view, not a reset one.
+  useEffect(() => {
+    saveListFilters(BILTY_LIST_KEY, { search, statusFilter, page });
+  }, [search, statusFilter, page]);
+
+  const { highlightId, onOpenRecord } = useListScrollRestore(BILTY_LIST_KEY, !loading);
 
   function handleConsignorChange(value: string) {
     setConsignorPartyId(value);
@@ -1326,9 +1356,16 @@ export default function BiltyPage() {
                   </thead>
                   <tbody>
                     {filteredBilties.map((bilty) => (
-                      <tr key={bilty.id} className="border-b hover:bg-gray-50">
+                      <tr
+                        key={bilty.id}
+                        className={`border-b hover:bg-gray-50 ${highlightId === bilty.id ? LIST_HIGHLIGHT_CLASS : ""}`}
+                      >
                         <td className="py-3 pr-4">
-                          <Link href={`/bilty/${bilty.id}`} className="font-medium text-blue-600 hover:underline">
+                          <Link
+                            href={`/bilty/${bilty.id}`}
+                            onClick={() => onOpenRecord(bilty.id)}
+                            className="font-medium text-blue-600 hover:underline"
+                          >
                             {bilty.biltyNo}
                           </Link>
                         </td>
@@ -1368,6 +1405,7 @@ export default function BiltyPage() {
                           <div className="flex flex-wrap gap-2">
                             <Link
                               href={`/bilty/${bilty.id}`}
+                              onClick={() => onOpenRecord(bilty.id)}
                               className="border rounded-lg px-3 py-1 text-sm hover:bg-gray-50"
                             >
                               View
