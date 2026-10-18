@@ -18,6 +18,20 @@ import {
   useLedgerDetailColumns,
   type LedgerRowDetailsLike,
 } from "@/components/LedgerDetailsPicker";
+import { getSavedListFilters, saveListFilters, useListScrollRestore, LIST_HIGHLIGHT_CLASS } from "@/components/useListScrollRestore";
+
+// Scoped per-party (not one shared key) - each party's own ledger is
+// genuinely its own "list" instance; restoring Party A's scroll/filters
+// must never bleed into Party B's.
+function partyLedgerListKey(partyId: string): string {
+  return `party-ledger:${partyId}`;
+}
+interface PartyLedgerListFilters {
+  from: string;
+  to: string;
+  typeFilter: string;
+  search: string;
+}
 
 type PartyType = "TRANSPORTER" | "CLEARING_AGENT" | "CUSTOMER" | "VENDOR";
 
@@ -116,6 +130,8 @@ function LedgerTable({
   setTo,
   typeFilter,
   setTypeFilter,
+  highlightId,
+  onOpenRecord,
 }: {
   partyId: string;
   ledger: LedgerEntry[];
@@ -126,9 +142,15 @@ function LedgerTable({
   setTo: (v: string) => void;
   typeFilter: TxType;
   setTypeFilter: (v: TxType) => void;
+  highlightId: string | null;
+  onOpenRecord: (id: string) => void;
 }) {
-  const [search, setSearch] = useState("");
+  const [search, setSearch] = useState(() => getSavedListFilters<PartyLedgerListFilters>(partyLedgerListKey(partyId))?.search ?? "");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    saveListFilters(partyLedgerListKey(partyId), { from, to, typeFilter, search });
+  }, [partyId, from, to, typeFilter, search]);
 
   // Configurable Ledger Details columns - shared with General Ledger
   // (components/LedgerDetailsPicker.tsx), persisted per-browser.
@@ -292,11 +314,16 @@ function LedgerTable({
 
                   return (
                     <Fragment key={entry.id}>
-                      <tr className="hover:bg-gray-50">
+                      <tr className={`hover:bg-gray-50 ${highlightId === entry.id ? LIST_HIGHLIGHT_CLASS : ""}`}>
                         <td className="px-4 py-3">{entry.isOpeningBalance ? "—" : formatBusinessDate(entry.date)}</td>
                         <td className="px-4 py-3">
                           {entry.referenceHref ? (
-                            <Link href={entry.referenceHref} className="text-blue-600 hover:underline" title="View source document">
+                            <Link
+                              href={entry.referenceHref}
+                              onClick={() => onOpenRecord(entry.id)}
+                              className="text-blue-600 hover:underline"
+                              title="View source document"
+                            >
                               {entry.reference}
                             </Link>
                           ) : (
@@ -393,8 +420,26 @@ export default function PartyLedgerPage({
 }) {
   const [partyId, setPartyId] = useState<string | null>(null);
 
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  const [typeFilter, setTypeFilter] = useState<TxType>("ALL");
+
   useEffect(() => {
-    params.then((p) => setPartyId(p.id));
+    params.then((p) => {
+      setPartyId(p.id);
+      // Restored in the SAME batch as partyId itself (not a separate
+      // effect keyed off partyId) - React's automatic batching means
+      // the data-fetch effect below (which depends on partyId/from/
+      // to/typeFilter) then fires exactly once, already with the
+      // restored values, instead of once with defaults and again a
+      // moment later once restoration catches up.
+      const saved = getSavedListFilters<PartyLedgerListFilters>(partyLedgerListKey(p.id));
+      if (saved) {
+        if (saved.from) setFrom(saved.from);
+        if (saved.to) setTo(saved.to);
+        if (saved.typeFilter) setTypeFilter(saved.typeFilter as TxType);
+      }
+    });
   }, [params]);
 
   const [lang, setLang] = useState<Lang>("en");
@@ -424,10 +469,6 @@ export default function PartyLedgerPage({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
-  const [from, setFrom] = useState("");
-  const [to, setTo] = useState("");
-  const [typeFilter, setTypeFilter] = useState<TxType>("ALL");
-
   useEffect(() => {
     if (!partyId) return;
     async function load() {
@@ -456,6 +497,16 @@ export default function PartyLedgerPage({
 
     load();
   }, [partyId, from, to, typeFilter]);
+
+  // Persist from/to/typeFilter whenever any of them change - `search`
+  // is persisted separately, inside LedgerTable itself (it's local
+  // state there, see that component's own effect).
+  useEffect(() => {
+    if (!partyId) return;
+    saveListFilters(partyLedgerListKey(partyId), { from, to, typeFilter });
+  }, [partyId, from, to, typeFilter]);
+
+  const { highlightId, onOpenRecord } = useListScrollRestore(partyId ? partyLedgerListKey(partyId) : "party-ledger:pending", !loading && !!partyId);
 
   const balanceTypeColor = useMemo(() => {
     if (!data) return "text-gray-600";
@@ -629,6 +680,8 @@ export default function PartyLedgerPage({
             setTo={setTo}
             typeFilter={typeFilter}
             setTypeFilter={setTypeFilter}
+            highlightId={highlightId}
+            onOpenRecord={onOpenRecord}
           />
         )}
 

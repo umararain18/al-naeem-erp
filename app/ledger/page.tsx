@@ -11,6 +11,17 @@ import {
   useLedgerDetailColumns,
   type LedgerRowDetailsLike,
 } from "@/components/LedgerDetailsPicker";
+import { getSavedListFilters, saveListFilters, useListScrollRestore, LIST_HIGHLIGHT_CLASS } from "@/components/useListScrollRestore";
+
+const GENERAL_LEDGER_LIST_KEY = "general-ledger-list";
+interface GeneralLedgerListFilters {
+  accountId: string;
+  from: string;
+  to: string;
+  search: string;
+  typeFilter: string;
+  summaryFilter: string;
+}
 
 type Account = {
   id: string;
@@ -102,21 +113,25 @@ export default function LedgerPage() {
   const [error, setError] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
+  const savedLedgerFilters = useMemo(() => getSavedListFilters<GeneralLedgerListFilters>(GENERAL_LEDGER_LIST_KEY), []);
+
   // A drill-down link (e.g. a P&L account row) may deep-link
-  // straight to an account via ?accountId=.
+  // straight to an account via ?accountId= - takes priority over a
+  // restored filter (a fresh, intentional navigation beats "where I
+  // was").
   const [accountId, setAccountId] = useState(() => {
     if (typeof window === "undefined") return "";
-    return new URLSearchParams(window.location.search).get("accountId") || "";
+    return new URLSearchParams(window.location.search).get("accountId") || savedLedgerFilters?.accountId || "";
   });
-  const [from, setFrom] = useState("");
-  const [to, setTo] = useState("");
-  const [search, setSearch] = useState("");
-  const [typeFilter, setTypeFilter] = useState<TxType>("ALL");
+  const [from, setFrom] = useState(() => savedLedgerFilters?.from ?? "");
+  const [to, setTo] = useState(() => savedLedgerFilters?.to ?? "");
+  const [search, setSearch] = useState(() => savedLedgerFilters?.search ?? "");
+  const [typeFilter, setTypeFilter] = useState<TxType>(() => (savedLedgerFilters?.typeFilter as TxType) ?? "ALL");
 
   // Filters the account-wise summary list below (landing state only,
   // before an account is selected) - independent of `search`, which
   // filters transactions once an account IS selected.
-  const [summaryFilter, setSummaryFilter] = useState("");
+  const [summaryFilter, setSummaryFilter] = useState(() => savedLedgerFilters?.summaryFilter ?? "");
 
   // Configurable Ledger Details columns - shared with Party Ledger
   // (components/LedgerDetailsPicker.tsx), persisted per-browser.
@@ -172,6 +187,12 @@ export default function LedgerPage() {
 
     load();
   }, [accountId, from, to, search, typeFilter]);
+
+  useEffect(() => {
+    saveListFilters(GENERAL_LEDGER_LIST_KEY, { accountId, from, to, search, typeFilter, summaryFilter });
+  }, [accountId, from, to, search, typeFilter, summaryFilter]);
+
+  const { highlightId, onOpenRecord } = useListScrollRestore(GENERAL_LEDGER_LIST_KEY, !loading);
 
   const accountOptions: SearchOption[] = useMemo(
     () =>
@@ -448,11 +469,16 @@ export default function LedgerPage() {
 
                     return (
                       <Fragment key={entry.id}>
-                        <tr className="hover:bg-gray-50">
+                        <tr className={`hover:bg-gray-50 ${highlightId === entry.id ? LIST_HIGHLIGHT_CLASS : ""}`}>
                           <td className="px-4 py-3">{entry.isOpeningBalance ? "—" : formatBusinessDate(entry.date)}</td>
                           <td className="px-4 py-3">
                             {entry.referenceHref ? (
-                              <Link href={entry.referenceHref} className="text-blue-600 hover:underline" title="View source document">
+                              <Link
+                                href={entry.referenceHref}
+                                onClick={() => onOpenRecord(entry.id)}
+                                className="text-blue-600 hover:underline"
+                                title="View source document"
+                              >
                                 {entry.reference}
                               </Link>
                             ) : (

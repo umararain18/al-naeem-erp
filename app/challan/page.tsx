@@ -4,6 +4,16 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { formatBusinessDate } from "@/lib/date-range";
+import { getSavedListFilters, saveListFilters, useListScrollRestore, LIST_HIGHLIGHT_CLASS } from "@/components/useListScrollRestore";
+
+const CHALLAN_LIST_KEY = "challan-list";
+interface ChallanListFilters {
+  search: string;
+  statusFilter: string;
+  financialFilter: string;
+  dateFrom: string;
+  dateTo: string;
+}
 
 // Shared sticky-header cell styling (see the table wrapper's own doc
 // comment below for why `sticky top-0` only works correctly once the
@@ -409,7 +419,9 @@ export default function ChallanPage() {
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
 
-  const [search, setSearch] = useState("");
+  const savedChallanFilters = useMemo(() => getSavedListFilters<ChallanListFilters>(CHALLAN_LIST_KEY), []);
+
+  const [search, setSearch] = useState(() => savedChallanFilters?.search ?? "");
   // A drill-down link (e.g. Dashboard's Challan status counts) may
   // deep-link straight to a filter via ?status=... / ?financial=...
   // Seeded from the URL on first mount, then kept in sync via the
@@ -424,16 +436,26 @@ export default function ChallanPage() {
   // only touches this state, never the URL, so it can never fight with
   // the sync effect.
   const searchParams = useSearchParams();
-  const [statusFilter, setStatusFilter] = useState(() => searchParams.get("status") || "ALL");
-  const [financialFilter, setFinancialFilter] = useState<FinancialFilter>(() => (searchParams.get("financial") as FinancialFilter) || "ALL");
+  const [statusFilter, setStatusFilter] = useState(() => searchParams.get("status") || savedChallanFilters?.statusFilter || "ALL");
+  const [financialFilter, setFinancialFilter] = useState<FinancialFilter>(
+    () => (searchParams.get("financial") as FinancialFilter) || (savedChallanFilters?.financialFilter as FinancialFilter) || "ALL"
+  );
 
+  // Only an EXPLICIT status/financial query param overrides the current
+  // filter (a fresh, intentional deep-link beats "where I was") - it no
+  // longer force-resets to "ALL" merely because a plain /challan
+  // navigation (e.g. Back to this list, see useListScrollRestore) has no
+  // query string at all, which would otherwise silently undo a restored
+  // filter a moment after mount.
   useEffect(() => {
-    setStatusFilter(searchParams.get("status") || "ALL");
-    setFinancialFilter((searchParams.get("financial") as FinancialFilter) || "ALL");
+    const urlStatus = searchParams.get("status");
+    const urlFinancial = searchParams.get("financial");
+    if (urlStatus) setStatusFilter(urlStatus);
+    if (urlFinancial) setFinancialFilter(urlFinancial as FinancialFilter);
   }, [searchParams]);
 
-  const [dateFrom, setDateFrom] = useState("");
-  const [dateTo, setDateTo] = useState("");
+  const [dateFrom, setDateFrom] = useState(() => savedChallanFilters?.dateFrom ?? "");
+  const [dateTo, setDateTo] = useState(() => savedChallanFilters?.dateTo ?? "");
 
   const [showForm, setShowForm] = useState(false);
 
@@ -605,6 +627,15 @@ export default function ChallanPage() {
     void loadChallans();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [statusFilter, financialFilter]);
+
+  // Persist filters/search whenever any of them change, so a Back
+  // navigation to this list (see useListScrollRestore) restores the
+  // exact same view, not a reset one.
+  useEffect(() => {
+    saveListFilters(CHALLAN_LIST_KEY, { search, statusFilter, financialFilter, dateFrom, dateTo });
+  }, [search, statusFilter, financialFilter, dateFrom, dateTo]);
+
+  const { highlightId, onOpenRecord } = useListScrollRestore(CHALLAN_LIST_KEY, !loading);
 
   function resetForm() {
     setChallanNo("");
@@ -1162,12 +1193,19 @@ export default function ChallanPage() {
                     const clearingAgentId = clearingAgentPartyId(challan);
 
                     return (
-                      <tr key={challan.id} className="hover:bg-gray-50">
+                      <tr
+                        key={challan.id}
+                        className={`hover:bg-gray-50 ${highlightId === challan.id ? LIST_HIGHLIGHT_CLASS : ""}`}
+                      >
                         <td className="px-4 py-3">
                           {formatBusinessDate(challan.loadingDate)}
                         </td>
                         <td className="px-4 py-3">
-                          <Link href={`/challan/${challan.id}`} className="font-medium text-blue-600 hover:underline">
+                          <Link
+                            href={`/challan/${challan.id}`}
+                            onClick={() => onOpenRecord(challan.id)}
+                            className="font-medium text-blue-600 hover:underline"
+                          >
                             {challan.challanNo}
                           </Link>
                         </td>
@@ -1228,6 +1266,7 @@ export default function ChallanPage() {
                           <div className="flex flex-wrap gap-2">
                             <Link
                               href={`/challan/${challan.id}`}
+                              onClick={() => onOpenRecord(challan.id)}
                               className="border rounded-lg px-3 py-1 text-xs hover:bg-gray-50"
                             >
                               View
@@ -1255,6 +1294,7 @@ export default function ChallanPage() {
                             {challan.status === "DELIVERED" && !challan.isSettled && (
                               <Link
                                 href={`/challan/${challan.id}`}
+                                onClick={() => onOpenRecord(challan.id)}
                                 className="bg-green-600 text-white rounded-lg px-3 py-1 text-xs hover:bg-green-700"
                               >
                                 Settle
