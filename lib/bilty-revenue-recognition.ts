@@ -52,6 +52,27 @@ export const BILTY_REVENUE_DEFERRAL_REFERENCE_TYPE = "BILTY_REVENUE_DEFERRAL";
 // where it belongs now that it is no longer actually dispatched.
 export const BILTY_REVENUE_RECOGNITION_REVERSAL_REFERENCE_TYPE = "BILTY_REVENUE_RECOGNITION_REVERSAL";
 
+// NET count (recognitions - reversals, both non-deleted) rather than a
+// plain "does any entry exist" check - a Bilty can now legitimately
+// cycle through recognize -> reverse -> recognize more than once (e.g.
+// Challan delete reverses it, a later Challan re-attach recognizes it
+// again; Challan restore re-recognizes after a block-free Bin round
+// trip). A simple existence check would wrongly treat the STALE entry
+// from a prior cycle as "already recognized"/"already reversed" and
+// silently no-op the second cycle. Net > 0 means currently recognized;
+// net <= 0 means currently not (initial state, or fully reversed).
+async function getRecognitionNet(tx: Tx, biltyId: string): Promise<number> {
+  const [recognizedCount, reversedCount] = await Promise.all([
+    tx.journalEntry.count({
+      where: { referenceType: BILTY_REVENUE_RECOGNITION_REFERENCE_TYPE, referenceId: biltyId, isDeleted: false },
+    }),
+    tx.journalEntry.count({
+      where: { referenceType: BILTY_REVENUE_RECOGNITION_REVERSAL_REFERENCE_TYPE, referenceId: biltyId, isDeleted: false },
+    }),
+  ]);
+  return recognizedCount - reversedCount;
+}
+
 async function getActiveBookingIncomeAccountId(tx: Tx): Promise<string> {
   const bookingIncomeAccount = await tx.account.findFirst({
     where: { category: "BOOKING_INCOME", isActive: true },
@@ -110,15 +131,8 @@ export async function recognizeBiltyBookingIncome(
   const total = Number(bilty.total);
   if (total <= 0) return false;
 
-  const alreadyRecognized = await tx.journalEntry.findFirst({
-    where: {
-      referenceType: BILTY_REVENUE_RECOGNITION_REFERENCE_TYPE,
-      referenceId: bilty.id,
-      isDeleted: false,
-    },
-    select: { id: true },
-  });
-  if (alreadyRecognized) return false;
+  const net = await getRecognitionNet(tx, bilty.id);
+  if (net > 0) return false;
 
   if (await isUnreclassifiedLegacyBilty(tx, bilty.id)) return false;
 
@@ -175,6 +189,13 @@ export async function reverseBiltyBookingIncome(
   bilty: { id: string; biltyNo: string },
   params: { entryDate: Date; reason: string; createdById: string }
 ): Promise<boolean> {
+  const net = await getRecognitionNet(tx, bilty.id);
+  if (net <= 0) return false;
+
+  // Latest (not just "any") non-deleted recognition entry - a Bilty
+  // past its first recognize/reverse cycle can have more than one
+  // historical recognition entry; the most recent one is the one
+  // currently "in effect" and whose amount must be reversed now.
   const recognitionEntry = await tx.journalEntry.findFirst({
     where: {
       referenceType: BILTY_REVENUE_RECOGNITION_REFERENCE_TYPE,
@@ -182,18 +203,9 @@ export async function reverseBiltyBookingIncome(
       isDeleted: false,
     },
     include: { lines: true },
+    orderBy: { createdAt: "desc" },
   });
   if (!recognitionEntry) return false;
-
-  const alreadyReversed = await tx.journalEntry.findFirst({
-    where: {
-      referenceType: BILTY_REVENUE_RECOGNITION_REVERSAL_REFERENCE_TYPE,
-      referenceId: bilty.id,
-      isDeleted: false,
-    },
-    select: { id: true },
-  });
-  if (alreadyReversed) return false;
 
   const bookingIncomeLine = recognitionEntry.lines.find((l) => Number(l.credit) > 0);
   const amount = Number(bookingIncomeLine?.credit ?? 0);

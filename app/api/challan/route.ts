@@ -266,13 +266,17 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({
       success: true,
       items,
-      // Matches the exact permission DELETE /api/challan/[id] (the
-      // Bin action) already enforces - lets the list page hide the
-      // Delete button for a role the backend would reject anyway,
-      // the same capabilities-flag pattern app/api/employees/route.ts
-      // already uses.
+      // Challan Bin now also resets every linked Bilty's status and
+      // reverses Booking Income (see the DELETE handler in
+      // app/api/challan/[id]/route.ts) - SUPER_ADMIN only, matching
+      // what that route itself enforces, regardless of the (now
+      // otherwise-vestigial, for Challan) "challan.bin" permission
+      // MANAGER still holds. Lets the list page hide the Bin button
+      // for a role the backend would reject anyway, the same
+      // capabilities-flag pattern app/api/employees/route.ts already
+      // uses.
       capabilities: {
-        canBin: hasPermission(currentUser, "challan.bin"),
+        canBin: currentUser.role === "SUPER_ADMIN",
       },
     });
   } catch (error) {
@@ -326,11 +330,15 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const existingChallan = await prisma.challan.findUnique({
-      where: { challanNo: data.challanNo },
+    // challanNo is no longer a plain DB-level @unique (see prisma/
+    // schema.prisma's own comment) - a Bin'd Challan's number is
+    // reusable, so this check (and the one inside the transaction
+    // below) is scoped to ACTIVE Challans only, via findFirst.
+    const existingChallan = await prisma.challan.findFirst({
+      where: { challanNo: data.challanNo, isDeleted: false },
     });
 
-    if (existingChallan && !existingChallan.isDeleted) {
+    if (existingChallan) {
       return NextResponse.json(
         { success: false, message: "Challan number already exists" },
         { status: 409 }

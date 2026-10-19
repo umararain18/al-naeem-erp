@@ -303,6 +303,11 @@ export async function getSettledPartyAccountIdsBatch(
 // duplicating a second copy) is what makes
 // Challan.outstandingReceivable/outstandingPayable stay correct
 // regardless of which mechanism writes next.
+// "SETTLEMENT_UNSETTLE_REVERSAL" (lib/challan-lifecycle.ts's Unsettle
+// action) added to the list - without it, a Challan's party-net would
+// stay stuck at its settled position even after Unsettle reversed
+// every one of these same-listed entries, since this function would
+// never see the reversing lines it just posted.
 export const SETTLEMENT_NET_REFERENCE_TYPES = [
   "SETTLEMENT",
   "SETTLEMENT_CORRECTION",
@@ -311,6 +316,7 @@ export const SETTLEMENT_NET_REFERENCE_TYPES = [
   "SETTLEMENT_PAYMENT_REVERSAL",
   "COLLECTION_MULTI_PAYER_TRANSITION",
   "CARRIER_RENT_MULTI_PAYER_TRANSITION",
+  "SETTLEMENT_UNSETTLE_REVERSAL",
 ];
 
 // Net (debit - credit) for a party account across the Challan's

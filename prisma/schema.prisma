@@ -492,7 +492,16 @@ enum ChallanStatus {
 
 model Challan {
   id          String        @id @default(cuid())
-  challanNo   String        @unique
+  // NOT a plain @unique - Prisma's declarative schema cannot express a
+  // partial/filtered unique constraint. Uniqueness is enforced at the
+  // DB level by a PARTIAL unique index, WHERE "isDeleted" = false (see
+  // migration add_challan_no_partial_unique_index), so a Bin'd
+  // Challan's old number becomes reusable by a brand new Challan - the
+  // @@index([challanNo]) below keeps lookups on this column fast;
+  // uniqueness among ACTIVE Challans is additionally re-checked at the
+  // application level (app/api/challan/route.ts POST,
+  // app/api/challan/[id]/route.ts PATCH) before relying on that index.
+  challanNo   String
   loadingDate DateTime
   status      ChallanStatus @default(IN_TRANSIT)
 

@@ -8,10 +8,14 @@ import { hasPermission } from "@/lib/permissions";
 //
 // Suggests the next sequential Challan number as a plain
 // increasing integer (4001, 4002, 4003, ...), based on the
-// highest PURELY NUMERIC challanNo across ALL Challans -
-// including soft-deleted ones, so a deleted number is never
-// reused. Non-numeric challan numbers (e.g. legacy/test data)
-// are ignored for this purpose; they don't participate in the
+// highest PURELY NUMERIC challanNo across ACTIVE (non-deleted)
+// Challans only - a Bin'd Challan's number is now reusable (see the
+// partial unique index on Challan.challanNo, scoped to
+// isDeleted=false), so it must not artificially inflate this
+// suggestion. A user who deliberately wants to reuse a Bin'd
+// Challan's exact number can still type it directly - this field
+// remains free text. Non-numeric challan numbers (e.g. legacy/test
+// data) are ignored for this purpose; they don't participate in the
 // sequence either way.
 //
 // This is a suggestion only - the Challan No. field remains a
@@ -36,9 +40,8 @@ export async function GET() {
       );
     }
 
-    // Deliberately includes soft-deleted Challans - a deleted
-    // number must not be reused.
     const challans = await prisma.challan.findMany({
+      where: { isDeleted: false },
       select: { challanNo: true },
     });
 
