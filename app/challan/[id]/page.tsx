@@ -734,6 +734,60 @@ export default function ChallanDetailPage({
     }
   }
 
+  async function markNotDelivered() {
+    if (!challan) return;
+    const confirmed = window.confirm(`Mark challan ${challan.challanNo} as Not Delivered?`);
+    if (!confirmed) return;
+
+    setActionLoading("markNotDelivered");
+    setError("");
+
+    try {
+      const response = await fetch(`/api/challan/${challan.id}/mark-not-delivered`, {
+        method: "POST",
+      });
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        setError(data.message || "Unable to mark challan as not delivered");
+        return;
+      }
+      await loadChallan();
+    } catch {
+      setError("Unable to connect to the server");
+    } finally {
+      setActionLoading(null);
+    }
+  }
+
+  async function unsettleChallan() {
+    if (!challan) return;
+    const typed = window.prompt(
+      `This reverses Challan ${challan.challanNo}'s settlement (party reclassifications) via new reversing entries, and allows it to be settled again. Type UNSETTLE to confirm.`
+    );
+    if (typed !== "UNSETTLE") return;
+
+    setActionLoading("unsettle");
+    setError("");
+
+    try {
+      const response = await fetch(`/api/challan/${challan.id}/unsettle`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirmation: "UNSETTLE" }),
+      });
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        setError(data.message || "Unable to unsettle challan");
+        return;
+      }
+      await loadChallan();
+    } catch {
+      setError("Unable to connect to the server");
+    } finally {
+      setActionLoading(null);
+    }
+  }
+
   async function cancelChallan() {
     if (!challan) return;
     const confirmed = window.confirm(`Cancel challan ${challan.challanNo}?`);
@@ -966,13 +1020,25 @@ export default function ChallanDetailPage({
         <div className="bg-white rounded-xl shadow-sm p-4 mb-4">
           <div className="flex items-center justify-between mb-3">
             <h2 className="text-lg font-semibold">Financial Summary</h2>
-            <span
-              className={`rounded-full px-3 py-1 text-xs font-semibold ${
-                challan.isSettled ? "bg-green-100 text-green-700" : "bg-gray-100 text-gray-700"
-              }`}
-            >
-              {challan.isSettled ? "SETTLED" : "NOT YET SETTLED"}
-            </span>
+            <div className="flex items-center gap-3">
+              <span
+                className={`rounded-full px-3 py-1 text-xs font-semibold ${
+                  challan.isSettled ? "bg-green-100 text-green-700" : "bg-gray-100 text-gray-700"
+                }`}
+              >
+                {challan.isSettled ? "SETTLED" : "NOT YET SETTLED"}
+              </span>
+              {challan.isSettled && currentUserRole === "SUPER_ADMIN" && (
+                <button
+                  type="button"
+                  onClick={unsettleChallan}
+                  disabled={actionLoading === "unsettle"}
+                  className="border border-red-300 text-red-700 px-3 py-1 rounded-full text-xs font-semibold hover:bg-red-50 disabled:opacity-50"
+                >
+                  {actionLoading === "unsettle" ? "Unsettling..." : "Unsettle"}
+                </button>
+              )}
+            </div>
           </div>
           <FinancialSummaryCards challan={challan} />
           <PartyNetPosition challan={challan} />
@@ -1416,6 +1482,16 @@ export default function ChallanDetailPage({
                 {actionLoading === "cancel" ? "Cancelling..." : "Cancel Challan"}
               </button>
             </>
+          )}
+          {challan.status === "DELIVERED" && !challan.isSettled && currentUserRole === "SUPER_ADMIN" && (
+            <button
+              type="button"
+              onClick={markNotDelivered}
+              disabled={actionLoading === "markNotDelivered"}
+              className="border border-amber-300 text-amber-700 px-4 py-2 rounded-lg text-sm hover:bg-amber-50 disabled:opacity-50"
+            >
+              {actionLoading === "markNotDelivered" ? "Updating..." : "Mark as Not Delivered"}
+            </button>
           )}
          </div>
 

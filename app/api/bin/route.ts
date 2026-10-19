@@ -84,7 +84,12 @@ export async function GET(request: NextRequest) {
 
     const biltyCanRestore = hasPermission(currentUser, "bilty.restore");
     const biltyCanPermanentlyDelete = hasPermission(currentUser, "bilty.permanentlyDelete");
-    const challanCanRestore = hasPermission(currentUser, "challan.restore");
+    // Challan restore now also resets every linked Bilty's status and
+    // re-recognizes Booking Income (see app/api/challan/[id]/restore/
+    // route.ts) - SUPER_ADMIN only, same as the route itself enforces,
+    // regardless of the (now otherwise-vestigial, for Challan)
+    // "challan.restore" permission MANAGER still holds.
+    const challanCanRestore = currentUser.role === "SUPER_ADMIN";
     const challanCanPermanentlyDelete = hasPermission(currentUser, "challan.permanentlyDelete");
     const journalCanRestore = hasPermission(currentUser, "accountingTransactions.restore");
     const journalCanPermanentlyDelete = hasPermission(currentUser, "accountingTransactions.permanentlyDelete");

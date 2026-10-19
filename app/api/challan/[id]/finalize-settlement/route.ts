@@ -178,15 +178,18 @@ export async function POST(
       return NextResponse.json({ success: false, message: "Challan is already settled" }, { status: 400 });
     }
 
-    const existingJournalEntry = await prisma.journalEntry.findFirst({
-      where: { referenceType: "SETTLEMENT", referenceId: challan.id, isDeleted: false },
-    });
-    if (existingJournalEntry) {
-      return NextResponse.json(
-        { success: false, message: "This Challan has already been settled." },
-        { status: 409 }
-      );
-    }
+    // NOTE: this used to also reject when ANY non-deleted SETTLEMENT
+    // JournalEntry existed for this Challan, regardless of
+    // `isSettled` - a redundant secondary guard on top of the
+    // `isSettled` check above (and the fresh, SERIALIZABLE in-
+    // transaction recheck further below), which already fully covers
+    // the concurrent-double-settle race this was defending against.
+    // It is also now actively WRONG: app/api/challan/[id]/unsettle/
+    // route.ts deliberately never deletes the original SETTLEMENT
+    // entry (append-only - it posts a new reversing entry instead),
+    // so after an Unsettle that original entry legitimately remains,
+    // non-deleted, while isSettled is correctly false - this guard
+    // would otherwise block every re-settlement forever.
 
     // ------------------------------------------------------------
     // ACTUAL outstanding Gross Commission Payable per Bilty (never
@@ -453,16 +456,13 @@ export async function POST(
               "This Challan was settled by another request just now. Please refresh."
             );
           }
-          const existingEntryInTx = await tx.journalEntry.findFirst({
-            where: { referenceType: "SETTLEMENT", referenceId: id, isDeleted: false },
-            select: { id: true },
-          });
-          if (existingEntryInTx) {
-            throw new SettlementPaymentError(
-              "ALREADY_SETTLED",
-              "This Challan was settled by another request just now. Please refresh."
-            );
-          }
+          // (A secondary "does a non-deleted SETTLEMENT entry exist"
+          // recheck used to run here too - removed for the same
+          // reason as the pre-transaction check above: it is
+          // redundant with the SERIALIZABLE isSettled recheck just
+          // above, and actively wrong once a Challan has been through
+          // Unsettle, which legitimately leaves its original,
+          // non-deleted SETTLEMENT entry in place.)
 
           const journalEntries = await Promise.all(
             settlementResult.entries.map((entrySpec) =>

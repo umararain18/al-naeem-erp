@@ -16,6 +16,7 @@ import { getBiltyPaidVerification } from "@/lib/bilty-paid-verification";
 import { computeChallanSettlementSummary } from "@/lib/challan-settlement-summary";
 import { recognizeBiltyBookingIncome, reverseBiltyBookingIncome, BiltyRevenueRecognitionError } from "@/lib/bilty-revenue-recognition";
 import { auditUpdate, auditDelete, auditRestore, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
+import { assertSuperAdmin, biltyHasPhonchOrBillReference, ChallanLifecycleError } from "@/lib/challan-lifecycle";
 
 function round2(value: number): number {
   return Math.round(value * 100) / 100;
@@ -377,8 +378,14 @@ export async function PATCH(
       ? Array.from(new Set<string>(body.removeBiltyIds)).filter((v) => typeof v === "string")
       : [];
 
+    // Adding a Bilty to a DELIVERED-but-not-settled Challan is a
+    // SUPER_ADMIN-only capability (point 4 of the Challan lifecycle
+    // spec) - removing a Bilty, and adding to anything other than
+    // IN_TRANSIT/DELIVERED(unsettled), is unchanged/unaffected.
+    const addingToDeliveredChallan = addBiltyIds.length > 0 && existingChallan.status === "DELIVERED";
+
     if (addBiltyIds.length > 0 || removeBiltyIds.length > 0) {
-      if (existingChallan.status !== "IN_TRANSIT") {
+      if (removeBiltyIds.length > 0 && existingChallan.status !== "IN_TRANSIT") {
         return NextResponse.json(
           {
             success: false,
@@ -386,6 +393,30 @@ export async function PATCH(
           },
           { status: 400 }
         );
+      }
+
+      if (addBiltyIds.length > 0 && existingChallan.status === "CANCELLED") {
+        return NextResponse.json(
+          { success: false, message: "Cannot add Bilties to a Cancelled Challan." },
+          { status: 400 }
+        );
+      }
+
+      if (addingToDeliveredChallan) {
+        if (existingChallan.isSettled) {
+          return NextResponse.json(
+            { success: false, message: "Settled Challan me Bilty add nahi ho sakti - pehle Unsettle karein." },
+            { status: 400 }
+          );
+        }
+        try {
+          assertSuperAdmin(currentUser);
+        } catch (permError) {
+          if (permError instanceof ChallanLifecycleError) {
+            return NextResponse.json({ success: false, message: permError.message }, { status: 403 });
+          }
+          throw permError;
+        }
       }
 
       const currentBiltyIds = new Set(existingChallan.bilties.map((cb) => cb.biltyId));
@@ -725,9 +756,13 @@ export async function PATCH(
           await tx.challanBilty.create({ data: { challanId: id, biltyId } });
         }
 
+        // A Bilty added to an already-DELIVERED (not settled) Challan
+        // becomes DELIVERED immediately too - it never passes through
+        // an intermediate IN_TRANSIT state it would otherwise have
+        // skipped.
         await tx.bilty.updateMany({
           where: { id: { in: addBiltyIds } },
-          data: { status: "IN_TRANSIT" },
+          data: { status: addingToDeliveredChallan ? "DELIVERED" : "IN_TRANSIT" },
         });
 
         // REVENUE RECOGNITION - a Bilty added to an ALREADY-EXISTING
@@ -979,11 +1014,13 @@ export async function DELETE(
       });
     }
 
-    if (!hasPermission(currentUser, "challan.bin")) {
-      return NextResponse.json(
-        { success: false, message: "Forbidden" },
-        { status: 403 }
-      );
+    try {
+      assertSuperAdmin(currentUser);
+    } catch (permError) {
+      if (permError instanceof ChallanLifecycleError) {
+        return NextResponse.json({ success: false, message: permError.message }, { status: 403 });
+      }
+      throw permError;
     }
 
     if (existingChallan.isDeleted) {
@@ -995,10 +1032,35 @@ export async function DELETE(
 
     if (existingChallan.isSettled) {
       return NextResponse.json(
-        { success: false, message: "Settled challans cannot be deleted" },
+        { success: false, message: "Settled Challan delete nahi ho sakta - pehle Unsettle karein." },
         { status: 400 }
       );
     }
+
+    // Every Bilty currently linked to this Challan (ChallanBilty rows
+    // are never deleted here - only Challan.isDeleted flips - so the
+    // existing `challan: { isDeleted: false, status: { not: "CANCELLED" } }`
+    // convention used elsewhere in this file/app automatically treats
+    // these links as inactive the moment this Challan is Bin'd,
+    // letting each Bilty be picked up by a brand new Challan).
+    const linkedBilties = await prisma.challanBilty.findMany({
+      where: { challanId: id },
+      include: { bilty: { select: { id: true, biltyNo: true, status: true, total: true, isDeleted: true } } },
+    });
+
+    for (const link of linkedBilties) {
+      if (link.bilty.status === "DELIVERED" && (await biltyHasPhonchOrBillReference(prisma, link.bilty.biltyNo))) {
+        return NextResponse.json(
+          {
+            success: false,
+            message: `Cannot delete Challan ${existingChallan.challanNo} - Bilty ${link.bilty.biltyNo} already has a Phonch/Bill recorded against it.`,
+          },
+          { status: 400 }
+        );
+      }
+    }
+
+    const biltyStatusChanges: { biltyNo: string; oldStatus: string }[] = [];
 
     await prisma.$transaction(async (tx) => {
       // Document-owned accounting (CHALLAN_DISPATCH at creation, plus
@@ -1022,6 +1084,29 @@ export async function DELETE(
         },
       });
 
+      // Every linked Bilty (whether IN_TRANSIT or DELIVERED) goes back
+      // to PENDING and has its Booking Income recognition reversed
+      // (Dr Booking Income / Cr Unearned Revenue) - it is no longer
+      // actually dispatched once this Challan is Bin'd, and must
+      // become available for a brand new Challan.
+      for (const link of linkedBilties) {
+        if (link.bilty.isDeleted) continue;
+
+        await reverseBiltyBookingIncome(tx, link.bilty, {
+          entryDate: new Date(),
+          reason: `Challan ${existingChallan.challanNo} moved to Bin`,
+          createdById: currentUser.userId,
+        });
+
+        if (link.bilty.status !== "PENDING") {
+          biltyStatusChanges.push({ biltyNo: link.bilty.biltyNo, oldStatus: link.bilty.status });
+          await tx.bilty.update({
+            where: { id: link.bilty.id },
+            data: { status: "PENDING" },
+          });
+        }
+      }
+
       await tx.challan.update({
         where: { id },
         data: {
@@ -1031,13 +1116,16 @@ export async function DELETE(
         },
       });
 
+      const biltySummary = biltyStatusChanges.map((c) => `Bilty ${c.biltyNo}: ${c.oldStatus} -> PENDING`).join("; ");
+
       await auditDelete(tx, {
         actor: actorFromUser(currentUser),
         module: "CHALLAN",
         entityType: "Challan",
         entityId: id,
         documentNo: existingChallan.challanNo,
-        description: `Moved Challan ${existingChallan.challanNo} to Bin`,
+        description: `Moved Challan ${existingChallan.challanNo} to Bin${biltySummary ? ` (${biltySummary})` : ""}`,
+        changedFields: biltyStatusChanges.length > 0 ? { bilties: { old: biltyStatusChanges.map((c) => ({ biltyNo: c.biltyNo, status: c.oldStatus })), new: biltyStatusChanges.map((c) => ({ biltyNo: c.biltyNo, status: "PENDING" })) } } : null,
         ...requestContext(request),
       });
     });
