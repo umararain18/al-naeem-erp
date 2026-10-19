@@ -263,22 +263,30 @@ export async function GET(request: NextRequest) {
     // to filter an unfiltered fetch.
     const items = financial ? itemsBeforeFinancialFilter.filter((item) => matchesFinancialFilter(item, financial)) : itemsBeforeFinancialFilter;
 
-    return NextResponse.json({
-      success: true,
-      items,
-      // Challan Bin now also resets every linked Bilty's status and
-      // reverses Booking Income (see the DELETE handler in
-      // app/api/challan/[id]/route.ts) - SUPER_ADMIN only, matching
-      // what that route itself enforces, regardless of the (now
-      // otherwise-vestigial, for Challan) "challan.bin" permission
-      // MANAGER still holds. Lets the list page hide the Bin button
-      // for a role the backend would reject anyway, the same
-      // capabilities-flag pattern app/api/employees/route.ts already
-      // uses.
-      capabilities: {
-        canBin: currentUser.role === "SUPER_ADMIN",
+    return NextResponse.json(
+      {
+        success: true,
+        items,
+        // Challan Bin now also resets every linked Bilty's status and
+        // reverses Booking Income (see the DELETE handler in
+        // app/api/challan/[id]/route.ts) - SUPER_ADMIN only, matching
+        // what that route itself enforces, regardless of the (now
+        // otherwise-vestigial, for Challan) "challan.bin" permission
+        // MANAGER still holds. Lets the list page hide the Bin button
+        // for a role the backend would reject anyway, the same
+        // capabilities-flag pattern app/api/employees/route.ts already
+        // uses.
+        capabilities: {
+          canBin: currentUser.role === "SUPER_ADMIN",
+        },
       },
-    });
+      // Explicit no-store, on top of the client fetch's own
+      // { cache: "no-store" } (app/challan/page.tsx) - defense in
+      // depth against any intermediary (CDN/reverse proxy) that might
+      // otherwise cache this exact, filter-less GET URL and serve a
+      // pre-restore/pre-delete snapshot.
+      { headers: { "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0" } }
+    );
   } catch (error) {
     console.error("List challans error:", error);
     return NextResponse.json(

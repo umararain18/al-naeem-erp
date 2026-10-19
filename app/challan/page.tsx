@@ -551,7 +551,15 @@ export default function ChallanPage() {
       const query = new URLSearchParams();
       if (statusFilter !== "ALL") query.set("status", statusFilter);
       if (financialFilter !== "ALL") query.set("financial", financialFilter);
-      const response = await fetch(`/api/challan${query.toString() ? `?${query.toString()}` : ""}`);
+      // no-store: unlike every other list fetch here (next-number,
+      // cancel, deliver, etc.) this one's URL is IDENTICAL across
+      // visits whenever no filter is active (plain "/api/challan") -
+      // exactly the case a bare Bin -> Restore -> back-to-list round
+      // trip hits. Without no-store, the browser's own HTTP cache can
+      // legitimately serve the pre-restore response for that
+      // unchanged URL instead of refetching, since the server sends
+      // no explicit Cache-Control header either way.
+      const response = await fetch(`/api/challan${query.toString() ? `?${query.toString()}` : ""}`, { cache: "no-store" });
       const data = await response.json();
       if (!response.ok || !data.success) {
         setError(data.message || "Unable to load challans");
