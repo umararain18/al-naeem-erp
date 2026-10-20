@@ -71,27 +71,10 @@ type Challan = {
   bilties: {
     bilty: Bilty;
   }[];
-  financials?: {
-    receivable: number;
-    payable: number;
-    received: number;
-    paid: number;
-    remainingReceivable: number;
-    remainingPayable: number;
-    excessReceived: number;
-    excessPaid: number;
-    isCleared: boolean;
-    status: "OPEN" | "PARTIALLY_CLEARED" | "CLEARED" | "OVERPAID";
-  } | null;
-  // Purely informational - who the receivable/payable totals above
-  // belong to. Never used to recalculate an amount.
-  responsibleParties?: {
-    receivable: { accountId: string; partyId: string; partyName: string }[];
-    payable: { accountId: string; partyId: string; partyName: string }[];
-  };
   // Dimensionally-separated settlement summary (Bilty Rent / Paid /
-  // To-Pay / Carrier Rent, never blended) - the same authoritative
-  // source Final Settlement and the Challan Detail page use. See
+  // To-Pay / Carrier Rent, never blended) - the ONE authoritative
+  // source Final Settlement, the Challan Detail page, and this list's
+  // own summary cards/table columns all read. See
   // lib/challan-settlement-summary.ts.
   settlementSummary?: SettlementSummary | null;
 };
@@ -109,9 +92,10 @@ type ComponentSummaryUI = {
   remaining: number;
   payers: SettlementPayerBreakdown[];
   isHistoricalFallback: boolean;
-  // Carrier Rent only: the economic residual claimant for the unpaid
-  // remainder (see lib/challan-settlement-summary.ts). Present only
-  // when remaining > 0 and safely resolved - never a guess.
+  // The economic residual claimant - who this component's unpaid
+  // remainder is still due from/to (see lib/challan-settlement-
+  // summary.ts). Present only when remaining > 0 and safely resolved
+  // - never a guess.
   residualPartyName?: string;
 };
 
@@ -143,32 +127,30 @@ type SettlementSummary = {
   partyNet: PartyNetEntryUI[];
 };
 
-type EngineFinancials = {
-  receivable: number;
-  payable: number;
+// Dimensionally-separated Received/Receivable/Payable, derived
+// ENTIRELY from challan.settlementSummary - the SAME authoritative
+// source Final Settlement and the Challan Detail page's Financial
+// Summary cards read (lib/challan-settlement-summary.ts). To-Pay
+// (Collection) is always the receivable side; Carrier Rent is always
+// the payable side - never blended into one signed figure, per the
+// same rule totalDueFromSummary() below documents. Replaces the old,
+// separately-computed lib/challan-financials.ts figures, which a
+// multi-line Daily Posting entry covering several Bilties/Challans at
+// once could misattribute entirely onto whichever Challan happened to
+// be checked first.
+type SettlementTotals = {
   received: number;
-  paid: number;
   remainingReceivable: number;
   remainingPayable: number;
-  excessReceived: number;
-  excessPaid: number;
-  isCleared: boolean;
-  status: "OPEN" | "PARTIALLY_CLEARED" | "CLEARED" | "OVERPAID";
 };
 
-function safeFinancials(challan: Challan | null | undefined): EngineFinancials {
-  const f = challan?.financials;
+function settlementTotals(challan: Challan | null | undefined): SettlementTotals {
+  const summary = challan?.settlementSummary;
+  if (!summary) return { received: 0, remainingReceivable: 0, remainingPayable: 0 };
   return {
-    receivable: Number(f?.receivable || 0),
-    payable: Number(f?.payable || 0),
-    received: Number(f?.received || 0),
-    paid: Number(f?.paid || 0),
-    remainingReceivable: Number(f?.remainingReceivable || 0),
-    remainingPayable: Number(f?.remainingPayable || 0),
-    excessReceived: Number(f?.excessReceived || 0),
-    excessPaid: Number(f?.excessPaid || 0),
-    isCleared: Boolean(f?.isCleared),
-    status: (f?.status || "OPEN") as EngineFinancials["status"],
+    received: summary.bilties.reduce((s, b) => s + b.toPay.paidOrReceived, 0),
+    remainingReceivable: summary.bilties.reduce((s, b) => s + b.toPay.remaining, 0),
+    remainingPayable: summary.carrierRent.remaining,
   };
 }
 
@@ -529,9 +511,9 @@ export default function ChallanPage() {
     let totalPayable = 0;
 
     for (const challan of filteredChallans) {
-      const fin = safeFinancials(challan);
-      totalReceivable += fin.remainingReceivable;
-      totalPayable += fin.remainingPayable;
+      const totals = settlementTotals(challan);
+      totalReceivable += totals.remainingReceivable;
+      totalPayable += totals.remainingPayable;
     }
 
     const net = totalReceivable - totalPayable;
@@ -1194,7 +1176,7 @@ export default function ChallanPage() {
                 <tbody className="divide-y">
                   {filteredChallans.map((challan) => {
                     const status = compactStatus(challan);
-                    const fin = safeFinancials(challan);
+                    const fin = settlementTotals(challan);
                     const partyNet = challan.settlementSummary?.partyNet || [];
                     const receivableParties = partyNet.filter((p) => p.direction === "RECEIVABLE").map((p) => ({ partyId: p.partyId, partyName: p.partyName }));
                     const payableParties = partyNet.filter((p) => p.direction === "PAYABLE").map((p) => ({ partyId: p.partyId, partyName: p.partyName }));

@@ -94,24 +94,6 @@ export type Challan = {
   bilties: {
     bilty: Bilty;
   }[];
-  financials?: {
-    receivable: number;
-    payable: number;
-    received: number;
-    paid: number;
-    remainingReceivable: number;
-    remainingPayable: number;
-    excessReceived: number;
-    excessPaid: number;
-    isCleared: boolean;
-    status: "OPEN" | "PARTIALLY_CLEARED" | "CLEARED" | "OVERPAID";
-  } | null;
-  // Purely informational - who the receivable/payable totals above
-  // belong to. Never used to recalculate an amount.
-  responsibleParties?: {
-    receivable: { accountId: string; partyId: string; partyName: string }[];
-    payable: { accountId: string; partyId: string; partyName: string }[];
-  };
   // Purely informational (read-only) current per-component
   // responsibility, used only to pre-fill the Super Admin "Edit
   // Settlement" form with what is already established in the
@@ -129,9 +111,9 @@ export type Challan = {
   };
   // Dimensionally-separated settlement summary (Bilty Rent / To-Pay /
   // Carrier Rent, never blended into one Receivable/Payable number) -
-  // the same authoritative source Final Settlement itself reads, via
-  // lib/challan-settlement-summary.ts. Replaces the old
-  // financials/responsibleParties pair for the Financial Summary card.
+  // the ONE authoritative source Final Settlement, this Financial
+  // Summary card, and the Challan list all read, via
+  // lib/challan-settlement-summary.ts.
   settlementSummary?: SettlementSummary | null;
 };
 
@@ -148,9 +130,10 @@ export type ComponentSummaryUI = {
   remaining: number;
   payers: SettlementPayerBreakdown[];
   isHistoricalFallback: boolean;
-  // Carrier Rent only: the economic residual claimant for the unpaid
-  // remainder (see lib/challan-settlement-summary.ts). Present only
-  // when remaining > 0 and safely resolved - never a guess.
+  // The economic residual claimant - who this component's unpaid
+  // remainder is still due from/to (see lib/challan-settlement-
+  // summary.ts). Present only when remaining > 0 and safely resolved
+  // - never a guess.
   residualPartyName?: string;
 };
 
@@ -263,6 +246,13 @@ function FinancialSummaryCards({ challan }: { challan: Challan }) {
   const toPayReceived = summary.bilties.reduce((s, b) => s + b.toPay.paidOrReceived, 0);
   const toPayRemaining = summary.bilties.reduce((s, b) => s + b.toPay.remaining, 0);
   const toPayPayers = mergePayers(summary.bilties.flatMap((b) => b.toPay.payers));
+  // Who the still-unreceived portion is due from (never a guess - see
+  // lib/challan-settlement-summary.ts's residualPartyName) - distinct
+  // names only, since every Bilty on a Challan is normally assigned
+  // the same Collection-responsible party.
+  const toPayResidualPartyNames = [
+    ...new Set(summary.bilties.filter((b) => b.toPay.remaining > 0.009 && b.toPay.residualPartyName).map((b) => b.toPay.residualPartyName as string)),
+  ];
 
   const cr = summary.carrierRent;
 
@@ -298,6 +288,9 @@ function FinancialSummaryCards({ challan }: { challan: Challan }) {
         <p className="font-semibold text-lg">Rs. {toPayDue.toLocaleString()}</p>
         <p className="mt-1 text-xs text-gray-600">Received: Rs. {toPayReceived.toLocaleString()}</p>
         <PayersList payers={toPayPayers} label="Collected by" />
+        {toPayRemaining > 0.009 && toPayResidualPartyNames.length > 0 && (
+          <p className="mt-1 text-xs text-gray-500">Due from: {toPayResidualPartyNames.join(", ")}</p>
+        )}
       </div>
 
       <div className="rounded-lg border p-3">
@@ -534,8 +527,6 @@ export default function ChallanDetailPage({
       }
       setChallan({
         ...data.challan,
-        financials: data.financials,
-        responsibleParties: data.responsibleParties,
         settlementBreakdown: data.settlementBreakdown,
         paidVerification: data.paidVerification,
         settlementSummary: data.settlementSummary,

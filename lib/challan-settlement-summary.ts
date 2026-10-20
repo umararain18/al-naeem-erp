@@ -2,7 +2,6 @@ import { prisma } from "@/lib/prisma";
 import { getBiltyPaidVerification } from "@/lib/bilty-paid-verification";
 import {
   getSettledPartyAccountIdsBatch,
-  getComponentNetAmount,
   SETTLEMENT_NET_REFERENCE_TYPES,
 } from "@/lib/settlement-correction";
 
@@ -23,18 +22,23 @@ import {
 // elsewhere, untouched here), and never recomputes PAID verification
 // itself - it reuses getBiltyPaidVerification() exactly.
 //
-// PRECEDENCE (per Bilty/Challan, per component):
-//   1. Live SettlementPayment rows for that component, if any exist -
-//      these ALWAYS take precedence once present.
-//   2. Otherwise, the OLD single-payer mechanism's CURRENT net
-//      attribution for that same component - via
-//      findSettledPartyAccountId()/getComponentNetAmount() (the same,
-//      unmodified functions the multi-payer engine's own floor-
-//      release logic already reads) - so a historical Challan the
-//      new engine has never touched still shows a real, correct
-//      figure instead of nothing.
-//   3. Otherwise (unsettled, or nothing ever established): zero
-//      payment activity - never fabricated.
+// "paidOrReceived" PRECEDENCE (per Bilty/Challan, per component):
+//   1. Live SettlementPayment rows for that component, if any exist.
+//   2. Otherwise, ZERO - exactly Final Settlement's own ground truth
+//      (lib/settlement-payments.ts's getComponentPaymentState(): paid
+//      = sum of active SettlementPayment rows only, nothing else).
+// A settlement's own reclassification entry (Dr responsible party /
+// Cr Gross Bilty Receivable or Gross Carrier Rent Payable) tells us
+// WHO is now responsible for an amount - it is NOT evidence that they
+// have actually paid/remitted it, and must never be read as such (a
+// past bug here did exactly that, via getComponentNetAmount(), making
+// an unpaid Carrier Rent/To-Pay show as fully "Received"/"Paid" the
+// moment settlement ran). That responsible party is still surfaced,
+// display-only, via `residualPartyName` whenever `remaining > 0` -
+// via findSettledPartyAccountId() (still used, for THAT purpose only)
+// - the same party the multi-payer engine's own floor-release logic
+// (ensureOldAttributionWithinFloor() in lib/settlement-payments.ts)
+// already tracks as holding the unpaid remainder.
 // ============================================================
 
 export interface SettlementPayerBreakdown {
@@ -49,16 +53,19 @@ export interface ComponentSummary {
   paidOrReceived: number;
   remaining: number;
   payers: SettlementPayerBreakdown[];
-  /** true when this figure came from the OLD single-payer mechanism
-   * (no live SettlementPayment rows exist for this component yet). */
+  /** Unused by any current display - kept for shape compatibility.
+   * `paidOrReceived` no longer has an OLD-mechanism fallback value at
+   * all (see this module's own doc comment), so this is always false. */
   isHistoricalFallback: boolean;
-  /** CARRIER_RENT only: the economic residual claimant (the party the
-   * Carrier Rent floor logic - lib/settlement-payments.ts - still
-   * attributes the unpaid remainder to, i.e. whoever finalize-
-   * settlement established as the default party). Present only when
-   * `remaining > 0` and that party could be safely resolved; never a
-   * guess - left unset otherwise. See ensureOldAttributionWithinFloor()
-   * for why this is always the SAME party the floor mechanism tracks. */
+  /** The economic residual claimant - the party the old single-payer
+   * mechanism's floor logic (lib/settlement-payments.ts's
+   * ensureOldAttributionWithinFloor()) still attributes this
+   * component's unpaid remainder to (i.e. whoever finalize-settlement
+   * established as the default responsible party for To-Pay's
+   * Collection or for Carrier Rent). Display-only - "who this is still
+   * due from/to", never folded into `paidOrReceived`. Present only
+   * when `remaining > 0` and that party could be safely resolved;
+   * never a guess - left unset otherwise. */
   residualPartyName?: string;
 }
 
@@ -308,47 +315,44 @@ export async function computeChallanSettlementSummaryBatch(
       const collectionPayers = payersFor(collectionKey);
       for (const p of collectionPayers) candidates.add(p.accountId);
 
-      let toPaySummary: ComponentSummary;
-      if (collectionPayers.length > 0) {
-        const paidOrReceived = round2(collectionPayers.reduce((s, p) => s + p.amount, 0));
-        toPaySummary = {
-          total: toPay,
-          paidOrReceived,
-          remaining: Math.max(0, round2(toPay - paidOrReceived)),
-          payers: collectionPayers,
-          isHistoricalFallback: false,
-        };
-      } else if (challan.isSettled && challan.settlementJournalEntryId && bookingIncomeAccount && toPay > 0) {
+      // Live SettlementPayment rows are the ONLY source of "actually
+      // received" - exactly like Final Settlement's own ground truth
+      // (lib/settlement-payments.ts's getComponentPaymentState(): paid
+      // = sum of active rows, nothing else). A Bilty's settlement-time
+      // reclassification (Dr responsible party / Cr Gross Bilty
+      // Receivable) tells us WHO is now responsible for this amount,
+      // never that they have actually remitted it - conflating the
+      // two previously made an unpaid To-Pay show as fully "Received"
+      // the moment settlement ran. When no live rows exist, the full
+      // amount is still due; WHO it is due from is surfaced below via
+      // residualPartyName (display-only, exactly mirroring Carrier
+      // Rent's own field), never folded into paidOrReceived.
+      const toPaySummary: ComponentSummary =
+        collectionPayers.length > 0
+          ? (() => {
+              const paidOrReceived = round2(collectionPayers.reduce((s, p) => s + p.amount, 0));
+              return {
+                total: toPay,
+                paidOrReceived,
+                remaining: Math.max(0, round2(toPay - paidOrReceived)),
+                payers: collectionPayers,
+                isHistoricalFallback: false,
+              };
+            })()
+          : emptyComponent(toPay);
+
+      if (toPaySummary.remaining > 0.009) {
         const oldPartyAccountId = oldCollectionPartyByBiltyId.get(bilty.id) || null;
         if (oldPartyAccountId) {
-          const net = await getComponentNetAmount(
-            prisma,
-            challan.id,
-            challan.settlementJournalEntryId,
-            "COLLECTION",
-            bookingIncomeAccount.id,
-            bilty.id,
-            oldPartyAccountId
-          );
-          const attributed = Math.max(0, round2(net));
           const account = await prisma.account.findUnique({
             where: { id: oldPartyAccountId },
-            select: { accountName: true, party: { select: { id: true, partyName: true } } },
+            select: { accountName: true, party: { select: { partyName: true } } },
           });
-          toPaySummary = {
-            total: toPay,
-            paidOrReceived: attributed,
-            remaining: Math.max(0, round2(toPay - attributed)),
-            payers: attributed > 0
-              ? [{ accountId: oldPartyAccountId, partyId: account?.party?.id || null, partyName: account?.party?.partyName || account?.accountName || "Party", amount: attributed }]
-              : [],
-            isHistoricalFallback: true,
-          };
-        } else {
-          toPaySummary = emptyComponent(toPay);
+          const residualPartyName = account?.party?.partyName || account?.accountName || null;
+          if (residualPartyName) {
+            toPaySummary.residualPartyName = residualPartyName;
+          }
         }
-      } else {
-        toPaySummary = emptyComponent(toPay);
       }
 
       const pv = paidVerificationByBiltyId.get(bilty.id);
@@ -370,7 +374,6 @@ export async function computeChallanSettlementSummaryBatch(
     const carrierRentPayers = payersFor(carrierRentKey);
     for (const p of carrierRentPayers) candidates.add(p.accountId);
 
-    let carrierRentSummary: ComponentSummary;
     // The residual claimant's account - the SAME party
     // ensureOldAttributionWithinFloor() itself tracks (already
     // resolved above, unconditionally, for the partyNet candidate
@@ -378,50 +381,24 @@ export async function computeChallanSettlementSummaryBatch(
     // still gated on remaining > 0, unlike the resolution itself.
     const carrierRentOldPartyAccountId = oldCarrierRentPartyAccountId;
 
-    if (carrierRentPayers.length > 0) {
-      const paidOrReceived = round2(carrierRentPayers.reduce((s, p) => s + p.amount, 0));
-      carrierRentSummary = {
-        total: carrierRentTotal,
-        paidOrReceived,
-        remaining: Math.max(0, round2(carrierRentTotal - paidOrReceived)),
-        payers: carrierRentPayers,
-        isHistoricalFallback: false,
-      };
-    } else if (challan.isSettled && challan.settlementJournalEntryId && carrierRentExpenseAccount && carrierRentTotal > 0) {
-      if (carrierRentOldPartyAccountId) {
-        const net = await getComponentNetAmount(
-          prisma,
-          challan.id,
-          challan.settlementJournalEntryId,
-          "CARRIER_RENT",
-          carrierRentExpenseAccount.id,
-          null,
-          carrierRentOldPartyAccountId
-        );
-        // CARRIER_RENT's net convention is a CREDIT (negative) per
-        // getComponentNetAmount's own debit-minus-credit convention -
-        // normalize to a positive "currently attributed" magnitude,
-        // exactly as ensureOldAttributionWithinFloor() already does.
-        const attributed = Math.max(0, round2(-net));
-        const account = await prisma.account.findUnique({
-          where: { id: carrierRentOldPartyAccountId },
-          select: { accountName: true, party: { select: { id: true, partyName: true } } },
-        });
-        carrierRentSummary = {
-          total: carrierRentTotal,
-          paidOrReceived: attributed,
-          remaining: Math.max(0, round2(carrierRentTotal - attributed)),
-          payers: attributed > 0
-            ? [{ accountId: carrierRentOldPartyAccountId, partyId: account?.party?.id || null, partyName: account?.party?.partyName || account?.accountName || "Party", amount: attributed }]
-            : [],
-          isHistoricalFallback: true,
-        };
-      } else {
-        carrierRentSummary = emptyComponent(carrierRentTotal);
-      }
-    } else {
-      carrierRentSummary = emptyComponent(carrierRentTotal);
-    }
+    // Same fix as To-Pay above: only a live SettlementPayment row
+    // counts as "actually paid" (Final Settlement's own ground
+    // truth) - the settlement-time reclassification to a responsible
+    // party (e.g. "ANC direct" -> the Transporter) establishes WHO
+    // Carrier Rent is now owed to, never that it has been disbursed.
+    const carrierRentSummary: ComponentSummary =
+      carrierRentPayers.length > 0
+        ? (() => {
+            const paidOrReceived = round2(carrierRentPayers.reduce((s, p) => s + p.amount, 0));
+            return {
+              total: carrierRentTotal,
+              paidOrReceived,
+              remaining: Math.max(0, round2(carrierRentTotal - paidOrReceived)),
+              payers: carrierRentPayers,
+              isHistoricalFallback: false,
+            };
+          })()
+        : emptyComponent(carrierRentTotal);
 
     if (carrierRentSummary.remaining > 0 && carrierRentOldPartyAccountId) {
       const account = await prisma.account.findUnique({
