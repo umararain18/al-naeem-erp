@@ -4,9 +4,7 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
-import { computeChallanFinancialsBatch } from "@/lib/challan-financials";
 import { getGrossCarrierRentPayableAccountId } from "@/lib/gross-accounts";
-import { getChallanResponsiblePartiesBatch } from "@/lib/document-party-resolution";
 import { computeChallanSettlementSummaryBatch } from "@/lib/challan-settlement-summary";
 import { SettlementPaymentError } from "@/lib/settlement-payments";
 import { recognizeBiltyBookingIncome, BiltyRevenueRecognitionError } from "@/lib/bilty-revenue-recognition";
@@ -225,33 +223,18 @@ export async function GET(request: NextRequest) {
     // and correct here, never partial/page-dependent).
     challans.sort((a, b) => compareChallanNoDesc(a.challanNo, b.challanNo) || b.createdAt.getTime() - a.createdAt.getTime());
 
-    const financialsMap = await computeChallanFinancialsBatch(
-      challans.map((c) => ({
-        id: c.id,
-        outstandingReceivable: c.outstandingReceivable,
-        outstandingPayable: c.outstandingPayable,
-        biltyIds: c.bilties.map((cb) => cb.biltyId),
-      }))
-    );
-
-    // Purely informational "who" behind the receivable/payable
-    // totals above - does not affect the amounts themselves.
-    const responsiblePartiesMap = await getChallanResponsiblePartiesBatch(
-      challans.filter((c) => c.isSettled).map((c) => c.id)
-    );
-
-    // Dimensionally-separated settlement summary (same authoritative
-    // source Final Settlement and the Challan Detail page use) -
-    // batched across every Challan in ONE pass (see
-    // lib/challan-settlement-summary.ts). `financials`/
-    // `responsibleParties` above are left unchanged for now; only
-    // what the list UI displays for Financial Summary changes.
+    // Dimensionally-separated settlement summary - the ONE
+    // authoritative source Final Settlement, the Challan Detail page,
+    // and this list's own summary cards/table columns all read (see
+    // lib/challan-settlement-summary.ts) - batched across every
+    // Challan in ONE pass. Replaces the old, separately-computed
+    // financials/responsibleParties pair (lib/challan-financials.ts,
+    // lib/document-party-resolution.ts), which nothing displays
+    // anymore and is no longer computed here.
     const settlementSummaryMap = await computeChallanSettlementSummaryBatch(challans.map((c) => c.id));
 
     const itemsBeforeFinancialFilter = challans.map((c) => ({
       ...c,
-      financials: financialsMap[c.id],
-      responsibleParties: responsiblePartiesMap[c.id],
       settlementSummary: settlementSummaryMap[c.id],
     }));
 
