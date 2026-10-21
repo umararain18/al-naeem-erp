@@ -3,12 +3,14 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { Prisma } from "@prisma/client";
+import { computeChallanFinancialsBatch } from "@/lib/challan-financials";
 import {
   applySettlementCorrection,
   getSettledPartyAccountIdsBatch,
   MissingResponsiblePartyError,
   type SettledPartyLookupRequest,
 } from "@/lib/settlement-correction";
+import { getChallanResponsibleParties } from "@/lib/document-party-resolution";
 import { assertComponentTotalNotBelowActiveRows, SettlementPaymentError } from "@/lib/settlement-payments";
 import { getBiltyPaidVerification } from "@/lib/bilty-paid-verification";
 import { computeChallanSettlementSummary } from "@/lib/challan-settlement-summary";
@@ -161,6 +163,23 @@ export async function GET(
       );
     }
 
+    const financials = (
+      await computeChallanFinancialsBatch([
+        {
+          id: challan.id,
+          outstandingReceivable: challan.outstandingReceivable,
+          outstandingPayable: challan.outstandingPayable,
+          biltyIds: challan.bilties.map((cb) => cb.biltyId),
+        },
+      ])
+    )[challan.id];
+
+    // Purely informational "who" behind the receivable/payable
+    // totals above - does not affect the amounts themselves.
+    const responsibleParties = challan.isSettled
+      ? await getChallanResponsibleParties(challan.id)
+      : { receivable: [], payable: [] };
+
     // Per-component current responsibility (Collection/Commission
     // per Bilty, Carrier Rent for the Challan) - read-only, used
     // only to pre-fill the Super Admin "Edit Settlement" form with
@@ -262,16 +281,19 @@ export async function GET(
     };
 
     // Dimensionally-separated settlement summary (Bilty Rent / Paid /
-    // To-Pay / Carrier Rent, never blended) - the ONE authoritative
-    // source for the Financial Summary card (and the Challan list's
-    // own summary cards - see app/api/challan/route.ts), replacing the
-    // old blended financials/responsibleParties pair, which nothing
-    // reads anymore and is no longer computed.
+    // To-Pay / Carrier Rent, never blended) - the authoritative source
+    // for the Financial Summary card, replacing the old blended
+    // financials/responsibleParties pair for DISPLAY purposes. Those
+    // two fields are left in the response unchanged (still written by
+    // the settlement engine, still potentially depended on elsewhere)
+    // - only what the UI reads for Financial Summary changes.
     const settlementSummary = await computeChallanSettlementSummary(challan.id);
 
     return NextResponse.json({
       success: true,
       challan,
+      financials,
+      responsibleParties,
       settlementBreakdown,
       paidVerification,
       settlementSummary,
