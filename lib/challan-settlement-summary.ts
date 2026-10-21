@@ -22,23 +22,45 @@ import {
 // elsewhere, untouched here), and never recomputes PAID verification
 // itself - it reuses getBiltyPaidVerification() exactly.
 //
-// "paidOrReceived" PRECEDENCE (per Bilty/Challan, per component):
-//   1. Live SettlementPayment rows for that component, if any exist.
-//   2. Otherwise, ZERO - exactly Final Settlement's own ground truth
-//      (lib/settlement-payments.ts's getComponentPaymentState(): paid
-//      = sum of active SettlementPayment rows only, nothing else).
+// "paidOrReceived" (per Bilty/Challan, per component) is the SUM of
+// the only two things allowed to count as "actually paid/received"
+// (buildComponentSummary() below):
+//   1. Live SettlementPayment rows for that component (the NEW
+//      multi-payer engine - Final Settlement's own ground truth for
+//      a Challan it has touched: lib/settlement-payments.ts's
+//      getComponentPaymentState()).
+//   2. REAL Daily Posting Cash/Bank-paired JournalLines against the
+//      same party (live payer accounts, plus the OLD single-payer
+//      mechanism's currently-attributed party) - correlated PER LINE
+//      via that line's own sourceType/sourceId, NEVER per whole
+//      JournalEntry. This is how a Challan settled BEFORE the
+//      multi-payer engine existed records an actual payment (e.g. a
+//      Carrier Rent Daily Posting receipt tagged sourceType:"CHALLAN")
+//      - without it, every such historical Challan would wrongly show
+//      as still fully DUE after being genuinely paid.
 // A settlement's own reclassification entry (Dr responsible party /
-// Cr Gross Bilty Receivable or Gross Carrier Rent Payable) tells us
-// WHO is now responsible for an amount - it is NOT evidence that they
-// have actually paid/remitted it, and must never be read as such (a
-// past bug here did exactly that, via getComponentNetAmount(), making
-// an unpaid Carrier Rent/To-Pay show as fully "Received"/"Paid" the
-// moment settlement ran). That responsible party is still surfaced,
-// display-only, via `residualPartyName` whenever `remaining > 0` -
-// via findSettledPartyAccountId() (still used, for THAT purpose only)
-// - the same party the multi-payer engine's own floor-release logic
+// Cr Gross Bilty Receivable or Gross Carrier Rent Payable) is NEITHER
+// of these - it tells us WHO is now responsible for an amount, never
+// that they have actually paid/remitted it, and must never be read as
+// such (a past bug here did exactly that, via getComponentNetAmount(),
+// making an unpaid Carrier Rent/To-Pay show as fully "Received"/"Paid"
+// the moment settlement ran - with no actual cash/bank line anywhere).
+// That responsible party is still surfaced, display-only, via
+// `residualPartyName` whenever `remaining > 0` - via
+// findSettledPartyAccountId() (still used, for THAT purpose only) -
+// the same party the multi-payer engine's own floor-release logic
 // (ensureOldAttributionWithinFloor() in lib/settlement-payments.ts)
 // already tracks as holding the unpaid remainder.
+//
+// Per-LINE Daily Posting correlation (not per-entry) is also what
+// fixes the Challan list's separate, now-unused
+// lib/challan-financials.ts bug: a single combined Daily Posting
+// voucher covering several unrelated Bilties/Challans in one
+// JournalEntry would leak amounts between them there, because that
+// function picks one "owner" per whole entry (its first matching
+// line) and sums every PARTY line in that entry into it. Resolving
+// ownership from each line's OWN sourceId, as this file already does,
+// never leaks.
 // ============================================================
 
 export interface SettlementPayerBreakdown {
@@ -238,6 +260,111 @@ export async function computeChallanSettlementSummaryBatch(
   );
 
   // ------------------------------------------------------------
+  // 4.5. REAL (cash/bank-backed) Daily Posting activity attributable
+  //    to each Challan - batched ONCE across every Challan/Bilty on
+  //    this page, PER-LINE (never per-entry): Daily Posting cannot be
+  //    found via JournalEntry.referenceType/referenceId (its
+  //    referenceId is the Cash/Bank account, not a Challan/Bilty) -
+  //    only JournalLine.sourceType/sourceId ("CHALLAN"/challanId or
+  //    "BILTY"/one of its Bilty ids) correlates it, and each line
+  //    carries its OWN sourceType/sourceId independently (see
+  //    app/api/daily-posting/route.ts) - a single combined voucher can
+  //    legitimately record several unrelated Bilties/Challans' own
+  //    receipts/payments in one JournalEntry. This is the SAME
+  //    per-line correlation lib/challan-financials.ts's
+  //    computeChallanFinancialsBatch() was SUPPOSED to do but doesn't
+  //    - that function instead picks ONE "owner" per whole JournalEntry
+  //    (its first matching line) and sums every PARTY line in that
+  //    entry into it, leaking amounts from a combined voucher's OTHER,
+  //    unrelated lines onto whichever Challan happened to be checked
+  //    first. Resolving ownership per LINE (via that line's own
+  //    sourceId) rather than per ENTRY is what avoids that leak here.
+  //
+  //    This is a REAL cash/bank-paired movement - the only thing
+  //    allowed to count as "actually paid/received" alongside live
+  //    SettlementPayment rows (see this module's own doc comment).
+  //    Only the PARTY-side line of each matched entry is summed (never
+  //    the Cash/Bank side itself).
+  //
+  //    PAID exclusion CANNOT reuse the settlement-side JournalEntry-id
+  //    exclusion further below: a PAID verification receipt is posted
+  //    as its OWN, separate DAILY_POSTING entry, tagged
+  //    sourceType:"BILTY"/sourceId:<biltyId> - the EXACT SAME tag
+  //    shape a legitimate Collection Daily Posting on that same Bilty
+  //    also uses (see lib/bilty-paid-verification.ts's own header
+  //    comment: "a JournalLine tagged sourceType 'BILTY', sourceId =
+  //    this Bilty, crediting the resolved Paid-responsible Party's
+  //    account"). The tag alone cannot distinguish them - only the
+  //    ACCOUNT can. So the exclusion here is precise and direct: the
+  //    authoritative SettlementPayment.payerAccountId for every
+  //    component:"PAID" row, per Bilty.
+  // ------------------------------------------------------------
+  const allPaidRows = allBiltyIds.length > 0
+    ? await prisma.settlementPayment.findMany({
+        where: { component: "PAID", biltyId: { in: allBiltyIds } },
+        select: { biltyId: true, payerAccountId: true },
+      })
+    : [];
+  const paidPayerAccountIdsByBiltyId = new Map<string, Set<string>>();
+  for (const row of allPaidRows) {
+    if (!row.biltyId) continue;
+    const set = paidPayerAccountIdsByBiltyId.get(row.biltyId) || new Set<string>();
+    set.add(row.payerAccountId);
+    paidPayerAccountIdsByBiltyId.set(row.biltyId, set);
+  }
+
+  const biltyIdToChallanId = new Map<string, string>();
+  for (const c of challans) {
+    for (const cb of c.bilties) {
+      if (!cb.bilty.isDeleted) biltyIdToChallanId.set(cb.bilty.id, c.id);
+    }
+  }
+
+  const dailyPostingLines =
+    challanIds.length > 0 || allBiltyIds.length > 0
+      ? await prisma.journalLine.findMany({
+          where: {
+            journalEntry: { referenceType: "DAILY_POSTING", isDeleted: false },
+            OR: [
+              { sourceType: "CHALLAN", sourceId: { in: challanIds } },
+              ...(allBiltyIds.length > 0 ? [{ sourceType: "BILTY", sourceId: { in: allBiltyIds } }] : []),
+            ],
+          },
+          select: {
+            accountId: true,
+            debit: true,
+            credit: true,
+            sourceType: true,
+            sourceId: true,
+            account: { select: { category: true } },
+          },
+        })
+      : [];
+
+  // Keyed `${challanId}:${accountId}` - net (debit - credit) real
+  // Daily Posting movement for that party, attributable to that
+  // Challan. A CARRIER_RENT payment to a party is a DEBIT to their
+  // account (positive here); a COLLECTION remittance FROM a party is
+  // a CREDIT to their account (negative here) - see each component's
+  // own sign handling below.
+  const dailyPostingNetByChallanAccount = new Map<string, number>();
+  for (const l of dailyPostingLines) {
+    if (l.account.category !== "PARTY") continue; // never the Cash/Bank side.
+    if (!l.sourceId) continue;
+    // PAID exclusion: only meaningful (and only ambiguous) for a
+    // BILTY-sourced line - a CHALLAN-sourced Carrier Rent Daily
+    // Posting can never collide with a Bilty-scoped PAID receipt.
+    if (l.sourceType === "BILTY" && paidPayerAccountIdsByBiltyId.get(l.sourceId)?.has(l.accountId)) continue;
+    const owningChallanId = l.sourceType === "CHALLAN" ? l.sourceId : biltyIdToChallanId.get(l.sourceId);
+    if (!owningChallanId) continue;
+    const key = `${owningChallanId}:${l.accountId}`;
+    dailyPostingNetByChallanAccount.set(
+      key,
+      round2((dailyPostingNetByChallanAccount.get(key) || 0) + Number(l.debit) - Number(l.credit))
+    );
+  }
+
+  // ------------------------------------------------------------
   // 5. Assemble, falling back to the OLD single-payer mechanism only
   //    for a component with ZERO live rows on an already-settled
   //    Challan - never for an unsettled one (nothing to fall back
@@ -248,6 +375,11 @@ export async function computeChallanSettlementSummaryBatch(
   // ONE pass per Challan afterward (step 6), then given names in one
   // final batched query across every Challan (step 7).
   const candidateAccountIdsByChallan = new Map<string, Set<string>>();
+
+  // Accounts behind a Daily-Posting-sourced payer entry (added by
+  // buildComponentSummary() below) - these arrive with partyName: ""
+  // and are named in step 7's one batched query, alongside partyNet.
+  const pendingNameAccountIds = new Set<string>();
 
   for (const challan of challans) {
     const candidates = new Set<string>();
@@ -306,6 +438,51 @@ export async function computeChallanSettlementSummaryBatch(
       if (id) candidates.add(id);
     }
 
+    // Builds a component's paidOrReceived/remaining/payers from the
+    // TWO things allowed to count as "actually paid/received" (see
+    // this module's own doc comment): live SettlementPayment rows,
+    // and REAL Daily Posting Cash/Bank-paired activity against the
+    // same candidate accounts (live payers + the old mechanism's
+    // currently-attributed party) - correlated PER-LINE via
+    // dailyPostingNetByChallanAccount, never per-entry. `dpSign` is
+    // "RECEIVE" for Collection/To-Pay (a party remitting to ANC is a
+    // CREDIT to their account, i.e. a negative debit-credit net) or
+    // "PAY" for Carrier Rent (ANC paying a party is a DEBIT, i.e. a
+    // positive net). Unnamed Daily-Posting-sourced payer entries are
+    // queued in `pendingNameAccountIds` for the one final batched
+    // name lookup (step 7) rather than a query per entry.
+    function buildComponentSummary(
+      total: number,
+      livePayers: SettlementPayerBreakdown[],
+      oldPartyAccountId: string | null,
+      dpSign: "RECEIVE" | "PAY"
+    ): ComponentSummary {
+      const dpCandidateAccountIds = new Set(livePayers.map((p) => p.accountId));
+      if (oldPartyAccountId) dpCandidateAccountIds.add(oldPartyAccountId);
+
+      const dpPayers: SettlementPayerBreakdown[] = [];
+      for (const accountId of dpCandidateAccountIds) {
+        const net = dailyPostingNetByChallanAccount.get(`${challan.id}:${accountId}`) || 0;
+        const amount = round2(dpSign === "RECEIVE" ? Math.max(0, -net) : Math.max(0, net));
+        if (amount > 0.009) {
+          dpPayers.push({ accountId, partyId: null, partyName: "", amount });
+          pendingNameAccountIds.add(accountId);
+        }
+      }
+
+      const livePaid = round2(livePayers.reduce((s, p) => s + p.amount, 0));
+      const dpPaid = round2(dpPayers.reduce((s, p) => s + p.amount, 0));
+      const paidOrReceived = round2(livePaid + dpPaid);
+
+      return {
+        total,
+        paidOrReceived,
+        remaining: Math.max(0, round2(total - paidOrReceived)),
+        payers: [...livePayers, ...dpPayers],
+        isHistoricalFallback: false,
+      };
+    }
+
     for (const cb of challan.bilties) {
       const bilty = cb.bilty;
       if (bilty.isDeleted) continue;
@@ -314,44 +491,18 @@ export async function computeChallanSettlementSummaryBatch(
       const collectionKey: RowGroupKey = `${challan.id}:COLLECTION:${bilty.id}`;
       const collectionPayers = payersFor(collectionKey);
       for (const p of collectionPayers) candidates.add(p.accountId);
+      const oldCollectionAccountId = oldCollectionPartyByBiltyId.get(bilty.id) || null;
 
-      // Live SettlementPayment rows are the ONLY source of "actually
-      // received" - exactly like Final Settlement's own ground truth
-      // (lib/settlement-payments.ts's getComponentPaymentState(): paid
-      // = sum of active rows, nothing else). A Bilty's settlement-time
-      // reclassification (Dr responsible party / Cr Gross Bilty
-      // Receivable) tells us WHO is now responsible for this amount,
-      // never that they have actually remitted it - conflating the
-      // two previously made an unpaid To-Pay show as fully "Received"
-      // the moment settlement ran. When no live rows exist, the full
-      // amount is still due; WHO it is due from is surfaced below via
-      // residualPartyName (display-only, exactly mirroring Carrier
-      // Rent's own field), never folded into paidOrReceived.
-      const toPaySummary: ComponentSummary =
-        collectionPayers.length > 0
-          ? (() => {
-              const paidOrReceived = round2(collectionPayers.reduce((s, p) => s + p.amount, 0));
-              return {
-                total: toPay,
-                paidOrReceived,
-                remaining: Math.max(0, round2(toPay - paidOrReceived)),
-                payers: collectionPayers,
-                isHistoricalFallback: false,
-              };
-            })()
-          : emptyComponent(toPay);
+      const toPaySummary = buildComponentSummary(toPay, collectionPayers, oldCollectionAccountId, "RECEIVE");
 
-      if (toPaySummary.remaining > 0.009) {
-        const oldPartyAccountId = oldCollectionPartyByBiltyId.get(bilty.id) || null;
-        if (oldPartyAccountId) {
-          const account = await prisma.account.findUnique({
-            where: { id: oldPartyAccountId },
-            select: { accountName: true, party: { select: { partyName: true } } },
-          });
-          const residualPartyName = account?.party?.partyName || account?.accountName || null;
-          if (residualPartyName) {
-            toPaySummary.residualPartyName = residualPartyName;
-          }
+      if (toPaySummary.remaining > 0.009 && oldCollectionAccountId) {
+        const account = await prisma.account.findUnique({
+          where: { id: oldCollectionAccountId },
+          select: { accountName: true, party: { select: { partyName: true } } },
+        });
+        const residualPartyName = account?.party?.partyName || account?.accountName || null;
+        if (residualPartyName) {
+          toPaySummary.residualPartyName = residualPartyName;
         }
       }
 
@@ -381,24 +532,7 @@ export async function computeChallanSettlementSummaryBatch(
     // still gated on remaining > 0, unlike the resolution itself.
     const carrierRentOldPartyAccountId = oldCarrierRentPartyAccountId;
 
-    // Same fix as To-Pay above: only a live SettlementPayment row
-    // counts as "actually paid" (Final Settlement's own ground
-    // truth) - the settlement-time reclassification to a responsible
-    // party (e.g. "ANC direct" -> the Transporter) establishes WHO
-    // Carrier Rent is now owed to, never that it has been disbursed.
-    const carrierRentSummary: ComponentSummary =
-      carrierRentPayers.length > 0
-        ? (() => {
-            const paidOrReceived = round2(carrierRentPayers.reduce((s, p) => s + p.amount, 0));
-            return {
-              total: carrierRentTotal,
-              paidOrReceived,
-              remaining: Math.max(0, round2(carrierRentTotal - paidOrReceived)),
-              payers: carrierRentPayers,
-              isHistoricalFallback: false,
-            };
-          })()
-        : emptyComponent(carrierRentTotal);
+    const carrierRentSummary = buildComponentSummary(carrierRentTotal, carrierRentPayers, carrierRentOldPartyAccountId, "PAY");
 
     if (carrierRentSummary.remaining > 0 && carrierRentOldPartyAccountId) {
       const account = await prisma.account.findUnique({
@@ -412,99 +546,6 @@ export async function computeChallanSettlementSummaryBatch(
     }
 
     result[challan.id] = { challanId: challan.id, bilties, carrierRent: carrierRentSummary, partyNet: [] };
-  }
-
-  // ------------------------------------------------------------
-  // 5.5. Daily Posting activity attributable to each Challan - batched
-  //    ONCE across every Challan/Bilty on this page (never per-
-  //    Challan), mirroring computeChallanFinancialsBatch()'s own
-  //    proven correlation pattern exactly: Daily Posting cannot be
-  //    found via JournalEntry.referenceType/referenceId (its
-  //    referenceId is the Cash/Bank account, not a Challan/Bilty) -
-  //    only JournalLine.sourceType/sourceId ("CHALLAN"/challanId or
-  //    "BILTY"/one of its Bilty ids) correlates it. Only the PARTY-
-  //    side line of each matched entry is summed (never the Cash/Bank
-  //    side) - same debit-minus-credit sign convention as the
-  //    settlement-side net below, so the two can be added directly.
-  //    A "DIRECT" Daily Posting entry, or one sourced to an unrelated
-  //    Challan/Bilty, never matches this query at all.
-  //
-  //    PAID exclusion for Daily Posting CANNOT reuse the settlement-
-  //    side JournalEntry-id exclusion below: a PAID verification
-  //    receipt is posted as its OWN, separate DAILY_POSTING entry,
-  //    tagged sourceType:"BILTY"/sourceId:<biltyId> - the EXACT SAME
-  //    tag shape a legitimate Collection Daily Posting on that same
-  //    Bilty also uses (see lib/bilty-paid-verification.ts's own
-  //    header comment: "a JournalLine tagged sourceType 'BILTY',
-  //    sourceId = this Bilty, crediting the resolved Paid-responsible
-  //    Party's account"). The tag alone cannot distinguish them - only
-  //    the ACCOUNT can. So the exclusion here is precise and direct:
-  //    the authoritative SettlementPayment.payerAccountId for every
-  //    component:"PAID" row, per Bilty (never inferred from a
-  //    JournalEntry/description shape, which would risk excluding a
-  //    legitimate Collection payer's own Daily Posting if that same
-  //    Bilty also has ANY PAID lifecycle event, since both components
-  //    share referenceType "SETTLEMENT_PAYMENT").
-  // ------------------------------------------------------------
-  const allPaidRows = allBiltyIds.length > 0
-    ? await prisma.settlementPayment.findMany({
-        where: { component: "PAID", biltyId: { in: allBiltyIds } },
-        select: { biltyId: true, payerAccountId: true },
-      })
-    : [];
-  const paidPayerAccountIdsByBiltyId = new Map<string, Set<string>>();
-  for (const row of allPaidRows) {
-    if (!row.biltyId) continue;
-    const set = paidPayerAccountIdsByBiltyId.get(row.biltyId) || new Set<string>();
-    set.add(row.payerAccountId);
-    paidPayerAccountIdsByBiltyId.set(row.biltyId, set);
-  }
-
-  const biltyIdToChallanId = new Map<string, string>();
-  for (const c of challans) {
-    for (const cb of c.bilties) {
-      if (!cb.bilty.isDeleted) biltyIdToChallanId.set(cb.bilty.id, c.id);
-    }
-  }
-
-  const dailyPostingLines =
-    challanIds.length > 0 || allBiltyIds.length > 0
-      ? await prisma.journalLine.findMany({
-          where: {
-            journalEntry: { referenceType: "DAILY_POSTING", isDeleted: false },
-            OR: [
-              { sourceType: "CHALLAN", sourceId: { in: challanIds } },
-              ...(allBiltyIds.length > 0 ? [{ sourceType: "BILTY", sourceId: { in: allBiltyIds } }] : []),
-            ],
-          },
-          select: {
-            accountId: true,
-            debit: true,
-            credit: true,
-            sourceType: true,
-            sourceId: true,
-            account: { select: { category: true } },
-          },
-        })
-      : [];
-
-  // Keyed `${challanId}:${accountId}` - the Daily Posting contribution
-  // to add to that party's settlement-derived net for that Challan.
-  const dailyPostingNetByChallanAccount = new Map<string, number>();
-  for (const l of dailyPostingLines) {
-    if (l.account.category !== "PARTY") continue; // never the Cash/Bank side.
-    if (!l.sourceId) continue;
-    // PAID exclusion: only meaningful (and only ambiguous) for a
-    // BILTY-sourced line - a CHALLAN-sourced Carrier Rent Daily
-    // Posting can never collide with a Bilty-scoped PAID receipt.
-    if (l.sourceType === "BILTY" && paidPayerAccountIdsByBiltyId.get(l.sourceId)?.has(l.accountId)) continue;
-    const owningChallanId = l.sourceType === "CHALLAN" ? l.sourceId : biltyIdToChallanId.get(l.sourceId);
-    if (!owningChallanId) continue;
-    const key = `${owningChallanId}:${l.accountId}`;
-    dailyPostingNetByChallanAccount.set(
-      key,
-      round2((dailyPostingNetByChallanAccount.get(key) || 0) + Number(l.debit) - Number(l.credit))
-    );
   }
 
   // ------------------------------------------------------------
@@ -598,12 +639,19 @@ export async function computeChallanSettlementSummaryBatch(
   }
 
   // ------------------------------------------------------------
-  // 7. Party names for every partyNet entry across every Challan, in
-  //    ONE final query (accounts already covered by payerAccountById
-  //    are looked up again here too - a small, bounded overlap, not
-  //    worth a second map/merge for the sizes involved).
+  // 7. Party names for every partyNet entry AND every Daily-Posting-
+  //    sourced payer entry (buildComponentSummary() above, flagged via
+  //    pendingNameAccountIds) across every Challan, in ONE final query
+  //    (accounts already covered by payerAccountById are looked up
+  //    again here too - a small, bounded overlap, not worth a second
+  //    map/merge for the sizes involved).
   // ------------------------------------------------------------
-  const allPartyNetAccountIds = [...new Set(Object.values(result).flatMap((r) => r.partyNet.map((p) => p.accountId)))];
+  const allPartyNetAccountIds = [
+    ...new Set([
+      ...Object.values(result).flatMap((r) => r.partyNet.map((p) => p.accountId)),
+      ...pendingNameAccountIds,
+    ]),
+  ];
   if (allPartyNetAccountIds.length > 0) {
     const accounts = await prisma.account.findMany({
       where: { id: { in: allPartyNetAccountIds } },
@@ -615,6 +663,20 @@ export async function computeChallanSettlementSummaryBatch(
         const account = accountById.get(entry.accountId);
         entry.partyId = account?.party?.id || null;
         entry.partyName = account?.party?.partyName || account?.accountName || "Party";
+      }
+      for (const b of summary.bilties) {
+        for (const payer of b.toPay.payers) {
+          if (payer.partyName !== "") continue;
+          const account = accountById.get(payer.accountId);
+          payer.partyId = account?.party?.id || null;
+          payer.partyName = account?.party?.partyName || account?.accountName || "Party";
+        }
+      }
+      for (const payer of summary.carrierRent.payers) {
+        if (payer.partyName !== "") continue;
+        const account = accountById.get(payer.accountId);
+        payer.partyId = account?.party?.id || null;
+        payer.partyName = account?.party?.partyName || account?.accountName || "Party";
       }
     }
   }
