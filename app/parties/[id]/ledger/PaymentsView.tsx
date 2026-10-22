@@ -5,6 +5,7 @@ import Link from "next/link";
 import { t, type Lang } from "@/lib/i18n/party-ledger";
 import AllocationPanel from "./AllocationPanel";
 import { formatBusinessDate } from "@/lib/date-range";
+import { useReturnToSuffix, withReturnTo } from "@/components/useListScrollRestore";
 
 type PaymentRow = {
   journalLineId: string;
@@ -54,6 +55,7 @@ function sourceDestination(row: PaymentRow): { href: string; label: string } {
 }
 
 export default function PaymentsView({ partyId, lang }: { partyId: string; lang: Lang }) {
+  const returnToSuffix = useReturnToSuffix();
   const [payments, setPayments] = useState<PaymentRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -135,7 +137,7 @@ export default function PaymentsView({ partyId, lang }: { partyId: string; lang:
                     <td className="px-3 py-2 text-right">{formatCurrency(row.amount)}</td>
                     <td className="px-3 py-2">{row.cashBankAccountName || "—"}</td>
                     <td className="px-3 py-2">
-                      <Link href={dest.href} className="text-blue-600 hover:underline">
+                      <Link href={withReturnTo(dest.href, returnToSuffix)} className="text-blue-600 hover:underline">
                         {dest.label}
                       </Link>
                     </td>

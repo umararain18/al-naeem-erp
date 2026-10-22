@@ -4,6 +4,7 @@ import { Suspense, useCallback, useEffect, useState } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { formatBusinessDate } from "@/lib/date-range";
+import { useReturnToSuffix, withReturnTo } from "@/components/useListScrollRestore";
 
 // ============================================================
 // Full Search page - paginated, filterable view over the same
@@ -70,6 +71,7 @@ function actionHref(result: SearchResultItem, action: string): string | null {
 }
 
 function ResultRow({ result }: { result: SearchResultItem }) {
+  const returnToSuffix = useReturnToSuffix();
   return (
     <div className="rounded-xl border bg-white p-4 shadow-sm">
       <div className="flex items-start justify-between gap-3">
@@ -109,7 +111,7 @@ function ResultRow({ result }: { result: SearchResultItem }) {
             return (
               <Link
                 key={action}
-                href={href}
+                href={withReturnTo(href, returnToSuffix)}
                 className="rounded-lg border px-3 py-1 text-xs font-medium text-gray-700 hover:bg-gray-50"
               >
                 {action.charAt(0) + action.slice(1).toLowerCase()}

@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { resolveBackHref, useReturnToSuffix, withReturnTo } from "@/components/useListScrollRestore";
 import { getChallanShareMessage } from "@/lib/share-messages";
 import { normalizePhone } from "@/lib/phone";
 import { formatBusinessDate, toBusinessDateInputValue } from "@/lib/date-range";
@@ -80,6 +81,7 @@ export type Challan = {
   challanNo: string;
   loadingDate: string;
   status: ChallanStatus;
+  isDeleted: boolean;
   transporterParty: (PartyRef & { phone?: string | null; whatsapp?: string | null }) | null;
   driverName: string | null;
   driverPhone: string | null;
@@ -455,9 +457,22 @@ export default function ChallanDetailPage({
 }: {
   params: Promise<{ id: string }>;
 }) {
+  // Read directly from the URL (not next/navigation's useSearchParams)
+  // for a one-time-on-mount read, matching the same pattern already
+  // used by app/phonch/[id]/page.tsx and app/bilty/page.tsx, to avoid
+  // that hook's Suspense-boundary requirement.
+  const [backHref, setBackHref] = useState("/challan");
+  useEffect(() => {
+    setBackHref(resolveBackHref(new URLSearchParams(window.location.search).get("returnTo"), "/challan"));
+  }, []);
+  // For this page's OWN links down to a Bilty (Bilties table,
+  // Settlement Breakdown) - so THEIR Back button returns here.
+  const returnToSuffix = useReturnToSuffix();
   const [challan, setChallan] = useState<Challan | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [canRestore, setCanRestore] = useState(false);
+  const [restoring, setRestoring] = useState(false);
   // Separate from `error` above - `error` drives the page-level
   // "Challan not found" fallback render (see the `if (error || !challan)`
   // early return below), so reusing it for an edit-form validation
@@ -543,6 +558,7 @@ export default function ChallanDetailPage({
         paidVerification: data.paidVerification,
         settlementSummary: data.settlementSummary,
       });
+      setCanRestore(!!data.capabilities?.canRestore);
     } catch {
       setError("Unable to connect to the server");
     } finally {
@@ -554,6 +570,25 @@ export default function ChallanDetailPage({
     loadChallan();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [params]);
+
+  async function handleRestoreChallan() {
+    if (!challan) return;
+    if (!window.confirm(`Restore Challan ${challan.challanNo} from the Bin?`)) return;
+    try {
+      setRestoring(true);
+      setError("");
+      const response = await fetch(`/api/challan/${challan.id}/restore`, { method: "POST" });
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        setError(data.message || "Unable to restore challan");
+        return;
+      }
+      setLoading(true);
+      await loadChallan();
+    } finally {
+      setRestoring(false);
+    }
+  }
 
   async function loadTransporters() {
     try {
@@ -898,9 +933,37 @@ export default function ChallanDetailPage({
       <main className="min-h-screen bg-gray-50">
         <div className="max-w-5xl mx-auto p-6">
           <p className="text-red-600">{error || "Challan not found"}</p>
-          <Link href="/challan" className="mt-4 inline-block border rounded-lg px-4 py-2 text-sm hover:bg-gray-50">
-            Back to Challan
+          <Link href={backHref} className="mt-4 inline-block border rounded-lg px-4 py-2 text-sm hover:bg-gray-50">
+            Back
           </Link>
+        </div>
+      </main>
+    );
+  }
+
+  if (challan.isDeleted) {
+    return (
+      <main className="min-h-screen bg-gray-50">
+        <div className="max-w-5xl mx-auto p-6">
+          <div className="bg-white rounded-xl shadow-sm p-6">
+            <h1 className="text-xl font-bold mb-2">Challan #{challan.challanNo}</h1>
+            <p className="text-amber-700 font-medium">This Challan is in the Bin.</p>
+            <div className="mt-4 flex flex-wrap gap-3">
+              <Link href={backHref} className="border rounded-lg px-4 py-2 text-sm hover:bg-gray-50">
+                Back
+              </Link>
+              {canRestore && (
+                <button
+                  type="button"
+                  disabled={restoring}
+                  onClick={() => void handleRestoreChallan()}
+                  className="bg-black text-white rounded-lg px-4 py-2 text-sm hover:bg-gray-800 disabled:opacity-50"
+                >
+                  {restoring ? "Restoring..." : "Restore"}
+                </button>
+              )}
+            </div>
+          </div>
         </div>
       </main>
     );
@@ -929,7 +992,7 @@ export default function ChallanDetailPage({
               {challan.isSettled && (
                 <span className="text-sm text-gray-500">(Settled)</span>
               )}
-              <Link href="/challan" className="border rounded-lg px-4 py-2 text-sm hover:bg-gray-50">
+              <Link href={backHref} className="border rounded-lg px-4 py-2 text-sm hover:bg-gray-50">
                 Back
               </Link>
             </div>
@@ -1074,7 +1137,7 @@ export default function ChallanDetailPage({
                         <tr key={idx}>
                           <td className="px-3 py-2">
                             {biltyForLine ? (
-                              <Link href={`/bilty/${biltyForLine.id}`} className="text-blue-600 hover:underline">
+                              <Link href={withReturnTo(`/bilty/${biltyForLine.id}`, returnToSuffix)} className="text-blue-600 hover:underline">
                                 {line.sourceNumber}
                               </Link>
                             ) : (
@@ -1433,7 +1496,7 @@ export default function ChallanDetailPage({
                     </td>
                     <td className="px-3 py-2">
                       <Link
-                        href={`/bilty/${cb.bilty.id}`}
+                        href={withReturnTo(`/bilty/${cb.bilty.id}`, returnToSuffix)}
                         className="border rounded-lg px-3 py-1 text-xs hover:bg-gray-50"
                       >
                         View Bilty

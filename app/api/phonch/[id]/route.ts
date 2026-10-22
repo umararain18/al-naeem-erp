@@ -117,6 +117,7 @@ export async function GET(
       capabilities: {
         canEdit: hasPermission(currentUser, "phonch.edit"),
         canBin: hasPermission(currentUser, "phonch.bin"),
+        canRestore: currentUser.role === "SUPER_ADMIN",
       },
     });
   } catch (error) {

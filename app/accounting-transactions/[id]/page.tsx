@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { formatBusinessDate } from "@/lib/date-range";
+import { useReturnToSuffix, withReturnTo } from "@/components/useListScrollRestore";
 
 type Account = {
   id: string;
@@ -46,6 +47,7 @@ export default function AccountingTransactionDetailPage({
 }: {
   params: Promise<{ id: string }>;
 }) {
+  const returnToSuffix = useReturnToSuffix();
   const [entry, setEntry] = useState<JournalEntry | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -110,11 +112,23 @@ export default function AccountingTransactionDetailPage({
     if (!line.sourceType || !line.sourceId) return null;
 
     if (line.sourceType === "BILTY") {
-      return { href: `/bilty/${line.sourceId}`, label: `Bilty ${line.sourceNumber || line.sourceId}` };
+      return { href: withReturnTo(`/bilty/${line.sourceId}`, returnToSuffix), label: `Bilty ${line.sourceNumber || line.sourceId}` };
     }
 
     if (line.sourceType === "CHALLAN") {
-      return { href: `/challan/${line.sourceId}`, label: `Challan ${line.sourceNumber || line.sourceId}` };
+      return { href: withReturnTo(`/challan/${line.sourceId}`, returnToSuffix), label: `Challan ${line.sourceNumber || line.sourceId}` };
+    }
+
+    if (line.sourceType === "BILL") {
+      return { href: withReturnTo(`/bill/${line.sourceId}`, returnToSuffix), label: `Bill ${line.sourceNumber || line.sourceId}` };
+    }
+
+    if (line.sourceType === "PHONCH") {
+      return { href: withReturnTo(`/phonch/${line.sourceId}`, returnToSuffix), label: `Phonch ${line.sourceNumber || line.sourceId}` };
+    }
+
+    if (line.sourceType === "PRIVATE_PHONCH") {
+      return { href: withReturnTo(`/private-phonch/${line.sourceId}`, returnToSuffix), label: `Private Phonch ${line.sourceNumber || line.sourceId}` };
     }
 
     return null;
@@ -134,7 +148,7 @@ export default function AccountingTransactionDetailPage({
             <div className="flex gap-3">
               {entry.referenceType === "SETTLEMENT" && entry.referenceId && (
                 <Link
-                  href={`/challan/${entry.referenceId}`}
+                  href={withReturnTo(`/challan/${entry.referenceId}`, returnToSuffix)}
                   className="bg-blue-600 text-white px-4 py-2 rounded-lg text-sm hover:bg-blue-700"
                 >
                   View Challan

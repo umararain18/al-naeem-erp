@@ -302,6 +302,7 @@ export async function GET(
       capabilities: {
         canEdit: hasPermission(currentUser, "privatePhonch.edit"),
         canBin: hasPermission(currentUser, "privatePhonch.bin"),
+        canRestore: currentUser.role === "SUPER_ADMIN",
       },
     });
   } catch (error) {

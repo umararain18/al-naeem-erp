@@ -4,7 +4,7 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { formatBusinessDate } from "@/lib/date-range";
-import { getSavedListFilters, saveListFilters, useListScrollRestore, LIST_HIGHLIGHT_CLASS } from "@/components/useListScrollRestore";
+import { getSavedListFilters, saveListFilters, useListScrollRestore, useReturnToSuffix, withReturnTo, LIST_HIGHLIGHT_CLASS } from "@/components/useListScrollRestore";
 
 const CHALLAN_LIST_KEY = "challan-list";
 interface ChallanListFilters {
@@ -319,6 +319,7 @@ function clearingAgentPartyId(challan: Challan): string | null {
 // the shown ones are links) - never guesses an id, always the exact
 // Bilty this Challan is actually linked to.
 function BiltyLinks({ challan }: { challan: Challan }) {
+  const returnToSuffix = useReturnToSuffix();
   const bilties = challan.bilties.map((cb) => cb.bilty);
   if (bilties.length === 0) return <>—</>;
 
@@ -330,7 +331,7 @@ function BiltyLinks({ challan }: { challan: Challan }) {
       {shown.map((b, i) => (
         <span key={b.id}>
           {i > 0 && ", "}
-          <Link href={`/bilty/${b.id}`} className="text-blue-600 hover:underline">
+          <Link href={withReturnTo(`/bilty/${b.id}`, returnToSuffix)} className="text-blue-600 hover:underline">
             {b.biltyNo}
           </Link>
         </span>
@@ -411,6 +412,7 @@ function compareChallanNewestFirst(a: Challan, b: Challan): number {
 }
 
 export default function ChallanPage() {
+  const returnToSuffix = useReturnToSuffix();
   const [challans, setChallans] = useState<Challan[]>([]);
   const [capabilities, setCapabilities] = useState({ canBin: false });
   const [loading, setLoading] = useState(true);
@@ -1046,7 +1048,7 @@ export default function ChallanPage() {
                             <td className="px-3 py-2">
                               <div className="flex gap-2">
                                 <Link
-                                  href={`/bilty/${bilty.id}`}
+                                  href={withReturnTo(`/bilty/${bilty.id}`, returnToSuffix)}
                                   className="text-xs border rounded px-2 py-1 hover:bg-gray-50"
                                 >
                                   View

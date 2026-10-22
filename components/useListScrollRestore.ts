@@ -166,3 +166,66 @@ export function useListScrollRestore(storageKey: string, ready: boolean) {
 /** Shared highlight class - consistent styling across every list page,
  * same transient amber tone Daily Posting's own existing highlight uses. */
 export const LIST_HIGHLIGHT_CLASS = "bg-yellow-50 transition-colors duration-1000";
+
+// ============================================================
+// returnTo - lets a document detail page's own "Back" button return
+// to the EXACT page it was opened from (a ledger view, Cash Book,
+// Search, a Challan's own Bilty list, ...), not just a hardcoded
+// module list link. The opening page appends `?returnTo=<its own
+// current path+query>` to the link it builds; the detail page reads
+// it back and falls through to its usual module-list link only when
+// absent (opened directly, e.g. a bookmark) or unsafe.
+// ============================================================
+
+/** Call from the page that is ABOUT TO LINK to a document detail page
+ * - captures THIS page's own current path+query, to hand to that
+ * detail page's Back button. Returns "" outside the browser (SSR). */
+export function buildReturnTo(): string {
+  if (typeof window === "undefined") return "";
+  return window.location.pathname + window.location.search;
+}
+
+/** Call from a document detail page to resolve its own Back button's
+ * href: the given `returnTo` value when it is a safe same-origin
+ * relative path, otherwise `fallbackHref` (the module list). Rejects
+ * anything not starting with a single "/" (an absolute URL or a
+ * protocol-relative "//host/..." could otherwise redirect off-site if
+ * a crafted link's returnTo were trusted as-is). */
+export function resolveBackHref(returnTo: string | null | undefined, fallbackHref: string): string {
+  if (!returnTo || !returnTo.startsWith("/") || returnTo.startsWith("//")) return fallbackHref;
+  return returnTo;
+}
+
+/**
+ * React hook for a page that LINKS to a document detail page: returns
+ * a `?returnTo=...` suffix (or "" before mount / outside the browser)
+ * for THIS page's own current path+query, to append to any Bilty/
+ * Challan/Bill/Phonch/Private-Phonch link this page builds.
+ *
+ * Deliberately NOT a plain inline `window.location` read during
+ * render (every existing read of it in this codebase - app/bilty/
+ * page.tsx, app/cash-book/page.tsx, app/phonch/[id]/page.tsx, etc. -
+ * happens inside a useEffect/event handler, never inline in JSX):
+ * reading it directly while rendering would compute "" on the
+ * server (no `window`) and a real path on the client, a server/
+ * client markup mismatch React would warn about on hydration.
+ * Starting at "" and setting the real value only after mount (like
+ * every other such read in this app) avoids that entirely - the very
+ * first paint has no returnTo, exactly like a plain href would.
+ */
+export function useReturnToSuffix(): string {
+  const [suffix, setSuffix] = useState("");
+  useEffect(() => {
+    const returnTo = buildReturnTo();
+    setSuffix(returnTo ? `?returnTo=${encodeURIComponent(returnTo)}` : "");
+  }, []);
+  return suffix;
+}
+
+/** Appends an already-built `returnTo` suffix (from useReturnToSuffix)
+ * to `basePath`, respecting a `?` the base path may already have. */
+export function withReturnTo(basePath: string, returnToSuffix: string): string {
+  if (!returnToSuffix) return basePath;
+  const joiner = basePath.includes("?") ? returnToSuffix.replace("?", "&") : returnToSuffix;
+  return `${basePath}${joiner}`;
+}

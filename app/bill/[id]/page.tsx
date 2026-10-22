@@ -5,6 +5,7 @@ import Link from "next/link";
 import Image from "next/image";
 import BillForm from "../BillForm";
 import { formatBusinessDate } from "@/lib/date-range";
+import { resolveBackHref } from "@/components/useListScrollRestore";
 
 function formatCurrency(value: number, currency: string) {
   return `${currency} ${Math.round(value).toLocaleString()}`;
@@ -146,12 +147,21 @@ type BillDetail = {
 
 export default function BillDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
+  // Read directly from the URL (not next/navigation's useSearchParams)
+  // for a one-time-on-mount read, matching the same pattern already
+  // used by app/phonch/[id]/page.tsx and app/bilty/page.tsx, to avoid
+  // that hook's Suspense-boundary requirement.
+  const [backHref, setBackHref] = useState("/bill");
+  useEffect(() => {
+    setBackHref(resolveBackHref(new URLSearchParams(window.location.search).get("returnTo"), "/bill"));
+  }, []);
   const [bill, setBill] = useState<BillDetail | null>(null);
-  const [capabilities, setCapabilities] = useState({ canEdit: false, canBin: false });
+  const [capabilities, setCapabilities] = useState({ canEdit: false, canBin: false, canRestore: false });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [binning, setBinning] = useState(false);
+  const [restoring, setRestoring] = useState(false);
   const [editing, setEditing] = useState(false);
   const [presentation, setPresentation] = useState<Presentation>(FALLBACK_PRESENTATION);
 
@@ -209,6 +219,23 @@ export default function BillDetailPage({ params }: { params: Promise<{ id: strin
       setError(err instanceof Error ? err.message : "Unable to move to Bin");
     } finally {
       setBinning(false);
+    }
+  }
+
+  async function handleRestore() {
+    if (!bill) return;
+    if (!window.confirm(`Restore Bill ${bill.billNo} from the Bin?`)) return;
+    try {
+      setRestoring(true);
+      setError("");
+      const res = await fetch(`/api/bill/${id}/restore`, { method: "POST" });
+      const data = await res.json();
+      if (!res.ok || !data.success) throw new Error(data.message || "Unable to restore");
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to restore");
+    } finally {
+      setRestoring(false);
     }
   }
 
@@ -303,8 +330,8 @@ export default function BillDetailPage({ params }: { params: Promise<{ id: strin
       <div className="mx-auto max-w-6xl">
         <div className="mb-6 flex items-center justify-between">
           <div>
-            <Link href="/bill" className="text-xs text-gray-500 hover:underline">
-              ← Back to Bill Book
+            <Link href={backHref} className="text-xs text-gray-500 hover:underline">
+              ← Back
             </Link>
             <h1 className="mt-1 text-2xl font-bold text-gray-900">Bill No. {bill.billNo}</h1>
           </div>
@@ -320,7 +347,7 @@ export default function BillDetailPage({ params }: { params: Promise<{ id: strin
                 Edit
               </button>
             )}
-            {capabilities.canBin && bill.receivedAmount <= 0.009 && (
+            {capabilities.canBin && !bill.isDeleted && bill.receivedAmount <= 0.009 && (
               <button
                 type="button"
                 disabled={binning}
@@ -330,8 +357,24 @@ export default function BillDetailPage({ params }: { params: Promise<{ id: strin
                 Move to Bin
               </button>
             )}
+            {bill.isDeleted && capabilities.canRestore && (
+              <button
+                type="button"
+                disabled={restoring}
+                onClick={() => void handleRestore()}
+                className="rounded-lg bg-black px-4 py-2 text-sm text-white hover:bg-gray-800 disabled:opacity-50"
+              >
+                {restoring ? "Restoring..." : "Restore"}
+              </button>
+            )}
           </div>
         </div>
+
+        {bill.isDeleted && (
+          <div className="mb-5 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+            This Bill is in the Bin.
+          </div>
+        )}
 
         {(error || message) && (
           <div
