@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import Link from "next/link";
+import { useReturnToSuffix, withReturnTo } from "@/components/useListScrollRestore";
 import DateRangeSelector from "@/components/dashboard/DateRangeSelector";
 import KpiCard, { KpiComparison } from "@/components/dashboard/KpiCard";
 import IncomeExpenseProfitChart, {
@@ -190,6 +191,7 @@ function buildQuery(preset: string, customFrom: string, customTo: string): strin
 }
 
 export default function DashboardPage() {
+  const returnToSuffix = useReturnToSuffix();
   const initialParams =
     typeof window !== "undefined" ? new URLSearchParams(window.location.search) : null;
   const initialFrom = initialParams?.get("from") || "";
@@ -564,7 +566,7 @@ export default function DashboardPage() {
                     {data.recentBilties.map((bilty) => (
                       <Link
                         key={bilty.id}
-                        href={`/bilty/${bilty.id}`}
+                        href={withReturnTo(`/bilty/${bilty.id}`, returnToSuffix)}
                         className="block hover:bg-gray-50 rounded-lg p-2 -mx-2"
                       >
                         <div className="flex items-center justify-between">
@@ -594,7 +596,7 @@ export default function DashboardPage() {
                     {data.recentChallans.map((challan) => (
                       <Link
                         key={challan.id}
-                        href={`/challan/${challan.id}`}
+                        href={withReturnTo(`/challan/${challan.id}`, returnToSuffix)}
                         className="block hover:bg-gray-50 rounded-lg p-2 -mx-2"
                       >
                         <div className="flex items-center justify-between">

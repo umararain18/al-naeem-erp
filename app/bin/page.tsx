@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { useReturnToSuffix, withReturnTo } from "@/components/useListScrollRestore";
 
 type ItemType = "BILTY" | "CHALLAN" | "PAYSLIP" | "JOURNAL_ENTRY" | "DAILY_POSTING";
 
@@ -40,6 +41,7 @@ function formatDate(value: string) {
 }
 
 export default function BinPage() {
+  const returnToSuffix = useReturnToSuffix();
   const [items, setItems] = useState<BinItem[]>([]);
   const [capabilities, setCapabilities] = useState<Capabilities>({
     canRestoreBilty: false,
@@ -320,7 +322,7 @@ export default function BinPage() {
                     <td className="px-4 py-4">
                       <div className="flex gap-2">
                         <Link
-                          href={item.moduleUrl}
+                          href={withReturnTo(item.moduleUrl, returnToSuffix)}
                           className="rounded border px-3 py-1.5 text-xs hover:bg-gray-50"
                         >
                           View

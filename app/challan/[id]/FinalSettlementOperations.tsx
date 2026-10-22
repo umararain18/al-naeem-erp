@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { PartyAccountSelect, type Challan, type Bilty } from "./page";
+import { useReturnToSuffix, withReturnTo } from "@/components/useListScrollRestore";
 
 // ============================================================
 // THE ONE FINAL SETTLEMENT SCREEN
@@ -721,6 +722,7 @@ function BiltySettlementBlock({
   stagedAllocations: StagedAllocation[];
   onStagedAllocationsChange: (next: StagedAllocation[]) => void;
 }) {
+  const returnToSuffix = useReturnToSuffix();
   const paidAmount = paidVerification?.paidAmount ?? Number(bilty.advance || 0);
   const verified = paidVerification?.verifiedReceivedAmount ?? 0;
   const unverified = paidVerification?.unverifiedAmount ?? Math.max(0, paidAmount - verified);
@@ -748,7 +750,7 @@ function BiltySettlementBlock({
     <div className="rounded-xl border p-4 md:p-5 mb-4">
       <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
         <h3 className="font-semibold">
-          <Link href={`/bilty/${bilty.id}`} className="text-blue-600 hover:underline">
+          <Link href={withReturnTo(`/bilty/${bilty.id}`, returnToSuffix)} className="text-blue-600 hover:underline">
             {bilty.biltyNo}
           </Link>{" "}
           <span className="text-sm font-normal text-gray-500">

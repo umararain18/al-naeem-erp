@@ -129,8 +129,14 @@ export async function GET(
       );
     }
 
-    const bilty = await prisma.bilty.findUnique({
-      where: { id },
+    // Accepts either the real id or the Bilty's own biltyNo (a true
+    // global unique column - `biltyNo String @unique` in schema.prisma,
+    // unlike Challan's partial-unique challanNo) - a few places still
+    // only have the human-readable number on hand (e.g. a typed-in
+    // search, an old bookmark). The id lookup is tried first since
+    // every real link in the app already uses it.
+    const bilty = await prisma.bilty.findFirst({
+      where: { OR: [{ id }, { biltyNo: id }] },
       include: {
         fromLocation: {
           select: {
@@ -234,7 +240,7 @@ export async function GET(
       },
     });
 
-    if (!bilty || bilty.isDeleted) {
+    if (!bilty) {
       return NextResponse.json(
         {
           success: false,
@@ -242,6 +248,20 @@ export async function GET(
         },
         { status: 404 }
       );
+    }
+
+    // A Bin'd Bilty is still returned (never 404) so the detail page
+    // can show a clear "this Bilty is in the Bin" message with a
+    // Restore link, instead of an indistinguishable "not found" -
+    // every other write/edit path on this Bilty remains blocked by
+    // its own existing isDeleted checks regardless.
+    if (bilty.isDeleted) {
+      return NextResponse.json({
+        success: true,
+        bilty,
+        paidVerification: null,
+        capabilities: { canRestore: currentUser.role === "SUPER_ADMIN" },
+      });
     }
 
     // Derived Unverified ANC receipt state - never a stored field,
@@ -253,6 +273,7 @@ export async function GET(
       success: true,
       bilty,
       paidVerification,
+      capabilities: { canRestore: false },
     });
   } catch (error) {
     console.error("Get bilty error:", error);

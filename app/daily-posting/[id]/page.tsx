@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { formatBusinessDate } from "@/lib/date-range";
+import { resolveBackHref } from "@/components/useListScrollRestore";
 
 type Account = {
   id: string;
@@ -53,6 +54,11 @@ export default function DailyPostingDetailPage({
   const [entry, setEntry] = useState<JournalEntry | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [backHref, setBackHref] = useState("/daily-posting");
+
+  useEffect(() => {
+    setBackHref(resolveBackHref(new URLSearchParams(window.location.search).get("returnTo"), "/daily-posting"));
+  }, []);
 
   useEffect(() => {
     async function load() {
@@ -74,6 +80,33 @@ export default function DailyPostingDetailPage({
     }
     load();
   }, [params]);
+
+  // Mirrors app/accounting-transactions/[id]/page.tsx's own
+  // getSourceLink() exactly - same sourceType -> route mapping, so a
+  // Daily Posting line traced back to a real source document links
+  // there too, instead of showing its raw type/id as plain text.
+  // PAYSLIP has no standalone detail page (managed inline within
+  // /employees) and SETTLEMENT_PAYMENT is not itself a document, so
+  // both are left as plain text, same as before.
+  function getSourceLink(line: JournalLine): { href: string; label: string } | null {
+    if (!line.sourceType || !line.sourceId) return null;
+    if (line.sourceType === "BILTY") {
+      return { href: `/bilty/${line.sourceId}`, label: `Bilty ${line.sourceNumber || line.sourceId}` };
+    }
+    if (line.sourceType === "CHALLAN") {
+      return { href: `/challan/${line.sourceId}`, label: `Challan ${line.sourceNumber || line.sourceId}` };
+    }
+    if (line.sourceType === "BILL") {
+      return { href: `/bill/${line.sourceId}`, label: `Bill ${line.sourceNumber || line.sourceId}` };
+    }
+    if (line.sourceType === "PHONCH") {
+      return { href: `/phonch/${line.sourceId}`, label: `Phonch ${line.sourceNumber || line.sourceId}` };
+    }
+    if (line.sourceType === "PRIVATE_PHONCH") {
+      return { href: `/private-phonch/${line.sourceId}`, label: `Private Phonch ${line.sourceNumber || line.sourceId}` };
+    }
+    return null;
+  }
 
   function formatCurrency(value: number) {
     return `Rs. ${value.toLocaleString()}`;
@@ -98,8 +131,8 @@ export default function DailyPostingDetailPage({
       <main className="min-h-screen bg-gray-50">
         <div className="max-w-6xl mx-auto p-6">
           <p className="text-red-600">{error || "Daily posting not found"}</p>
-          <Link href="/daily-posting" className="mt-4 inline-block border rounded-lg px-4 py-2 text-sm hover:bg-gray-50">
-            Back to Daily Posting
+          <Link href={backHref} className="mt-4 inline-block border rounded-lg px-4 py-2 text-sm hover:bg-gray-50">
+            Back
           </Link>
         </div>
       </main>
@@ -117,8 +150,8 @@ export default function DailyPostingDetailPage({
               <h1 className="text-2xl font-bold">Daily Posting</h1>
               <p className="text-gray-600">{entry.id}</p>
             </div>
-            <Link href="/daily-posting" className="border rounded-lg px-4 py-2 text-sm hover:bg-gray-50">
-              Back to Daily Posting
+            <Link href={backHref} className="border rounded-lg px-4 py-2 text-sm hover:bg-gray-50">
+              Back
             </Link>
           </div>
         </div>
@@ -186,13 +219,23 @@ export default function DailyPostingDetailPage({
                     </td>
                     <td className="px-4 py-3">{line.description || "—"}</td>
                     <td className="px-4 py-3">
-                      {line.sourceType ? (
-                        <span className="text-xs">
-                          {line.sourceType}: {line.sourceNumber || line.sourceId || "—"}
-                        </span>
-                      ) : (
-                        "—"
-                      )}
+                      {(() => {
+                        const link = getSourceLink(line);
+                        if (link) {
+                          return (
+                            <Link href={link.href} className="text-blue-600 hover:underline text-xs">
+                              {link.label}
+                            </Link>
+                          );
+                        }
+                        return line.sourceType ? (
+                          <span className="text-xs">
+                            {line.sourceType}: {line.sourceNumber || line.sourceId || "—"}
+                          </span>
+                        ) : (
+                          "—"
+                        );
+                      })()}
                     </td>
                   </tr>
                 ))}

@@ -5,6 +5,7 @@ import Link from "next/link";
 import PhonchForm from "../PhonchForm";
 import { DocumentFooter, DocumentHeader, useDocumentPresentation } from "@/components/documents/DocumentPresentation";
 import { formatBusinessDate } from "@/lib/date-range";
+import { resolveBackHref } from "@/components/useListScrollRestore";
 
 function formatCurrency(value: number) {
   return `Rs. ${Math.round(value).toLocaleString()}`;
@@ -50,12 +51,14 @@ type PhonchDetail = {
 export default function PhonchDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const [phonch, setPhonch] = useState<PhonchDetail | null>(null);
-  const [capabilities, setCapabilities] = useState({ canEdit: false, canBin: false });
+  const [capabilities, setCapabilities] = useState({ canEdit: false, canBin: false, canRestore: false });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [binning, setBinning] = useState(false);
+  const [restoring, setRestoring] = useState(false);
   const [editing, setEditing] = useState(false);
+  const [backHref, setBackHref] = useState("/phonch");
   const presentation = useDocumentPresentation("SHOWROOM_PHONCH");
 
   async function load() {
@@ -85,7 +88,9 @@ export default function PhonchDetailPage({ params }: { params: Promise<{ id: str
   // app/bilty/page.tsx, to avoid that hook's Suspense-boundary
   // requirement.
   useEffect(() => {
-    if (new URLSearchParams(window.location.search).get("edit") === "1") setEditing(true);
+    const params = new URLSearchParams(window.location.search);
+    if (params.get("edit") === "1") setEditing(true);
+    setBackHref(resolveBackHref(params.get("returnTo"), "/phonch"));
   }, []);
 
   async function handleBin() {
@@ -102,6 +107,23 @@ export default function PhonchDetailPage({ params }: { params: Promise<{ id: str
       setError(err instanceof Error ? err.message : "Unable to move to Bin");
     } finally {
       setBinning(false);
+    }
+  }
+
+  async function handleRestore() {
+    if (!phonch) return;
+    if (!window.confirm(`Restore Phonch ${phonch.phonchNo} from the Bin?`)) return;
+    try {
+      setRestoring(true);
+      setError("");
+      const res = await fetch(`/api/phonch/${id}/restore`, { method: "POST" });
+      const data = await res.json();
+      if (!res.ok || !data.success) throw new Error(data.message || "Unable to restore");
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to restore");
+    } finally {
+      setRestoring(false);
     }
   }
 
@@ -171,8 +193,8 @@ export default function PhonchDetailPage({ params }: { params: Promise<{ id: str
 
         <div className="mb-6 flex items-center justify-between">
           <div>
-            <Link href="/phonch" className="text-xs text-gray-500 hover:underline">
-              ← Back to Phonch
+            <Link href={backHref} className="text-xs text-gray-500 hover:underline">
+              ← Back
             </Link>
             <h1 className="mt-1 text-2xl font-bold text-gray-900">Phonch No. {phonch.phonchNo}</h1>
           </div>
@@ -193,7 +215,7 @@ export default function PhonchDetailPage({ params }: { params: Promise<{ id: str
                 Edit
               </button>
             )}
-            {capabilities.canBin && phonch.receivedAmount <= 0.009 && (
+            {capabilities.canBin && !phonch.isDeleted && phonch.receivedAmount <= 0.009 && (
               <button
                 type="button"
                 disabled={binning}
@@ -203,8 +225,24 @@ export default function PhonchDetailPage({ params }: { params: Promise<{ id: str
                 Move to Bin
               </button>
             )}
+            {phonch.isDeleted && capabilities.canRestore && (
+              <button
+                type="button"
+                disabled={restoring}
+                onClick={() => void handleRestore()}
+                className="rounded-lg bg-black px-4 py-2 text-sm text-white hover:bg-gray-800 disabled:opacity-50"
+              >
+                {restoring ? "Restoring..." : "Restore"}
+              </button>
+            )}
           </div>
         </div>
+
+        {phonch.isDeleted && (
+          <div className="mb-5 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+            This Phonch is in the Bin.
+          </div>
+        )}
 
         {(error || message) && (
           <div

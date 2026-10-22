@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { t, type Lang } from "@/lib/i18n/party-ledger";
 import { formatBusinessDate } from "@/lib/date-range";
+import { useReturnToSuffix, withReturnTo } from "@/components/useListScrollRestore";
 
 type AllocationRow = {
   id: string;
@@ -47,6 +48,7 @@ export default function AllocationPanel({
   onClose: () => void;
   onChanged: () => void;
 }) {
+  const returnToSuffix = useReturnToSuffix();
   const [state, setState] = useState<PaymentState | null>(null);
   const [outstanding, setOutstanding] = useState<OutstandingDocument[]>([]);
   const [loading, setLoading] = useState(true);
@@ -230,7 +232,8 @@ export default function AllocationPanel({
   }
 
   function targetHref(row: { targetSourceType: string; targetSourceId: string }) {
-    return row.targetSourceType === "BILTY" ? `/bilty/${row.targetSourceId}` : `/challan/${row.targetSourceId}`;
+    const base = row.targetSourceType === "BILTY" ? `/bilty/${row.targetSourceId}` : `/challan/${row.targetSourceId}`;
+    return withReturnTo(base, returnToSuffix);
   }
 
   return (

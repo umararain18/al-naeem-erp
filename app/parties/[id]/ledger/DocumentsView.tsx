@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { t, type Lang } from "@/lib/i18n/party-ledger";
 import { formatBusinessDate } from "@/lib/date-range";
+import { useReturnToSuffix, withReturnTo } from "@/components/useListScrollRestore";
 
 type DocumentRow = {
   targetSourceType: "BILTY" | "CHALLAN";
@@ -86,6 +87,7 @@ export default function DocumentsView({
   lang: Lang;
   onlyOutstanding: boolean;
 }) {
+  const returnToSuffix = useReturnToSuffix();
   const [documents, setDocuments] = useState<DocumentRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -153,8 +155,8 @@ export default function DocumentsView({
   }, [partyId, onlyOutstanding, biltyNo, challanNo, registrationNumber, chassisNumber]);
 
   function documentHref(row: DocumentRow) {
-    if (row.targetSourceType === "BILTY" && row.biltyId) return `/bilty/${row.biltyId}`;
-    if (row.challanId) return `/challan/${row.challanId}`;
+    if (row.targetSourceType === "BILTY" && row.biltyId) return withReturnTo(`/bilty/${row.biltyId}`, returnToSuffix);
+    if (row.challanId) return withReturnTo(`/challan/${row.challanId}`, returnToSuffix);
     return null;
   }
 
@@ -270,7 +272,7 @@ export default function DocumentsView({
                     {visibleColumns.has("challanNo") && (
                       <td className="px-3 py-2">
                         {row.challanId && row.challanNo ? (
-                          <Link href={`/challan/${row.challanId}`} className="text-blue-600 hover:underline">
+                          <Link href={withReturnTo(`/challan/${row.challanId}`, returnToSuffix)} className="text-blue-600 hover:underline">
                             {row.challanNo}
                           </Link>
                         ) : (

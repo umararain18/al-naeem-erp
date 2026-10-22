@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { t, type Lang } from "@/lib/i18n/party-ledger";
+import { useReturnToSuffix, withReturnTo } from "@/components/useListScrollRestore";
 
 type DocumentRow = {
   targetSourceType: "BILTY" | "CHALLAN";
@@ -49,6 +50,7 @@ function describeBilty(row: DocumentRow): string {
 }
 
 export default function SummaryView({ partyId, lang }: { partyId: string; lang: Lang }) {
+  const returnToSuffix = useReturnToSuffix();
   const [documents, setDocuments] = useState<DocumentRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -109,7 +111,7 @@ export default function SummaryView({ partyId, lang }: { partyId: string; lang: 
               <h3 className="font-semibold text-lg">
                 {t("challan", lang)}{" "}
                 {group.challanId ? (
-                  <Link href={`/challan/${group.challanId}`} className="text-blue-600 hover:underline">
+                  <Link href={withReturnTo(`/challan/${group.challanId}`, returnToSuffix)} className="text-blue-600 hover:underline">
                     {group.challanNo}
                   </Link>
                 ) : (
@@ -121,7 +123,7 @@ export default function SummaryView({ partyId, lang }: { partyId: string; lang: 
             <ol className="space-y-3 list-decimal list-inside">
               {biltyRows.map((row) => (
                 <li key={row.targetSourceId} className="text-sm">
-                  <Link href={`/bilty/${row.biltyId}`} className="text-blue-600 hover:underline font-medium">
+                  <Link href={withReturnTo(`/bilty/${row.biltyId}`, returnToSuffix)} className="text-blue-600 hover:underline font-medium">
                     {describeBilty(row)}
                   </Link>
                   {row.chassisNumber && (
@@ -152,11 +154,11 @@ export default function SummaryView({ partyId, lang }: { partyId: string; lang: 
             {standalone.map((row) => (
               <li key={row.targetSourceId} className="text-sm">
                 {row.targetSourceType === "BILTY" ? (
-                  <Link href={`/bilty/${row.biltyId}`} className="text-blue-600 hover:underline font-medium">
+                  <Link href={withReturnTo(`/bilty/${row.biltyId}`, returnToSuffix)} className="text-blue-600 hover:underline font-medium">
                     {describeBilty(row)}
                   </Link>
                 ) : (
-                  <Link href={`/challan/${row.challanId}`} className="text-blue-600 hover:underline font-medium">
+                  <Link href={withReturnTo(`/challan/${row.challanId}`, returnToSuffix)} className="text-blue-600 hover:underline font-medium">
                     {t("challan", lang)} {row.documentNo} · {t("carrierRent", lang)} {formatCurrency(row.carrierRent || 0)}
                   </Link>
                 )}

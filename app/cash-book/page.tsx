@@ -3,6 +3,15 @@
 import { useEffect, useMemo, useState } from "react";import { useRouter } from "next/navigation"; import TransactionViewModal from "./TransactionViewModal"; import TransactionEditModal from "./TransactionEditModal";
 import { presetRange } from "@/components/LedgerFilters";
 import { formatBusinessDate } from "@/lib/date-range";
+import { getSavedListFilters, saveListFilters, useReturnToSuffix, withReturnTo } from "@/components/useListScrollRestore";
+
+const CASH_BOOK_LIST_KEY = "cash-book";
+interface CashBookFilters {
+  accountId: string;
+  accountName: string;
+  fromDate: string;
+  toDate: string;
+}
 
 type Account = {
   id: string;
@@ -83,23 +92,33 @@ function formatMoney(amount: number) {
 
 export default function CashBookPage() {
   const router = useRouter();
+  const returnToSuffix = useReturnToSuffix();
 
   const [accounts, setAccounts] = useState<Account[]>([]);
 
+  // Seeded from sessionStorage (the same Bilty/Challan/Party-Ledger-
+  // style filter persistence - see components/useListScrollRestore.ts)
+  // so returning here via a document's own Back button (or plain
+  // browser Back) restores the same selected account + date range,
+  // not a blank picker. A real `?accountId=...` URL deep-link (e.g.
+  // from Dashboard Cash/Bank) still takes priority - see the mount
+  // effect below, unchanged.
+  const savedCashBookFilters = useMemo(() => getSavedListFilters<CashBookFilters>(CASH_BOOK_LIST_KEY), []);
+
   const [selectedAccountId, setSelectedAccountId] =
-    useState("");
+    useState(() => savedCashBookFilters?.accountId ?? "");
 
   const [selectedAccountName, setSelectedAccountName] =
-    useState("");
+    useState(() => savedCashBookFilters?.accountName ?? "");
 
   const [accountSearch, setAccountSearch] =
     useState("");
 
   const [fromDate, setFromDate] =
-    useState("");
+    useState(() => savedCashBookFilters?.fromDate ?? "");
 
   const [toDate, setToDate] =
-    useState("");
+    useState(() => savedCashBookFilters?.toDate ?? "");
 
   const [transactionSearch, setTransactionSearch] =
     useState("");
@@ -312,19 +331,30 @@ export default function CashBookPage() {
       // mount and avoids that hook's Suspense-boundary requirement.
       const urlParams = new URLSearchParams(window.location.search);
       const urlAccountId = urlParams.get("accountId");
-      if (!urlAccountId) return;
 
-      const match = loadedAccounts.find((a) => a.id === urlAccountId);
-      if (!match) return;
+      if (urlAccountId) {
+        const match = loadedAccounts.find((a) => a.id === urlAccountId);
+        if (!match) return;
 
-      const urlFrom = urlParams.get("from") || "";
-      const urlTo = urlParams.get("to") || "";
+        const urlFrom = urlParams.get("from") || "";
+        const urlTo = urlParams.get("to") || "";
 
-      setSelectedAccountId(match.id);
-      setSelectedAccountName(match.accountName);
-      setFromDate(urlFrom);
-      setToDate(urlTo);
-      loadCashBook(match.id, urlFrom, urlTo);
+        setSelectedAccountId(match.id);
+        setSelectedAccountName(match.accountName);
+        setFromDate(urlFrom);
+        setToDate(urlTo);
+        loadCashBook(match.id, urlFrom, urlTo);
+        return;
+      }
+
+      // No explicit deep-link - fall back to whatever account/date
+      // range was saved before the user left this page (see
+      // savedCashBookFilters above), so a document's own Back button
+      // returns to the same view instead of a blank picker.
+      if (savedCashBookFilters?.accountId) {
+        const match = loadedAccounts.find((a) => a.id === savedCashBookFilters.accountId);
+        if (match) loadCashBook(match.id, savedCashBookFilters.fromDate, savedCashBookFilters.toDate);
+      }
     })();
   }, 0);
 
@@ -333,6 +363,17 @@ export default function CashBookPage() {
   };
   // eslint-disable-next-line react-hooks/exhaustive-deps
 }, []);
+
+  // Persist the current account/date-range selection whenever it
+  // changes, for the same return-to-this-exact-view restore above.
+  useEffect(() => {
+    saveListFilters(CASH_BOOK_LIST_KEY, {
+      accountId: selectedAccountId,
+      accountName: selectedAccountName,
+      fromDate,
+      toDate,
+    });
+  }, [selectedAccountId, selectedAccountName, fromDate, toDate]);
 
   /*
    * Account search.
@@ -1078,7 +1119,7 @@ export default function CashBookPage() {
                                               // document's own page instead.
                                               <button
                                                 type="button"
-                                                onClick={() => router.push(entry.sourceDocument!.href)}
+                                                onClick={() => router.push(withReturnTo(entry.sourceDocument!.href, returnToSuffix))}
                                                 className="rounded-md border border-blue-200 px-3 py-1.5 text-xs font-medium text-blue-600 hover:bg-blue-50"
                                               >
                                                 {entry.sourceDocument.label}

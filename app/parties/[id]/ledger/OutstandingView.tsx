@@ -6,6 +6,7 @@ import { t, type Lang } from "@/lib/i18n/party-ledger";
 import { presetRange } from "@/components/LedgerFilters";
 import { filterOutstandingRows, documentDateKey } from "@/lib/outstanding-filters";
 import { formatBusinessDate } from "@/lib/date-range";
+import { useReturnToSuffix, withReturnTo } from "@/components/useListScrollRestore";
 
 // ============================================================
 // PARTY OUTSTANDING LEDGER (document-level) - powered by the NEW,
@@ -130,6 +131,7 @@ function rowKey(row: OutstandingRow): string {
 }
 
 export default function OutstandingView({ partyId, lang }: { partyId: string; lang: Lang }) {
+  const returnToSuffix = useReturnToSuffix();
   const [data, setData] = useState<OutstandingResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -363,7 +365,7 @@ export default function OutstandingView({ partyId, lang }: { partyId: string; la
                         <td className="px-4 py-3">{documentLabel(row)}</td>
                         <td className="px-4 py-3 font-medium">
                           {href ? (
-                            <Link href={href} className="text-blue-600 hover:underline">
+                            <Link href={withReturnTo(href, returnToSuffix)} className="text-blue-600 hover:underline">
                               {row.documentNo}
                             </Link>
                           ) : (

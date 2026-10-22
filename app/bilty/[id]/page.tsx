@@ -7,6 +7,7 @@ import { getBiltyShareMessage } from "@/lib/share-messages";
 import { normalizePhone } from "@/lib/phone";
 import { formatBusinessDate } from "@/lib/date-range";
 import { DocumentFooter, DocumentHeader, useDocumentPresentation } from "@/components/documents/DocumentPresentation";
+import { resolveBackHref, useReturnToSuffix, withReturnTo } from "@/components/useListScrollRestore";
 
 type BiltyStatus = "PENDING" | "IN_TRANSIT" | "DELIVERED" | "CANCELLED";
 
@@ -75,6 +76,7 @@ type Bilty = {
   createdBy: Creator | null;
   createdAt: string;
   challanBilties: { challan: { id: string; challanNo: string } }[];
+  isDeleted: boolean;
 };
 
 const statusColors: Record<BiltyStatus, string> = {
@@ -90,43 +92,69 @@ export default function BiltyDetailPage({
   params: Promise<{ id: string }>;
 }) {
   const routeParams = useParams();
+  // Read directly from the URL (not next/navigation's useSearchParams)
+  // for a one-time-on-mount read, matching the same pattern already
+  // used by app/phonch/[id]/page.tsx and app/bilty/page.tsx, to avoid
+  // that hook's Suspense-boundary requirement.
+  const [backHref, setBackHref] = useState("/bilty");
+  useEffect(() => {
+    setBackHref(resolveBackHref(new URLSearchParams(window.location.search).get("returnTo"), "/bilty"));
+  }, []);
+  // For this page's OWN link down to its Challan - so the Challan
+  // page's Back button returns here.
+  const returnToSuffix = useReturnToSuffix();
   const [bilty, setBilty] = useState<Bilty | null>(null);
+  const [canRestore, setCanRestore] = useState(false);
+  const [restoring, setRestoring] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const presentation = useDocumentPresentation("BILTY");
 
-  useEffect(() => {
-    async function load() {
-      try {
-        setError("");
+  async function load() {
+    try {
+      setError("");
 
-        const response = await fetch("/api/bilty");
+      const { id } = await params;
+      const response = await fetch(`/api/bilty/${id}`);
+      const data = await response.json();
 
-        const data = await response.json();
-
-        if (!response.ok) {
-          setError(data.message || "Unable to load bilty");
-          return;
-        }
-
-        const { id } = await params;
-        const found = data.bilties.find((b: Bilty) => b.id === id);
-
-        if (!found) {
-          setError("Bilty not found");
-          return;
-        }
-
-        setBilty(found);
-      } catch {
-        setError("Unable to connect to the server");
-      } finally {
-        setLoading(false);
+      if (!response.ok || !data.success) {
+        setError(data.message || "Unable to load bilty");
+        return;
       }
-    }
 
+      setBilty(data.bilty);
+      setCanRestore(!!data.capabilities?.canRestore);
+    } catch {
+      setError("Unable to connect to the server");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
     load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [params]);
+
+  async function handleRestore() {
+    if (!bilty) return;
+    if (!window.confirm(`Restore Bilty ${bilty.biltyNo} from the Bin?`)) return;
+    try {
+      setRestoring(true);
+      setError("");
+      const response = await fetch(`/api/bilty/${bilty.id}/restore`, { method: "POST" });
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        setError(data.message || "Unable to restore bilty");
+        return;
+      }
+      setLoading(true);
+      await load();
+    } finally {
+      setRestoring(false);
+    }
+  }
 
   if (loading) {
     return (
@@ -144,11 +172,40 @@ export default function BiltyDetailPage({
         <div className="max-w-4xl mx-auto p-6">
           <p className="text-red-600">{error || "Bilty not found"}</p>
           <Link
-            href="/bilty"
+            href={backHref}
             className="mt-4 inline-block border rounded-lg px-4 py-2 text-sm hover:bg-gray-50"
           >
-            Back to Bilty
+            Back
           </Link>
+        </div>
+      </main>
+    );
+  }
+
+  if (bilty.isDeleted) {
+    return (
+      <main className="min-h-screen bg-gray-50">
+        <div className="max-w-4xl mx-auto p-6">
+          <div className="bg-white rounded-xl shadow-sm p-6">
+            <h1 className="text-xl font-bold mb-2">Bilty #{bilty.biltyNo}</h1>
+            <p className="text-amber-700 font-medium">This Bilty is in the Bin.</p>
+            {error && <p className="mt-2 text-sm text-red-600">{error}</p>}
+            <div className="mt-4 flex flex-wrap gap-3">
+              <Link href={backHref} className="border rounded-lg px-4 py-2 text-sm hover:bg-gray-50">
+                Back
+              </Link>
+              {canRestore && (
+                <button
+                  type="button"
+                  disabled={restoring}
+                  onClick={() => void handleRestore()}
+                  className="bg-black text-white rounded-lg px-4 py-2 text-sm hover:bg-gray-800 disabled:opacity-50"
+                >
+                  {restoring ? "Restoring..." : "Restore"}
+                </button>
+              )}
+            </div>
+          </div>
         </div>
       </main>
     );
@@ -179,7 +236,7 @@ export default function BiltyDetailPage({
 
               {bilty.challanBilties[0] && (
                 <Link
-                  href={`/challan/${bilty.challanBilties[0].challan.id}`}
+                  href={withReturnTo(`/challan/${bilty.challanBilties[0].challan.id}`, returnToSuffix)}
                   className="text-sm text-blue-600 hover:underline"
                 >
                   Challan {bilty.challanBilties[0].challan.challanNo}
@@ -187,10 +244,10 @@ export default function BiltyDetailPage({
               )}
 
               <Link
-                href="/bilty"
+                href={backHref}
                 className="border rounded-lg px-4 py-2 text-sm hover:bg-gray-50"
               >
-                Back to Bilty
+                Back
               </Link>
 
               <Link
@@ -439,10 +496,10 @@ export default function BiltyDetailPage({
 
            <div className="flex flex-col sm:flex-row gap-3">
              <Link
-               href="/bilty"
+               href={backHref}
                className="flex-1 border rounded-lg px-4 py-3 text-center text-sm hover:bg-gray-50"
              >
-               Back to Bilty
+               Back
              </Link>
              <Link
                href="/bilty"

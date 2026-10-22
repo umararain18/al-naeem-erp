@@ -156,11 +156,31 @@ export async function GET(
       },
     });
 
-    if (!challan || challan.isDeleted) {
+    if (!challan) {
       return NextResponse.json(
         { success: false, message: "Challan not found" },
         { status: 404 }
       );
+    }
+
+    // A Bin'd Challan is still returned (never 404) so the detail
+    // page can show a clear "this Challan is in the Bin" message with
+    // a Restore link, instead of an indistinguishable "not found" -
+    // every write/edit path on this Challan remains blocked by its
+    // own existing isDeleted checks regardless. None of the financial/
+    // settlement computation below is meaningful for a binned
+    // Challan, so it is skipped entirely here.
+    if (challan.isDeleted) {
+      return NextResponse.json({
+        success: true,
+        challan,
+        financials: null,
+        responsibleParties: null,
+        settlementBreakdown: null,
+        paidVerification: null,
+        settlementSummary: null,
+        capabilities: { canRestore: currentUser.role === "SUPER_ADMIN" },
+      });
     }
 
     const financials = (
@@ -297,6 +317,7 @@ export async function GET(
       settlementBreakdown,
       paidVerification,
       settlementSummary,
+      capabilities: { canRestore: false },
     });
   } catch (error) {
     console.error("Get challan error:", error);

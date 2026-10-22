@@ -86,6 +86,7 @@ export async function GET(
       capabilities: {
         canEdit: hasPermission(currentUser, "bill.edit"),
         canBin: hasPermission(currentUser, "bill.bin"),
+        canRestore: currentUser.role === "SUPER_ADMIN",
       },
     });
   } catch (error) {
