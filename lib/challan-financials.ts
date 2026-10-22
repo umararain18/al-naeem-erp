@@ -49,9 +49,17 @@ function toNum(value: number | string | Decimal): number {
  *  - Party DEBIT   = amount actually paid    (reduces payable)
  * Cash/Bank lines are ignored for amounts (they are the other side).
  *
- * Each matched JournalEntry is counted exactly once via its owner Challan,
- * so a Bilty-linked posting (party line BILTY + cash line CHALLAN) is not
- * double-counted.
+ * Each PARTY line is attributed to its OWN owner Challan independently
+ * (via that line's own sourceType/sourceId) - never "the first matching
+ * line in this whole JournalEntry wins for every other line too". A
+ * single combined Daily Posting voucher can legitimately record several
+ * unrelated Bilties'/Challans' own receipts/payments in one JournalEntry
+ * (each line carries its own sourceType/sourceId - see app/api/daily-
+ * posting/route.ts); attributing by ENTRY instead of by LINE would leak
+ * an unrelated line's amount onto whichever Challan happened to be
+ * checked first. A Bilty-linked posting (party line BILTY + cash line
+ * CHALLAN) is still never double-counted, since only PARTY-category
+ * lines are summed here at all - the Cash/Bank line is always skipped.
  */
 export async function computeChallanFinancialsBatch(
   inputs: ChallanFinancialInput[]
@@ -99,36 +107,36 @@ export async function computeChallanFinancialsBatch(
     });
 
     for (const entry of entries) {
-      // Resolve which Challan this entry belongs to (once per entry).
-      let owner: string | null = null;
-
+      // Resolve EACH line's own owner Challan independently - never
+      // "the first matching line of this entry wins for every other
+      // line too". A single combined Daily Posting voucher can
+      // legitimately record several unrelated Bilties'/Challans' own
+      // receipts/payments in one JournalEntry (each line carries its
+      // own sourceType/sourceId - see app/api/daily-posting/route.ts);
+      // the previous per-ENTRY attribution leaked an unrelated line's
+      // amount onto whichever Challan happened to be checked first.
       for (const line of entry.lines) {
+        if (line.account?.category !== "PARTY") continue;
+
         const sid = line.sourceId;
         if (!sid) continue;
+
+        let owner: string | null = null;
         if (line.sourceType === "CHALLAN" && challanIds.includes(sid)) {
           owner = sid;
-          break;
-        }
-        if (line.sourceType === "BILTY" && biltyToChallan.has(sid)) {
+        } else if (line.sourceType === "BILTY" && biltyToChallan.has(sid)) {
           owner = biltyToChallan.get(sid) as string;
-          break;
         }
-      }
+        if (!owner) continue;
 
-      if (!owner) continue;
-
-      // Sum only the PARTY-side line of this entry.
-      for (const line of entry.lines) {
-        if (line.account?.category === "PARTY") {
-          receivedMap.set(
-            owner,
-            receivedMap.get(owner)!.plus(new Decimal(line.credit))
-          );
-          paidMap.set(
-            owner,
-            paidMap.get(owner)!.plus(new Decimal(line.debit))
-          );
-        }
+        receivedMap.set(
+          owner,
+          receivedMap.get(owner)!.plus(new Decimal(line.credit))
+        );
+        paidMap.set(
+          owner,
+          paidMap.get(owner)!.plus(new Decimal(line.debit))
+        );
       }
     }
   }

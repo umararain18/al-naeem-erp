@@ -236,10 +236,13 @@ function PayersList({ payers, label }: { payers: SettlementPayerBreakdown[]; lab
   );
 }
 
-function ClearedOrDueBadge({ remaining, total }: { remaining: number; total: number }) {
+function ClearedOrDueBadge({ remaining, total, paidOrReceived }: { remaining: number; total: number; paidOrReceived: number }) {
   if (total <= 0.009) return null;
   if (remaining <= 0.009) {
     return <span className="text-xs font-semibold text-green-700">CLEARED ✓</span>;
+  }
+  if (paidOrReceived > 0.009) {
+    return <span className="text-xs font-semibold text-blue-700">PARTIAL - DUE Rs. {remaining.toLocaleString()}</span>;
   }
   return <span className="text-xs font-semibold text-amber-700">DUE Rs. {remaining.toLocaleString()}</span>;
 }
@@ -293,7 +296,7 @@ function FinancialSummaryCards({ challan }: { challan: Challan }) {
       <div className="rounded-lg border p-3">
         <div className="flex items-center justify-between">
           <p className="text-xs text-gray-500">To-Pay</p>
-          <ClearedOrDueBadge remaining={toPayRemaining} total={toPayDue} />
+          <ClearedOrDueBadge remaining={toPayRemaining} total={toPayDue} paidOrReceived={toPayReceived} />
         </div>
         <p className="font-semibold text-lg">Rs. {toPayDue.toLocaleString()}</p>
         <p className="mt-1 text-xs text-gray-600">Received: Rs. {toPayReceived.toLocaleString()}</p>
@@ -303,7 +306,7 @@ function FinancialSummaryCards({ challan }: { challan: Challan }) {
       <div className="rounded-lg border p-3">
         <div className="flex items-center justify-between">
           <p className="text-xs text-gray-500">Carrier Rent</p>
-          <ClearedOrDueBadge remaining={cr.remaining} total={cr.total} />
+          <ClearedOrDueBadge remaining={cr.remaining} total={cr.total} paidOrReceived={cr.paidOrReceived} />
         </div>
         <p className="font-semibold text-lg">Rs. {cr.total.toLocaleString()}</p>
         <p className="mt-1 text-xs text-gray-600">Paid: Rs. {cr.paidOrReceived.toLocaleString()}</p>

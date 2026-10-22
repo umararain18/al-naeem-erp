@@ -2,7 +2,6 @@ import { prisma } from "@/lib/prisma";
 import { getBiltyPaidVerification } from "@/lib/bilty-paid-verification";
 import {
   getSettledPartyAccountIdsBatch,
-  getComponentNetAmount,
   SETTLEMENT_NET_REFERENCE_TYPES,
 } from "@/lib/settlement-correction";
 
@@ -25,16 +24,15 @@ import {
 //
 // PRECEDENCE (per Bilty/Challan, per component):
 //   1. Live SettlementPayment rows for that component, if any exist -
-//      these ALWAYS take precedence once present.
-//   2. Otherwise, the OLD single-payer mechanism's CURRENT net
-//      attribution for that same component - via
-//      findSettledPartyAccountId()/getComponentNetAmount() (the same,
-//      unmodified functions the multi-payer engine's own floor-
-//      release logic already reads) - so a historical Challan the
-//      new engine has never touched still shows a real, correct
-//      figure instead of nothing.
-//   3. Otherwise (unsettled, or nothing ever established): zero
-//      payment activity - never fabricated.
+//      these are the ONLY source of "paidOrReceived". A SettlementPayment
+//      row is a real, explicit payment record (see lib/settlement-
+//      payments.ts).
+//   2. Otherwise: zero payment activity. The settlement's own
+//      reclassification entry (the one that moves the component's
+//      amount from the booking/expense account onto a party account at
+//      Final Settlement time) is NEVER treated as a payment - it only
+//      records who currently owes/is owed the amount, not that it was
+//      actually paid.
 // ============================================================
 
 export interface SettlementPayerBreakdown {
@@ -49,8 +47,9 @@ export interface ComponentSummary {
   paidOrReceived: number;
   remaining: number;
   payers: SettlementPayerBreakdown[];
-  /** true when this figure came from the OLD single-payer mechanism
-   * (no live SettlementPayment rows exist for this component yet). */
+  /** Always false now - kept for API shape compatibility. paidOrReceived
+   * only ever comes from live SettlementPayment rows (see PRECEDENCE
+   * above); there is no fallback source any more. */
   isHistoricalFallback: boolean;
   /** CARRIER_RENT only: the economic residual claimant (the party the
    * Carrier Rent floor logic - lib/settlement-payments.ts - still
@@ -318,35 +317,6 @@ export async function computeChallanSettlementSummaryBatch(
           payers: collectionPayers,
           isHistoricalFallback: false,
         };
-      } else if (challan.isSettled && challan.settlementJournalEntryId && bookingIncomeAccount && toPay > 0) {
-        const oldPartyAccountId = oldCollectionPartyByBiltyId.get(bilty.id) || null;
-        if (oldPartyAccountId) {
-          const net = await getComponentNetAmount(
-            prisma,
-            challan.id,
-            challan.settlementJournalEntryId,
-            "COLLECTION",
-            bookingIncomeAccount.id,
-            bilty.id,
-            oldPartyAccountId
-          );
-          const attributed = Math.max(0, round2(net));
-          const account = await prisma.account.findUnique({
-            where: { id: oldPartyAccountId },
-            select: { accountName: true, party: { select: { id: true, partyName: true } } },
-          });
-          toPaySummary = {
-            total: toPay,
-            paidOrReceived: attributed,
-            remaining: Math.max(0, round2(toPay - attributed)),
-            payers: attributed > 0
-              ? [{ accountId: oldPartyAccountId, partyId: account?.party?.id || null, partyName: account?.party?.partyName || account?.accountName || "Party", amount: attributed }]
-              : [],
-            isHistoricalFallback: true,
-          };
-        } else {
-          toPaySummary = emptyComponent(toPay);
-        }
       } else {
         toPaySummary = emptyComponent(toPay);
       }
@@ -387,38 +357,6 @@ export async function computeChallanSettlementSummaryBatch(
         payers: carrierRentPayers,
         isHistoricalFallback: false,
       };
-    } else if (challan.isSettled && challan.settlementJournalEntryId && carrierRentExpenseAccount && carrierRentTotal > 0) {
-      if (carrierRentOldPartyAccountId) {
-        const net = await getComponentNetAmount(
-          prisma,
-          challan.id,
-          challan.settlementJournalEntryId,
-          "CARRIER_RENT",
-          carrierRentExpenseAccount.id,
-          null,
-          carrierRentOldPartyAccountId
-        );
-        // CARRIER_RENT's net convention is a CREDIT (negative) per
-        // getComponentNetAmount's own debit-minus-credit convention -
-        // normalize to a positive "currently attributed" magnitude,
-        // exactly as ensureOldAttributionWithinFloor() already does.
-        const attributed = Math.max(0, round2(-net));
-        const account = await prisma.account.findUnique({
-          where: { id: carrierRentOldPartyAccountId },
-          select: { accountName: true, party: { select: { id: true, partyName: true } } },
-        });
-        carrierRentSummary = {
-          total: carrierRentTotal,
-          paidOrReceived: attributed,
-          remaining: Math.max(0, round2(carrierRentTotal - attributed)),
-          payers: attributed > 0
-            ? [{ accountId: carrierRentOldPartyAccountId, partyId: account?.party?.id || null, partyName: account?.party?.partyName || account?.accountName || "Party", amount: attributed }]
-            : [],
-          isHistoricalFallback: true,
-        };
-      } else {
-        carrierRentSummary = emptyComponent(carrierRentTotal);
-      }
     } else {
       carrierRentSummary = emptyComponent(carrierRentTotal);
     }
