@@ -227,13 +227,14 @@ function matchesFinancialFilter(challan: Challan, filter: FinancialFilter): bool
 
 // Vehicle names only (never registration numbers), one per linked
 // Bilty, comma-separated - never deduplicated and never collapsed
-// into a "2 Vehicles" count, so "Alto, Alto, Cultus" shows every
-// Bilty's own vehicle exactly once. Vehicle Model is the specific
-// name (e.g. "Alto"/"Cultus"); Vehicle Type ("Car"/"Truck") is only
-// a fallback for a Bilty that never had a Model entered.
+// into a "2 Vehicles" count, so "Alto, Rusi, Corolla" shows every
+// Bilty's own vehicle exactly once. Vehicle Type is where the actual
+// vehicle name is written (e.g. "Alto"/"Rusi"/"Corolla"); Vehicle
+// Model (a year, on this Bilty form) is only a fallback for a Bilty
+// that never had a Type entered.
 function vehicleSummary(challan: Challan): string {
   const names = challan.bilties
-    .map((cb) => cb.bilty.vehicleModel || cb.bilty.vehicleType || null)
+    .map((cb) => cb.bilty.vehicleType || cb.bilty.vehicleModel || null)
     .filter((n): n is string => Boolean(n));
 
   if (names.length === 0) return "—";
