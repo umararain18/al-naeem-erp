@@ -213,6 +213,20 @@ export async function GET(
       outstandingReceivable: challan.outstandingReceivable,
       outstandingPayable: challan.outstandingPayable,
       biltyIds: challan.bilties.map((cb) => cb.biltyId),
+      transporterParty: challan.transporterParty
+        ? { partyId: challan.transporterParty.id, partyName: challan.transporterParty.partyName }
+        : null,
+      biltyParties: challan.bilties.map((cb) => ({
+        clearingAgent: cb.bilty.clearingAgentParty
+          ? { partyId: cb.bilty.clearingAgentParty.id, partyName: cb.bilty.clearingAgentParty.partyName }
+          : null,
+        consignor: cb.bilty.consignorParty
+          ? { partyId: cb.bilty.consignorParty.id, partyName: cb.bilty.consignorParty.partyName }
+          : null,
+        consignee: cb.bilty.consigneeParty
+          ? { partyId: cb.bilty.consigneeParty.id, partyName: cb.bilty.consigneeParty.partyName }
+          : null,
+      })),
     });
 
     // Per-component current responsibility (Collection/Commission

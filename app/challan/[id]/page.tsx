@@ -189,7 +189,7 @@ export type SettlementSummary = {
 };
 
 type ChallanPositionParty = {
-  accountId: string;
+  accountId: string | null;
   partyId: string | null;
   partyName: string;
 };
@@ -388,29 +388,33 @@ function PositionDisplay({ challan }: { challan: Challan }) {
       <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Position</p>
       <div className="space-y-2">
         {position.lines.map((line) => (
-          <div key={line.direction} className="flex items-center justify-between text-sm">
+          <div key={line.direction}>
             <span
               className={`inline-block rounded-full px-2 py-0.5 text-xs font-semibold ${positionChipStyles[line.direction]}`}
             >
               {line.direction === "RECEIVABLE" ? "Receivable" : "Payable"} Rs. {line.amount.toLocaleString()}
             </span>
-            {line.parties.length > 0 && (
-              <span className="text-gray-600">
-                {line.direction === "RECEIVABLE" ? "from" : "to"}{" "}
-                {line.parties.map((p, i) => (
-                  <span key={p.accountId}>
-                    {i > 0 && " + "}
-                    {p.partyId ? (
-                      <Link href={`/parties/${p.partyId}/ledger`} className="text-blue-600 hover:underline font-medium">
-                        {p.partyName}
-                      </Link>
-                    ) : (
-                      <span className="font-medium">{p.partyName}</span>
-                    )}
-                  </span>
-                ))}
-              </span>
-            )}
+            <p className="mt-0.5 text-sm text-gray-600">
+              {line.parties.length > 0 ? (
+                <>
+                  {line.direction === "RECEIVABLE" ? "from" : "to"}{" "}
+                  {line.parties.map((p, i) => (
+                    <span key={p.partyId || p.accountId || p.partyName}>
+                      {i > 0 && " + "}
+                      {p.partyId ? (
+                        <Link href={`/parties/${p.partyId}/ledger`} className="text-blue-600 hover:underline font-medium">
+                          {p.partyName}
+                        </Link>
+                      ) : (
+                        <span className="font-medium">{p.partyName}</span>
+                      )}
+                    </span>
+                  ))}
+                </>
+              ) : (
+                <span className="font-medium text-amber-600">Party not set</span>
+              )}
+            </p>
           </div>
         ))}
       </div>

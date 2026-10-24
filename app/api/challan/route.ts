@@ -238,6 +238,20 @@ export async function GET(request: NextRequest) {
         outstandingReceivable: c.outstandingReceivable,
         outstandingPayable: c.outstandingPayable,
         biltyIds: c.bilties.map((cb) => cb.biltyId),
+        transporterParty: c.transporterParty
+          ? { partyId: c.transporterParty.id, partyName: c.transporterParty.partyName }
+          : null,
+        biltyParties: c.bilties.map((cb) => ({
+          clearingAgent: cb.bilty.clearingAgentParty
+            ? { partyId: cb.bilty.clearingAgentParty.id, partyName: cb.bilty.clearingAgentParty.partyName }
+            : null,
+          consignor: cb.bilty.consignorParty
+            ? { partyId: cb.bilty.consignorParty.id, partyName: cb.bilty.consignorParty.partyName }
+            : null,
+          consignee: cb.bilty.consigneeParty
+            ? { partyId: cb.bilty.consigneeParty.id, partyName: cb.bilty.consigneeParty.partyName }
+            : null,
+        })),
       }))
     );
 
