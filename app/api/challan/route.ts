@@ -8,6 +8,7 @@ import { computeChallanFinancialsBatch } from "@/lib/challan-financials";
 import { getGrossCarrierRentPayableAccountId } from "@/lib/gross-accounts";
 import { getChallanResponsiblePartiesBatch } from "@/lib/document-party-resolution";
 import { computeChallanSettlementSummaryBatch } from "@/lib/challan-settlement-summary";
+import { computeChallanPositionsBatch, type ChallanPosition } from "@/lib/challan-position";
 import { SettlementPaymentError } from "@/lib/settlement-payments";
 import { recognizeBiltyBookingIncome, BiltyRevenueRecognitionError } from "@/lib/bilty-revenue-recognition";
 import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
@@ -106,58 +107,34 @@ function compareChallanNoDesc(a: string, b: string): number {
   return b.localeCompare(a);
 }
 
-// Mirrors app/challan/page.tsx's own compactStatus()/matchesFinancialFilter()
-// exactly (same field names, same derivation) - a single source of truth so
-// the dashboard's "Active/Delivered/Settled Challan" drill-down cards get a
-// REAL server-side filtered result, never a trust-the-client filter. This
-// value is computed (not a raw column), so it is applied by filtering the
-// already-batch-computed `items` array below, after settlementSummary is
-// available - never pushed into the Prisma `where` clause directly.
-type CompactStatus = "BEFORE SETTLEMENT" | "RECEIVABLE" | "PAYABLE" | "RECEIVABLE + PAYABLE" | "DUE" | "CLEARED";
+// "financial" filter values - driven ENTIRELY by challan.position
+// (lib/challan-position.ts), the SAME one shared calculation the
+// list's summary cards and the Challan Detail page also read. There
+// is no more separate, independently-derived "compact status" here -
+// that used to read challan.settlementSummary.partyNet while the
+// summary cards summed challan.financials.remainingReceivable/
+// remainingPayable, two different calculations that could (and did)
+// disagree. "DUE" no longer exists as a bucket: computeChallanPositionsBatch
+// always resolves a settled Challan with a real remaining amount into
+// RECEIVABLE/PAYABLE/RECEIVABLE_PAYABLE, never an unclassified
+// leftover.
+type FinancialFilterValue = "BEFORE_SETTLEMENT" | "AFTER_SETTLEMENT" | "RECEIVABLE" | "PAYABLE" | "RECEIVABLE_PAYABLE" | "CLEARED";
+const FINANCIAL_FILTER_VALUES: FinancialFilterValue[] = ["BEFORE_SETTLEMENT", "AFTER_SETTLEMENT", "RECEIVABLE", "PAYABLE", "RECEIVABLE_PAYABLE", "CLEARED"];
 
-function totalDueFromSummary(item: { settlementSummary?: { bilties: { toPay: { remaining: number } }[]; carrierRent: { remaining: number } } }): number {
-  const summary = item.settlementSummary;
-  if (!summary) return 0;
-  const toPayRemaining = summary.bilties.reduce((s, b) => s + b.toPay.remaining, 0);
-  return toPayRemaining + summary.carrierRent.remaining;
-}
-
-function compactStatus(item: {
-  isSettled: boolean;
-  settlementSummary?: { partyNet: { net: number }[]; bilties: { toPay: { remaining: number } }[]; carrierRent: { remaining: number } };
-}): CompactStatus {
-  if (!item.isSettled) return "BEFORE SETTLEMENT";
-
-  const partyNet = item.settlementSummary?.partyNet || [];
-  const hasReceivable = partyNet.some((p) => p.net > 0);
-  const hasPayable = partyNet.some((p) => p.net < 0);
-
-  if (hasReceivable && hasPayable) return "RECEIVABLE + PAYABLE";
-  if (hasReceivable) return "RECEIVABLE";
-  if (hasPayable) return "PAYABLE";
-
-  return totalDueFromSummary(item) > 0.009 ? "DUE" : "CLEARED";
-}
-
-type FinancialFilterValue = "BEFORE_SETTLEMENT" | "AFTER_SETTLEMENT" | "RECEIVABLE" | "PAYABLE" | "RECEIVABLE_PAYABLE" | "DUE" | "CLEARED";
-const FINANCIAL_FILTER_VALUES: FinancialFilterValue[] = ["BEFORE_SETTLEMENT", "AFTER_SETTLEMENT", "RECEIVABLE", "PAYABLE", "RECEIVABLE_PAYABLE", "DUE", "CLEARED"];
-
-function matchesFinancialFilter(item: { isSettled: boolean; settlementSummary?: { partyNet: { net: number }[]; bilties: { toPay: { remaining: number } }[]; carrierRent: { remaining: number } } }, filter: FinancialFilterValue): boolean {
+function matchesFinancialFilter(item: { isSettled: boolean; position?: ChallanPosition }, filter: FinancialFilterValue): boolean {
   switch (filter) {
     case "BEFORE_SETTLEMENT":
       return !item.isSettled;
     case "AFTER_SETTLEMENT":
       return item.isSettled;
     case "RECEIVABLE":
-      return compactStatus(item) === "RECEIVABLE";
+      return item.position?.bucket === "RECEIVABLE";
     case "PAYABLE":
-      return compactStatus(item) === "PAYABLE";
+      return item.position?.bucket === "PAYABLE";
     case "RECEIVABLE_PAYABLE":
-      return compactStatus(item) === "RECEIVABLE + PAYABLE";
-    case "DUE":
-      return compactStatus(item) === "DUE";
+      return item.position?.bucket === "RECEIVABLE_PAYABLE";
     case "CLEARED":
-      return compactStatus(item) === "CLEARED";
+      return item.position?.bucket === "CLEARED";
     default:
       return true;
   }
@@ -242,25 +219,42 @@ export async function GET(request: NextRequest) {
 
     // Dimensionally-separated settlement summary (same authoritative
     // source Final Settlement and the Challan Detail page use) -
-    // batched across every Challan in ONE pass (see
-    // lib/challan-settlement-summary.ts). `financials`/
-    // `responsibleParties` above are left unchanged for now; only
-    // what the list UI displays for Financial Summary changes.
+    // still needed here ONLY for the list's own "Bilty Rent" column
+    // total (biltyRentTotal() in app/challan/page.tsx) - no longer
+    // for any Receivable/Payable/Due classification, which now comes
+    // entirely from `position` below.
     const settlementSummaryMap = await computeChallanSettlementSummaryBatch(challans.map((c) => c.id));
+
+    // ONE financial position per Challan (lib/challan-position.ts) -
+    // the single shared calculation the list's table, filter, and
+    // summary cards, AND the Challan Detail page, all read. Built
+    // from financialsMap's own amounts (above) and
+    // responsiblePartiesMap's own party names (above) - never a
+    // third, independent calculation.
+    const positionsMap = await computeChallanPositionsBatch(
+      challans.map((c) => ({
+        id: c.id,
+        isSettled: c.isSettled,
+        outstandingReceivable: c.outstandingReceivable,
+        outstandingPayable: c.outstandingPayable,
+        biltyIds: c.bilties.map((cb) => cb.biltyId),
+      }))
+    );
 
     const itemsBeforeFinancialFilter = challans.map((c) => ({
       ...c,
       financials: financialsMap[c.id],
       responsibleParties: responsiblePartiesMap[c.id],
       settlementSummary: settlementSummaryMap[c.id],
+      position: positionsMap[c.id],
     }));
 
-    // "financial" (RECEIVABLE/PAYABLE/DUE/CLEARED/...) is a computed
-    // value, not a raw column - filtered here, server-side, AFTER the
-    // batch computation above, rather than in the Prisma `where`
-    // clause. Real server-side filtering either way - the dashboard's
-    // "Settled Challan" etc. drill-down cards never rely on the client
-    // to filter an unfiltered fetch.
+    // "financial" (RECEIVABLE/PAYABLE/RECEIVABLE_PAYABLE/CLEARED/...)
+    // is a computed value, not a raw column - filtered here, server-
+    // side, AFTER the batch computation above, rather than in the
+    // Prisma `where` clause. Real server-side filtering either way -
+    // the dashboard's "Settled Challan" etc. drill-down cards never
+    // rely on the client to filter an unfiltered fetch.
     const items = financial ? itemsBeforeFinancialFilter.filter((item) => matchesFinancialFilter(item, financial)) : itemsBeforeFinancialFilter;
 
     return NextResponse.json(

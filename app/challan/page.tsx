@@ -2,7 +2,7 @@
 
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import Link from "next/link";
-import { useSearchParams } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { formatBusinessDate } from "@/lib/date-range";
 import { getSavedListFilters, saveListFilters, useListScrollRestore, useReturnToSuffix, withReturnTo, LIST_HIGHLIGHT_CLASS } from "@/components/useListScrollRestore";
 
@@ -92,8 +92,35 @@ type Challan = {
   // Dimensionally-separated settlement summary (Bilty Rent / Paid /
   // To-Pay / Carrier Rent, never blended) - the same authoritative
   // source Final Settlement and the Challan Detail page use. See
-  // lib/challan-settlement-summary.ts.
+  // lib/challan-settlement-summary.ts. Still used here ONLY for the
+  // Rent column's Bilty Rent total (biltyRentTotal() below) - no
+  // longer for any Receivable/Payable/Due classification.
   settlementSummary?: SettlementSummary | null;
+  // ONE financial position for this Challan (lib/challan-position.ts)
+  // - the single shared calculation this list's table, filter, and
+  // summary cards, AND the Challan Detail page, all read.
+  position?: ChallanPosition;
+};
+
+type ChallanPositionParty = {
+  accountId: string;
+  partyId: string | null;
+  partyName: string;
+};
+
+type ChallanPositionLine = {
+  direction: "RECEIVABLE" | "PAYABLE";
+  amount: number;
+  parties: ChallanPositionParty[];
+};
+
+type ChallanPositionBucket = "BEFORE_SETTLEMENT" | "RECEIVABLE" | "PAYABLE" | "RECEIVABLE_PAYABLE" | "CLEARED";
+
+type ChallanPosition = {
+  bucket: ChallanPositionBucket;
+  lines: ChallanPositionLine[];
+  totalReceivable: number;
+  totalPayable: number;
 };
 
 type SettlementPayerBreakdown = {
@@ -143,99 +170,29 @@ type SettlementSummary = {
   partyNet: PartyNetEntryUI[];
 };
 
-type EngineFinancials = {
-  receivable: number;
-  payable: number;
-  received: number;
-  paid: number;
-  remainingReceivable: number;
-  remainingPayable: number;
-  excessReceived: number;
-  excessPaid: number;
-  isCleared: boolean;
-  status: "OPEN" | "PARTIALLY_CLEARED" | "CLEARED" | "OVERPAID";
-};
-
-function safeFinancials(challan: Challan | null | undefined): EngineFinancials {
-  const f = challan?.financials;
-  return {
-    receivable: Number(f?.receivable || 0),
-    payable: Number(f?.payable || 0),
-    received: Number(f?.received || 0),
-    paid: Number(f?.paid || 0),
-    remainingReceivable: Number(f?.remainingReceivable || 0),
-    remainingPayable: Number(f?.remainingPayable || 0),
-    excessReceived: Number(f?.excessReceived || 0),
-    excessPaid: Number(f?.excessPaid || 0),
-    isCleared: Boolean(f?.isCleared),
-    status: (f?.status || "OPEN") as EngineFinancials["status"],
-  };
-}
 
 // ============================================================
-// Compact Financial Status label - derived ENTIRELY from
-// challan.settlementSummary (lib/challan-settlement-summary.ts), the
-// same dimensionally-separated source the Financial Summary and
-// expanded SettlementDetails already use, via totalDueFromSummary()
-// below. This is deliberately a single aggregate "how much is still
-// outstanding across every component/party on this Challan" figure -
-// it is NEVER presented as one party's Receivable or Payable amount
-// (see totalDueFromSummary()'s own comment for why that distinction
-// would be misleading once Collection and Carrier Rent can each be
-// owed by/to different parties on the same Challan).
+// ONE financial position per Challan - read ENTIRELY from
+// challan.position (lib/challan-position.ts), the SAME shared
+// calculation the summary cards below and the Challan Detail page
+// also read. There is deliberately no separate, independently-
+// derived status here any more: the previous version of this file
+// derived its badge from challan.settlementSummary.partyNet while the
+// summary cards summed challan.financials.remainingReceivable/
+// remainingPayable - two different calculations that could (and did)
+// disagree, e.g. the filter showing a Challan as "Due" while the
+// cards showed Rs 0 for it. "DUE" no longer exists as a bucket:
+// computeChallanPositionsBatch always resolves a settled Challan with
+// a real remaining amount into RECEIVABLE/PAYABLE/RECEIVABLE_PAYABLE.
 // ============================================================
 
-// Sum of every component's still-outstanding amount for this
-// Challan (To-Pay remaining across all Bilties + Carrier Rent
-// remaining) - a neutral "Total Due" figure. Deliberately NOT the
-// old blended outstandingReceivable/outstandingPayable split: that
-// split implies a single direction/party per Challan, which no
-// longer holds once Collection and Carrier Rent can each be owed by
-// or to a DIFFERENT party on the very same Challan (e.g. a Clearing
-// Agent still owes To-Pay while the Transporter is separately owed
-// the Carrier Rent remainder) - summing the two into one signed
-// number would silently misrepresent who owes what to whom.
-function totalDueFromSummary(challan: Challan): number {
-  const summary = challan.settlementSummary;
-  if (!summary) return 0;
-  const toPayRemaining = summary.bilties.reduce((s, b) => s + b.toPay.remaining, 0);
-  return toPayRemaining + summary.carrierRent.remaining;
+function safePosition(challan: Challan): ChallanPosition {
+  return challan.position || { bucket: challan.isSettled ? "CLEARED" : "BEFORE_SETTLEMENT", lines: [], totalReceivable: 0, totalPayable: 0 };
 }
 
-// Status is driven by the cross-component PARTY NET (challan.
-// settlementSummary.partyNet), per the approved locked prototype -
-// NOT by component remaining amounts. A Challan can have To-Pay
-// remaining=0 AND Carrier Rent remaining=0 and still be RECEIVABLE
-// (a party collected more than they paid out) or PAYABLE (the
-// reverse) - see lib/challan-settlement-summary.ts's own doc comment
-// on partyNet for why. "DUE" is a fallback for the (rare) case where
-// some component still has a real remaining amount but no party has
-// been resolved to hold it yet - never silently reported as CLEARED.
-type CompactStatus = "BEFORE SETTLEMENT" | "RECEIVABLE" | "PAYABLE" | "RECEIVABLE + PAYABLE" | "DUE" | "CLEARED";
-
-function compactStatus(challan: Challan): CompactStatus {
-  if (!challan.isSettled) return "BEFORE SETTLEMENT";
-
-  const partyNet = challan.settlementSummary?.partyNet || [];
-  const hasReceivable = partyNet.some((p) => p.net > 0);
-  const hasPayable = partyNet.some((p) => p.net < 0);
-
-  if (hasReceivable && hasPayable) return "RECEIVABLE + PAYABLE";
-  if (hasReceivable) return "RECEIVABLE";
-  if (hasPayable) return "PAYABLE";
-
-  // No non-zero party net anywhere - CLEARED only if every component
-  // balance is also actually zero, never assumed.
-  return totalDueFromSummary(challan) > 0.009 ? "DUE" : "CLEARED";
-}
-
-const compactStatusStyles: Record<CompactStatus, string> = {
-  "BEFORE SETTLEMENT": "bg-gray-100 text-gray-700",
-  RECEIVABLE: "bg-blue-100 text-blue-700",
-  PAYABLE: "bg-purple-100 text-purple-700",
-  "RECEIVABLE + PAYABLE": "bg-indigo-100 text-indigo-700",
-  DUE: "bg-amber-100 text-amber-700",
-  CLEARED: "bg-green-100 text-green-700",
+const positionChipStyles: Record<"RECEIVABLE" | "PAYABLE", string> = {
+  RECEIVABLE: "bg-green-100 text-green-700",
+  PAYABLE: "bg-red-100 text-red-700",
 };
 
 type FinancialFilter =
@@ -245,7 +202,6 @@ type FinancialFilter =
   | "RECEIVABLE"
   | "PAYABLE"
   | "RECEIVABLE_PAYABLE"
-  | "DUE"
   | "CLEARED";
 
 function matchesFinancialFilter(challan: Challan, filter: FinancialFilter): boolean {
@@ -257,15 +213,13 @@ function matchesFinancialFilter(challan: Challan, filter: FinancialFilter): bool
     case "AFTER_SETTLEMENT":
       return challan.isSettled;
     case "RECEIVABLE":
-      return compactStatus(challan) === "RECEIVABLE";
+      return safePosition(challan).bucket === "RECEIVABLE";
     case "PAYABLE":
-      return compactStatus(challan) === "PAYABLE";
+      return safePosition(challan).bucket === "PAYABLE";
     case "RECEIVABLE_PAYABLE":
-      return compactStatus(challan) === "RECEIVABLE + PAYABLE";
-    case "DUE":
-      return compactStatus(challan) === "DUE";
+      return safePosition(challan).bucket === "RECEIVABLE_PAYABLE";
     case "CLEARED":
-      return compactStatus(challan) === "CLEARED";
+      return safePosition(challan).bucket === "CLEARED";
     default:
       return true;
   }
@@ -383,6 +337,41 @@ function PartyLinks({ parties }: { parties: { partyId: string | null; partyName:
   );
 }
 
+// "Receivable Rs X from <party>" (green) / "Payable Rs X to <party>"
+// (red) / "Cleared" (grey) / "Before Settlement" (grey) - the ONE
+// position chip, read straight from challan.position
+// (lib/challan-position.ts), used identically in the table and the
+// mobile card view below. Two lines (one per direction) only when
+// the Challan genuinely has a different party on each side - never
+// netted together (see lib/challan-position.ts's own doc comment).
+function PositionCell({ challan }: { challan: Challan }) {
+  const position = safePosition(challan);
+
+  if (position.bucket === "BEFORE_SETTLEMENT") {
+    return <span className="inline-block rounded-full px-2 py-0.5 text-xs font-semibold whitespace-nowrap bg-gray-100 text-gray-700">Before Settlement</span>;
+  }
+  if (position.lines.length === 0) {
+    return <span className="inline-block rounded-full px-2 py-0.5 text-xs font-semibold whitespace-nowrap bg-gray-100 text-gray-700">Cleared</span>;
+  }
+
+  return (
+    <div className="space-y-1">
+      {position.lines.map((line) => (
+        <div key={line.direction} className="flex flex-wrap items-baseline gap-1">
+          <span className={`inline-block rounded-full px-2 py-0.5 text-xs font-semibold whitespace-nowrap ${positionChipStyles[line.direction]}`}>
+            {line.direction === "RECEIVABLE" ? "Receivable" : "Payable"} Rs. {line.amount.toLocaleString()}
+          </span>
+          {line.parties.length > 0 && (
+            <span className="text-xs text-gray-500">
+              {line.direction === "RECEIVABLE" ? "from" : "to"} <PartyLinks parties={line.parties} />
+            </span>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 // Numeric-aware Challan No. comparator (ascending): "4002" sorts
 // before "40010" (unlike plain string comparison, which would put
 // "40010" first). Non-numeric challan numbers sort after numeric
@@ -412,12 +401,11 @@ function compareChallanNewestFirst(a: Challan, b: Challan): number {
 }
 
 export default function ChallanPage() {
+  const router = useRouter();
   const returnToSuffix = useReturnToSuffix();
   const [challans, setChallans] = useState<Challan[]>([]);
-  const [capabilities, setCapabilities] = useState({ canBin: false });
   const [loading, setLoading] = useState(true);
   const [creating, setCreating] = useState(false);
-  const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
 
@@ -526,14 +514,19 @@ export default function ChallanPage() {
     return [...filtered].sort(compareChallanNewestFirst);
   }, [challans, search, statusFilter, financialFilter, dateFrom, dateTo]);
 
+  // Sums challan.position's own totalReceivable/totalPayable (lib/
+  // challan-position.ts) - the EXACT same per-Challan figures the
+  // RECEIVABLE/PAYABLE filter options and the table's Position chips
+  // read, so these cards can never show a different total than what
+  // the filter/table agree on.
   const summary = useMemo(() => {
     let totalReceivable = 0;
     let totalPayable = 0;
 
     for (const challan of filteredChallans) {
-      const fin = safeFinancials(challan);
-      totalReceivable += fin.remainingReceivable;
-      totalPayable += fin.remainingPayable;
+      const position = safePosition(challan);
+      totalReceivable += position.totalReceivable;
+      totalPayable += position.totalPayable;
     }
 
     const net = totalReceivable - totalPayable;
@@ -568,7 +561,6 @@ export default function ChallanPage() {
         return;
       }
       setChallans(data.items || []);
-      setCapabilities(data.capabilities || { canBin: false });
     } catch {
       setError("Unable to connect to the server");
     } finally {
@@ -712,90 +704,6 @@ export default function ChallanPage() {
     }
   }
 
-  async function cancelChallan(challan: Challan) {
-    const confirmed = window.confirm(
-      `Are you sure you want to cancel challan ${challan.challanNo}?`
-    );
-    if (!confirmed) return;
-
-    setActionLoading(challan.id);
-    setError("");
-    setMessage("");
-
-    try {
-      const response = await fetch(`/api/challan/${challan.id}/cancel`, {
-        method: "POST",
-      });
-      const data = await response.json();
-      if (!response.ok || !data.success) {
-        setError(data.message || "Unable to cancel challan");
-        return;
-      }
-      setMessage("Challan cancelled successfully.");
-      await loadChallans();
-    } catch {
-      setError("Unable to connect to the server");
-    } finally {
-      setActionLoading(null);
-    }
-  }
-
-  async function deliverChallan(challan: Challan) {
-    const confirmed = window.confirm(
-      `Mark challan ${challan.challanNo} as delivered?`
-    );
-    if (!confirmed) return;
-
-    setActionLoading(challan.id);
-    setError("");
-    setMessage("");
-
-    try {
-      const response = await fetch(`/api/challan/${challan.id}/deliver`, {
-        method: "POST",
-      });
-      const data = await response.json();
-      if (!response.ok || !data.success) {
-        setError(data.message || "Unable to deliver challan");
-        return;
-      }
-      setMessage("Challan delivered successfully.");
-      await loadChallans();
-    } catch {
-      setError("Unable to connect to the server");
-    } finally {
-      setActionLoading(null);
-    }
-  }
-
-  async function deleteChallan(challan: Challan) {
-    const confirmed = window.confirm(
-      `Are you sure you want to move challan ${challan.challanNo} to Bin?`
-    );
-    if (!confirmed) return;
-
-    setActionLoading(challan.id);
-    setError("");
-    setMessage("");
-
-    try {
-      const response = await fetch(`/api/challan/${challan.id}`, {
-        method: "DELETE",
-      });
-      const data = await response.json();
-      if (!response.ok || !data.success) {
-        setError(data.message || "Unable to delete challan");
-        return;
-      }
-      setMessage(data.message || "Challan moved to Bin successfully.");
-      await loadChallans();
-    } catch {
-      setError("Unable to connect to the server");
-    } finally {
-      setActionLoading(null);
-    }
-  }
-
   return (
     <main className="min-h-screen bg-gray-50">
       <div className="max-w-7xl mx-auto p-6">
@@ -850,7 +758,6 @@ export default function ChallanPage() {
               <option value="RECEIVABLE">Receivable</option>
               <option value="PAYABLE">Payable</option>
               <option value="RECEIVABLE_PAYABLE">Receivable + Payable</option>
-              <option value="DUE">Due</option>
               <option value="CLEARED">Financially Cleared</option>
             </select>
             <input
@@ -1124,7 +1031,14 @@ export default function ChallanPage() {
           </div>
         )}
 
-        {/* List */}
+      </div>
+
+      {/* List - full width next to the sidebar (not constrained to
+          the max-w-7xl container above, which the top area - title/
+          cards/filters/New Challan - keeps exactly as before), 16-24px
+          side padding, no horizontal scroll needed at 1366px since this
+          is only 7 columns. */}
+      <div className="px-4 sm:px-6 pb-6">
         <div className="bg-white rounded-xl shadow-sm overflow-hidden">
           {loading ? (
             <div className="p-10 text-center text-gray-500">Loading challans...</div>
@@ -1135,206 +1049,150 @@ export default function ChallanPage() {
                 : "No challans found."}
             </div>
           ) : (
-            // Compact, scannable list (Private Phonch's own list as the UX
-            // reference) - one flat row per Challan, no per-row expandable
-            // sub-table. The full Financial Details / per-Bilty breakdown
-            // this used to show inline remains fully available on the
-            // Challan detail page's own "Settlement Breakdown"/"Bilties"
-            // sections - nothing here was removed, only moved one click
-            // away.
-            // ROOT CAUSE of the previous attempt's failure: `sticky top-0`
-            // on the <th> was never actually broken by itself, but its
-            // positioning ancestor was wrong. The wrapping div only had
-            // `overflow-x-auto` with no `overflow-y`/height of its own -
-            // per the CSS overflow spec, a non-`visible` overflow-x on an
-            // element whose overflow-y is otherwise `visible` bumps that
-            // axis's COMPUTED value to `auto` too, so this div silently
-            // became a "scroll container" for sticky-positioning purposes
-            // even though it never actually clips/scrolls anything itself
-            // (it has no bounded height - it just grows to fit the whole
-            // table). Because sticky elements stick relative to their
-            // NEAREST scroll-container ancestor, and that ancestor here
-            // never scrolls, the header had nowhere real to "stick" -
-            // it just flowed away with the rest of the table as the page
-            // scrolled. `app/layout.tsx`'s <main> was never reached, and
-            // never mattered either way.
-            //
-            // FIX: make this div the genuine, explicit, BOUNDED scroll
-            // container for the table (both axes) - the standard "frozen
-            // header" data-table pattern. `max-h-[70vh]` + `overflow-auto`
-            // give it a real, definite height smaller than its content, so
-            // it actually scrolls itself, and `sticky top-0` on each <th>
-            // now sticks to a real thing. Horizontal scroll keeps working
-            // exactly as before (still the same `overflow-auto` axis);
-            // header/body columns stay aligned since both are cells of the
-            // one <table>. This nested scroll region is intentional, not a
-            // "double scrollbar" bug - the page still scrolls normally to
-            // reveal the table section; the table's OWN rows then scroll
-            // within their own bounded box, same as any spreadsheet-style
-            // widget.
-            <div className="overflow-auto max-h-[70vh]">
-              <table className="w-full text-sm">
-                <thead className="text-left text-xs uppercase text-gray-500">
-                  <tr>
-                    <th className={challanHeaderCellClass}>Date</th>
-                    <th className={challanHeaderCellClass}>Challan No.</th>
-                    <th className={challanHeaderCellClass}>Bilty No.</th>
-                    <th className={challanHeaderCellClass}>Vehicle</th>
-                    <th className={challanHeaderCellClass}>Clearing Agent</th>
-                    <th className={challanHeaderCellClass}>Transporter</th>
-                    <th className={challanHeaderCellClass}>Carrier No.</th>
-                    <th className={`${challanHeaderCellClass} text-right`}>Bilty Rent</th>
-                    <th className={`${challanHeaderCellClass} text-right`}>Carrier Rent</th>
-                    <th className={`${challanHeaderCellClass} text-right`}>Received</th>
-                    <th className={`${challanHeaderCellClass} text-right`}>Receivable</th>
-                    <th className={`${challanHeaderCellClass} text-right`}>Payable</th>
-                    <th className={challanHeaderCellClass}>Receivable/Payable Parties</th>
-                    <th className={challanHeaderCellClass}>Details</th>
-                    <th className={challanHeaderCellClass}>Status</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y">
-                  {filteredChallans.map((challan) => {
-                    const status = compactStatus(challan);
-                    const fin = safeFinancials(challan);
-                    const partyNet = challan.settlementSummary?.partyNet || [];
-                    const receivableParties = partyNet.filter((p) => p.direction === "RECEIVABLE").map((p) => ({ partyId: p.partyId, partyName: p.partyName }));
-                    const payableParties = partyNet.filter((p) => p.direction === "PAYABLE").map((p) => ({ partyId: p.partyId, partyName: p.partyName }));
-                    const clearingAgentId = clearingAgentPartyId(challan);
-
-                    return (
-                      <tr
-                        key={challan.id}
-                        className={`hover:bg-gray-50 ${highlightId === challan.id ? LIST_HIGHLIGHT_CLASS : ""}`}
-                      >
-                        <td className="px-4 py-3">
-                          {formatBusinessDate(challan.loadingDate)}
-                        </td>
-                        <td className="px-4 py-3">
-                          <Link
-                            href={`/challan/${challan.id}`}
-                            onClick={() => onOpenRecord(challan.id)}
-                            className="font-medium text-blue-600 hover:underline"
-                          >
-                            {challan.challanNo}
-                          </Link>
-                        </td>
-                        <td className="px-4 py-3">
-                          <BiltyLinks challan={challan} />
-                        </td>
-                        <td className="px-4 py-3">{vehicleSummary(challan)}</td>
-                        <td className="px-4 py-3">
-                          {clearingAgentId ? (
-                            <Link href={`/parties/${clearingAgentId}/ledger`} className="text-blue-600 hover:underline">
-                              {clearingAgentSummary(challan)}
-                            </Link>
-                          ) : (
-                            clearingAgentSummary(challan)
-                          )}
-                        </td>
-                        <td className="px-4 py-3">
-                          {challan.transporterParty ? (
-                            <Link href={`/parties/${challan.transporterParty.id}/ledger`} className="text-blue-600 hover:underline">
-                              {challan.transporterParty.partyName}
-                            </Link>
-                          ) : (
-                            "—"
-                          )}
-                        </td>
-                        <td className="px-4 py-3">{challan.carrierNumber || "—"}</td>
-                        <td className="px-4 py-3 text-right">
-                          Rs. {biltyRentTotal(challan).toLocaleString()}
-                        </td>
-                        <td className="px-4 py-3 text-right">
-                          Rs. {Number(challan.carrierRent || 0).toLocaleString()}
-                        </td>
-                        <td className="px-4 py-3 text-right">Rs. {fin.received.toLocaleString()}</td>
-                        <td className="px-4 py-3 text-right">
-                          {fin.remainingReceivable > 0.009 ? `Rs. ${fin.remainingReceivable.toLocaleString()}` : "—"}
-                        </td>
-                        <td className="px-4 py-3 text-right">
-                          {fin.remainingPayable > 0.009 ? `Rs. ${fin.remainingPayable.toLocaleString()}` : "—"}
-                        </td>
-                        <td className="px-4 py-3">
-                          <div className="space-y-0.5">
-                            {receivableParties.length > 0 && (
-                              <div className="text-blue-700">
-                                Receivable: <PartyLinks parties={receivableParties} />
-                              </div>
-                            )}
-                            {payableParties.length > 0 && (
-                              <div className="text-purple-700">
-                                Payable: <PartyLinks parties={payableParties} />
-                              </div>
-                            )}
-                            {receivableParties.length === 0 && payableParties.length === 0 && (
-                              <span className="text-gray-400">—</span>
-                            )}
-                          </div>
-                        </td>
-                        <td className="px-4 py-3">
-                          <div className="flex flex-wrap gap-2">
-                            <Link
-                              href={`/challan/${challan.id}`}
-                              onClick={() => onOpenRecord(challan.id)}
-                              className="border rounded-lg px-3 py-1 text-xs hover:bg-gray-50"
-                            >
-                              View
-                            </Link>
-                            {challan.status === "IN_TRANSIT" && (
-                              <>
-                                <button
-                                  type="button"
-                                  onClick={() => deliverChallan(challan)}
-                                  disabled={actionLoading === challan.id}
-                                  className="border rounded-lg px-3 py-1 text-xs hover:bg-gray-50 disabled:opacity-50"
-                                >
-                                  Deliver
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => cancelChallan(challan)}
-                                  disabled={actionLoading === challan.id}
-                                  className="border border-red-300 text-red-600 rounded-lg px-3 py-1 text-xs hover:bg-red-50 disabled:opacity-50"
-                                >
-                                  Cancel
-                                </button>
-                              </>
-                            )}
-                            {challan.status === "DELIVERED" && !challan.isSettled && (
-                              <Link
-                                href={`/challan/${challan.id}`}
-                                onClick={() => onOpenRecord(challan.id)}
-                                className="bg-green-600 text-white rounded-lg px-3 py-1 text-xs hover:bg-green-700"
-                              >
-                                Settle
+            <>
+              {/* Desktop/tablet table, 768px and up - 7 columns, two-line
+                  cells. The whole row is clickable (navigates to the
+                  Challan detail page, carrying returnTo + the existing
+                  scroll-restore record-open); a cell with its own nested
+                  link (Bilty, Clearing Agent, Transporter, Position's
+                  party) stops that click from also bubbling into the
+                  row's own navigation. */}
+              <div className="hidden md:block overflow-auto max-h-[70vh]">
+                <table className="w-full text-sm">
+                  <thead className="text-left text-xs uppercase text-gray-500">
+                    <tr>
+                      <th className={challanHeaderCellClass}>Challan</th>
+                      <th className={challanHeaderCellClass}>Bilty / Vehicle</th>
+                      <th className={challanHeaderCellClass}>Clearing Agent</th>
+                      <th className={challanHeaderCellClass}>Transporter</th>
+                      <th className={`${challanHeaderCellClass} text-right`}>Rent</th>
+                      <th className={challanHeaderCellClass}>Position</th>
+                      <th className={challanHeaderCellClass}></th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y">
+                    {filteredChallans.map((challan) => {
+                      const clearingAgentId = clearingAgentPartyId(challan);
+                      return (
+                        <tr
+                          key={challan.id}
+                          onClick={() => {
+                            onOpenRecord(challan.id);
+                            router.push(withReturnTo(`/challan/${challan.id}`, returnToSuffix));
+                          }}
+                          className={`cursor-pointer hover:bg-gray-50 ${highlightId === challan.id ? LIST_HIGHLIGHT_CLASS : ""}`}
+                        >
+                          <td className="px-4 py-2.5 whitespace-nowrap">
+                            <p className="font-semibold text-gray-900">{challan.challanNo}</p>
+                            <p className="text-xs text-gray-500">{formatBusinessDate(challan.loadingDate)}</p>
+                          </td>
+                          <td className="px-4 py-2.5" onClick={(e) => e.stopPropagation()}>
+                            <p><BiltyLinks challan={challan} /></p>
+                            <p className="text-xs text-gray-500">{vehicleSummary(challan)}</p>
+                          </td>
+                          <td className="px-4 py-2.5" onClick={(e) => e.stopPropagation()}>
+                            {clearingAgentId ? (
+                              <Link href={`/parties/${clearingAgentId}/ledger`} className="text-blue-600 hover:underline">
+                                {clearingAgentSummary(challan)}
                               </Link>
+                            ) : (
+                              clearingAgentSummary(challan)
                             )}
-                            {capabilities.canBin && (
-                              <button
-                                type="button"
-                                disabled={actionLoading === challan.id}
-                                onClick={() => deleteChallan(challan)}
-                                className="border border-red-300 text-red-600 rounded-lg px-3 py-1 text-xs hover:bg-red-50 disabled:opacity-50"
-                              >
-                                Delete
-                              </button>
+                          </td>
+                          <td className="px-4 py-2.5" onClick={(e) => e.stopPropagation()}>
+                            <p>
+                              {challan.transporterParty ? (
+                                <Link href={`/parties/${challan.transporterParty.id}/ledger`} className="text-blue-600 hover:underline">
+                                  {challan.transporterParty.partyName}
+                                </Link>
+                              ) : (
+                                "—"
+                              )}
+                            </p>
+                            <p className="text-xs text-gray-500">{challan.carrierNumber || "—"}</p>
+                          </td>
+                          <td className="px-4 py-2.5 text-right whitespace-nowrap">
+                            <p>Rs. {biltyRentTotal(challan).toLocaleString()}</p>
+                            <p className="text-xs text-gray-500">Carrier Rs. {Number(challan.carrierRent || 0).toLocaleString()}</p>
+                          </td>
+                          <td className="px-4 py-2.5" onClick={(e) => e.stopPropagation()}>
+                            <PositionCell challan={challan} />
+                          </td>
+                          <td className="px-4 py-2.5 text-right text-gray-300">›</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+
+              {/* Mobile cards, below 768px - one card per Challan,
+                  replacing the table entirely (same whole-card-clickable
+                  + nested-link-stopPropagation pattern as the table). */}
+              <div className="md:hidden divide-y">
+                {filteredChallans.map((challan) => {
+                  const clearingAgentId = clearingAgentPartyId(challan);
+                  return (
+                    <div
+                      key={challan.id}
+                      onClick={() => {
+                        onOpenRecord(challan.id);
+                        router.push(withReturnTo(`/challan/${challan.id}`, returnToSuffix));
+                      }}
+                      className={`p-4 cursor-pointer active:bg-gray-100 ${highlightId === challan.id ? LIST_HIGHLIGHT_CLASS : ""}`}
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div>
+                          <p className="font-semibold text-gray-900">{challan.challanNo}</p>
+                          <p className="text-xs text-gray-500">{formatBusinessDate(challan.loadingDate)}</p>
+                        </div>
+                        <span className="text-gray-300">›</span>
+                      </div>
+                      <div className="mt-2" onClick={(e) => e.stopPropagation()}>
+                        <p className="text-sm"><BiltyLinks challan={challan} /></p>
+                        <p className="text-xs text-gray-500">{vehicleSummary(challan)}</p>
+                      </div>
+                      <div className="mt-2 grid grid-cols-2 gap-2 text-sm" onClick={(e) => e.stopPropagation()}>
+                        <div>
+                          <p className="text-xs text-gray-500">Clearing Agent</p>
+                          <p>
+                            {clearingAgentId ? (
+                              <Link href={`/parties/${clearingAgentId}/ledger`} className="text-blue-600 hover:underline">
+                                {clearingAgentSummary(challan)}
+                              </Link>
+                            ) : (
+                              clearingAgentSummary(challan)
                             )}
-                          </div>
-                        </td>
-                        <td className="px-4 py-3">
-                          <span
-                            className={`rounded-full px-2 py-0.5 text-xs font-semibold ${compactStatusStyles[status]}`}
-                          >
-                            {status}
-                          </span>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
+                          </p>
+                        </div>
+                        <div>
+                          <p className="text-xs text-gray-500">Transporter</p>
+                          <p>
+                            {challan.transporterParty ? (
+                              <Link href={`/parties/${challan.transporterParty.id}/ledger`} className="text-blue-600 hover:underline">
+                                {challan.transporterParty.partyName}
+                              </Link>
+                            ) : (
+                              "—"
+                            )}
+                          </p>
+                          <p className="text-xs text-gray-500">{challan.carrierNumber || "—"}</p>
+                        </div>
+                      </div>
+                      <div className="mt-3 flex items-end justify-between gap-2">
+                        <div className="text-sm">
+                          <p>Rs. {biltyRentTotal(challan).toLocaleString()}</p>
+                          <p className="text-xs text-gray-500">Carrier Rs. {Number(challan.carrierRent || 0).toLocaleString()}</p>
+                        </div>
+                        <div onClick={(e) => e.stopPropagation()}>
+                          <PositionCell challan={challan} />
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </>
           )}
         </div>
       </div>
