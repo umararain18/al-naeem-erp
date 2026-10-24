@@ -103,7 +103,7 @@ type Challan = {
 };
 
 type ChallanPositionParty = {
-  accountId: string;
+  accountId: string | null;
   partyId: string | null;
   partyName: string;
 };
@@ -225,22 +225,19 @@ function matchesFinancialFilter(challan: Challan, filter: FinancialFilter): bool
   }
 }
 
-// Vehicle info from linked Bilty/Bilties, compacted for the list.
+// Vehicle names only (never registration numbers), one per linked
+// Bilty, comma-separated - never deduplicated and never collapsed
+// into a "2 Vehicles" count, so "Alto, Alto, Cultus" shows every
+// Bilty's own vehicle exactly once. Vehicle Model is the specific
+// name (e.g. "Alto"/"Cultus"); Vehicle Type ("Car"/"Truck") is only
+// a fallback for a Bilty that never had a Model entered.
 function vehicleSummary(challan: Challan): string {
-  const descriptors = challan.bilties
-    .map((cb) =>
-      [cb.bilty.vehicleType, cb.bilty.vehicleModel, cb.bilty.registrationNumber]
-        .filter(Boolean)
-        .join(" / ")
-    )
-    .filter((d) => d.length > 0);
+  const names = challan.bilties
+    .map((cb) => cb.bilty.vehicleModel || cb.bilty.vehicleType || null)
+    .filter((n): n is string => Boolean(n));
 
-  if (descriptors.length === 0) return "—";
-
-  const unique = Array.from(new Set(descriptors));
-  if (unique.length === 1) return unique[0];
-
-  return `${challan.bilties.length} Vehicles`;
+  if (names.length === 0) return "—";
+  return names.join(", ");
 }
 
 // Clearing Agent from linked Bilty/Bilties - only shown as a
@@ -355,17 +352,21 @@ function PositionCell({ challan }: { challan: Challan }) {
   }
 
   return (
-    <div className="space-y-1">
+    <div className="space-y-1.5">
       {position.lines.map((line) => (
-        <div key={line.direction} className="flex flex-wrap items-baseline gap-1">
+        <div key={line.direction}>
           <span className={`inline-block rounded-full px-2 py-0.5 text-xs font-semibold whitespace-nowrap ${positionChipStyles[line.direction]}`}>
             {line.direction === "RECEIVABLE" ? "Receivable" : "Payable"} Rs. {line.amount.toLocaleString()}
           </span>
-          {line.parties.length > 0 && (
-            <span className="text-xs text-gray-500">
-              {line.direction === "RECEIVABLE" ? "from" : "to"} <PartyLinks parties={line.parties} />
-            </span>
-          )}
+          <p className="mt-0.5 text-xs text-gray-500">
+            {line.parties.length > 0 ? (
+              <>
+                {line.direction === "RECEIVABLE" ? "from" : "to"} <PartyLinks parties={line.parties} />
+              </>
+            ) : (
+              <span className="font-medium text-amber-600">Party not set</span>
+            )}
+          </p>
         </div>
       ))}
     </div>
@@ -1039,7 +1040,15 @@ export default function ChallanPage() {
           side padding, no horizontal scroll needed at 1366px since this
           is only 7 columns. */}
       <div className="px-4 sm:px-6 pb-6">
-        <div className="bg-white rounded-xl shadow-sm overflow-hidden">
+        {/* No overflow-hidden here (or on the table wrapper below) -
+            either one would make this element the nearest "scroll
+            container" ancestor for the header's sticky positioning,
+            which only ever stays visually stuck while THIS element's
+            own (never-actually-scrolled) internal scroll position
+            changes - never while the page itself scrolls past it.
+            Only the page scrolls now; the header stays sticky to the
+            page's own viewport instead. */}
+        <div className="bg-white rounded-xl shadow-sm">
           {loading ? (
             <div className="p-10 text-center text-gray-500">Loading challans...</div>
           ) : filteredChallans.length === 0 ? (
@@ -1057,7 +1066,7 @@ export default function ChallanPage() {
                   link (Bilty, Clearing Agent, Transporter, Position's
                   party) stops that click from also bubbling into the
                   row's own navigation. */}
-              <div className="hidden md:block overflow-auto max-h-[70vh]">
+              <div className="hidden md:block">
                 <table className="w-full text-sm">
                   <thead className="text-left text-xs uppercase text-gray-500">
                     <tr>

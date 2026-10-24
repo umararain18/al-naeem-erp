@@ -80,7 +80,7 @@ function describePosition(position: ChallanPosition): string {
   if (position.lines.length === 0) return "Cleared";
   return position.lines
     .map((l) => {
-      const parties = l.parties.map((p) => p.partyName).join(" + ") || "(no party resolved)";
+      const parties = l.parties.map((p) => p.partyName).join(" + ") || "(party not set)";
       return `${l.direction === "RECEIVABLE" ? "Receivable" : "Payable"} Rs. ${l.amount.toLocaleString()} ${l.direction === "RECEIVABLE" ? "from" : "to"} ${parties}`;
     })
     .join("; ");
@@ -96,10 +96,21 @@ async function main() {
       outstandingReceivable: true,
       outstandingPayable: true,
       transporterPartyId: true,
+      transporterParty: { select: { id: true, partyName: true } },
       bilties: {
         select: {
           biltyId: true,
-          bilty: { select: { id: true, isDeleted: true, consignorPartyId: true, clearingAgentPartyId: true } },
+          bilty: {
+            select: {
+              id: true,
+              isDeleted: true,
+              consignorPartyId: true,
+              clearingAgentPartyId: true,
+              consignorParty: { select: { id: true, partyName: true } },
+              consigneeParty: { select: { id: true, partyName: true } },
+              clearingAgentParty: { select: { id: true, partyName: true } },
+            },
+          },
         },
       },
     },
@@ -119,6 +130,20 @@ async function main() {
     outstandingReceivable: c.outstandingReceivable,
     outstandingPayable: c.outstandingPayable,
     biltyIds: c.bilties.map((cb) => cb.biltyId),
+    transporterParty: c.transporterParty
+      ? { partyId: c.transporterParty.id, partyName: c.transporterParty.partyName }
+      : null,
+    biltyParties: c.bilties.map((cb) => ({
+      clearingAgent: cb.bilty.clearingAgentParty
+        ? { partyId: cb.bilty.clearingAgentParty.id, partyName: cb.bilty.clearingAgentParty.partyName }
+        : null,
+      consignor: cb.bilty.consignorParty
+        ? { partyId: cb.bilty.consignorParty.id, partyName: cb.bilty.consignorParty.partyName }
+        : null,
+      consignee: cb.bilty.consigneeParty
+        ? { partyId: cb.bilty.consigneeParty.id, partyName: cb.bilty.consigneeParty.partyName }
+        : null,
+    })),
   }));
 
   const [listPositions, oldSettlementSummaries] = await Promise.all([
