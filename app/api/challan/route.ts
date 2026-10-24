@@ -219,40 +219,45 @@ export async function GET(request: NextRequest) {
 
     // Dimensionally-separated settlement summary (same authoritative
     // source Final Settlement and the Challan Detail page use) -
-    // still needed here ONLY for the list's own "Bilty Rent" column
-    // total (biltyRentTotal() in app/challan/page.tsx) - no longer
-    // for any Receivable/Payable/Due classification, which now comes
-    // entirely from `position` below.
+    // needed here both for the list's own "Bilty Rent" column total
+    // (biltyRentTotal() in app/challan/page.tsx) AND, below, to feed
+    // `position`'s own party resolution (its partyNet and live
+    // "Collected by"/"Paid by" payers - tiers 1-2, see lib/challan-
+    // position.ts's own doc comment) - never a separate calculation.
     const settlementSummaryMap = await computeChallanSettlementSummaryBatch(challans.map((c) => c.id));
 
     // ONE financial position per Challan (lib/challan-position.ts) -
     // the single shared calculation the list's table, filter, and
     // summary cards, AND the Challan Detail page, all read. Built
     // from financialsMap's own amounts (above) and
-    // responsiblePartiesMap's own party names (above) - never a
-    // third, independent calculation.
+    // settlementSummaryMap's own partyNet/live payers (party names,
+    // tiers 1-2) plus document role fields (tier 3) - never a
+    // fourth, independent calculation.
     const positionsMap = await computeChallanPositionsBatch(
-      challans.map((c) => ({
-        id: c.id,
-        isSettled: c.isSettled,
-        outstandingReceivable: c.outstandingReceivable,
-        outstandingPayable: c.outstandingPayable,
-        biltyIds: c.bilties.map((cb) => cb.biltyId),
-        transporterParty: c.transporterParty
-          ? { partyId: c.transporterParty.id, partyName: c.transporterParty.partyName }
-          : null,
-        biltyParties: c.bilties.map((cb) => ({
-          clearingAgent: cb.bilty.clearingAgentParty
-            ? { partyId: cb.bilty.clearingAgentParty.id, partyName: cb.bilty.clearingAgentParty.partyName }
+      challans.map((c) => {
+        const summary = settlementSummaryMap[c.id];
+        return {
+          id: c.id,
+          isSettled: c.isSettled,
+          outstandingReceivable: c.outstandingReceivable,
+          outstandingPayable: c.outstandingPayable,
+          biltyIds: c.bilties.map((cb) => cb.biltyId),
+          partyNet: summary?.partyNet || [],
+          collectedByParties: summary?.bilties.flatMap((b) => b.toPay.payers) || [],
+          paidByParties: summary?.carrierRent.payers || [],
+          transporterParty: c.transporterParty
+            ? { partyId: c.transporterParty.id, partyName: c.transporterParty.partyName }
             : null,
-          consignor: cb.bilty.consignorParty
-            ? { partyId: cb.bilty.consignorParty.id, partyName: cb.bilty.consignorParty.partyName }
-            : null,
-          consignee: cb.bilty.consigneeParty
-            ? { partyId: cb.bilty.consigneeParty.id, partyName: cb.bilty.consigneeParty.partyName }
-            : null,
-        })),
-      }))
+          biltyParties: c.bilties.map((cb) => ({
+            consignor: cb.bilty.consignorParty
+              ? { partyId: cb.bilty.consignorParty.id, partyName: cb.bilty.consignorParty.partyName }
+              : null,
+            consignee: cb.bilty.consigneeParty
+              ? { partyId: cb.bilty.consigneeParty.id, partyName: cb.bilty.consigneeParty.partyName }
+              : null,
+          })),
+        };
+      })
     );
 
     const itemsBeforeFinancialFilter = challans.map((c) => ({
