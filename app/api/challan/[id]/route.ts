@@ -197,29 +197,42 @@ export async function GET(
     )[challan.id];
 
     // Purely informational "who" behind the receivable/payable
-    // totals above - does not affect the amounts themselves.
+    // totals above - does not affect the amounts themselves. Kept
+    // for whatever else still reads this field; no longer used for
+    // `position` below (see lib/challan-position.ts's own doc
+    // comment on why - this function is blind to an Unsettle
+    // reversal, which a Challan's own partyNet already accounts for).
     const responsibleParties = challan.isSettled
       ? await getChallanResponsibleParties(challan.id)
       : { receivable: [], payable: [] };
 
+    // Dimensionally-separated settlement summary (Bilty Rent / Paid /
+    // To-Pay / Carrier Rent, never blended) - moved ahead of
+    // `position` below so its own partyNet and live "Collected by"/
+    // "Paid by" payers can feed the position's party resolution
+    // (tiers 1 and 2 - see lib/challan-position.ts's own doc comment)
+    // instead of a third, independent calculation.
+    const settlementSummary = await computeChallanSettlementSummary(challan.id);
+
     // ONE financial position for this Challan (lib/challan-
     // position.ts) - the exact same shared calculation the Challan
     // list's table, filter, and summary cards read, built from
-    // `financials` and `responsibleParties` above (never a third,
-    // independent calculation).
+    // `financials` (amounts) and settlementSummary's own partyNet/
+    // live payers (party names, tiers 1-2) plus document role fields
+    // (tier 3) - never a fourth, independent calculation.
     const position = await computeChallanPosition({
       id: challan.id,
       isSettled: challan.isSettled,
       outstandingReceivable: challan.outstandingReceivable,
       outstandingPayable: challan.outstandingPayable,
       biltyIds: challan.bilties.map((cb) => cb.biltyId),
+      partyNet: settlementSummary?.partyNet || [],
+      collectedByParties: settlementSummary?.bilties.flatMap((b) => b.toPay.payers) || [],
+      paidByParties: settlementSummary?.carrierRent.payers || [],
       transporterParty: challan.transporterParty
         ? { partyId: challan.transporterParty.id, partyName: challan.transporterParty.partyName }
         : null,
       biltyParties: challan.bilties.map((cb) => ({
-        clearingAgent: cb.bilty.clearingAgentParty
-          ? { partyId: cb.bilty.clearingAgentParty.id, partyName: cb.bilty.clearingAgentParty.partyName }
-          : null,
         consignor: cb.bilty.consignorParty
           ? { partyId: cb.bilty.consignorParty.id, partyName: cb.bilty.consignorParty.partyName }
           : null,
@@ -328,15 +341,6 @@ export async function GET(
         hasInconsistency: paidVerificationByBilty.some((v) => v.isInconsistent),
       },
     };
-
-    // Dimensionally-separated settlement summary (Bilty Rent / Paid /
-    // To-Pay / Carrier Rent, never blended) - the authoritative source
-    // for the Financial Summary card, replacing the old blended
-    // financials/responsibleParties pair for DISPLAY purposes. Those
-    // two fields are left in the response unchanged (still written by
-    // the settlement engine, still potentially depended on elsewhere)
-    // - only what the UI reads for Financial Summary changes.
-    const settlementSummary = await computeChallanSettlementSummary(challan.id);
 
     return NextResponse.json({
       success: true,

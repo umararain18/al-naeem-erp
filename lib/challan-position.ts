@@ -1,30 +1,47 @@
 import { Decimal } from "@prisma/client/runtime/library";
-import { prisma } from "@/lib/prisma";
 import { computeChallanFinancialsBatch, type ChallanFinancialInput } from "./challan-financials";
-import { getChallanResponsiblePartiesBatch } from "./document-party-resolution";
 
 // ============================================================
 // ONE FINANCIAL POSITION PER CHALLAN - the single shared calculation
 // the Challan list (table, filter, summary cards) and the Challan
 // Detail page must all read, so they can never disagree again.
 //
-// Deliberately built ONLY from two already-existing, already-
-// approved primitives - never a new amount calculation:
+// The AMOUNTS (remainingReceivable/remainingPayable) come from
+// computeChallanFinancialsBatch() (lib/challan-financials.ts),
+// UNCHANGED - `remainingReceivable`/`remainingPayable` already read
+// Challan.outstandingReceivable/outstandingPayable (which the
+// SettlementPayment multi-payer engine keeps continuously adjusted -
+// see adjustChallanOutstanding() in lib/settlement-payments.ts) minus
+// real, per-line-attributed Daily Posting receipts/payments. Never
+// the settlement reclassification entry, never both sources summed,
+// never negative.
 //
-//  - computeChallanFinancialsBatch() (lib/challan-financials.ts) -
-//    the AMOUNTS. `remainingReceivable`/`remainingPayable` already
-//    read Challan.outstandingReceivable/outstandingPayable (which the
-//    SettlementPayment multi-payer engine keeps continuously adjusted
-//    - see adjustChallanOutstanding() in lib/settlement-payments.ts)
-//    minus real, per-line-attributed Daily Posting receipts/payments.
-//    Never the settlement reclassification entry, never both sources
-//    summed, never negative. This function is UNCHANGED here.
-//
-//  - getChallanResponsiblePartiesBatch() (lib/document-party-
-//    resolution.ts) - the PARTY NAME(s) those amounts belong to.
-//    Purely informational (its own doc comment: "does NOT recompute
-//    or duplicate the amounts") - never used for an amount here
-//    either, only for the label.
+// The PARTY NAME(s) those amounts belong to are resolved through
+// THREE tiers, in order (see resolveParties() below for the full
+// reasoning) - deliberately NOT getChallanResponsiblePartiesBatch()
+// (lib/document-party-resolution.ts): that function only reads
+// SETTLEMENT/SETTLEMENT_CORRECTION JournalLines, which makes it
+// structurally blind to a Challan that was Unsettled and re-Settled -
+// Unsettle never edits or deletes the original entries, it posts a
+// NEW, separate SETTLEMENT_UNSETTLE_REVERSAL-tagged entry instead
+// (lib/challan-lifecycle.ts's reverseChallanSettlementEntries()) -
+// so a resolver that only reads SETTLEMENT/SETTLEMENT_CORRECTION
+// still sees the ORIGINAL, now-reversed party as if still valid. This
+// was the exact cause of Challan 6425 showing "Receivable ... from
+// Mumtaz Ali Digree" (the Bilty's Clearing Agent, attributed at the
+// FIRST settlement) when the CURRENT, active settlement had already
+// reassigned Collection to Nawab Broker:
+//  1. getChallanResponsibleParties() (OLD) found Mumtaz Ali Digree -
+//     a real, non-empty result, so the bug was never "found nobody,
+//     fell back to a guess" (that would have been caught already) -
+//     it was "found a STALE answer and trusted it".
+//  2. SETTLEMENT_UNSETTLE_REVERSAL IS already included in
+//     SETTLEMENT_NET_REFERENCE_TYPES (lib/settlement-correction.ts),
+//     so partyNet (lib/challan-settlement-summary.ts, computed the
+//     SAME way getPartyNetFromSettlement() does) already correctly
+//     nets the reversal to zero for Mumtaz Ali Digree and shows the
+//     CURRENT reassignment to Nawab Broker instead - this is why
+//     tier 1 below reads partyNet, never getChallanResponsibleParties().
 //
 // A Challan's position is:
 //  - BEFORE_SETTLEMENT: not settled yet - no Receivable/Payable/
@@ -58,9 +75,19 @@ export interface ChallanPositionParty {
 }
 
 export interface ChallanPositionBiltyPartyRoles {
-  clearingAgent: { partyId: string; partyName: string } | null;
+  // Deliberately NO Clearing Agent field here - Clearing Agent must
+  // never be used as a blind role-based guess (tier 3 below); it may
+  // still be the CORRECT answer, but only by actually appearing in
+  // the ledger (tier 1) or as a live "Collected by" payer (tier 2).
   consignor: { partyId: string; partyName: string } | null;
   consignee: { partyId: string; partyName: string } | null;
+}
+
+export interface ChallanPositionPartyNetEntry {
+  accountId: string;
+  partyId: string | null;
+  partyName: string;
+  direction: "RECEIVABLE" | "PAYABLE";
 }
 
 export interface ChallanPositionLine {
@@ -87,17 +114,37 @@ export interface ChallanPosition {
   totalPayable: number;
 }
 
+export interface ChallanPositionLivePayer {
+  accountId: string;
+  partyId: string | null;
+  partyName: string;
+}
+
 export interface ChallanPositionInput {
   id: string;
   isSettled: boolean;
   outstandingReceivable: number | string | Decimal;
   outstandingPayable: number | string | Decimal;
   biltyIds: string[];
-  // Fallback-only party candidates (display, never an amount) - see
-  // resolveFallbackParty()'s own doc comment for when/why these are
-  // used. The caller already has these fields selected for its own
-  // other display needs (Transporter/Clearing Agent name columns
-  // etc.) - passed straight through, never a new query here.
+  // TIER 1 - the Challan's own current, active, cross-component party
+  // net (lib/challan-settlement-summary.ts's partyNet - computed the
+  // same way getPartyNetFromSettlement() does, reading
+  // SETTLEMENT_NET_REFERENCE_TYPES, which already includes
+  // SETTLEMENT_UNSETTLE_REVERSAL). The caller already computes this
+  // for its own Bilty-Rent-total/Final-Settlement needs - passed
+  // straight through, never a new query here.
+  partyNet: ChallanPositionPartyNetEntry[];
+  // TIER 2 - the live "Collected by" (To-Pay) / "Paid by" (Carrier
+  // Rent) payers already shown on the Detail page's own component
+  // cards (challan.settlementSummary.bilties[].toPay.payers /
+  // .carrierRent.payers) - per-component, catching a party whose
+  // cross-component net (tier 1) happens to net to zero while one
+  // component individually still has a live payer.
+  collectedByParties: ChallanPositionLivePayer[];
+  paidByParties: ChallanPositionLivePayer[];
+  // TIER 3 - document role fields, display-only fallback for the
+  // (rare) Challan where neither tier above resolves anyone. Never
+  // Clearing Agent (see ChallanPositionBiltyPartyRoles's own comment).
   transporterParty: { partyId: string; partyName: string } | null;
   biltyParties: ChallanPositionBiltyPartyRoles[];
 }
@@ -107,30 +154,25 @@ function clearedPosition(): ChallanPosition {
 }
 
 // ============================================================
-// PARTY-RESOLUTION FALLBACK (display only - never an amount).
+// PARTY RESOLUTION - THREE TIERS, in order (display only, never an
+// amount). See this file's own module header above for the full
+// Challan 6425 case study this fixes.
 //
-// getChallanResponsiblePartiesBatch() only reads SETTLEMENT/
-// SETTLEMENT_CORRECTION JournalLines - it is structurally blind to a
-// party whose ENTIRE attribution came through the newer multi-payer
-// SettlementPayment engine (referenceType "SETTLEMENT_PAYMENT", a
-// different set). This is the exact same gap lib/party-outstanding.ts
-// documents for its own identical Carrier Rent/Collection resolution
-// ("Confirmed live: Challan 4028's Carrier Rent is multi-payer... and
-// was silently dropped"). When that happens here, a real Receivable/
-// Payable amount would otherwise render with no party name at all.
-//
-// Two fallback tiers, in order, used ONLY when
-// getChallanResponsiblePartiesBatch found nobody for that direction:
-//  1. Live SettlementPayment payer(s) for that component (CARRIER_RENT
-//     for Payable, COLLECTION for Receivable) - one batched query,
-//     mirroring lib/challan-settlement-summary.ts's own identical
-//     SettlementPayment read.
-//  2. The document's own role field(s): the Challan's Transporter for
-//     Payable; a linked Bilty's own Clearing Agent, else Consignor,
-//     else Consignee, for Receivable (all already selected by the
-//     caller for its own display needs - no new query here).
-// If NEITHER resolves anyone, `parties` stays empty and the caller
-// shows "Party not set" - never silently blank, never a guess.
+//  1. partyNet, filtered to this direction - the Challan's own
+//     current, active, cross-component net (already correctly nets
+//     out an Unsettle reversal, a correction, or a multi-payer
+//     reassignment - see SETTLEMENT_NET_REFERENCE_TYPES).
+//  2. The live "Collected by"/"Paid by" payers already shown on the
+//     Detail page's own component cards - catches a party whose
+//     CROSS-component net (tier 1) nets to zero while THIS component
+//     alone still has a real, live payer.
+//  3. Document role fields - the Transporter for Payable; a linked
+//     Bilty's own Consignor, else Consignee, for Receivable. Never
+//     Clearing Agent here - only tiers 1/2 above may ever surface a
+//     Clearing Agent, and only when the ledger itself says so.
+// If none of the three resolves anyone, `parties` stays empty and
+// the caller shows "Party not set" - never silently blank, never a
+// guess presented as fact.
 // ============================================================
 
 function dedupeParties(parties: ChallanPositionParty[]): ChallanPositionParty[] {
@@ -140,6 +182,32 @@ function dedupeParties(parties: ChallanPositionParty[]): ChallanPositionParty[] 
     if (!seen.has(key)) seen.set(key, p);
   }
   return [...seen.values()];
+}
+
+function toPositionParty(p: { accountId: string; partyId: string | null; partyName: string }): ChallanPositionParty {
+  return { accountId: p.accountId, partyId: p.partyId, partyName: p.partyName };
+}
+
+function roleFallbackParties(inp: ChallanPositionInput, direction: "RECEIVABLE" | "PAYABLE"): ChallanPositionParty[] {
+  if (direction === "PAYABLE") {
+    return inp.transporterParty
+      ? [{ accountId: null, partyId: inp.transporterParty.partyId, partyName: inp.transporterParty.partyName }]
+      : [];
+  }
+  const consignors = inp.biltyParties.map((b) => b.consignor).filter((p): p is { partyId: string; partyName: string } => Boolean(p));
+  if (consignors.length > 0) return consignors.map((p) => ({ accountId: null, partyId: p.partyId, partyName: p.partyName }));
+  const consignees = inp.biltyParties.map((b) => b.consignee).filter((p): p is { partyId: string; partyName: string } => Boolean(p));
+  return consignees.map((p) => ({ accountId: null, partyId: p.partyId, partyName: p.partyName }));
+}
+
+function resolveParties(inp: ChallanPositionInput, direction: "RECEIVABLE" | "PAYABLE"): ChallanPositionParty[] {
+  const tier1 = inp.partyNet.filter((p) => p.direction === direction).map(toPositionParty);
+  if (tier1.length > 0) return dedupeParties(tier1);
+
+  const tier2 = (direction === "RECEIVABLE" ? inp.collectedByParties : inp.paidByParties).map(toPositionParty);
+  if (tier2.length > 0) return dedupeParties(tier2);
+
+  return dedupeParties(roleFallbackParties(inp, direction));
 }
 
 export async function computeChallanPositionsBatch(
@@ -156,69 +224,6 @@ export async function computeChallanPositionsBatch(
   }));
   const financialsMap = await computeChallanFinancialsBatch(financialInputs);
 
-  const settledIds = inputs.filter((i) => i.isSettled).map((i) => i.id);
-  const partiesMap = await getChallanResponsiblePartiesBatch(settledIds);
-
-  // Fallback tier 1: live SettlementPayment payers, batched once
-  // across every settled Challan - never per-document.
-  const livePaymentRows = settledIds.length > 0
-    ? await prisma.settlementPayment.findMany({
-        where: { challanId: { in: settledIds }, component: { in: ["CARRIER_RENT", "COLLECTION"] } },
-        select: { challanId: true, component: true, payerAccountId: true },
-      })
-    : [];
-  const livePayerAccountIdsByChallan = new Map<string, { receivable: Set<string>; payable: Set<string> }>();
-  for (const row of livePaymentRows) {
-    if (!row.challanId) continue;
-    const entry = livePayerAccountIdsByChallan.get(row.challanId) || { receivable: new Set(), payable: new Set() };
-    if (row.component === "COLLECTION") entry.receivable.add(row.payerAccountId);
-    else if (row.component === "CARRIER_RENT") entry.payable.add(row.payerAccountId);
-    livePayerAccountIdsByChallan.set(row.challanId, entry);
-  }
-  const allLivePayerAccountIds = [...new Set(livePaymentRows.map((r) => r.payerAccountId))];
-  const livePayerAccounts = allLivePayerAccountIds.length > 0
-    ? await prisma.account.findMany({
-        where: { id: { in: allLivePayerAccountIds } },
-        select: { id: true, accountName: true, party: { select: { id: true, partyName: true } } },
-      })
-    : [];
-  const livePayerAccountById = new Map(livePayerAccounts.map((a) => [a.id, a]));
-
-  function liveFallbackParties(challanId: string, direction: "RECEIVABLE" | "PAYABLE"): ChallanPositionParty[] {
-    const accountIds = livePayerAccountIdsByChallan.get(challanId);
-    const ids = direction === "RECEIVABLE" ? accountIds?.receivable : accountIds?.payable;
-    if (!ids || ids.size === 0) return [];
-    return [...ids].map((accountId) => {
-      const account = livePayerAccountById.get(accountId);
-      return {
-        accountId,
-        partyId: account?.party?.id || null,
-        partyName: account?.party?.partyName || account?.accountName || "Party",
-      };
-    });
-  }
-
-  function roleFallbackParties(inp: ChallanPositionInput, direction: "RECEIVABLE" | "PAYABLE"): ChallanPositionParty[] {
-    if (direction === "PAYABLE") {
-      return inp.transporterParty
-        ? [{ accountId: null, partyId: inp.transporterParty.partyId, partyName: inp.transporterParty.partyName }]
-        : [];
-    }
-    const clearingAgents = inp.biltyParties.map((b) => b.clearingAgent).filter((p): p is { partyId: string; partyName: string } => Boolean(p));
-    if (clearingAgents.length > 0) return clearingAgents.map((p) => ({ accountId: null, partyId: p.partyId, partyName: p.partyName }));
-    const consignors = inp.biltyParties.map((b) => b.consignor).filter((p): p is { partyId: string; partyName: string } => Boolean(p));
-    if (consignors.length > 0) return consignors.map((p) => ({ accountId: null, partyId: p.partyId, partyName: p.partyName }));
-    const consignees = inp.biltyParties.map((b) => b.consignee).filter((p): p is { partyId: string; partyName: string } => Boolean(p));
-    return consignees.map((p) => ({ accountId: null, partyId: p.partyId, partyName: p.partyName }));
-  }
-
-  function resolveParties(inp: ChallanPositionInput, direction: "RECEIVABLE" | "PAYABLE", primary: ChallanPositionParty[]): ChallanPositionParty[] {
-    if (primary.length > 0) return primary;
-    const live = liveFallbackParties(inp.id, direction);
-    if (live.length > 0) return dedupeParties(live);
-    return dedupeParties(roleFallbackParties(inp, direction));
-  }
-
   for (const inp of inputs) {
     if (!inp.isSettled) {
       result[inp.id] = { bucket: "BEFORE_SETTLEMENT", lines: [], totalReceivable: 0, totalPayable: 0 };
@@ -234,17 +239,8 @@ export async function computeChallanPositionsBatch(
       continue;
     }
 
-    const parties = partiesMap[inp.id] || { receivable: [], payable: [] };
-    const rParties = resolveParties(inp, "RECEIVABLE", parties.receivable.map((p) => ({
-      accountId: p.accountId,
-      partyId: p.partyId,
-      partyName: p.partyName,
-    })));
-    const pParties = resolveParties(inp, "PAYABLE", parties.payable.map((p) => ({
-      accountId: p.accountId,
-      partyId: p.partyId,
-      partyName: p.partyName,
-    })));
+    const rParties = resolveParties(inp, "RECEIVABLE");
+    const pParties = resolveParties(inp, "PAYABLE");
 
     // Net ONLY when both sides are non-zero AND resolve to exactly
     // the same single party - anything more ambiguous (zero, several

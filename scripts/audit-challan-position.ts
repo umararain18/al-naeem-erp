@@ -1,35 +1,45 @@
 // READ-ONLY AUDIT - no writes, ever. Safe to run against production.
 //
-// This audit covers the Challan list redesign + "one financial
-// position per Challan" change (lib/challan-position.ts). Two things
-// are checked:
+// Covers three things for the Challan list/detail "one financial
+// position" feature (lib/challan-position.ts):
 //
-// 1. LIST vs DETAIL AGREEMENT (must be 0 disagreements). Both now
-//    read the exact same computeChallanPositionsBatch()/
-//    computeChallanPosition() - the list calls the batch form once
-//    for every Challan on the page, the detail page calls the single
-//    form for just its own Challan. Since both are thin wrappers
-//    around the SAME per-Challan logic, they cannot disagree by
-//    construction; this audit verifies that empirically rather than
-//    just trusting the code, by calling BOTH forms for every Challan
-//    and comparing bucket/lines/totals.
+// 1. LIST vs DETAIL AGREEMENT (must be 0 disagreements). Both read
+//    the exact same computeChallanPositionsBatch()/
+//    computeChallanPosition() - verified empirically by calling BOTH
+//    forms for every Challan and comparing bucket/lines/totals.
 //
-// 2. OLD vs NEW classification. The OLD list used to derive its
-//    financial-status filter/badge from a FROZEN, reproduced-here
-//    copy of the pre-this-PR compactStatus()/matchesFinancialFilter()
-//    (challan.settlementSummary.partyNet-based - see app/api/challan/
-//    route.ts's git history) - a DIFFERENT calculation from the one
-//    the summary cards always used (challan.financials.
-//    remainingReceivable/remainingPayable, lib/challan-financials.ts,
-//    unchanged by this PR). That mismatch between two independently-
-//    derived figures is exactly the reported bug ("filter 'Due' lists
-//    6473/6454/6447/6422 while the cards show Rs 0"). The summary
-//    cards' own AMOUNTS never change in this PR (still
-//    challan.financials, read via lib/challan-position.ts, never
-//    recomputed) - only the BUCKET/classification a Challan falls
-//    into changes, so this audit prints every Challan whose OLD vs
-//    NEW bucket differs, never a "the numbers changed" comparison
-//    that doesn't exist.
+// 2. PARTY RESOLUTION correctness - the bug this script's current
+//    version was written to confirm the fix for: Challan 6425 showed
+//    "Receivable Rs. 9,000 from Mumtaz Ali Digree" (the Bilty's
+//    Clearing Agent, attributed at a FIRST settlement that was later
+//    Unsettled) when the CURRENT, active settlement had already
+//    reassigned Collection to Nawab Broker. Root cause:
+//    getChallanResponsibleParties() (lib/document-party-resolution.ts)
+//    only reads SETTLEMENT/SETTLEMENT_CORRECTION JournalLines -
+//    Unsettle never edits/deletes those, it posts a SEPARATE
+//    SETTLEMENT_UNSETTLE_REVERSAL-tagged entry instead (lib/challan-
+//    lifecycle.ts), so that resolver still sees the ORIGINAL,
+//    now-reversed party as if still valid. lib/challan-position.ts no
+//    longer uses that function at all - it now resolves through three
+//    tiers (partyNet, live "Collected by"/"Paid by" payers, then
+//    document role fields, never Clearing Agent as a guess).
+//
+//    This script checks, for every Challan with a Receivable/Payable
+//    line:
+//    (a) the shown party is backed by a REAL ledger line for this
+//        Challan (tier 1 or 2 - partyNet or a live payer) - flags any
+//        line resolved only through tier 3 (a role-field guess, never
+//        ledger-backed by definition) as a diagnostic, and
+//    (b) what the OLD, buggy getChallanResponsibleParties() would
+//        have shown instead, for direct comparison.
+//
+// 3. UNSETTLED-AT-LEAST-ONCE Challans - every Challan with any
+//    SETTLEMENT_UNSETTLE_REVERSAL-referenced JournalEntry against it
+//    or one of its Bilties, with its CURRENT position/party next to
+//    what the OLD resolver would have shown - flags any Challan where
+//    those two disagree (expect 0 after this fix; a disagreement here
+//    is the exact "resettled, OLD resolver stuck on the pre-Unsettle
+//    party" bug class).
 //
 // Usage:
 //   npx tsx scripts/audit-challan-position.ts
@@ -37,6 +47,7 @@
 import { PrismaClient } from "@prisma/client";
 import { computeChallanPositionsBatch, computeChallanPosition, type ChallanPosition } from "../lib/challan-position";
 import { computeChallanSettlementSummaryBatch } from "../lib/challan-settlement-summary";
+import { getChallanResponsiblePartiesBatch } from "../lib/document-party-resolution";
 import { getPartyLedgerData } from "../lib/ledger-description";
 
 const prisma = new PrismaClient();
@@ -44,35 +55,6 @@ const EPS = 0.01;
 
 function round2(value: number): number {
   return Math.round(value * 100) / 100;
-}
-
-// ============================================================
-// FROZEN pre-this-PR reference implementation - the exact
-// compactStatus()/totalDueFromSummary() app/api/challan/route.ts and
-// app/challan/page.tsx both used to run, reproduced verbatim so this
-// script can show what the list USED to classify a Challan as,
-// independent of what the real (now-fixed) code does today.
-// ============================================================
-type OldCompactStatus = "BEFORE SETTLEMENT" | "RECEIVABLE" | "PAYABLE" | "RECEIVABLE + PAYABLE" | "DUE" | "CLEARED";
-
-function oldTotalDueFromSummary(summary: { bilties: { toPay: { remaining: number } }[]; carrierRent: { remaining: number } } | undefined): number {
-  if (!summary) return 0;
-  const toPayRemaining = summary.bilties.reduce((s, b) => s + b.toPay.remaining, 0);
-  return toPayRemaining + summary.carrierRent.remaining;
-}
-
-function oldCompactStatus(
-  isSettled: boolean,
-  summary: { partyNet: { net: number }[]; bilties: { toPay: { remaining: number } }[]; carrierRent: { remaining: number } } | undefined
-): OldCompactStatus {
-  if (!isSettled) return "BEFORE SETTLEMENT";
-  const partyNet = summary?.partyNet || [];
-  const hasReceivable = partyNet.some((p) => p.net > 0);
-  const hasPayable = partyNet.some((p) => p.net < 0);
-  if (hasReceivable && hasPayable) return "RECEIVABLE + PAYABLE";
-  if (hasReceivable) return "RECEIVABLE";
-  if (hasPayable) return "PAYABLE";
-  return oldTotalDueFromSummary(summary) > 0.009 ? "DUE" : "CLEARED";
 }
 
 function describePosition(position: ChallanPosition): string {
@@ -84,6 +66,34 @@ function describePosition(position: ChallanPosition): string {
       return `${l.direction === "RECEIVABLE" ? "Receivable" : "Payable"} Rs. ${l.amount.toLocaleString()} ${l.direction === "RECEIVABLE" ? "from" : "to"} ${parties}`;
     })
     .join("; ");
+}
+
+function describeOldParties(old: { receivable: { partyName: string }[]; payable: { partyName: string }[] } | undefined): string {
+  if (!old) return "(none)";
+  const r = old.receivable.map((p) => p.partyName).join(" + ");
+  const p = old.payable.map((p) => p.partyName).join(" + ");
+  const parts: string[] = [];
+  if (r) parts.push(`Receivable from ${r}`);
+  if (p) parts.push(`Payable to ${p}`);
+  return parts.length > 0 ? parts.join("; ") : "(none)";
+}
+
+// Party-identity-only comparison (names per direction, NEVER amounts
+// or wording) - describePosition()/describeOldParties() above are
+// for DISPLAY only; comparing those full strings directly would flag
+// a false "differs" for every Challan merely because the new wording
+// includes the amount and the old one doesn't. This is what actually
+// decides whether OLD and NEW resolved to the SAME party or not.
+function partyNamesDiffer(
+  position: ChallanPosition,
+  old: { receivable: { partyName: string }[]; payable: { partyName: string }[] } | undefined
+): boolean {
+  const newReceivable = new Set(position.lines.find((l) => l.direction === "RECEIVABLE")?.parties.map((p) => p.partyName) || []);
+  const newPayable = new Set(position.lines.find((l) => l.direction === "PAYABLE")?.parties.map((p) => p.partyName) || []);
+  const oldReceivable = new Set((old?.receivable || []).map((p) => p.partyName));
+  const oldPayable = new Set((old?.payable || []).map((p) => p.partyName));
+  const sameSet = (a: Set<string>, b: Set<string>) => a.size === b.size && [...a].every((x) => b.has(x));
+  return !sameSet(newReceivable, oldReceivable) || !sameSet(newPayable, oldPayable);
 }
 
 async function main() {
@@ -124,35 +134,42 @@ async function main() {
   }
 
   const challanIds = challans.map((c) => c.id);
-  const positionInputs = challans.map((c) => ({
-    id: c.id,
-    isSettled: c.isSettled,
-    outstandingReceivable: c.outstandingReceivable,
-    outstandingPayable: c.outstandingPayable,
-    biltyIds: c.bilties.map((cb) => cb.biltyId),
-    transporterParty: c.transporterParty
-      ? { partyId: c.transporterParty.id, partyName: c.transporterParty.partyName }
-      : null,
-    biltyParties: c.bilties.map((cb) => ({
-      clearingAgent: cb.bilty.clearingAgentParty
-        ? { partyId: cb.bilty.clearingAgentParty.id, partyName: cb.bilty.clearingAgentParty.partyName }
-        : null,
-      consignor: cb.bilty.consignorParty
-        ? { partyId: cb.bilty.consignorParty.id, partyName: cb.bilty.consignorParty.partyName }
-        : null,
-      consignee: cb.bilty.consigneeParty
-        ? { partyId: cb.bilty.consigneeParty.id, partyName: cb.bilty.consigneeParty.partyName }
-        : null,
-    })),
-  }));
+  const settledIds = challans.filter((c) => c.isSettled).map((c) => c.id);
 
-  const [listPositions, oldSettlementSummaries] = await Promise.all([
-    computeChallanPositionsBatch(positionInputs),
+  const [settlementSummaries, oldResponsibleParties] = await Promise.all([
     computeChallanSettlementSummaryBatch(challanIds),
+    getChallanResponsiblePartiesBatch(settledIds),
   ]);
 
+  const positionInputs = challans.map((c) => {
+    const summary = settlementSummaries[c.id];
+    return {
+      id: c.id,
+      isSettled: c.isSettled,
+      outstandingReceivable: c.outstandingReceivable,
+      outstandingPayable: c.outstandingPayable,
+      biltyIds: c.bilties.map((cb) => cb.biltyId),
+      partyNet: summary?.partyNet || [],
+      collectedByParties: summary?.bilties.flatMap((b) => b.toPay.payers) || [],
+      paidByParties: summary?.carrierRent.payers || [],
+      transporterParty: c.transporterParty
+        ? { partyId: c.transporterParty.id, partyName: c.transporterParty.partyName }
+        : null,
+      biltyParties: c.bilties.map((cb) => ({
+        consignor: cb.bilty.consignorParty
+          ? { partyId: cb.bilty.consignorParty.id, partyName: cb.bilty.consignorParty.partyName }
+          : null,
+        consignee: cb.bilty.consigneeParty
+          ? { partyId: cb.bilty.consigneeParty.id, partyName: cb.bilty.consigneeParty.partyName }
+          : null,
+      })),
+    };
+  });
+
+  const listPositions = await computeChallanPositionsBatch(positionInputs);
+
   // ------------------------------------------------------------
-  // Check 1: list (batch) vs detail (single) agreement.
+  // Section 1: list (batch) vs detail (single) agreement.
   // ------------------------------------------------------------
   let disagreements = 0;
   for (const inp of positionInputs) {
@@ -171,81 +188,124 @@ async function main() {
       console.log(`  detail: ${describePosition(detailPosition)}`);
     }
   }
-  if (disagreements === 0) {
-    console.log("List/Detail agreement check passed: 0 disagreements across every Challan.\n");
-  } else {
-    console.log(`\n!!! ${disagreements} Challan(s) show a LIST vs DETAIL disagreement - this is a bug !!!\n`);
+  console.log(
+    disagreements === 0
+      ? "Section 1 - List/Detail agreement: PASSED, 0 disagreements across every Challan.\n"
+      : `\n!!! Section 1 - ${disagreements} Challan(s) show a LIST vs DETAIL disagreement - this is a bug !!!\n`
+  );
+
+  // ------------------------------------------------------------
+  // Section 2: party resolution - every Receivable/Payable line,
+  // which tier resolved it (ledger-backed tier 1/2, or a tier-3
+  // role-field guess), and what the OLD resolver would have shown.
+  // ------------------------------------------------------------
+  let tier3Count = 0;
+  let oldVsNewDiffCount = 0;
+  console.log("=== Section 2: party resolution per Challan (Receivable/Payable only) ===");
+  for (const c of challans) {
+    const position = listPositions[c.id];
+    if (position.lines.length === 0) continue;
+
+    const summary = settlementSummaries[c.id];
+    const partyNetAccountIds = new Set((summary?.partyNet || []).map((p) => p.accountId));
+    const liveAccountIds = new Set([
+      ...(summary?.bilties.flatMap((b) => b.toPay.payers.map((p) => p.accountId)) || []),
+      ...(summary?.carrierRent.payers.map((p) => p.accountId) || []),
+    ]);
+
+    const oldForThis = oldResponsibleParties[c.id];
+    const oldDescription = describeOldParties(oldForThis);
+    const newDescription = describePosition(position);
+    const differs = partyNamesDiffer(position, oldForThis);
+    if (differs) oldVsNewDiffCount++;
+
+    let anyTier3 = false;
+    for (const line of position.lines) {
+      for (const p of line.parties) {
+        const ledgerBacked = (p.accountId && (partyNetAccountIds.has(p.accountId) || liveAccountIds.has(p.accountId)));
+        if (!ledgerBacked) anyTier3 = true;
+      }
+    }
+    if (anyTier3) tier3Count++;
+
+    if (differs || anyTier3) {
+      console.log(`\nChallan ${c.challanNo} (${c.id})`);
+      console.log(`  OLD (getChallanResponsibleParties, buggy): ${oldDescription}`);
+      console.log(`  NEW (lib/challan-position.ts, 3-tier):      ${newDescription}`);
+      if (anyTier3) console.log(`  NOTE: at least one party above came from tier 3 (role field, no real ledger line for this Challan) - diagnostic only, not necessarily wrong.`);
+    }
+  }
+  console.log(`\n=== Section 2 totals: ${challans.length} Challans checked, ${oldVsNewDiffCount} where OLD vs NEW differ, ${tier3Count} using a tier-3 (non-ledger-backed) party ===\n`);
+
+  // ------------------------------------------------------------
+  // Section 3: Challans that have been Unsettled at least once -
+  // current position/party vs what the OLD resolver shows, flagging
+  // any disagreement (the exact "stuck on a reversed entry" bug).
+  // ------------------------------------------------------------
+  const allBiltyIds = challans.flatMap((c) => c.bilties.map((cb) => cb.biltyId));
+  const reversalEntries = await prisma.journalEntry.findMany({
+    where: {
+      referenceType: "SETTLEMENT_UNSETTLE_REVERSAL",
+      referenceId: { in: [...challanIds, ...allBiltyIds] },
+      isDeleted: false,
+    },
+    select: { referenceId: true },
+  });
+  const biltyIdToChallanId = new Map<string, string>();
+  for (const c of challans) for (const cb of c.bilties) biltyIdToChallanId.set(cb.biltyId, c.id);
+  const unsettledAtLeastOnceChallanIds = new Set<string>();
+  for (const e of reversalEntries) {
+    if (!e.referenceId) continue;
+    if (challanIds.includes(e.referenceId)) unsettledAtLeastOnceChallanIds.add(e.referenceId);
+    const viaChallan = biltyIdToChallanId.get(e.referenceId);
+    if (viaChallan) unsettledAtLeastOnceChallanIds.add(viaChallan);
   }
 
-  // ------------------------------------------------------------
-  // Check 2: OLD (settlementSummary.partyNet-based) vs NEW
-  // (financials + responsible-parties-based) classification.
-  // ------------------------------------------------------------
-  let changed = 0;
-  let oldReceivableCount = 0;
-  let oldPayableCount = 0;
-  let oldDueCount = 0;
-  let oldClearedCount = 0;
-  let newReceivableTotal = 0;
-  let newPayableTotal = 0;
-  let partyLedgerReceivableTotal = 0;
-  let partyLedgerPayableTotal = 0;
-  const countedPartyIds = new Set<string>();
-
-  for (const c of challans) {
-    const newPosition = listPositions[c.id];
-    const oldStatus = oldCompactStatus(c.isSettled, oldSettlementSummaries[c.id]);
-
-    if (oldStatus === "RECEIVABLE") oldReceivableCount++;
-    else if (oldStatus === "PAYABLE") oldPayableCount++;
-    else if (oldStatus === "DUE") oldDueCount++;
-    else if (oldStatus === "CLEARED") oldClearedCount++;
-
-    newReceivableTotal = round2(newReceivableTotal + newPosition.totalReceivable);
-    newPayableTotal = round2(newPayableTotal + newPosition.totalPayable);
-
-    const newBucketAsOldLabel: Record<string, string> = {
-      BEFORE_SETTLEMENT: "BEFORE SETTLEMENT",
-      RECEIVABLE: "RECEIVABLE",
-      PAYABLE: "PAYABLE",
-      RECEIVABLE_PAYABLE: "RECEIVABLE + PAYABLE",
-      CLEARED: "CLEARED",
-    };
-    const bucketChanged = newBucketAsOldLabel[newPosition.bucket] !== oldStatus;
-
-    if (!bucketChanged) continue;
-    changed++;
+  console.log(`=== Section 3: Challans Unsettled at least once (${unsettledAtLeastOnceChallanIds.size} found) ===`);
+  let section3Mismatches = 0;
+  const partyLedgerCache = new Map<string, { partyName: string; closingBalance: number; balanceType: string }>();
+  for (const challanId of unsettledAtLeastOnceChallanIds) {
+    const c = challans.find((x) => x.id === challanId);
+    if (!c) continue;
+    const position = listPositions[challanId];
+    const oldForThis = oldResponsibleParties[challanId];
+    const oldDescription = describeOldParties(oldForThis);
+    const newDescription = describePosition(position);
+    const mismatch = partyNamesDiffer(position, oldForThis);
+    if (mismatch) section3Mismatches++;
 
     console.log(`\nChallan ${c.challanNo} (${c.id})`);
-    console.log(`  Old bucket: ${oldStatus}`);
-    console.log(`  New position: ${describePosition(newPosition)}  (bucket: ${newPosition.bucket})`);
+    console.log(`  Current position: ${newDescription}`);
+    console.log(`  OLD resolver would show: ${oldDescription}${mismatch ? "  <-- DIFFERS (this Challan would have shown the wrong party under the old code)" : "  (same - no visible difference for this one)"}`);
 
-    const relevantPartyIds = new Set<string>();
-    if (c.transporterPartyId) relevantPartyIds.add(c.transporterPartyId);
-    for (const cb of c.bilties) {
-      if (cb.bilty.isDeleted) continue;
-      if (cb.bilty.consignorPartyId) relevantPartyIds.add(cb.bilty.consignorPartyId);
-      if (cb.bilty.clearingAgentPartyId) relevantPartyIds.add(cb.bilty.clearingAgentPartyId);
-    }
-    for (const partyId of relevantPartyIds) {
-      try {
-        const ledger = await getPartyLedgerData(partyId, { order: "desc", includeOpeningBalanceRow: false });
-        console.log(`  Party Ledger - ${ledger.party.partyName}: closing balance Rs. ${ledger.summary.closingBalance} (${ledger.summary.balanceType})`);
-        if (!countedPartyIds.has(partyId)) {
-          countedPartyIds.add(partyId);
-          if (ledger.summary.closingBalance > EPS) partyLedgerReceivableTotal = round2(partyLedgerReceivableTotal + ledger.summary.closingBalance);
-          else if (ledger.summary.closingBalance < -EPS) partyLedgerPayableTotal = round2(partyLedgerPayableTotal + Math.abs(ledger.summary.closingBalance));
+    // Party Ledger cross-check for every party actually shown.
+    for (const line of position.lines) {
+      for (const p of line.parties) {
+        if (!p.partyId || partyLedgerCache.has(p.partyId)) continue;
+        try {
+          const ledger = await getPartyLedgerData(p.partyId, { order: "desc", includeOpeningBalanceRow: false });
+          partyLedgerCache.set(p.partyId, {
+            partyName: ledger.party.partyName,
+            closingBalance: ledger.summary.closingBalance,
+            balanceType: ledger.summary.balanceType,
+          });
+        } catch {
+          // Party/account not resolvable - skip, never fabricate.
         }
-      } catch {
-        // Party/account not resolvable (e.g. deactivated) - skip, never fabricate.
+      }
+    }
+    for (const line of position.lines) {
+      for (const p of line.parties) {
+        const cached = p.partyId ? partyLedgerCache.get(p.partyId) : null;
+        if (cached) console.log(`  Party Ledger - ${cached.partyName}: closing balance Rs. ${cached.closingBalance} (${cached.balanceType})`);
       }
     }
   }
+  console.log(
+    `\n=== Section 3 totals: ${unsettledAtLeastOnceChallanIds.size} Challan(s) ever Unsettled, ${section3Mismatches} where the shown party differs from what the OLD (reversal-blind) resolver would show (expect 0 after this fix for any that are STILL wrong - differing is EXPECTED and CORRECT for one that was previously bugged) ===\n`
+  );
 
-  console.log(`\n=== ${changed} of ${challans.length} Challan(s) changed bucket (old vs new classification) ===`);
-  console.log(`Old buckets: RECEIVABLE=${oldReceivableCount}, PAYABLE=${oldPayableCount}, DUE=${oldDueCount}, CLEARED=${oldClearedCount} (DUE no longer exists after this fix)`);
-  console.log(`New totals: Receivable Rs. ${newReceivableTotal}, Payable Rs. ${newPayableTotal}  |  sum of every touched party's own ledger RECEIVABLE balance: ${partyLedgerReceivableTotal}, PAYABLE balance: ${partyLedgerPayableTotal}`);
-  console.log(`(Party ledger totals are a cross-check, not a target to match exactly - a party's own ledger blends EVERY Challan/Bilty/Phonch/etc. they are involved in, not just the ones audited here.)`);
+  console.log("Done. Party Ledger totals above are a cross-check, not a target to match exactly - a party's own ledger blends EVERY Challan/Bilty/Phonch/etc. they are involved in, not just the ones audited here.");
 
   await prisma.$disconnect();
 }
