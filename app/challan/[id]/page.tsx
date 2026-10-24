@@ -265,7 +265,7 @@ function PayersList({ payers, label }: { payers: SettlementPayerBreakdown[]; lab
 
 // The dimensionally-separated Financial Summary tiles - Bilty Rent /
 // Paid (+ Verified/Unverified) / To-Pay (Total/Received/Remaining) /
-// Carrier Rent (Total/Paid/Remaining). Sourced entirely from
+// Carrier Rent (Total/Paid/Remaining). Totals come from
 // challan.settlementSummary (lib/challan-settlement-summary.ts) and
 // challan.paidVerification (unchanged, existing) - never recomputed
 // here. No per-card badge any more - the ONE overall Receivable/
@@ -274,6 +274,20 @@ function PayersList({ payers, label }: { payers: SettlementPayerBreakdown[]; lab
 // per component. Works for both an unsettled and a settled Challan;
 // a Challan with no settlementSummary yet (still loading) renders
 // nothing rather than guessing.
+//
+// "Paid"/"Received" specifically: live SettlementPayment rows if any
+// exist for that component (summary's own paidOrReceived, unchanged -
+// a real, explicit payment record); OTHERWISE challan.financials'
+// own received/paid (lib/challan-financials.ts, unchanged - the
+// per-line Daily Posting amount, the exact same number the list's
+// position/cards read), capped at the component's own total. Never
+// the settlement reclassification entry (that tier was removed, not
+// reinstated), never both sources summed - this mirrors the list's
+// own "live rows, else Daily Posting" precedence (lib/challan-
+// position.ts) so a Challan like 6396 (Carrier Rent paid entirely via
+// a plain Daily Posting entry, no SettlementPayment row) shows Paid/
+// Remaining consistently here too, not stuck at 0/full-total just
+// because no multi-payer row was ever created for it.
 function FinancialSummaryCards({ challan }: { challan: Challan }) {
   const summary = challan.settlementSummary;
   if (!summary) return <p className="text-sm text-gray-500">Loading...</p>;
@@ -282,11 +296,17 @@ function FinancialSummaryCards({ challan }: { challan: Challan }) {
   const pv = challan.paidVerification?.aggregate;
 
   const toPayDue = summary.bilties.reduce((s, b) => s + b.toPay.total, 0);
-  const toPayReceived = summary.bilties.reduce((s, b) => s + b.toPay.paidOrReceived, 0);
-  const toPayRemaining = summary.bilties.reduce((s, b) => s + b.toPay.remaining, 0);
   const toPayPayers = mergePayers(summary.bilties.flatMap((b) => b.toPay.payers));
+  const toPayReceived = toPayPayers.length > 0
+    ? summary.bilties.reduce((s, b) => s + b.toPay.paidOrReceived, 0)
+    : Math.min(toPayDue, Number(challan.financials?.received || 0));
+  const toPayRemaining = Math.max(0, Math.round((toPayDue - toPayReceived) * 100) / 100);
 
   const cr = summary.carrierRent;
+  const crPaidOrReceived = cr.payers.length > 0
+    ? cr.paidOrReceived
+    : Math.min(cr.total, Number(challan.financials?.paid || 0));
+  const crRemaining = Math.max(0, Math.round((cr.total - crPaidOrReceived) * 100) / 100);
 
   return (
     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
@@ -323,10 +343,10 @@ function FinancialSummaryCards({ challan }: { challan: Challan }) {
       <div className="rounded-lg border p-3">
         <p className="text-xs text-gray-500">Carrier Rent</p>
         <p className="font-semibold text-lg">Rs. {cr.total.toLocaleString()}</p>
-        <p className="mt-1 text-xs text-gray-600">Paid: Rs. {cr.paidOrReceived.toLocaleString()}</p>
-        <p className="text-xs text-gray-600">Remaining: Rs. {cr.remaining.toLocaleString()}</p>
+        <p className="mt-1 text-xs text-gray-600">Paid: Rs. {crPaidOrReceived.toLocaleString()}</p>
+        <p className="text-xs text-gray-600">Remaining: Rs. {crRemaining.toLocaleString()}</p>
         <PayersList payers={cr.payers} label="Paid by" />
-        {cr.remaining > 0.009 && cr.residualPartyName && (
+        {crRemaining > 0.009 && cr.residualPartyName && (
           <p className="mt-1 text-xs text-gray-500">Payable to: {cr.residualPartyName}</p>
         )}
       </div>
