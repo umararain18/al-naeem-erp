@@ -1777,18 +1777,58 @@ export interface ReassignPaidResponsibilityResult {
   amountMoved: number;
 }
 
+/**
+ * Every account's own net balance (debit - credit) from PAID-
+ * component-tagged JournalLines for this Bilty - establishment
+ * (SETTLEMENT_PAYMENT), correction, reversal, or a prior
+ * reassignment (PAID_RESPONSIBILITY_REASSIGNMENT). This is the SAME
+ * referenceType scoping getBiltyPaidVerification() uses to find
+ * "every account ever tagged by a PAID-component line" - just kept
+ * per-account instead of merged into one Bilty-wide total, so a
+ * caller can see exactly which account(s) still hold a stray balance
+ * rather than only whether the Bilty as a whole is "verified".
+ *
+ * Used by reassignPaidResponsibility() (the OLD party's own entry)
+ * and by scripts/scan-and-correct-party-mismatches.ts (every account
+ * AT ALL, read-only, to find Bilties where a past reassignment moved the
+ * SettlementPayment row's payerAccountId without ever posting the
+ * matching reclassification entry - the exact shape of the bug this
+ * function's own fix was written to close).
+ */
+export async function getPaidAccountNetBalances(tx: Tx, biltyId: string): Promise<Map<string, number>> {
+  const paidTaggedLines = await tx.journalLine.findMany({
+    where: {
+      sourceType: "BILTY",
+      sourceId: biltyId,
+      OR: [
+        {
+          journalEntry: {
+            isDeleted: false,
+            referenceType: { in: ["SETTLEMENT_PAYMENT", "SETTLEMENT_PAYMENT_CORRECTION", "SETTLEMENT_PAYMENT_REVERSAL"] },
+            referenceId: biltyId,
+          },
+        },
+        {
+          journalEntry: { isDeleted: false, referenceType: "PAID_RESPONSIBILITY_REASSIGNMENT" },
+        },
+      ],
+    },
+    select: { accountId: true, debit: true, credit: true },
+  });
+  const byAccount = new Map<string, number>();
+  for (const line of paidTaggedLines) {
+    const prior = byAccount.get(line.accountId) || 0;
+    byAccount.set(line.accountId, round2(prior + Number(line.debit) - Number(line.credit)));
+  }
+  return byAccount;
+}
+
 export async function reassignPaidResponsibility(
   tx: Tx,
   biltyId: string,
   newPayerAccountId: string,
   createdById: string
 ): Promise<ReassignPaidResponsibilityResult> {
-  // Imported lazily to avoid a require-cycle at module load time
-  // (lib/bilty-paid-verification.ts imports lib/document-party-
-  // resolution.ts, which does not import this module, so this is
-  // safe, but kept local to keep the dependency direction obvious).
-  const { getBiltyPaidVerification } = await import("@/lib/bilty-paid-verification");
-
   const existingRow = await tx.settlementPayment.findFirst({
     where: { component: "PAID", biltyId },
   });
@@ -1806,10 +1846,26 @@ export async function reassignPaidResponsibility(
 
   await assertValidPayerAccount(tx, newPayerAccountId);
 
-  // Read BEFORE any mutation - resolves the OLD party's remaining
-  // unverified amount from the live ledger.
-  const verification = await getBiltyPaidVerification(tx, biltyId);
-  const remaining = round2(verification.unverifiedAmount);
+  // Read BEFORE any mutation - the OLD party's own CURRENT net
+  // balance across every PAID-component-tagged line for this Bilty,
+  // NOT getBiltyPaidVerification()'s Bilty-wide "unverified" amount.
+  //
+  // Those are NOT the same number: a Daily Posting receipt routed to
+  // Gross Bilty Receivable (rather than credited to the old party's
+  // own account) fully verifies the Bilty's Paid claim as a whole
+  // (see lib/bilty-paid-verification.ts lines 162-197), but it never
+  // touches the old party's account - so "unverifiedAmount" can be
+  // zero while the old party's OWN ledger still shows the full
+  // original debit for this Bilty. Using unverifiedAmount here left
+  // that debit stranded on the old party forever once responsibility
+  // moved (the exact bug this function existed to prevent). Moving
+  // the old party's own net balance instead is correct in every case:
+  // when verification happened via a receipt credited directly to
+  // the old party's account, that same credit already nets against
+  // this balance, so the two amounts agree; only the Gross-routed
+  // case differs, and only in the direction that fixes the bug.
+  const netBalances = await getPaidAccountNetBalances(tx, biltyId);
+  const remaining = round2(Math.max(0, netBalances.get(existingRow.payerAccountId) || 0));
 
   const bilty = await tx.bilty.findUniqueOrThrow({ where: { id: biltyId }, select: { biltyNo: true } });
 
