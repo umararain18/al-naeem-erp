@@ -4,6 +4,7 @@ import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { Prisma } from "@prisma/client";
 import { computeChallanFinancialsBatch } from "@/lib/challan-financials";
+import { computeChallanPosition } from "@/lib/challan-position";
 import {
   applySettlementCorrection,
   getSettledPartyAccountIdsBatch,
@@ -179,7 +180,8 @@ export async function GET(
         settlementBreakdown: null,
         paidVerification: null,
         settlementSummary: null,
-        capabilities: { canRestore: currentUser.role === "SUPER_ADMIN" },
+        position: null,
+        capabilities: { canRestore: currentUser.role === "SUPER_ADMIN", canBin: false },
       });
     }
 
@@ -199,6 +201,19 @@ export async function GET(
     const responsibleParties = challan.isSettled
       ? await getChallanResponsibleParties(challan.id)
       : { receivable: [], payable: [] };
+
+    // ONE financial position for this Challan (lib/challan-
+    // position.ts) - the exact same shared calculation the Challan
+    // list's table, filter, and summary cards read, built from
+    // `financials` and `responsibleParties` above (never a third,
+    // independent calculation).
+    const position = await computeChallanPosition({
+      id: challan.id,
+      isSettled: challan.isSettled,
+      outstandingReceivable: challan.outstandingReceivable,
+      outstandingPayable: challan.outstandingPayable,
+      biltyIds: challan.bilties.map((cb) => cb.biltyId),
+    });
 
     // Per-component current responsibility (Collection/Commission
     // per Bilty, Carrier Rent for the Challan) - read-only, used
@@ -317,7 +332,12 @@ export async function GET(
       settlementBreakdown,
       paidVerification,
       settlementSummary,
-      capabilities: { canRestore: false },
+      position,
+      // canBin mirrors GET /api/challan's own identical capability
+      // exactly (SUPER_ADMIN only) - Challan Bin also resets every
+      // linked Bilty's status and reverses Booking Income (see the
+      // DELETE handler below), so it is gated the same way there too.
+      capabilities: { canRestore: false, canBin: currentUser.role === "SUPER_ADMIN" },
     });
   } catch (error) {
     console.error("Get challan error:", error);

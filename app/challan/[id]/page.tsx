@@ -135,6 +135,10 @@ export type Challan = {
   // lib/challan-settlement-summary.ts. Replaces the old
   // financials/responsibleParties pair for the Financial Summary card.
   settlementSummary?: SettlementSummary | null;
+  // ONE financial position for this Challan (lib/challan-position.ts)
+  // - the exact same shared calculation the Challan list's table,
+  // filter, and summary cards read. Null only for a binned Challan.
+  position?: ChallanPosition | null;
 };
 
 export type SettlementPayerBreakdown = {
@@ -182,6 +186,27 @@ export type SettlementSummary = {
   // To-Pay due, never blended with either. See
   // lib/challan-settlement-summary.ts's own doc comment.
   partyNet: PartyNetEntryUI[];
+};
+
+type ChallanPositionParty = {
+  accountId: string;
+  partyId: string | null;
+  partyName: string;
+};
+
+type ChallanPositionLine = {
+  direction: "RECEIVABLE" | "PAYABLE";
+  amount: number;
+  parties: ChallanPositionParty[];
+};
+
+type ChallanPositionBucket = "BEFORE_SETTLEMENT" | "RECEIVABLE" | "PAYABLE" | "RECEIVABLE_PAYABLE" | "CLEARED";
+
+export type ChallanPosition = {
+  bucket: ChallanPositionBucket;
+  lines: ChallanPositionLine[];
+  totalReceivable: number;
+  totalPayable: number;
 };
 
 type ResponsibilityChoiceUI = {
@@ -238,24 +263,16 @@ function PayersList({ payers, label }: { payers: SettlementPayerBreakdown[]; lab
   );
 }
 
-function ClearedOrDueBadge({ remaining, total, paidOrReceived }: { remaining: number; total: number; paidOrReceived: number }) {
-  if (total <= 0.009) return null;
-  if (remaining <= 0.009) {
-    return <span className="text-xs font-semibold text-green-700">CLEARED ✓</span>;
-  }
-  if (paidOrReceived > 0.009) {
-    return <span className="text-xs font-semibold text-blue-700">PARTIAL - DUE Rs. {remaining.toLocaleString()}</span>;
-  }
-  return <span className="text-xs font-semibold text-amber-700">DUE Rs. {remaining.toLocaleString()}</span>;
-}
-
 // The dimensionally-separated Financial Summary tiles - Bilty Rent /
-// Paid (+ Verified/Unverified) / To-Pay (Due/Received/Remaining) /
-// Carrier Rent (Due/Paid/Remaining). Sourced entirely from
+// Paid (+ Verified/Unverified) / To-Pay (Total/Received/Remaining) /
+// Carrier Rent (Total/Paid/Remaining). Sourced entirely from
 // challan.settlementSummary (lib/challan-settlement-summary.ts) and
 // challan.paidVerification (unchanged, existing) - never recomputed
-// here. Works for both an unsettled and a settled Challan; a
-// Challan with no settlementSummary yet (still loading) renders
+// here. No per-card badge any more - the ONE overall Receivable/
+// Payable/Cleared position for this Challan (challan.position, lib/
+// challan-position.ts) is shown once, in PositionDisplay below, not
+// per component. Works for both an unsettled and a settled Challan;
+// a Challan with no settlementSummary yet (still loading) renders
 // nothing rather than guessing.
 function FinancialSummaryCards({ challan }: { challan: Challan }) {
   const summary = challan.settlementSummary;
@@ -296,22 +313,18 @@ function FinancialSummaryCards({ challan }: { challan: Challan }) {
       </div>
 
       <div className="rounded-lg border p-3">
-        <div className="flex items-center justify-between">
-          <p className="text-xs text-gray-500">To-Pay</p>
-          <ClearedOrDueBadge remaining={toPayRemaining} total={toPayDue} paidOrReceived={toPayReceived} />
-        </div>
+        <p className="text-xs text-gray-500">To-Pay</p>
         <p className="font-semibold text-lg">Rs. {toPayDue.toLocaleString()}</p>
         <p className="mt-1 text-xs text-gray-600">Received: Rs. {toPayReceived.toLocaleString()}</p>
+        <p className="text-xs text-gray-600">Remaining: Rs. {toPayRemaining.toLocaleString()}</p>
         <PayersList payers={toPayPayers} label="Collected by" />
       </div>
 
       <div className="rounded-lg border p-3">
-        <div className="flex items-center justify-between">
-          <p className="text-xs text-gray-500">Carrier Rent</p>
-          <ClearedOrDueBadge remaining={cr.remaining} total={cr.total} paidOrReceived={cr.paidOrReceived} />
-        </div>
+        <p className="text-xs text-gray-500">Carrier Rent</p>
         <p className="font-semibold text-lg">Rs. {cr.total.toLocaleString()}</p>
         <p className="mt-1 text-xs text-gray-600">Paid: Rs. {cr.paidOrReceived.toLocaleString()}</p>
+        <p className="text-xs text-gray-600">Remaining: Rs. {cr.remaining.toLocaleString()}</p>
         <PayersList payers={cr.payers} label="Paid by" />
         {cr.remaining > 0.009 && cr.residualPartyName && (
           <p className="mt-1 text-xs text-gray-500">Payable to: {cr.residualPartyName}</p>
@@ -321,38 +334,63 @@ function FinancialSummaryCards({ challan }: { challan: Challan }) {
   );
 }
 
-// Cross-component PARTY NET POSITION - deliberately a SEPARATE block
-// from the component tiles above (never a 5th tile inside that grid,
-// never merged into Carrier Rent/To-Pay's own remaining figure). A
-// party's net here reflects their TOTAL Collection + Carrier Rent
-// position on this Challan (see lib/challan-settlement-summary.ts) -
-// e.g. a Clearing Agent who collected more than they paid out in
-// Carrier Rent shows as a receivable here even when both components
-// are individually CLEARED above. Renders nothing when every party's
-// net is zero - never fabricates a balance.
-function PartyNetPosition({ challan }: { challan: Challan }) {
-  const partyNet = challan.settlementSummary?.partyNet || [];
-  if (partyNet.length === 0) return null;
+// ONE financial position for this Challan - read straight from
+// challan.position (lib/challan-position.ts), the EXACT same shared
+// calculation the Challan list's table, filter, and summary cards
+// also read (see app/challan/page.tsx's own PositionCell - same
+// chip colors, same "Receivable/Payable Rs X from/to <party>"
+// wording, same never-net-different-parties rule). Deliberately a
+// SEPARATE block from the component tiles above (never a 5th tile
+// inside that grid, never merged into Carrier Rent/To-Pay's own
+// remaining figure) - renders nothing while still loading (position
+// undefined) or for an unsettled Challan with no position to show
+// yet beyond the "BEFORE SETTLEMENT" status badge already shown
+// above.
+const positionChipStyles: Record<"RECEIVABLE" | "PAYABLE", string> = {
+  RECEIVABLE: "bg-green-100 text-green-700",
+  PAYABLE: "bg-red-100 text-red-700",
+};
+
+function PositionDisplay({ challan }: { challan: Challan }) {
+  const position = challan.position;
+  if (!position || position.bucket === "BEFORE_SETTLEMENT") return null;
+
+  if (position.lines.length === 0) {
+    return (
+      <div className="rounded-lg border p-3 bg-gray-50 mt-3">
+        <span className="inline-block rounded-full px-2 py-0.5 text-xs font-semibold bg-gray-100 text-gray-700">Cleared</span>
+      </div>
+    );
+  }
 
   return (
     <div className="rounded-lg border p-3 bg-gray-50 mt-3">
-      <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Party Net Position</p>
+      <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide mb-2">Position</p>
       <div className="space-y-2">
-        {partyNet.map((p) => (
-          <div key={p.accountId} className="flex items-center justify-between text-sm">
-            <span>
-              {p.direction === "RECEIVABLE" ? "Receivable from" : "Payable to"}{" "}
-              {p.partyId ? (
-                <Link href={`/parties/${p.partyId}/ledger`} className="text-blue-600 hover:underline font-medium">
-                  {p.partyName}
-                </Link>
-              ) : (
-                <span className="font-medium">{p.partyName}</span>
-              )}
+        {position.lines.map((line) => (
+          <div key={line.direction} className="flex items-center justify-between text-sm">
+            <span
+              className={`inline-block rounded-full px-2 py-0.5 text-xs font-semibold ${positionChipStyles[line.direction]}`}
+            >
+              {line.direction === "RECEIVABLE" ? "Receivable" : "Payable"} Rs. {line.amount.toLocaleString()}
             </span>
-            <span className={`font-semibold ${p.direction === "RECEIVABLE" ? "text-blue-700" : "text-purple-700"}`}>
-              Rs. {Math.abs(p.net).toLocaleString()}
-            </span>
+            {line.parties.length > 0 && (
+              <span className="text-gray-600">
+                {line.direction === "RECEIVABLE" ? "from" : "to"}{" "}
+                {line.parties.map((p, i) => (
+                  <span key={p.accountId}>
+                    {i > 0 && " + "}
+                    {p.partyId ? (
+                      <Link href={`/parties/${p.partyId}/ledger`} className="text-blue-600 hover:underline font-medium">
+                        {p.partyName}
+                      </Link>
+                    ) : (
+                      <span className="font-medium">{p.partyName}</span>
+                    )}
+                  </span>
+                ))}
+              </span>
+            )}
           </div>
         ))}
       </div>
@@ -473,6 +511,12 @@ export default function ChallanDetailPage({
   const [error, setError] = useState("");
   const [canRestore, setCanRestore] = useState(false);
   const [restoring, setRestoring] = useState(false);
+  // Challan Bin used to only be reachable from the Challan list (now
+  // a pure navigational table with no inline actions - see app/
+  // challan/page.tsx) - moved here so SUPER_ADMIN never loses this
+  // capability. Same endpoint, same SUPER_ADMIN-only gate.
+  const [canBin, setCanBin] = useState(false);
+  const [binning, setBinning] = useState(false);
   // Separate from `error` above - `error` drives the page-level
   // "Challan not found" fallback render (see the `if (error || !challan)`
   // early return below), so reusing it for an edit-form validation
@@ -557,8 +601,10 @@ export default function ChallanDetailPage({
         settlementBreakdown: data.settlementBreakdown,
         paidVerification: data.paidVerification,
         settlementSummary: data.settlementSummary,
+        position: data.position,
       });
       setCanRestore(!!data.capabilities?.canRestore);
+      setCanBin(!!data.capabilities?.canBin);
     } catch {
       setError("Unable to connect to the server");
     } finally {
@@ -587,6 +633,25 @@ export default function ChallanDetailPage({
       await loadChallan();
     } finally {
       setRestoring(false);
+    }
+  }
+
+  async function handleBin() {
+    if (!challan) return;
+    if (!window.confirm(`Move Challan ${challan.challanNo} to Bin?`)) return;
+    try {
+      setBinning(true);
+      setError("");
+      const response = await fetch(`/api/challan/${challan.id}`, { method: "DELETE" });
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        setError(data.message || "Unable to move challan to Bin");
+        return;
+      }
+      setLoading(true);
+      await loadChallan();
+    } finally {
+      setBinning(false);
     }
   }
 
@@ -992,6 +1057,16 @@ export default function ChallanDetailPage({
               {challan.isSettled && (
                 <span className="text-sm text-gray-500">(Settled)</span>
               )}
+              {canBin && (
+                <button
+                  type="button"
+                  disabled={binning}
+                  onClick={() => void handleBin()}
+                  className="border border-red-300 text-red-600 rounded-lg px-4 py-2 text-sm hover:bg-red-50 disabled:opacity-50"
+                >
+                  {binning ? "Moving..." : "Move to Bin"}
+                </button>
+              )}
               <Link href={backHref} className="border rounded-lg px-4 py-2 text-sm hover:bg-gray-50">
                 Back
               </Link>
@@ -1107,7 +1182,7 @@ export default function ChallanDetailPage({
             </div>
           </div>
           <FinancialSummaryCards challan={challan} />
-          <PartyNetPosition challan={challan} />
+          <PositionDisplay challan={challan} />
         </div>
 
         {/* Settlement Breakdown (who ended up responsible for what) */}
