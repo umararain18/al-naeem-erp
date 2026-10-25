@@ -11,6 +11,7 @@ import {
   findSettledBiltyIds,
 } from "@/lib/cash-bank-bin-policy";
 import { isOpeningBalanceReferenceType } from "@/lib/account-opening-balance";
+import { getCurrentChallanNoByBiltyId } from "@/lib/ledger-description";
 
 function startOfDay(date: string) {
   return new Date(`${date}T00:00:00`);
@@ -327,6 +328,19 @@ export async function GET(request: NextRequest) {
     }
 
     // ============================================================
+    // CURRENT CHALLAN LINK (display only) - for every Bilty-sourced
+    // line, resolved live from the Bilty's CURRENT active (non-
+    // deleted) Challan link, never stored. See
+    // lib/ledger-description.ts's getCurrentChallanNoByBiltyId() -
+    // the SAME helper Party/General Ledger use for this.
+    // ============================================================
+    const biltySourcedIds = new Set<string>();
+    for (const line of journalLines) {
+      if (line.sourceType === "BILTY" && line.sourceId) biltySourcedIds.add(line.sourceId);
+    }
+    const currentChallanNoByBiltyId = await getCurrentChallanNoByBiltyId([...biltySourcedIds]);
+
+    // ============================================================
     // SOURCE DOCUMENT LINKS - for a row that is itself a system-
     // generated posting from another module (not Daily Posting, not
     // Opening Balance), resolve a real "Open <Document No>" target
@@ -450,6 +464,17 @@ export async function GET(request: NextRequest) {
     // CONVERT DECIMAL VALUES
     // ============================================================
 
+    // Appends ", Challan No X" to a Bilty-sourced line's own already-
+    // stored description, display only - never edits the stored
+    // JournalEntry/JournalLine. Omitted entirely when the Bilty isn't
+    // currently on any (non-deleted) Challan.
+    function withCurrentChallanNo(line: (typeof journalLines)[number], description: string): string {
+      if (line.sourceType !== "BILTY" || !line.sourceId) return description;
+      const challanNo = currentChallanNoByBiltyId.get(line.sourceId);
+      if (!challanNo) return description;
+      return description ? `${description}, Challan No ${challanNo}` : `Challan No ${challanNo}`;
+    }
+
     const normalizedLines = journalLines.map(
       (line) => ({
         id: line.id,
@@ -470,9 +495,7 @@ export async function GET(request: NextRequest) {
         account: line.account.accountName,
 
         description:
-          line.description ||
-          line.journalEntry.description ||
-          "",
+          withCurrentChallanNo(line, line.description || line.journalEntry.description || ""),
 
         debit: Number(line.debit),
 
