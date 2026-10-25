@@ -14,9 +14,13 @@ import { getAllocatedAmountForDocument } from "@/lib/payment-allocation";
 // edited or soft-deleted (see lib/challan-lifecycle.ts's
 // reverseChallanSettlementEntries). Challan flips SETTLED ->
 // DELIVERED (isSettled=false) so it can be settled again later.
-// SettlementPayment rows themselves are left completely untouched -
-// their history stays exactly as it was; only their accounting EFFECT
-// is reversed.
+// Every COLLECTION/CARRIER_RENT SettlementPayment row for this
+// Challan is also soft-deactivated (isActive: false) in the SAME
+// transaction - their row history (amount, payer, journalEntryId)
+// is never deleted or edited, only excluded from "current" reads
+// (Financial Summary, Challan position, the Rent-reduction active-
+// total guard) going forward. A later re-settle starts clean and
+// establishes fresh rows.
 //
 // Daily-Posting "verified/allocated" block (point 6 of the spec):
 // investigated rather than guessed - COLLECTION/CARRIER_RENT
@@ -117,6 +121,7 @@ export async function POST(
     }
 
     let reversedCount = 0;
+    let deactivatedPaymentRowCount = 0;
 
     await prisma.$transaction(async (tx) => {
       const result = await reverseChallanSettlementEntries(tx, {
@@ -126,6 +131,7 @@ export async function POST(
         reason: "Unsettle",
       });
       reversedCount = result.reversedCount;
+      deactivatedPaymentRowCount = result.deactivatedPaymentRowCount;
 
       await tx.challan.update({
         where: { id },
@@ -145,7 +151,7 @@ export async function POST(
         entityType: "Challan",
         entityId: id,
         documentNo: challan.challanNo,
-        description: `Unsettled Challan ${challan.challanNo} - ${result.reversedCount} settlement JournalEntry(ies) reversed`,
+        description: `Unsettled Challan ${challan.challanNo} - ${result.reversedCount} settlement JournalEntry(ies) reversed, ${result.deactivatedPaymentRowCount} settlement payment row(s) deactivated`,
         changedFields: { isSettled: { old: true, new: false } },
         ...requestContext(request),
       });
@@ -153,7 +159,7 @@ export async function POST(
 
     return NextResponse.json({
       success: true,
-      message: `Challan unsettled successfully (${reversedCount} settlement entry(ies) reversed).`,
+      message: `Challan unsettled successfully (${reversedCount} settlement entry(ies) reversed, ${deactivatedPaymentRowCount} settlement payment row(s) deactivated).`,
       challanId: id,
     });
   } catch (error) {

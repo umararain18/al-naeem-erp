@@ -31,6 +31,7 @@ interface PartyLedgerListFilters {
   to: string;
   typeFilter: string;
   search: string;
+  hideReversed?: boolean;
 }
 
 type PartyType = "TRANSPORTER" | "CLEARING_AGENT" | "CUSTOMER" | "VENDOR";
@@ -130,6 +131,8 @@ function LedgerTable({
   setTo,
   typeFilter,
   setTypeFilter,
+  hideReversed,
+  setHideReversed,
   highlightId,
   onOpenRecord,
 }: {
@@ -142,6 +145,8 @@ function LedgerTable({
   setTo: (v: string) => void;
   typeFilter: TxType;
   setTypeFilter: (v: TxType) => void;
+  hideReversed: boolean;
+  setHideReversed: (v: boolean) => void;
   highlightId: string | null;
   onOpenRecord: (id: string) => void;
 }) {
@@ -149,8 +154,8 @@ function LedgerTable({
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
   useEffect(() => {
-    saveListFilters(partyLedgerListKey(partyId), { from, to, typeFilter, search });
-  }, [partyId, from, to, typeFilter, search]);
+    saveListFilters(partyLedgerListKey(partyId), { from, to, typeFilter, search, hideReversed });
+  }, [partyId, from, to, typeFilter, search, hideReversed]);
 
   // Configurable Ledger Details columns - shared with General Ledger
   // (components/LedgerDetailsPicker.tsx), persisted per-browser.
@@ -248,6 +253,15 @@ function LedgerTable({
                 .join(" ")}
             </button>
           ))}
+          <label className="flex items-center gap-1.5 text-xs text-gray-600 ml-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={hideReversed}
+              onChange={(e) => setHideReversed(e.target.checked)}
+              className="h-3.5 w-3.5"
+            />
+            Hide reversed entries
+          </label>
         </div>
         {search.trim() && (
           <p className="text-xs text-gray-500 mt-2">
@@ -277,6 +291,7 @@ function LedgerTable({
               setTypeFilter("ALL");
               setFrom("");
               setTo("");
+              setHideReversed(false);
             }}
             className="border rounded-lg px-4 py-2 text-sm hover:bg-gray-50"
           >
@@ -423,6 +438,11 @@ export default function PartyLedgerPage({
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
   const [typeFilter, setTypeFilter] = useState<TxType>("ALL");
+  // Default OFF - every existing user keeps seeing exactly what they
+  // see today unless they explicitly turn this on. Display only
+  // (lib/ledger-description.ts's hideReversedEntries) - never changes
+  // any balance.
+  const [hideReversed, setHideReversed] = useState(false);
 
   useEffect(() => {
     params.then((p) => {
@@ -438,6 +458,7 @@ export default function PartyLedgerPage({
         if (saved.from) setFrom(saved.from);
         if (saved.to) setTo(saved.to);
         if (saved.typeFilter) setTypeFilter(saved.typeFilter as TxType);
+        if (saved.hideReversed) setHideReversed(true);
       }
     });
   }, [params]);
@@ -478,6 +499,7 @@ export default function PartyLedgerPage({
         if (from) query.set("from", from);
         if (to) query.set("to", to);
         if (typeFilter !== "ALL") query.set("type", typeFilter);
+        if (hideReversed) query.set("hideReversed", "true");
 
         const response = await fetch(`/api/parties/${partyId}/ledger?${query.toString()}`);
         const result = await response.json();
@@ -496,15 +518,15 @@ export default function PartyLedgerPage({
     }
 
     load();
-  }, [partyId, from, to, typeFilter]);
+  }, [partyId, from, to, typeFilter, hideReversed]);
 
-  // Persist from/to/typeFilter whenever any of them change - `search`
-  // is persisted separately, inside LedgerTable itself (it's local
-  // state there, see that component's own effect).
+  // Persist from/to/typeFilter/hideReversed whenever any of them
+  // change - `search` is persisted separately, inside LedgerTable
+  // itself (it's local state there, see that component's own effect).
   useEffect(() => {
     if (!partyId) return;
-    saveListFilters(partyLedgerListKey(partyId), { from, to, typeFilter });
-  }, [partyId, from, to, typeFilter]);
+    saveListFilters(partyLedgerListKey(partyId), { from, to, typeFilter, hideReversed });
+  }, [partyId, from, to, typeFilter, hideReversed]);
 
   const { highlightId, onOpenRecord } = useListScrollRestore(partyId ? partyLedgerListKey(partyId) : "party-ledger:pending", !loading && !!partyId);
 
@@ -680,6 +702,8 @@ export default function PartyLedgerPage({
             setTo={setTo}
             typeFilter={typeFilter}
             setTypeFilter={setTypeFilter}
+            hideReversed={hideReversed}
+            setHideReversed={setHideReversed}
             highlightId={highlightId}
             onOpenRecord={onOpenRecord}
           />
