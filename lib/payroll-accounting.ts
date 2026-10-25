@@ -135,6 +135,53 @@ export function isValidPayrollMonth(value: unknown): value is string {
   return typeof value === "string" && /^\d{4}-\d{2}$/.test(value);
 }
 
+/**
+ * [start, end) real calendar-date bounds for a "YYYY-MM" payrollMonth
+ * string, local midnight to local midnight (end is EXCLUSIVE, the
+ * first instant of the FOLLOWING month) - for filtering a JournalEntry's
+ * own entryDate, never Payslip.payrollMonth itself (a Daily Posting/
+ * Manual Journal payment has no payrollMonth field at all, only a
+ * real date - see getActualPaymentsThisMonth() below).
+ */
+export function payrollMonthDateRange(payrollMonth: string): { start: Date; end: Date } {
+  const start = new Date(`${payrollMonth}-01T00:00:00`);
+  const end = new Date(start);
+  end.setMonth(end.getMonth() + 1);
+  return { start, end };
+}
+
+/**
+ * "Total Paid This Month" (display only) - the sum of every REAL
+ * Cash/Bank payment to any of these employee accounts dated inside
+ * payrollMonth, from ANY source (the dedicated Payslip Payment
+ * feature, Daily Posting, or a Manual Journal) - never only the ones
+ * tagged sourceType:"PAYSLIP"/referenceType:"PAYROLL_PAYMENT", which
+ * misses a salary/advance paid through Daily Posting or a Manual
+ * Journal entry directly (the exact gap this was written to close).
+ *
+ * Scoped by the JournalEntry's own real entryDate (never
+ * Payslip.payrollMonth, which a Daily-Posting/Manual-Journal payment
+ * has no such field for at all). Counted via the employee-account
+ * leg's own DEBIT only (a LIABILITY account's debit side is "money
+ * given to them" - the SAME sign convention this file's own doc
+ * comment establishes at the top) - the paired Cash/Bank credit leg
+ * lives on a DIFFERENT account, so it is structurally excluded, never
+ * a second, overlapping sum that could double-count the same payment.
+ */
+export async function getActualPaymentsThisMonth(tx: Tx, employeeAccountIds: string[], payrollMonth: string): Promise<number> {
+  if (employeeAccountIds.length === 0) return 0;
+  const { start, end } = payrollMonthDateRange(payrollMonth);
+  const agg = await tx.journalLine.aggregate({
+    where: {
+      accountId: { in: employeeAccountIds },
+      debit: { gt: 0 },
+      journalEntry: { isDeleted: false, entryDate: { gte: start, lt: end } },
+    },
+    _sum: { debit: true },
+  });
+  return round2(Number(agg._sum.debit || 0));
+}
+
 // ------------------------------------------------------------
 // PAYSLIP PAYMENT STATE - derived purely from JournalLines, never
 // stored redundantly (Part 20). "Paid" = sum of DEBITS to the
@@ -189,6 +236,81 @@ export async function getPayslipPaymentState(
   }
 
   return { netPay, paidAmount, remainingAmount, status };
+}
+
+// ------------------------------------------------------------
+// POOLED PAYSLIP PAYMENT STATE (display only) - getPayslipPaymentState()
+// above stays exactly as it was, UNCHANGED, and keeps gating the two
+// write-paths that must never depend on any OTHER payslip's own state
+// (app/api/payslips/[id]/route.ts's PATCH/DELETE guards: "this ONE
+// payslip has no payment of its own recorded against it yet"). This
+// is a SEPARATE, read-only view for the Payroll screen/export/payment-
+// response display, which must instead reflect the employee's own
+// ACCOUNT - any Cash/Bank payment ever posted to it, from ANY source
+// (the dedicated Payslip Payment feature, Daily Posting, or a Manual
+// Journal), not only the ones explicitly tagged to one specific
+// Payslip. Never writes anything - purely a different way of reading
+// the SAME existing JournalLines.
+//
+// Allocation: the employee's account's total DEBIT (a LIABILITY
+// account's debit side is, by this file's own sign convention above,
+// always "money/value given to them" - true regardless of which
+// module posted it) is one single pool, applied across every one of
+// their Payslips OLDEST FIRST (by payDate, createdAt as the same-day
+// tiebreak - mirrors lib/ledger-description.ts's own compareChronological
+// precedent). A Payslip is "Paid" once its own netPay is fully covered
+// by the pool reaching it; any leftover pool after the LAST (most
+// recent) Payslip means the employee's account as a whole is paid
+// ahead, surfaced as "Paid in Advance" on that most recent Payslip
+// specifically (an invented extra row would misrepresent a Payslip
+// that was never actually issued).
+// ------------------------------------------------------------
+
+export async function getPooledPayslipPaymentStates(
+  tx: Tx,
+  employeeId: string,
+  employeeAccountId: string
+): Promise<Map<string, PayslipPaymentState>> {
+  const debitAgg = await tx.journalLine.aggregate({
+    where: { accountId: employeeAccountId, journalEntry: { isDeleted: false } },
+    _sum: { debit: true },
+  });
+  let remainingPool = round2(Number(debitAgg._sum.debit || 0));
+
+  const payslips = await tx.payslip.findMany({
+    where: { employeeId, isDeleted: false },
+    select: { id: true, netPay: true },
+    orderBy: [{ payDate: "asc" }, { createdAt: "asc" }],
+  });
+
+  const states = new Map<string, PayslipPaymentState>();
+  for (let i = 0; i < payslips.length; i++) {
+    const p = payslips[i];
+    const netPay = round2(Number(p.netPay));
+    const isLast = i === payslips.length - 1;
+    const allocated = round2(Math.min(remainingPool, netPay));
+    remainingPool = round2(remainingPool - allocated);
+
+    let paidAmount = allocated;
+    let remainingAmount = round2(netPay - allocated);
+    let status: PayslipPaymentState["status"];
+
+    if (allocated <= EPS) {
+      status = "Unpaid";
+    } else if (remainingAmount > EPS) {
+      status = "Partially Paid";
+    } else if (isLast && remainingPool > EPS) {
+      status = "Paid in Advance";
+      paidAmount = round2(netPay + remainingPool);
+      remainingAmount = round2(-remainingPool);
+    } else {
+      status = "Paid";
+    }
+
+    states.set(p.id, { netPay, paidAmount, remainingAmount, status });
+  }
+
+  return states;
 }
 
 // ------------------------------------------------------------

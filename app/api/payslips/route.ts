@@ -6,12 +6,13 @@ import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import {
   PayrollValidationError,
-  getPayslipPaymentState,
+  getPooledPayslipPaymentStates,
   isValidPayrollMonth,
   nextPayslipNo,
   payrollMonthLabel,
   postSalaryRecognition,
   validatePayslipInput,
+  type PayslipPaymentState,
 } from "@/lib/payroll-accounting";
 import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
 
@@ -75,10 +76,24 @@ export async function GET(request: NextRequest) {
       orderBy: [{ payDate: "desc" }, { createdAt: "desc" }],
     });
 
+    // Pooled, employee-account-wide status (display only - see
+    // lib/payroll-accounting.ts's getPooledPayslipPaymentStates) -
+    // computed ONCE per distinct employee appearing on this page
+    // (never per row), each covering that employee's FULL payslip
+    // history regardless of this list's own payrollMonth/search
+    // filters, so a filtered view still allocates the pool correctly
+    // against whatever payslips came before the ones shown here.
+    const employeesById = new Map(payslips.map((p) => [p.employee.id, p.employee]));
+    const stateMapsByEmployeeId = new Map<string, Map<string, PayslipPaymentState>>();
+    for (const employee of employeesById.values()) {
+      if (!employee.account) continue;
+      stateMapsByEmployeeId.set(employee.id, await getPooledPayslipPaymentStates(prisma, employee.id, employee.account.id));
+    }
+
     const items = await Promise.all(
       payslips.map(async (p) => {
         const netPay = Number(p.netPay);
-        const state = await getPayslipPaymentState(prisma, p.id, netPay, p.employee.account!.id);
+        const state = stateMapsByEmployeeId.get(p.employee.id)!.get(p.id)!;
         return {
           id: p.id,
           payslipNo: p.payslipNo,

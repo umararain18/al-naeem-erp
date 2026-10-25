@@ -7,6 +7,7 @@ import { hasPermission } from "@/lib/permissions";
 import {
   PayrollValidationError,
   getPayslipPaymentState,
+  getPooledPayslipPaymentStates,
   payrollMonthLabel,
   postSalaryRecognition,
   validatePayslipInput,
@@ -67,7 +68,12 @@ export async function GET(_request: NextRequest, context: { params: Promise<{ id
     }
 
     const netPay = Number(payslip.netPay);
-    const state = await getPayslipPaymentState(prisma, id, netPay, payslip.employee.account!.id);
+    // Pooled, employee-account-wide status for display (see
+    // lib/payroll-accounting.ts's getPooledPayslipPaymentStates) -
+    // getPayslipPaymentState() itself stays reserved for this file's
+    // own PATCH/DELETE write-path guards below, unchanged.
+    const pooledStates = await getPooledPayslipPaymentStates(prisma, payslip.employee.id, payslip.employee.account!.id);
+    const state = pooledStates.get(id)!;
 
     const payments = await prisma.journalLine.findMany({
       where: { sourceType: "PAYSLIP", sourceId: id, journalEntry: { referenceType: "PAYROLL_PAYMENT", isDeleted: false } },

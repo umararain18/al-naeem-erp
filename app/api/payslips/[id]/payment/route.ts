@@ -6,7 +6,7 @@ import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import {
   PayrollValidationError,
-  getPayslipPaymentState,
+  getPooledPayslipPaymentStates,
   payrollMonthLabel,
   round2,
 } from "@/lib/payroll-accounting";
@@ -157,7 +157,9 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
         { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
       );
 
-      const newState = await getPayslipPaymentState(prisma, id, Number(payslip.netPay), payslip.employee.account!.id);
+      // Pooled, employee-account-wide status for display (see
+      // lib/payroll-accounting.ts's getPooledPayslipPaymentStates).
+      const newState = (await getPooledPayslipPaymentStates(prisma, payslip.employee.id, payslip.employee.account!.id)).get(id)!;
 
       return NextResponse.json(
         { success: true, message: "Payment recorded successfully.", state: newState },
@@ -180,7 +182,7 @@ export async function POST(request: NextRequest, context: { params: Promise<{ id
         success: true,
         message: "This payment was already processed.",
         idempotentReplay: true,
-        state: await getPayslipPaymentState(prisma, id, Number(payslip.netPay), payslip.employee.account!.id),
+        state: (await getPooledPayslipPaymentStates(prisma, payslip.employee.id, payslip.employee.account!.id)).get(id)!,
       });
     }
   } catch (error) {
