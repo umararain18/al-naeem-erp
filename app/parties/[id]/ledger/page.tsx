@@ -32,6 +32,7 @@ interface PartyLedgerListFilters {
   typeFilter: string;
   search: string;
   hideReversed?: boolean;
+  shortView?: boolean;
 }
 
 type PartyType = "TRANSPORTER" | "CLEARING_AGENT" | "CUSTOMER" | "VENDOR";
@@ -133,6 +134,8 @@ function LedgerTable({
   setTypeFilter,
   hideReversed,
   setHideReversed,
+  shortView,
+  setShortView,
   highlightId,
   onOpenRecord,
 }: {
@@ -147,6 +150,8 @@ function LedgerTable({
   setTypeFilter: (v: TxType) => void;
   hideReversed: boolean;
   setHideReversed: (v: boolean) => void;
+  shortView: boolean;
+  setShortView: (v: boolean) => void;
   highlightId: string | null;
   onOpenRecord: (id: string) => void;
 }) {
@@ -154,8 +159,8 @@ function LedgerTable({
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
   useEffect(() => {
-    saveListFilters(partyLedgerListKey(partyId), { from, to, typeFilter, search, hideReversed });
-  }, [partyId, from, to, typeFilter, search, hideReversed]);
+    saveListFilters(partyLedgerListKey(partyId), { from, to, typeFilter, search, hideReversed, shortView });
+  }, [partyId, from, to, typeFilter, search, hideReversed, shortView]);
 
   // Configurable Ledger Details columns - shared with General Ledger
   // (components/LedgerDetailsPicker.tsx), persisted per-browser.
@@ -194,6 +199,8 @@ function LedgerTable({
     ...(to ? { to } : {}),
     ...(typeFilter !== "ALL" ? { type: typeFilter } : {}),
     ...(search.trim() ? { search: search.trim() } : {}),
+    ...(hideReversed ? { hideReversed: "true" } : {}),
+    ...(!shortView ? { view: "full" } : {}),
     details: [...visibleDetails].join(","),
   }).toString();
 
@@ -253,6 +260,24 @@ function LedgerTable({
                 .join(" ")}
             </button>
           ))}
+          <div className="flex items-center ml-2 border rounded-lg overflow-hidden text-xs">
+            <button
+              type="button"
+              onClick={() => setShortView(true)}
+              className={`px-3 py-1.5 ${shortView ? "bg-blue-600 text-white" : "text-gray-600 hover:bg-gray-50"}`}
+              title="Grouped, net lines per document - settlement edit/Unsettle noise that cancels out is hidden"
+            >
+              Short view
+            </button>
+            <button
+              type="button"
+              onClick={() => setShortView(false)}
+              className={`px-3 py-1.5 border-l ${!shortView ? "bg-blue-600 text-white" : "text-gray-600 hover:bg-gray-50"}`}
+              title="Every posted line individually - today's existing behaviour"
+            >
+              Full view
+            </button>
+          </div>
           <label className="flex items-center gap-1.5 text-xs text-gray-600 ml-2 cursor-pointer">
             <input
               type="checkbox"
@@ -292,6 +317,7 @@ function LedgerTable({
               setFrom("");
               setTo("");
               setHideReversed(false);
+              setShortView(true);
             }}
             className="border rounded-lg px-4 py-2 text-sm hover:bg-gray-50"
           >
@@ -443,6 +469,10 @@ export default function PartyLedgerPage({
   // (lib/ledger-description.ts's hideReversedEntries) - never changes
   // any balance.
   const [hideReversed, setHideReversed] = useState(false);
+  // Short view is DEFAULT ON (lib/ledger-description.ts's shortView) -
+  // display only, never changes any balance; "Full view" is today's
+  // exact existing behaviour, always one click away.
+  const [shortView, setShortView] = useState(true);
 
   useEffect(() => {
     params.then((p) => {
@@ -459,6 +489,7 @@ export default function PartyLedgerPage({
         if (saved.to) setTo(saved.to);
         if (saved.typeFilter) setTypeFilter(saved.typeFilter as TxType);
         if (saved.hideReversed) setHideReversed(true);
+        if (saved.shortView === false) setShortView(false);
       }
     });
   }, [params]);
@@ -500,6 +531,7 @@ export default function PartyLedgerPage({
         if (to) query.set("to", to);
         if (typeFilter !== "ALL") query.set("type", typeFilter);
         if (hideReversed) query.set("hideReversed", "true");
+        if (!shortView) query.set("view", "full");
 
         const response = await fetch(`/api/parties/${partyId}/ledger?${query.toString()}`);
         const result = await response.json();
@@ -518,15 +550,15 @@ export default function PartyLedgerPage({
     }
 
     load();
-  }, [partyId, from, to, typeFilter, hideReversed]);
+  }, [partyId, from, to, typeFilter, hideReversed, shortView]);
 
-  // Persist from/to/typeFilter/hideReversed whenever any of them
-  // change - `search` is persisted separately, inside LedgerTable
+  // Persist from/to/typeFilter/hideReversed/shortView whenever any of
+  // them change - `search` is persisted separately, inside LedgerTable
   // itself (it's local state there, see that component's own effect).
   useEffect(() => {
     if (!partyId) return;
-    saveListFilters(partyLedgerListKey(partyId), { from, to, typeFilter, hideReversed });
-  }, [partyId, from, to, typeFilter, hideReversed]);
+    saveListFilters(partyLedgerListKey(partyId), { from, to, typeFilter, hideReversed, shortView });
+  }, [partyId, from, to, typeFilter, hideReversed, shortView]);
 
   const { highlightId, onOpenRecord } = useListScrollRestore(partyId ? partyLedgerListKey(partyId) : "party-ledger:pending", !loading && !!partyId);
 
@@ -704,6 +736,8 @@ export default function PartyLedgerPage({
             setTypeFilter={setTypeFilter}
             hideReversed={hideReversed}
             setHideReversed={setHideReversed}
+            shortView={shortView}
+            setShortView={setShortView}
             highlightId={highlightId}
             onOpenRecord={onOpenRecord}
           />

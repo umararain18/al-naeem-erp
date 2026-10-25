@@ -78,6 +78,8 @@ export async function GET(
     const from = searchParams.get("from");
     const to = searchParams.get("to");
     const documentType = parseLedgerEntryType(searchParams.get("type"));
+    const hideReversedEntries = searchParams.get("hideReversed") === "true";
+    const shortView = searchParams.get("view") !== "full";
     const search = searchParams.get("search") || searchParams.get("q");
     // The SAME Ledger Details selection the on-screen table used to
     // produce this export - never a second, export-only selection,
@@ -92,7 +94,7 @@ export async function GET(
     // orders itself. When a Type filter is active, every row AND the
     // Opening/Closing balance below are scoped to only that type -
     // see getPartyLedgerData()'s own doc comment.
-    const data = await getPartyLedgerData(id, { from, to, order: "asc", documentType });
+    const data = await getPartyLedgerData(id, { from, to, order: "asc", documentType, hideReversedEntries, shortView });
 
     // Search narrows ROWS only - Opening/Closing Balance stay as
     // data.summary's own Type+Date-filtered figures, exactly mirroring
