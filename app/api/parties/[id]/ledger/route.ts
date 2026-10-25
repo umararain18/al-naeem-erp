@@ -25,6 +25,10 @@ export async function GET(
     const to = searchParams.get("to");
     const documentType = parseLedgerEntryType(searchParams.get("type"));
     const hideReversedEntries = searchParams.get("hideReversed") === "true";
+    // Short view is DEFAULT ON - only an explicit "view=full" turns it
+    // off (see lib/ledger-description.ts's AccountLedgerOptions.
+    // shortView for the full balance-safety contract).
+    const shortView = searchParams.get("view") !== "full";
 
     // Normal browser Party Ledger screen: newest -> oldest, like
     // every other normal ERP transaction/list screen. The
@@ -38,6 +42,7 @@ export async function GET(
       documentType,
       includeOpeningBalanceRow: true,
       hideReversedEntries,
+      shortView,
     });
 
     return NextResponse.json({ success: true, ...data });

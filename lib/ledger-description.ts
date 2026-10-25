@@ -126,6 +126,22 @@ export function parseLedgerEntryType(value: string | null | undefined): LedgerEn
   return (LEDGER_ENTRY_TYPES as readonly string[]).includes(upper) ? (upper as LedgerEntryType) : null;
 }
 
+/**
+ * The "money type" Party Ledger's Short View (AccountLedgerOptions.
+ * shortView) groups and nets by, together with the row's own document
+ * identity (Bilty No/Challan No from `details`) - see
+ * groupRowsForShortView() below. Derived the SAME way documentType
+ * already is: from sourceType/referenceType/component, falling back to
+ * the line's own already-persisted description text ONLY where no
+ * structural signal exists (an Unsettle reversal, or the OLD single-
+ * payer mechanism's own reclassification lines - both already use this
+ * exact precedent elsewhere in this file, e.g. extractHousekeepingNoise's
+ * isOldMechanismCarrierRentLine). "DAILY_POSTING" is never grouped by
+ * Short View (every receipt/payment stays its own line) - see this
+ * type's own callers.
+ */
+export type MoneyType = "BILTY_RENT_COLLECTION" | "BILTY_PAID" | "CARRIER_RENT" | "DAILY_POSTING" | "OTHER";
+
 export interface DisplayLedgerRow {
   id: string;
   date: string;
@@ -145,6 +161,7 @@ export interface DisplayLedgerRow {
    * the final `ledger` array); nothing here changes any balance.
    */
   isReversedPairMember: boolean;
+  moneyType: MoneyType;
   history: DisplayHistoryItem[];
   documentType: LedgerEntryType;
   details: LedgerRowDetails;
@@ -408,6 +425,95 @@ function challanDescription(
   const veh = relevantBilty ? vehicleLabel(relevantBilty) : vehicleLabels(challan.bilties);
   if (veh) parts.push(veh);
   return `${parts.join(", ")}, ${direction} ${formatRs(amount)}`;
+}
+
+// ============================================================
+// CLEARER DESCRIPTIONS - 3 specific, narrow cases only (everything
+// else keeps its existing wording, byte-for-byte). Format: "<refs> —
+// <meaning>", refs joined by " · " (never ", " - deliberately
+// distinct from biltyDescription()/challanDescription()'s own comma
+// style above, so these 3 cases read visibly differently from the
+// generic amount-bearing description they replace).
+// ============================================================
+
+function shortRef(parts: (string | null | undefined)[]): string {
+  return parts.filter((p): p is string => !!p).join(" · ");
+}
+
+/**
+ * Rule 1: a Daily Posting receipt/payment resolved (directly or via
+ * PaymentAllocation) to a Challan or one of its Bilties. Always
+ * Challan-first (even when resolved only via a Bilty, per the
+ * approved spec's own single example covering both cases) - omitted
+ * when not currently resolvable, never guessed.
+ */
+function dailyPostingAgainstDocumentDescription(
+  challanNo: string | null,
+  biltyNo: string | null,
+  vehicle: string | null,
+  mainAccountName: string | null,
+  direction: "Received" | "Paid"
+): string {
+  const refs = shortRef([challanNo ? `Challan ${challanNo}` : null, biltyNo ? `Bilty ${biltyNo}` : null, vehicle]);
+  const meaning =
+    direction === "Received"
+      ? mainAccountName
+        ? `Commission received in ${mainAccountName}`
+        : "Commission received"
+      : mainAccountName
+        ? `Paid to party from ${mainAccountName}`
+        : "Paid to party";
+  return refs ? `${refs} — ${meaning}` : meaning;
+}
+
+/** Rule 2: a Bilty rent/To-Pay Collection SettlementPayment row - Bilty-first. */
+function collectionDescription(biltyNo: string | null, challanNo: string | null, vehicle: string | null, direction: "Received" | "Paid"): string {
+  const refs = shortRef([biltyNo ? `Bilty ${biltyNo}` : null, challanNo ? `Challan ${challanNo}` : null, vehicle]);
+  const meaning = direction === "Received" ? "Bilty rent received from client" : "Bilty rent paid to client";
+  return refs ? `${refs} — ${meaning}` : meaning;
+}
+
+/** Rule 3: a Carrier Rent SettlementPayment row (or the OLD single-payer mechanism's own equivalent) - Challan-first. */
+function carrierRentDescription(challanNo: string | null, biltyNo: string | null, vehicle: string | null, direction: "Received" | "Paid"): string {
+  const refs = shortRef([challanNo ? `Challan ${challanNo}` : null, biltyNo ? `Bilty ${biltyNo}` : null, vehicle]);
+  const meaning = direction === "Paid" ? "Paid carrier rent" : "Carrier rent received";
+  return refs ? `${refs} — ${meaning}` : meaning;
+}
+
+/**
+ * MoneyType for a STANDALONE line (never a grouped SettlementPayment
+ * bucket - see classifyBucketMoneyType below). Structural signals
+ * first (referenceType, matching this file's existing branches
+ * exactly); description-text detection only where no structural
+ * signal exists - the SAME precedent extractHousekeepingNoise's own
+ * isOldMechanismCarrierRentLine already established in this file.
+ */
+function classifyStandaloneMoneyType(line: RawLedgerLine): MoneyType {
+  if (line.referenceType === "DAILY_POSTING") return "DAILY_POSTING";
+  if (line.referenceType === "PAID_RESPONSIBILITY_REASSIGNMENT") return "BILTY_PAID";
+
+  const text = (line.lineDescription || line.entryDescription || "").toLowerCase();
+
+  if (line.referenceType === "SETTLEMENT_UNSETTLE_REVERSAL") {
+    // Copies the ORIGINAL line's own description verbatim into
+    // "...reversing: <original description>" (see lib/challan-
+    // lifecycle.ts's reverseChallanSettlementEntries) - the same
+    // keywords the original's own classification below would have
+    // matched are still present here.
+    if (text.includes("carrier rent")) return "CARRIER_RENT";
+    if (text.includes("collection reclassified")) return "BILTY_RENT_COLLECTION";
+    if (text.includes("paid responsibility")) return "BILTY_PAID";
+    return "OTHER";
+  }
+
+  if ((line.referenceType === "SETTLEMENT" || line.referenceType === "SETTLEMENT_CORRECTION") && text.includes("carrier rent")) {
+    return "CARRIER_RENT";
+  }
+  if ((line.referenceType === "SETTLEMENT" || line.referenceType === "SETTLEMENT_CORRECTION") && text.includes("collection reclassified")) {
+    return "BILTY_RENT_COLLECTION";
+  }
+
+  return "OTHER";
 }
 
 interface SettlementPaymentLite {
@@ -741,6 +847,25 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
       }
       if (a.targetSourceType === "BILTY") biltyIds.add(a.targetSourceId);
       if (a.targetSourceType === "CHALLAN") challanIds.add(a.targetSourceId);
+    }
+  }
+
+  // "Main account" for a Daily Posting entry (e.g. "Umar Bank") - the
+  // ONE line in the entry whose account is a real Cash/Bank account
+  // (never guessed by position/amount - every Daily Posting entry has
+  // exactly one, see app/api/daily-posting/route.ts), used by
+  // dailyPostingAgainstDocumentDescription() above. Keyed by
+  // journalEntryId since one entry can have several counter lines
+  // (a multi-split Daily Posting) sharing the SAME main account.
+  const dailyPostingEntryIds = [...new Set(remaining.filter((l) => l.referenceType === "DAILY_POSTING").map((l) => l.journalEntryId))];
+  const mainAccountNameByEntryId = new Map<string, string>();
+  if (dailyPostingEntryIds.length > 0) {
+    const mainAccountLines = await prisma.journalLine.findMany({
+      where: { journalEntryId: { in: dailyPostingEntryIds }, account: { category: { in: ["CASH", "BANK"] } } },
+      select: { journalEntryId: true, account: { select: { accountName: true } } },
+    });
+    for (const l of mainAccountLines) {
+      if (!mainAccountNameByEntryId.has(l.journalEntryId)) mainAccountNameByEntryId.set(l.journalEntryId, l.account.accountName);
     }
   }
 
@@ -1133,16 +1258,19 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
       let documentType: LedgerEntryType;
       let details: LedgerRowDetails;
 
+      let moneyType: MoneyType;
+
       if (p.component === "CARRIER_RENT" && p.challanId) {
         const challan = challanCtxById.get(p.challanId);
         const direction: "Received" | "Paid" = net >= 0 ? "Received" : "Paid";
         reference = challan ? challanReference(challan.challanNo) : "Challan";
         referenceHref = `/challan/${p.challanId}`;
         description = challan
-          ? challanDescription(challan, null, Math.abs(net), direction)
+          ? carrierRentDescription(challan.challanNo, challan.soleBiltyNo, vehicleLabels(challan.bilties), direction)
           : `Carrier Rent, ${direction} ${formatRs(net)}`;
         documentType = "CHALLAN";
         details = challan ? challanDetails(challan, null, direction) : { paymentType: direction };
+        moneyType = "CARRIER_RENT";
       } else if (p.biltyId) {
         const bilty = biltyById.get(p.biltyId);
         reference = bilty ? biltyReference(bilty.biltyNo) : "Bilty";
@@ -1157,13 +1285,22 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
         // state, not a cash "Received"). An actual cash receipt is
         // always a SEPARATE, plain DAILY_POSTING-tagged line, handled
         // by directionWord() in the standalone-lines loop below, which
-        // this branch never touches. Every other Bilty-related
-        // component (e.g. COLLECTION) keeps its existing sign-based
-        // wording unchanged.
+        // this branch never touches.
         const direction: "Received" | "Paid" = p.component === "PAID" ? "Paid" : net >= 0 ? "Received" : "Paid";
-        description = bilty
-          ? biltyDescription(bilty, Math.abs(net), direction, biltyChallanLinkById.get(bilty.id)?.challanNo)
-          : `Bilty, ${direction} ${formatRs(net)}`;
+        const currentChallanNo = bilty ? biltyChallanLinkById.get(bilty.id)?.challanNo || null : null;
+        if (p.component === "COLLECTION") {
+          description = bilty
+            ? collectionDescription(bilty.biltyNo, currentChallanNo, vehicleLabel(bilty), direction)
+            : `Bilty rent, ${direction} ${formatRs(net)}`;
+          moneyType = "BILTY_RENT_COLLECTION";
+        } else {
+          // PAID - keeps its existing wording (not one of the 3
+          // clearer-description cases).
+          description = bilty
+            ? biltyDescription(bilty, Math.abs(net), direction, currentChallanNo)
+            : `Bilty, ${direction} ${formatRs(net)}`;
+          moneyType = "BILTY_PAID";
+        }
         documentType = "BILTY";
         details = bilty ? biltyDetails(bilty, direction) : { paymentType: direction };
       } else {
@@ -1173,6 +1310,7 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
         description = `${direction} ${formatRs(net)}`;
         documentType = "OTHER";
         details = { paymentType: direction };
+        moneyType = "OTHER";
       }
 
       rows.push({
@@ -1183,6 +1321,7 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
         description,
         debit,
         credit,
+        moneyType,
         isGrouped: history.length > 1,
         isRemoved: false,
         isReversedPairMember: reversedPairBucketKeys.has(key),
@@ -1222,6 +1361,7 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
         description: documentLabel ? `${documentLabel}, Settlement payment removed` : "Settlement payment removed",
         debit,
         credit,
+        moneyType: "OTHER",
         isGrouped: true,
         isRemoved: true,
         isReversedPairMember: false,
@@ -1243,6 +1383,8 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
     const credit = line.credit;
     const amount = Math.abs(debit - credit) || Math.max(debit, credit);
     const direction = directionWord(line.referenceType, debit, credit);
+    const moneyType = classifyStandaloneMoneyType(line);
+    const mainAccountName = moneyType === "DAILY_POSTING" ? mainAccountNameByEntryId.get(line.journalEntryId) || null : null;
 
     let reference: string;
     let referenceHref: string | null;
@@ -1269,7 +1411,12 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
       const specificBilty = line.sourceId ? biltyById.get(line.sourceId) : null;
       reference = challanReference(challan.challanNo);
       referenceHref = `/challan/${line.referenceId}`;
-      description = challanDescription(challan, specificBilty, amount, direction);
+      description = carrierRentDescription(
+        challan.challanNo,
+        specificBilty?.biltyNo || challan.soleBiltyNo,
+        specificBilty ? vehicleLabel(specificBilty) : vehicleLabels(challan.bilties),
+        direction
+      );
       documentType = "CHALLAN";
       details = challanDetails(challan, specificBilty, direction);
     } else if (line.sourceType === "BILTY" && line.sourceId && biltyById.has(line.sourceId)) {
@@ -1287,6 +1434,14 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
       const rawDescription = line.lineDescription || line.entryDescription || "";
       description = rawDescription.includes("bilty expense.")
         ? rawDescription
+        : line.referenceType === "DAILY_POSTING"
+        ? dailyPostingAgainstDocumentDescription(
+            biltyChallanLinkById.get(bilty.id)?.challanNo || null,
+            bilty.biltyNo,
+            vehicleLabel(bilty),
+            mainAccountName,
+            direction
+          )
         : biltyDescription(bilty, amount, direction, biltyChallanLinkById.get(bilty.id)?.challanNo);
       documentType = "BILTY";
       details = biltyDetails(bilty, direction);
@@ -1294,7 +1449,10 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
       const challan = challanCtxById.get(line.sourceId)!;
       reference = challanReference(challan.challanNo);
       referenceHref = `/challan/${line.sourceId}`;
-      description = challanDescription(challan, null, amount, direction);
+      description =
+        line.referenceType === "DAILY_POSTING"
+          ? dailyPostingAgainstDocumentDescription(challan.challanNo, challan.soleBiltyNo, vehicleLabels(challan.bilties), mainAccountName, direction)
+          : challanDescription(challan, null, amount, direction);
       documentType = "CHALLAN";
       details = challanDetails(challan, null, direction);
     } else if (
@@ -1328,14 +1486,20 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
         const bilty = biltyById.get(alloc.targetSourceId)!;
         reference = biltyReference(bilty.biltyNo);
         referenceHref = `/bilty/${alloc.targetSourceId}`;
-        description = biltyDescription(bilty, amount, direction, biltyChallanLinkById.get(bilty.id)?.challanNo);
+        description = dailyPostingAgainstDocumentDescription(
+          biltyChallanLinkById.get(bilty.id)?.challanNo || null,
+          bilty.biltyNo,
+          vehicleLabel(bilty),
+          mainAccountName,
+          direction
+        );
         documentType = "BILTY";
         details = biltyDetails(bilty, direction);
       } else if (alloc?.targetSourceType === "CHALLAN" && challanCtxById.has(alloc.targetSourceId)) {
         const challan = challanCtxById.get(alloc.targetSourceId)!;
         reference = challanReference(challan.challanNo);
         referenceHref = `/challan/${alloc.targetSourceId}`;
-        description = challanDescription(challan, null, amount, direction);
+        description = dailyPostingAgainstDocumentDescription(challan.challanNo, challan.soleBiltyNo, vehicleLabels(challan.bilties), mainAccountName, direction);
         documentType = "CHALLAN";
         details = challanDetails(challan, null, direction);
       } else if (line.sourceType === "PRIVATE_PHONCH" && line.sourceId) {
@@ -1474,6 +1638,7 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
       description,
       debit,
       credit,
+      moneyType,
       isGrouped: false,
       isRemoved: false,
       isReversedPairMember: reversedPairLineIds.has(line.id),
@@ -1533,6 +1698,7 @@ export interface FinalLedgerRow {
   isGrouped: boolean;
   isReversedPairMember: boolean;
   isRemoved: boolean;
+  moneyType: MoneyType;
   history: DisplayHistoryItem[];
   documentType: LedgerEntryType;
   details: LedgerRowDetails;
@@ -1610,6 +1776,27 @@ export interface AccountLedgerOptions {
    * keeps its exact current row list unless it asks for this.
    */
   hideReversedEntries?: boolean;
+  /**
+   * Party Ledger's "Short view" - groups the returned `ledger` array
+   * by document (Bilty/Challan) and MoneyType into ONE net row per
+   * group (see groupRowsForShortView below), dropping any group whose
+   * net rounds to 0 (an add/remove or Unsettle-reversal pair that
+   * cancels out) - never a DAILY_POSTING row, which always stays its
+   * own separate line. Applied strictly AFTER every row's own
+   * `balance` and the account's own summary are already computed from
+   * the FULL, unfiltered set (same philosophy as hideReversedEntries
+   * above) - a grouped row's `balance` is simply its latest member's
+   * own already-correct value, so the closing balance is always
+   * identical whether this is on or off. Also applies
+   * hideReversedEntries's own filtering first (redundant with this
+   * option's own net-zero drop for an EXACT Unsettle pair, but a
+   * second, independent safety net for it, and the only thing that
+   * removes a pair with no document reference to group by at all).
+   * Opt-in and default false/omitted so every existing caller
+   * (General Ledger, PDF/Excel exports that don't ask for it) keeps
+   * its exact current row list.
+   */
+  shortView?: boolean;
 }
 
 export interface AccountLedgerData {
@@ -1635,6 +1822,131 @@ function classifyBalance(value: number): "RECEIVABLE" | "PAYABLE" | "SETTLED" {
   return "SETTLED";
 }
 
+/**
+ * The document a row groups under for Short View, per MoneyType's own
+ * natural anchor (CARRIER_RENT -> Challan; BILTY_RENT_COLLECTION/
+ * BILTY_PAID -> Bilty; OTHER -> whichever reference exists, Challan
+ * preferred) - reusing `details.biltyNo`/`details.challanNo`, already
+ * resolved by buildUserFacingLedgerRows() for display, never a second
+ * lookup. `null` means "never grouped, always its own row" - every
+ * DAILY_POSTING row (per the approved spec: "stay as separate lines,
+ * never merged") and anything with no document reference at all (a
+ * Manual Journal, a plain Direct Entry) falls here.
+ */
+function shortViewGroupKey(row: FinalLedgerRow): string | null {
+  if (row.moneyType === "DAILY_POSTING") return null;
+  const biltyNo = row.details.biltyNo || null;
+  const challanNo = row.details.challanNo || null;
+  if (row.moneyType === "CARRIER_RENT") {
+    if (challanNo) return `CARRIER_RENT:challan:${challanNo}`;
+    if (biltyNo) return `CARRIER_RENT:bilty:${biltyNo}`;
+    return null;
+  }
+  if (row.moneyType === "BILTY_RENT_COLLECTION" || row.moneyType === "BILTY_PAID") {
+    if (biltyNo) return `${row.moneyType}:bilty:${biltyNo}`;
+    if (challanNo) return `${row.moneyType}:challan:${challanNo}`;
+    return null;
+  }
+  if (challanNo) return `OTHER:challan:${challanNo}`;
+  if (biltyNo) return `OTHER:bilty:${biltyNo}`;
+  return null;
+}
+
+/**
+ * Regenerates a Short View group's description from its own net
+ * direction - needed ONLY when 2+ rows actually combine into the
+ * group (the amount differs from what any single member's own
+ * description already says). When a group has exactly ONE real
+ * member, that member's own description is reused completely
+ * unchanged - it is already correct (Full View's own per-row/per-
+ * bucket wording for BILTY_RENT_COLLECTION/CARRIER_RENT is the SAME
+ * clearer wording this produces, by construction - see
+ * collectionDescription()/carrierRentDescription() above; BILTY_PAID/
+ * OTHER keep their own existing wording either way, per the approved
+ * spec's "other entry types keep current wording").
+ */
+function shortViewGroupDescription(moneyType: MoneyType, details: LedgerRowDetails, net: number, direction: "Received" | "Paid"): string {
+  const biltyNo = details.biltyNo || null;
+  const challanNo = details.challanNo || null;
+  const vehicle = details.vehicle || null;
+  if (moneyType === "BILTY_RENT_COLLECTION") return collectionDescription(biltyNo, challanNo, vehicle, direction);
+  if (moneyType === "CARRIER_RENT") return carrierRentDescription(challanNo, biltyNo, vehicle, direction);
+  if (moneyType === "BILTY_PAID") {
+    const refs = shortRef([biltyNo ? `Bilty ${biltyNo}` : null, challanNo ? `Challan ${challanNo}` : null, vehicle]);
+    const meaning = direction === "Received" ? "Bilty paid amount received from client" : "Bilty paid amount paid to client";
+    return refs ? `${refs} — ${meaning}` : meaning;
+  }
+  const refs = shortRef([challanNo ? `Challan ${challanNo}` : null, biltyNo ? `Bilty ${biltyNo}` : null, vehicle]);
+  const meaning = `${direction} ${formatRs(net)}`;
+  return refs ? `${refs} — ${meaning}` : meaning;
+}
+
+/**
+ * Party Ledger's "Short view" (AccountLedgerOptions.shortView) - see
+ * that option's own doc comment for the full balance-safety
+ * contract. Groups `rows` (already in true chronological order) by
+ * shortViewGroupKey(), nets each group's debit/credit, and drops any
+ * group whose net rounds to 0 - an add/remove pair, a "Settlement
+ * payment removed" row, or a correction/Unsettle-reversal pair that
+ * cancels out, exactly as the approved spec lists. Never drops a row
+ * with no group key (DAILY_POSTING, or no document reference at
+ * all) - those always pass through untouched, one line per entry.
+ *
+ * Positioning: a group's single output row is emitted at the
+ * position of its LATEST member (by `effective date` - see the
+ * approved spec) - walking `rows` once in their already-correct
+ * chronological order and emitting a group only at its last member's
+ * index is what achieves this without any new sort (which would lose
+ * the same-day createdAt tiebreak compareChronological() already
+ * established upstream).
+ */
+function groupRowsForShortView(rows: FinalLedgerRow[]): FinalLedgerRow[] {
+  const keys = rows.map(shortViewGroupKey);
+  const lastIndexForKey = new Map<string, number>();
+  keys.forEach((k, i) => {
+    if (k !== null) lastIndexForKey.set(k, i);
+  });
+  const membersForKey = new Map<string, FinalLedgerRow[]>();
+  rows.forEach((row, i) => {
+    const k = keys[i];
+    if (k === null) return;
+    const arr = membersForKey.get(k) || [];
+    arr.push(row);
+    membersForKey.set(k, arr);
+  });
+
+  const result: FinalLedgerRow[] = [];
+  rows.forEach((row, i) => {
+    const k = keys[i];
+    if (k === null) {
+      result.push(row);
+      return;
+    }
+    if (lastIndexForKey.get(k) !== i) return; // not this group's last member - already accounted for below.
+
+    const members = membersForKey.get(k)!;
+    const net = round2(members.reduce((s, m) => s + m.debit - m.credit, 0));
+    if (Math.abs(net) < 0.01) return; // cancels out entirely - dropped.
+
+    const latest = members[members.length - 1];
+    const direction: "Received" | "Paid" = net >= 0 ? "Received" : "Paid";
+    const history = members.flatMap((m) => m.history);
+
+    result.push({
+      ...latest,
+      debit: net > 0 ? Math.abs(net) : 0,
+      credit: net < 0 ? Math.abs(net) : 0,
+      description: members.length > 1 ? shortViewGroupDescription(latest.moneyType, latest.details, Math.abs(net), direction) : latest.description,
+      isGrouped: history.length > 1,
+      isRemoved: members.every((m) => m.isRemoved),
+      isReversedPairMember: false,
+      history,
+    });
+  });
+
+  return result;
+}
+
 // ============================================================
 // ACCOUNT-GENERIC CORE (used by General Ledger for ANY account -
 // system/Gross accounts, Cash/Bank, Party, or any user-created
@@ -1657,7 +1969,8 @@ export async function getAccountLedgerData(
   const order = options.order || "asc";
   const documentType = options.documentType || null;
   const includeOpeningBalanceRow = !!options.includeOpeningBalanceRow;
-  const hideReversedEntries = !!options.hideReversedEntries;
+  const shortView = !!options.shortView;
+  const hideReversedEntries = !!options.hideReversedEntries || shortView;
 
   const account = await prisma.account.findUnique({ where: { id: accountId }, select: { id: true, accountName: true } });
   if (!account) {
@@ -1830,6 +2143,7 @@ export async function getAccountLedgerData(
       isGrouped: row.isGrouped,
       isRemoved: row.isRemoved,
       isReversedPairMember: row.isReversedPairMember,
+      moneyType: row.moneyType,
       history: row.history,
       documentType: row.documentType,
       details: row.details,
@@ -1849,7 +2163,8 @@ export async function getAccountLedgerData(
   // and the already-computed summary (openingBalance/periodDebit/
   // periodCredit/closingBalance) above is entirely unaffected (display
   // only, matching the exact philosophy `order` itself already uses).
-  const visibleLedger = hideReversedEntries ? ledger.filter((row) => !row.isReversedPairMember) : ledger;
+  const reversedFilteredLedger = hideReversedEntries ? ledger.filter((row) => !row.isReversedPairMember) : ledger;
+  const visibleLedger = shortView ? groupRowsForShortView(reversedFilteredLedger) : reversedFilteredLedger;
   const orderedLedger = order === "desc" ? [...visibleLedger].reverse() : visibleLedger;
 
   // Opening Balance row - never part of the chronological reversal
@@ -1882,6 +2197,7 @@ export async function getAccountLedgerData(
       isGrouped: false,
       isRemoved: false,
       isReversedPairMember: false,
+      moneyType: "OTHER",
       history: [],
       documentType: "OTHER",
       details: {},

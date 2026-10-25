@@ -56,6 +56,8 @@ export async function GET(
     const from = searchParams.get("from");
     const to = searchParams.get("to");
     const documentType = parseLedgerEntryType(searchParams.get("type"));
+    const hideReversedEntries = searchParams.get("hideReversed") === "true";
+    const shortView = searchParams.get("view") !== "full";
     const search = searchParams.get("search") || searchParams.get("q");
     // The SAME Ledger Details selection the on-screen table used to
     // produce this export - never a second, export-only selection,
@@ -71,7 +73,7 @@ export async function GET(
     // type - see getPartyLedgerData()'s own doc comment - so the
     // exported PDF always matches exactly what the filtered screen
     // shows, never the full unfiltered account.
-    const data = await getPartyLedgerData(id, { from, to, order: "asc", documentType });
+    const data = await getPartyLedgerData(id, { from, to, order: "asc", documentType, hideReversedEntries, shortView });
 
     // Search narrows which ROWS appear - the exact same
     // filterLedgerRowsBySearch() the screen/General Ledger already
