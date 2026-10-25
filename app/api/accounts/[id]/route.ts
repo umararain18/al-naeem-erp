@@ -28,6 +28,7 @@ const updateAccountSchema = z.object({
       "EQUITY",
       "INCOME",
       "EXPENSE",
+      "PARTY",
     ])
     .optional(),
 
@@ -41,6 +42,7 @@ const updateAccountSchema = z.object({
       "TRANSPORTER_PAYABLE",
       "DELIVERY_POINT_PAYABLE",
       "VENDOR_PAYABLE",
+      "EMPLOYEE_PAYABLE",
       "OTHER_LIABILITY",
       "OWNER_CAPITAL",
       "OWNER_DRAWING",
@@ -57,6 +59,7 @@ const updateAccountSchema = z.object({
       "REPAIR_MAINTENANCE",
       "OTHER_EXPENSE",
       "CARRIER_RENT",
+      "PARTY",
     ])
     .optional(),
 
@@ -109,6 +112,7 @@ const allowedCategories: Record<
     AccountCategory.TRANSPORTER_PAYABLE,
     AccountCategory.DELIVERY_POINT_PAYABLE,
     AccountCategory.VENDOR_PAYABLE,
+    AccountCategory.EMPLOYEE_PAYABLE,
     AccountCategory.OTHER_LIABILITY,
   ],
 
@@ -347,13 +351,28 @@ export async function PATCH(
       }
     }
 
-    const accountType =
-      (data.accountType ||
-        existingAccount.accountType) as AccountType;
+    // Employee/Party-linked accounts (employeeId/partyId set at
+    // creation - see app/api/employees/route.ts and
+    // app/api/parties/route.ts) are, like a system account, never
+    // actually free to change type/category - an Employee account is
+    // always LIABILITY/EMPLOYEE_PAYABLE, a Party account always
+    // PARTY/PARTY, by construction. UNLIKE a system account, this is
+    // never rejected outright: the existing value is just silently
+    // kept, so a stale/incorrect value the edit form happened to
+    // submit (e.g. a category dropdown whose fixed option list didn't
+    // include this account's own category, so it visually - but never
+    // in the submitted state - looked like a different one was
+    // selected) can never corrupt the account, and the rest of the
+    // save (Name/Description/Opening Balance) still goes through.
+    const isLinkedAccount = !!existingAccount.employeeId || !!existingAccount.partyId;
 
-    const category =
-      (data.category ||
-        existingAccount.category) as AccountCategory;
+    const accountType = (
+      isLinkedAccount ? existingAccount.accountType : data.accountType || existingAccount.accountType
+    ) as AccountType;
+
+    const category = (
+      isLinkedAccount ? existingAccount.category : data.category || existingAccount.category
+    ) as AccountCategory;
 
     if (
       !isCategoryValidForType(

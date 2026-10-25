@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
-import { getPayslipPaymentState, payrollMonthLabel } from "@/lib/payroll-accounting";
+import { getPooledPayslipPaymentStates, payrollMonthLabel, type PayslipPaymentState } from "@/lib/payroll-accounting";
 import { formatBusinessDate } from "@/lib/date-range";
 
 // ============================================================
@@ -46,15 +46,26 @@ export async function GET(request: NextRequest) {
     const payslips = await prisma.payslip.findMany({
       where: { isDeleted: false, payrollMonth },
       include: {
-        employee: { select: { name: true, designation: true, account: { select: { id: true } } } },
+        employee: { select: { id: true, name: true, designation: true, account: { select: { id: true } } } },
       },
       orderBy: [{ employee: { name: "asc" } }],
     });
 
+    // Pooled, employee-account-wide status (see lib/payroll-
+    // accounting.ts's getPooledPayslipPaymentStates) - computed once
+    // per distinct employee on this page, each covering that
+    // employee's FULL payslip history, not only this one month's.
+    const employeesById = new Map(payslips.map((p) => [p.employee.id, p.employee]));
+    const stateMapsByEmployeeId = new Map<string, Map<string, PayslipPaymentState>>();
+    for (const employee of employeesById.values()) {
+      if (!employee.account) continue;
+      stateMapsByEmployeeId.set(employee.id, await getPooledPayslipPaymentStates(prisma, employee.id, employee.account.id));
+    }
+
     const rows = await Promise.all(
       payslips.map(async (p) => {
         const netPay = Number(p.netPay);
-        const state = await getPayslipPaymentState(prisma, p.id, netPay, p.employee.account!.id);
+        const state = stateMapsByEmployeeId.get(p.employee.id)!.get(p.id)!;
         return {
           payslipNo: p.payslipNo,
           employeeName: p.employee.name,

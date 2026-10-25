@@ -34,6 +34,7 @@ type AccountCategory =
   | "TRANSPORTER_PAYABLE"
   | "DELIVERY_POINT_PAYABLE"
   | "VENDOR_PAYABLE"
+  | "EMPLOYEE_PAYABLE"
   | "OTHER_LIABILITY"
   | "OWNER_CAPITAL"
   | "OWNER_DRAWING"
@@ -86,6 +87,12 @@ type Account = {
     id: string;
     partyName: string;
   } | null;
+
+  // Set only for an Employee's own automatic account (see
+  // app/api/employees/route.ts) - like partyId, this means the
+  // account's type/category are structurally fixed (always LIABILITY/
+  // EMPLOYEE_PAYABLE) and can never actually change via this form.
+  employeeId: string | null;
 };
 
 const accountTypes: {
@@ -156,6 +163,10 @@ const categoriesByType: Record<
     {
       value: "VENDOR_PAYABLE",
       label: "Vendor Payable",
+    },
+    {
+      value: "EMPLOYEE_PAYABLE",
+      label: "Employee Payable",
     },
     {
       value: "OTHER_LIABILITY",
@@ -433,17 +444,17 @@ export default function AccountsPage() {
         ? `/api/accounts/${editingAccount.id}`
         : "/api/accounts";
 
-      // A system account can only have its Name/Description changed
-      // (see app/api/accounts/[id]/route.ts's own enforcement) - only
-      // those two fields are sent, so an unrelated stale value in the
-      // form (accountCode/accountType/category/parentId/partyId, all
-      // disabled below) is never mistaken for an intended change.
-      // Opening Balance is NOT one of those structural fields -
-      // system accounts (e.g. Office Cash) can still have it, so it
-      // is sent on BOTH branches below - except for the Opening
-      // Balance Equity system account itself, which has no eligible
-      // counter-equity account of its own.
-      const isSystemEdit = !!editingAccount?.isSystem;
+      // A system account, or an Employee/Party-linked one, can only
+      // have its Name/Description changed (see app/api/accounts/[id]/
+      // route.ts's own enforcement) - only those two fields are sent,
+      // so an unrelated stale value in the form (accountCode/
+      // accountType/category/parentId/partyId, all disabled below) is
+      // never mistaken for an intended change. Opening Balance is NOT
+      // one of those structural fields - these accounts (e.g. Office
+      // Cash, or any Employee account) can still have it, so it is
+      // sent on BOTH branches below - except for the Opening Balance
+      // Equity system account itself, which has no eligible counter-
+      // equity account of its own.
 
       const isOpeningBalanceEquityAccount =
         !!editingAccount?.isSystem &&
@@ -475,7 +486,7 @@ export default function AccountsPage() {
         },
 
         body: JSON.stringify(
-          isSystemEdit
+          isLinkedEdit
             ? {
                 accountName: accountName.trim(),
                 description: description.trim(),
@@ -507,9 +518,19 @@ export default function AccountsPage() {
       const data = await response.json();
 
       if (!response.ok) {
+        // Zod validation failures (data.errors, a field -> reasons
+        // map from the backend's own result.error.flatten().fieldErrors)
+        // carry the REAL reason a save was rejected - the generic
+        // `message` alone ("Invalid account data") never says which
+        // field or why, so it is appended here rather than shown
+        // alone.
+        const fieldReasons = data.errors
+          ? Object.entries(data.errors as Record<string, string[]>)
+              .map(([field, reasons]) => `${field}: ${reasons.join(", ")}`)
+              .join("; ")
+          : "";
         setError(
-          data.message ||
-            "Unable to save account"
+          [data.message || "Unable to save account", fieldReasons].filter(Boolean).join(" — ")
         );
         return;
       }
@@ -789,6 +810,17 @@ export default function AccountsPage() {
         account.isActive
     );
 
+  // Like a system account, an Employee/Party-linked account's own
+  // type/category/code/parent/party can never actually change here -
+  // see app/api/accounts/[id]/route.ts's own matching guard. Locking
+  // these fields in the form (rather than letting them submit a value
+  // the backend will just silently ignore) keeps the UI honest about
+  // what an edit here can and cannot do.
+  const isLinkedEdit =
+    !!editingAccount?.isSystem ||
+    !!editingAccount?.employeeId ||
+    !!editingAccount?.partyId;
+
   const isOpeningBalanceEquityAccount =
     !!editingAccount?.isSystem &&
     editingAccount?.accountCode === "OPENING-BALANCE";
@@ -824,7 +856,9 @@ export default function AccountsPage() {
               {editingAccount
                 ? editingAccount.isSystem
                   ? "Rename System Account"
-                  : "Edit Account"
+                  : isLinkedEdit
+                    ? "Rename Linked Account"
+                    : "Edit Account"
                 : "Create Account"}
             </h2>
 
@@ -834,6 +868,15 @@ export default function AccountsPage() {
                 Description can be changed - the account code, type, category, parent,
                 and active state are fixed so existing and future JournalLines keep
                 pointing to this same account.
+              </p>
+            )}
+
+            {!editingAccount?.isSystem && isLinkedEdit && (
+              <p className="mb-4 text-sm text-blue-700 bg-blue-50 border border-blue-200 rounded-lg px-4 py-3">
+                This account belongs to {editingAccount?.employeeId ? "an Employee" : "a Party"} and is
+                always {formatCategory(editingAccount!.category)}. Only its Name, Description, and Opening
+                Balance can be changed here - the account code, type, category, parent, and party link are
+                fixed.
               </p>
             )}
 
@@ -859,7 +902,7 @@ export default function AccountsPage() {
                 type="text"
                 placeholder="Account Code (optional)"
                 value={accountCode}
-                disabled={!!editingAccount?.isSystem}
+                disabled={isLinkedEdit}
                 onChange={(e) =>
                   setAccountCode(
                     e.target.value
@@ -872,7 +915,7 @@ export default function AccountsPage() {
 
               <select
                 value={accountType}
-                disabled={!!editingAccount?.isSystem}
+                disabled={isLinkedEdit}
                 onChange={(e) =>
                   handleAccountTypeChange(
                     e.target.value as AccountType
@@ -896,7 +939,7 @@ export default function AccountsPage() {
 
               <select
                 value={category}
-                disabled={!!editingAccount?.isSystem}
+                disabled={isLinkedEdit}
                 onChange={(e) =>
                   setCategory(
                     e.target.value as AccountCategory
@@ -920,7 +963,7 @@ export default function AccountsPage() {
 
               <select
                 value={parentId}
-                disabled={!!editingAccount?.isSystem}
+                disabled={isLinkedEdit}
                 onChange={(e) =>
                   setParentId(
                     e.target.value
@@ -951,7 +994,7 @@ export default function AccountsPage() {
 
               <select
                 value={partyId}
-                disabled={!!editingAccount?.isSystem}
+                disabled={isLinkedEdit}
                 onChange={(e) =>
                   setPartyId(
                     e.target.value

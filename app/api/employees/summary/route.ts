@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
-import { isValidPayrollMonth, round2 } from "@/lib/payroll-accounting";
+import { getActualPaymentsThisMonth, isValidPayrollMonth, round2 } from "@/lib/payroll-accounting";
 
 // ============================================================
 // GET /api/employees/summary?payrollMonth=YYYY-MM
@@ -23,20 +23,20 @@ import { isValidPayrollMonth, round2 } from "@/lib/payroll-accounting";
 // totalPayable (balance > 0) or totalAdvance (balance < 0, summed as
 // its absolute value) - never both, never cancelled out.
 //
-// "Total Paid This Month" / "This Month Payroll" are scoped to the
-// given payrollMonth's Payslips specifically (Part 3/6/7): payroll =
-// sum(Payslip.netPay), paid = sum of REAL PAYROLL_PAYMENT debits on
-// the employee-account leg only. Neither is filtered by the
-// employee's own isDeleted/isActive status - this deliberately
-// matches the Payroll tab's own existing /api/payslips totals
-// exactly (Part 12's "same authoritative formula, do not calculate
-// independently"), which likewise never cross-references Employee
-// Bin status - Payslip Bin is its own, independent action. The
-// employee-account leg is isolated via `debit > 0` (never `credit >
-// 0`), the SAME structural invariant already relied on in
-// app/api/payslips/[id]/route.ts's own payments list: a
-// PAYROLL_PAYMENT entry always debits the employee account and
-// credits Cash/Bank, never the reverse.
+// "This Month Payroll" = sum(Payslip.netPay) for this payrollMonth's
+// Payslips - not filtered by the employee's own isDeleted/isActive
+// status, matching the Payroll tab's own existing /api/payslips
+// totals (which likewise never cross-references Employee Bin status
+// - Payslip Bin is its own, independent action).
+//
+// "Total Paid This Month" is a DIFFERENT, broader scope: every real
+// Cash/Bank payment to an employee account dated inside this calendar
+// month, from ANY source (Payslip Payment feature, Daily Posting, or
+// a Manual Journal) - see lib/payroll-accounting.ts's
+// getActualPaymentsThisMonth(). NOT scoped to this month's own
+// Payslips (a salary/advance paid via Daily Posting carries no
+// Payslip link, and a payment can land in a different month than the
+// Payslip it covers anyway).
 // ============================================================
 
 export async function GET(request: NextRequest) {
@@ -99,19 +99,14 @@ export async function GET(request: NextRequest) {
     });
     const thisMonthPayroll = round2(payslips.reduce((sum, p) => sum + Number(p.netPay), 0));
 
-    let paidThisMonth = 0;
-    if (payslips.length > 0) {
-      const paymentAgg = await prisma.journalLine.aggregate({
-        where: {
-          sourceType: "PAYSLIP",
-          sourceId: { in: payslips.map((p) => p.id) },
-          debit: { gt: 0 }, // employee-account leg only - excludes the Cash/Bank credit leg of the same entry
-          journalEntry: { referenceType: "PAYROLL_PAYMENT", isDeleted: false },
-        },
-        _sum: { debit: true },
-      });
-      paidThisMonth = round2(Number(paymentAgg._sum.debit || 0));
-    }
+    // "Total Paid This Month" - EVERY real Cash/Bank payment to an
+    // employee account dated in this month, any source (see
+    // lib/payroll-accounting.ts's getActualPaymentsThisMonth) - NOT
+    // scoped to this month's own Payslips (a salary/advance paid via
+    // Daily Posting or a Manual Journal carries no Payslip link at
+    // all, and a payment can land in a different month than the
+    // Payslip it happens to cover anyway).
+    const paidThisMonth = await getActualPaymentsThisMonth(prisma, accountIds, payrollMonth);
 
     return NextResponse.json({
       success: true,
