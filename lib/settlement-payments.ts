@@ -1114,7 +1114,13 @@ export async function getActiveSettlementPayments(
   component: MultiPayerComponent,
   target: { challanId?: string | null; biltyId?: string | null }
 ): Promise<SettlementPaymentRow[]> {
-  const where: Prisma.SettlementPaymentWhereInput = { component };
+  // isActive: true - excludes rows Unsettle deactivated (see
+  // lib/challan-lifecycle.ts's reverseChallanSettlementEntries). Every
+  // caller of this function already means "the CURRENT total" by
+  // "active" (Financial Summary's payer breakdown, the Rent-reduction
+  // active-total guard) - a deactivated row's real journal lines stay
+  // in history forever, just excluded here.
+  const where: Prisma.SettlementPaymentWhereInput = { component, isActive: true };
   if (component === "CARRIER_RENT") {
     where.challanId = target.challanId ?? undefined;
     where.biltyId = null;

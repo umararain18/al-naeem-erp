@@ -163,7 +163,7 @@ export async function computeChallanSettlementSummaryBatch(
   // ------------------------------------------------------------
   const rows = challanIds.length > 0
     ? await prisma.settlementPayment.findMany({
-        where: { challanId: { in: challanIds } },
+        where: { challanId: { in: challanIds }, isActive: true },
         select: { challanId: true, biltyId: true, component: true, payerAccountId: true, amount: true },
       })
     : [];

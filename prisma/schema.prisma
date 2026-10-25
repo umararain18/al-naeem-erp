@@ -8,40 +8,41 @@ datasource db {
 }
 
 model User {
-  id                        String              @id @default(cuid())
-  fullName                  String
-  username                  String              @unique
-  password                  String
-  role                      Role
-  isActive                  Boolean             @default(true)
-  createdAt                 DateTime            @default(now())
-  updatedAt                 DateTime            @updatedAt
-  lastLogin                 DateTime?
-  phone                     String?
-  createdJournalEntries     JournalEntry[]      @relation("JournalEntryCreatedBy")
-  deletedJournalEntries     JournalEntry[]      @relation("JournalEntryDeletedBy")
-  createdBilties            Bilty[]             @relation("BiltyCreatedBy")
-  updatedBilties            Bilty[]             @relation("BiltyUpdatedBy")
-  deletedBilties            Bilty[]             @relation("BiltyDeletedBy")
-  createdChallans           Challan[]           @relation("ChallanCreatedBy")
-  updatedChallans           Challan[]           @relation("ChallanUpdatedBy")
-  deletedChallans           Challan[]           @relation("ChallanDeletedBy")
-  settledChallans           Challan[]           @relation("ChallanSettledBy")
-  createdSettlementPayments SettlementPayment[] @relation("SettlementPaymentCreatedBy")
-  createdEmployees          Employee[]          @relation("EmployeeCreatedBy")
-  deletedEmployees          Employee[]          @relation("EmployeeDeletedBy")
-  createdPayslips           Payslip[]           @relation("PayslipCreatedBy")
-  deletedPayslips           Payslip[]           @relation("PayslipDeletedBy")
-  createdPhonches           Phonch[]            @relation("PhonchCreatedBy")
-  updatedPhonches           Phonch[]            @relation("PhonchUpdatedBy")
-  deletedPhonches           Phonch[]            @relation("PhonchDeletedBy")
-  createdPrivatePhonches    PrivatePhonch[]     @relation("PrivatePhonchCreatedBy")
-  updatedPrivatePhonches    PrivatePhonch[]     @relation("PrivatePhonchUpdatedBy")
-  deletedPrivatePhonches    PrivatePhonch[]     @relation("PrivatePhonchDeletedBy")
-  createdBills              Bill[]              @relation("BillCreatedBy")
-  updatedBills              Bill[]              @relation("BillUpdatedBy")
-  deletedBills              Bill[]              @relation("BillDeletedBy")
-  updatedBusinessSettings   BusinessSettings[]  @relation("BusinessSettingsUpdatedBy")
+  id                            String              @id @default(cuid())
+  fullName                      String
+  username                      String              @unique
+  password                      String
+  role                          Role
+  isActive                      Boolean             @default(true)
+  createdAt                     DateTime            @default(now())
+  updatedAt                     DateTime            @updatedAt
+  lastLogin                     DateTime?
+  phone                         String?
+  createdJournalEntries         JournalEntry[]      @relation("JournalEntryCreatedBy")
+  deletedJournalEntries         JournalEntry[]      @relation("JournalEntryDeletedBy")
+  createdBilties                Bilty[]             @relation("BiltyCreatedBy")
+  updatedBilties                Bilty[]             @relation("BiltyUpdatedBy")
+  deletedBilties                Bilty[]             @relation("BiltyDeletedBy")
+  createdChallans               Challan[]           @relation("ChallanCreatedBy")
+  updatedChallans               Challan[]           @relation("ChallanUpdatedBy")
+  deletedChallans               Challan[]           @relation("ChallanDeletedBy")
+  settledChallans               Challan[]           @relation("ChallanSettledBy")
+  createdSettlementPayments     SettlementPayment[] @relation("SettlementPaymentCreatedBy")
+  deactivatedSettlementPayments SettlementPayment[] @relation("SettlementPaymentDeactivatedBy")
+  createdEmployees              Employee[]          @relation("EmployeeCreatedBy")
+  deletedEmployees              Employee[]          @relation("EmployeeDeletedBy")
+  createdPayslips               Payslip[]           @relation("PayslipCreatedBy")
+  deletedPayslips               Payslip[]           @relation("PayslipDeletedBy")
+  createdPhonches               Phonch[]            @relation("PhonchCreatedBy")
+  updatedPhonches               Phonch[]            @relation("PhonchUpdatedBy")
+  deletedPhonches               Phonch[]            @relation("PhonchDeletedBy")
+  createdPrivatePhonches        PrivatePhonch[]     @relation("PrivatePhonchCreatedBy")
+  updatedPrivatePhonches        PrivatePhonch[]     @relation("PrivatePhonchUpdatedBy")
+  deletedPrivatePhonches        PrivatePhonch[]     @relation("PrivatePhonchDeletedBy")
+  createdBills                  Bill[]              @relation("BillCreatedBy")
+  updatedBills                  Bill[]              @relation("BillUpdatedBy")
+  deletedBills                  Bill[]              @relation("BillDeletedBy")
+  updatedBusinessSettings       BusinessSettings[]  @relation("BusinessSettingsUpdatedBy")
 }
 
 model Party {
@@ -415,9 +416,34 @@ model SettlementPayment {
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
 
+  // Soft-deactivation only - NEVER a substitute for reversing the
+  // real accounting (that always happens via a new, balanced
+  // JournalEntry; this row's own history is never deleted or
+  // mutated beyond these fields). Set by Unsettle
+  // (lib/challan-lifecycle.ts's reverseChallanSettlementEntries) for
+  // every COLLECTION/CARRIER_RENT row scoped to the Challan it
+  // reverses, in the SAME transaction as the reversing entries - a
+  // Challan's Unsettle is all-or-nothing for its own settlement
+  // position, so every such row is deactivated together; there is no
+  // partial-reversal case to track per-row. PAID rows are never
+  // touched by Unsettle (resolved independently of any Challan/
+  // Settlement - see this model's own earlier doc comment). Every
+  // reader that computes a "current"/"active" total (Financial
+  // Summary, Challan position, the Carrier Rent/Collection active-
+  // total guard) must filter isActive: true - a deactivated row and
+  // its real journal lines both stay in history forever, just
+  // excluded from current totals.
+  isActive           Boolean   @default(true)
+  deactivatedAt      DateTime?
+  deactivatedById    String?
+  deactivatedBy      User?     @relation("SettlementPaymentDeactivatedBy", fields: [deactivatedById], references: [id], onDelete: SetNull)
+  deactivationReason String?
+
   @@index([challanId, component])
   @@index([biltyId, component])
   @@index([payerAccountId])
+  @@index([challanId, component, isActive])
+  @@index([biltyId, component, isActive])
 }
 
 enum Role {
@@ -1024,30 +1050,30 @@ model BusinessSettings {
   // ---- Business Details (Section 2) - all optional except the
   // business name itself, per "Optional fields must remain optional.
   // Do not invent mandatory tax/legal fields." ----
-  businessName         String  @default("")
-  legalName            String?
-  shortName            String?
-  phone1               String?
-  phone2               String?
-  whatsapp             String?
-  email                String?
-  website              String?
-  address              String?
-  city                 String?
-  province             String?
-  country              String?
-  ntnNumber            String?
-  registrationNumber   String?
+  businessName       String  @default("")
+  legalName          String?
+  shortName          String?
+  phone1             String?
+  phone2             String?
+  whatsapp           String?
+  email              String?
+  website            String?
+  address            String?
+  city               String?
+  province           String?
+  country            String?
+  ntnNumber          String?
+  registrationNumber String?
 
   // ---- Branding (Section 3) - stable file references only, never
   // binary data. ----
-  mainLogoUrl          String?
-  smallLogoUrl         String?
-  faviconUrl           String?
-  signatureUrl         String?
-  stampUrl             String?
-  brandPrimaryColor    String?
-  brandSecondaryColor  String?
+  mainLogoUrl         String?
+  smallLogoUrl        String?
+  faviconUrl          String?
+  signatureUrl        String?
+  stampUrl            String?
+  brandPrimaryColor   String?
+  brandSecondaryColor String?
 
   // ---- Header & Footer (Section 4) ----
   headerShowLogo         Boolean         @default(true)
@@ -1069,13 +1095,13 @@ model BusinessSettings {
   defaultUseFooter Boolean @default(true)
   defaultUseLogo   Boolean @default(true)
 
-  footerText             String?
-  footerShowPhone        Boolean @default(true)
-  footerShowAddress      Boolean @default(false)
-  footerShowWebsite      Boolean @default(false)
-  footerShowPageNumber   Boolean @default(true)
+  footerText              String?
+  footerShowPhone         Boolean @default(true)
+  footerShowAddress       Boolean @default(false)
+  footerShowWebsite       Boolean @default(false)
+  footerShowPageNumber    Boolean @default(true)
   footerShowGeneratedDate Boolean @default(true)
-  termsAndConditions     String?
+  termsAndConditions      String?
 
   // ---- Invoice / Bill Settings (Section 6) - display/document
   // preferences only. Never a second Bill numbering system: Bill's own
@@ -1083,24 +1109,24 @@ model BusinessSettings {
   // lib/bill-accounting.ts) - invoiceNumberPrefix here is a purely
   // presentational default the Bill form MAY offer to pre-fill in a
   // future integration, never an authoritative counter of its own. ----
-  invoiceTitle           String  @default("BILL")
-  invoiceNumberPrefix    String?
-  currencyLabel          String  @default("Rs.")
-  paymentInstructions    String?
+  invoiceTitle              String  @default("BILL")
+  invoiceNumberPrefix       String?
+  currencyLabel             String  @default("Rs.")
+  paymentInstructions       String?
   defaultTermsAndConditions String?
-  authorizedByLabel      String  @default("Authorized Signature")
-  signatureLabel         String  @default("Signature")
+  authorizedByLabel         String  @default("Authorized Signature")
+  signatureLabel            String  @default("Signature")
 
   // ---- PDF & Print Settings (Section 7) ----
-  pdfPageSize            PdfPageSize    @default(A4)
-  pdfOrientation         PdfOrientation @default(PORTRAIT)
-  pdfDefaultFont         String?
-  pdfDefaultFontSize     Int            @default(10)
-  pdfTableBorderStyle    String?
-  pdfShowWatermark       Boolean        @default(false)
-  pdfWatermarkText       String?
-  pdfShowPageNumber      Boolean        @default(true)
-  pdfShowGeneratedDate   Boolean        @default(true)
+  pdfPageSize          PdfPageSize    @default(A4)
+  pdfOrientation       PdfOrientation @default(PORTRAIT)
+  pdfDefaultFont       String?
+  pdfDefaultFontSize   Int            @default(10)
+  pdfTableBorderStyle  String?
+  pdfShowWatermark     Boolean        @default(false)
+  pdfWatermarkText     String?
+  pdfShowPageNumber    Boolean        @default(true)
+  pdfShowGeneratedDate Boolean        @default(true)
 
   documentTypeSettings DocumentTypeSettings[]
 

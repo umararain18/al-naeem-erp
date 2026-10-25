@@ -85,6 +85,7 @@ interface ReverseSettlementEntriesParams {
 interface ReverseSettlementEntriesResult {
   reversedCount: number;
   reversedEntryIds: string[];
+  deactivatedPaymentRowCount: number;
 }
 
 /**
@@ -161,5 +162,42 @@ export async function reverseChallanSettlementEntries(
     reversedEntryIds.push(entry.id);
   }
 
-  return { reversedCount: reversedEntryIds.length, reversedEntryIds };
+  // DEACTIVATE every COLLECTION/CARRIER_RENT SettlementPayment row for
+  // this Challan - SOFT only (isActive: false), never a delete, and
+  // never touching the real accounting lines above (those stay exactly
+  // as posted, reversal entries included, forever). Scoped to
+  // `challanId: params.challanId` alone: both components "always set
+  // this" (see the model's own doc comment) - CARRIER_RENT rows live
+  // directly on the Challan (biltyId null), COLLECTION rows live on one
+  // of its Bilties but still carry this SAME challanId - so this one
+  // filter already captures every row this Unsettle call's reversal
+  // above just reversed the accounting effect of. A Challan's Unsettle
+  // is all-or-nothing for its own settlement position (see this
+  // function's own module doc comment: "reversing literally every entry
+  // currently in scope"), so there is no partial case where only SOME
+  // of a Challan's rows should be deactivated here.
+  //
+  // PAID rows are never touched - they always have challanId: null
+  // (resolved independently of any Challan/Settlement, see the model's
+  // own doc comment), so this filter structurally excludes them even
+  // without the explicit component check below.
+  const deactivation = await tx.settlementPayment.updateMany({
+    where: {
+      challanId: params.challanId,
+      component: { in: ["COLLECTION", "CARRIER_RENT"] },
+      isActive: true,
+    },
+    data: {
+      isActive: false,
+      deactivatedAt: new Date(),
+      deactivatedById: params.createdById,
+      deactivationReason: params.reason,
+    },
+  });
+
+  return {
+    reversedCount: reversedEntryIds.length,
+    reversedEntryIds,
+    deactivatedPaymentRowCount: deactivation.count,
+  };
 }

@@ -112,6 +112,15 @@ export interface DisplayLedgerRow {
   credit: number;
   isGrouped: boolean;
   isRemoved: boolean;
+  /**
+   * True for a line/grouped-bucket row that is one half of an exact
+   * Unsettle original/reversal pair (see extractReversedPairs below) -
+   * pure metadata, computed unconditionally regardless of whether any
+   * caller asks to hide it. AccountLedgerOptions.hideReversedEntries
+   * decides whether this flag is actually ACTED on (filtered out of
+   * the final `ledger` array); nothing here changes any balance.
+   */
+  isReversedPairMember: boolean;
   history: DisplayHistoryItem[];
   documentType: LedgerEntryType;
   details: LedgerRowDetails;
@@ -503,6 +512,100 @@ function extractHousekeepingNoise(lines: RawLedgerLine[]): { remaining: RawLedge
   return { remaining, suppressed };
 }
 
+/**
+ * Finds every line (standalone OR the single original line living
+ * inside a grouped SettlementPayment bucket) that is one half of an
+ * exact Unsettle original/reversal pair, plus which bucket KEYS are
+ * entirely accounted for by such a match - pure metadata (never
+ * removes/suppresses anything itself; see
+ * DisplayLedgerRow.isReversedPairMember's own doc comment for how a
+ * caller opts in to actually hiding these).
+ *
+ * Pairing key is (sourceType, sourceId) - reverseChallanSettlementEntries
+ * (lib/challan-lifecycle.ts) copies the ORIGINAL line's sourceType/
+ * sourceId verbatim onto its SETTLEMENT_UNSETTLE_REVERSAL mirror, so
+ * this is an exact, reliable match, never amount/date guessing alone.
+ * Each reversal is matched against the first not-yet-consumed
+ * non-reversal line whose own (debit - credit) is its exact negation -
+ * greedy, but safe: an unmatched reversal (no exact-opposite found) is
+ * never hidden, so a genuine data inconsistency never silently
+ * disappears.
+ *
+ * A multi-payer SettlementPayment ESTABLISHMENT line's journalEntryId
+ * matches the row's own `journalEntryId` (see groupSettlementPaymentLines),
+ * so it is pulled OUT of `standalone` and into its bucket - but
+ * Unsettle's reversal of it is a brand-new JournalEntry whose id does
+ * NOT match, so that reversal stays standalone. Without checking bucket
+ * lines too, this exact (and most common) case would never match: the
+ * original lives in a bucket, its reversal lives in `standalone`, and
+ * neither list alone contains both halves of the pair. Checking both
+ * buckets AND standalone here, and letting a bucket's own rendered row
+ * be hidden via `bucketKey`, closes that gap without needing to
+ * physically merge the reversal into the bucket's own `history`.
+ */
+function extractReversedPairs(
+  buckets: Map<string, Bucket>,
+  standaloneLines: RawLedgerLine[]
+): { hiddenLineIds: Set<string>; hiddenBucketKeys: Set<string> } {
+  const hiddenLineIds = new Set<string>();
+  const hiddenBucketKeys = new Set<string>();
+  const sourceBuckets = new Map<string, { line: RawLedgerLine; bucketKey: string | null }[]>();
+
+  function index(line: RawLedgerLine, bucketKey: string | null) {
+    if (!line.sourceType || !line.sourceId) return;
+    const key = `${line.sourceType}:${line.sourceId}`;
+    const arr = sourceBuckets.get(key) || [];
+    arr.push({ line, bucketKey });
+    sourceBuckets.set(key, arr);
+  }
+
+  for (const line of standaloneLines) index(line, null);
+  for (const [key, bucket] of buckets) {
+    for (const line of bucket.lines) index(line, key);
+  }
+
+  // bucketKey -> sum of (debit - credit) of every external reversal
+  // matched against one of ITS lines, used below to decide whether
+  // the bucket's OWN net, once those matches are accounted for,
+  // becomes exactly zero (the only condition under which the bucket's
+  // rendered row itself is also safe to hide).
+  const matchedReversalNetByBucketKey = new Map<string, number>();
+
+  for (const arr of sourceBuckets.values()) {
+    const reversals = arr.filter((e) => e.line.referenceType === "SETTLEMENT_UNSETTLE_REVERSAL");
+    if (reversals.length === 0) continue;
+    const originals = arr.filter((e) => e.line.referenceType !== "SETTLEMENT_UNSETTLE_REVERSAL");
+    const consumed = new Set<string>();
+    for (const rev of reversals) {
+      const revNet = round2(rev.line.debit - rev.line.credit);
+      const match = originals.find((o) => !consumed.has(o.line.id) && round2(o.line.debit - o.line.credit) === round2(-revNet));
+      if (!match) continue;
+      consumed.add(match.line.id);
+      hiddenLineIds.add(rev.line.id);
+      if (match.bucketKey === null) {
+        // Both halves standalone (e.g. the OLD single-payer mechanism's
+        // own default reclassification + its Unsettle reversal) - hide
+        // the matched original line directly, no bucket involved.
+        hiddenLineIds.add(match.line.id);
+      } else {
+        const prior = matchedReversalNetByBucketKey.get(match.bucketKey) || 0;
+        matchedReversalNetByBucketKey.set(match.bucketKey, round2(prior + revNet));
+      }
+    }
+  }
+
+  for (const [bucketKey, matchedNet] of matchedReversalNetByBucketKey) {
+    const bucket = buckets.get(bucketKey);
+    if (!bucket) continue;
+    const bucketOwnNet = round2(bucket.lines.reduce((s, l) => s + l.debit - l.credit, 0));
+    if (Math.abs(round2(bucketOwnNet + matchedNet)) < 0.01) {
+      hiddenBucketKeys.add(bucketKey);
+    }
+  }
+
+  return { hiddenLineIds, hiddenBucketKeys };
+}
+
 function toHistoryItem(line: RawLedgerLine): DisplayHistoryItem {
   return {
     date: line.entryDate.toISOString(),
@@ -532,6 +635,7 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
   const { buckets, standalone } = groupSettlementPaymentLines(lines, settlementPayments);
   const { remaining, suppressed } = extractHousekeepingNoise(standalone);
   void suppressed; // fully-zero-net internal plumbing - intentionally not rendered, never deleted from the database
+  const { hiddenLineIds: reversedPairLineIds, hiddenBucketKeys: reversedPairBucketKeys } = extractReversedPairs(buckets, remaining);
 
   // ----------------------------------------------------------
   // Collect every Bilty/Challan id this account's rows could need
@@ -1048,6 +1152,7 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
         credit,
         isGrouped: history.length > 1,
         isRemoved: false,
+        isReversedPairMember: reversedPairBucketKeys.has(key),
         history,
         documentType,
         details,
@@ -1086,6 +1191,7 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
         credit,
         isGrouped: true,
         isRemoved: true,
+        isReversedPairMember: false,
         history,
         documentType: removedDocumentType,
         details: {},
@@ -1337,6 +1443,7 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
       credit,
       isGrouped: false,
       isRemoved: false,
+      isReversedPairMember: reversedPairLineIds.has(line.id),
       history: [toHistoryItem(line)],
       documentType,
       details,
@@ -1391,6 +1498,7 @@ export interface FinalLedgerRow {
   balance: number;
   balanceType: "RECEIVABLE" | "PAYABLE" | "SETTLED";
   isGrouped: boolean;
+  isReversedPairMember: boolean;
   isRemoved: boolean;
   history: DisplayHistoryItem[];
   documentType: LedgerEntryType;
@@ -1456,6 +1564,19 @@ export interface AccountLedgerOptions {
    * screen routes.
    */
   includeOpeningBalanceRow?: boolean;
+  /**
+   * When true, hides a line or grouped bucket row and its exact
+   * Unsettle original/reversal pair (see
+   * DisplayLedgerRow.isReversedPairMember / extractReversedPairs) from
+   * the returned `ledger` array ONLY - display only, applied strictly
+   * AFTER every row's own
+   * `balance` and the account's own summary (openingBalance/
+   * periodDebit/periodCredit/closingBalance) are already computed from
+   * the FULL, unfiltered set, so no balance is ever affected by this
+   * flag. Opt-in and default false/omitted so every existing caller
+   * keeps its exact current row list unless it asks for this.
+   */
+  hideReversedEntries?: boolean;
 }
 
 export interface AccountLedgerData {
@@ -1503,6 +1624,7 @@ export async function getAccountLedgerData(
   const order = options.order || "asc";
   const documentType = options.documentType || null;
   const includeOpeningBalanceRow = !!options.includeOpeningBalanceRow;
+  const hideReversedEntries = !!options.hideReversedEntries;
 
   const account = await prisma.account.findUnique({ where: { id: accountId }, select: { id: true, accountName: true } });
   if (!account) {
@@ -1674,6 +1796,7 @@ export async function getAccountLedgerData(
       balanceType: classifyBalance(displayRunningBalance),
       isGrouped: row.isGrouped,
       isRemoved: row.isRemoved,
+      isReversedPairMember: row.isReversedPairMember,
       history: row.history,
       documentType: row.documentType,
       details: row.details,
@@ -1685,7 +1808,16 @@ export async function getAccountLedgerData(
   // AFTER the fact only changes which order the finished rows are
   // handed back in; each row's own `balance` already reflects the
   // true balance as of that transaction and needs no recomputation.
-  const orderedLedger = order === "desc" ? [...ledger].reverse() : ledger;
+  //
+  // hideReversedEntries filters HERE, strictly AFTER every row's own
+  // `balance` was already computed above from the FULL, unfiltered
+  // set, in true chronological order - removing a pair member from
+  // the list handed back never changes any OTHER row's own balance,
+  // and the already-computed summary (openingBalance/periodDebit/
+  // periodCredit/closingBalance) above is entirely unaffected (display
+  // only, matching the exact philosophy `order` itself already uses).
+  const visibleLedger = hideReversedEntries ? ledger.filter((row) => !row.isReversedPairMember) : ledger;
+  const orderedLedger = order === "desc" ? [...visibleLedger].reverse() : visibleLedger;
 
   // Opening Balance row - never part of the chronological reversal
   // above (it has no real date of its own). Only injected when asked
@@ -1716,6 +1848,7 @@ export async function getAccountLedgerData(
       balanceType: classifyBalance(openingBalanceFromEntry),
       isGrouped: false,
       isRemoved: false,
+      isReversedPairMember: false,
       history: [],
       documentType: "OTHER",
       details: {},
