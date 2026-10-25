@@ -34,6 +34,30 @@ import { prisma } from "@/lib/prisma";
 // and never misattributes an amount.
 // ============================================================
 
+/**
+ * The Bilty's CURRENT active (non-deleted) Challan link, keyed by
+ * Bilty id - resolved live, at display/read time, never stored.
+ * Shared by every ledger-style view that shows a Bilty-sourced line's
+ * Challan No in its description (Party/General Ledger via
+ * buildUserFacingLedgerRows below, and Cash Book directly - see
+ * app/api/cash-book/route.ts). Takes the first linked Challan when
+ * more than one exists (rare) - never guessed beyond that. A Bilty
+ * moved to a different Challan, or removed from one entirely, is
+ * reflected automatically on the next read - there is no caching.
+ */
+export async function getCurrentChallanNoByBiltyId(biltyIds: string[]): Promise<Map<string, string>> {
+  if (biltyIds.length === 0) return new Map();
+  const links = await prisma.challanBilty.findMany({
+    where: { biltyId: { in: biltyIds }, challan: { isDeleted: false } },
+    select: { biltyId: true, challan: { select: { challanNo: true } } },
+  });
+  const byBiltyId = new Map<string, string>();
+  for (const link of links) {
+    if (!byBiltyId.has(link.biltyId)) byBiltyId.set(link.biltyId, link.challan.challanNo);
+  }
+  return byBiltyId;
+}
+
 export interface RawLedgerLine {
   id: string;
   journalEntryId: string;
@@ -336,9 +360,18 @@ function challanReference(challanNo: string): string {
  * PDF/Excel exports (which carry no Source column at all), so it
  * must be fully self-contained. Only includes a field when the
  * underlying data actually exists - never invented.
+ *
+ * `currentChallanNo` is the Bilty's CURRENT active (non-deleted)
+ * Challan link, resolved at display time by the caller (never stored,
+ * never written back to the JournalEntry/JournalLine) - mirrors
+ * challanDescription()'s own "Bilty No" placement: right after the
+ * line's own primary reference, before Vehicle/Chassis. Omitted
+ * entirely when the Bilty isn't currently on any Challan - never a
+ * stale/historical one.
  */
-function biltyDescription(bilty: BiltyCtx, amount: number, direction: "Received" | "Paid"): string {
+function biltyDescription(bilty: BiltyCtx, amount: number, direction: "Received" | "Paid", currentChallanNo?: string | null): string {
   const parts: string[] = [biltyReference(bilty.biltyNo)];
+  if (currentChallanNo) parts.push(challanReference(currentChallanNo));
   const veh = vehicleLabel(bilty);
   if (veh) parts.push(veh);
   if (bilty.chassisNumber) parts.push(`Chassis No ${bilty.chassisNumber}`);
@@ -1129,7 +1162,7 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
         // wording unchanged.
         const direction: "Received" | "Paid" = p.component === "PAID" ? "Paid" : net >= 0 ? "Received" : "Paid";
         description = bilty
-          ? biltyDescription(bilty, Math.abs(net), direction)
+          ? biltyDescription(bilty, Math.abs(net), direction, biltyChallanLinkById.get(bilty.id)?.challanNo)
           : `Bilty, ${direction} ${formatRs(net)}`;
         documentType = "BILTY";
         details = bilty ? biltyDetails(bilty, direction) : { paymentType: direction };
@@ -1254,7 +1287,7 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
       const rawDescription = line.lineDescription || line.entryDescription || "";
       description = rawDescription.includes("bilty expense.")
         ? rawDescription
-        : biltyDescription(bilty, amount, direction);
+        : biltyDescription(bilty, amount, direction, biltyChallanLinkById.get(bilty.id)?.challanNo);
       documentType = "BILTY";
       details = biltyDetails(bilty, direction);
     } else if (line.sourceType === "CHALLAN" && line.sourceId && challanCtxById.has(line.sourceId)) {
@@ -1272,7 +1305,7 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
       const bilty = biltyById.get(line.referenceId)!;
       reference = biltyReference(bilty.biltyNo);
       referenceHref = `/bilty/${line.referenceId}`;
-      description = biltyDescription(bilty, amount, direction);
+      description = biltyDescription(bilty, amount, direction, biltyChallanLinkById.get(bilty.id)?.challanNo);
       documentType = "BILTY";
       details = biltyDetails(bilty, direction);
     } else if (
@@ -1295,7 +1328,7 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
         const bilty = biltyById.get(alloc.targetSourceId)!;
         reference = biltyReference(bilty.biltyNo);
         referenceHref = `/bilty/${alloc.targetSourceId}`;
-        description = biltyDescription(bilty, amount, direction);
+        description = biltyDescription(bilty, amount, direction, biltyChallanLinkById.get(bilty.id)?.challanNo);
         documentType = "BILTY";
         details = biltyDetails(bilty, direction);
       } else if (alloc?.targetSourceType === "CHALLAN" && challanCtxById.has(alloc.targetSourceId)) {
