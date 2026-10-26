@@ -644,6 +644,13 @@ export async function PATCH(
     const newCarrierRent = body.carrierRent !== undefined ? Number(body.carrierRent) : oldCarrierRent;
     const carrierRentDelta = Number((newCarrierRent - oldCarrierRent).toFixed(2));
 
+    // Settlement posting date = Challan date - if THIS SAME request
+    // also edits loadingDate, the correction below (posted in the
+    // same transaction) uses the NEW date; existing, already-posted
+    // entries are never re-dated (see updateData.loadingDate above,
+    // which only ever affects future writes, never past ones).
+    const effectiveLoadingDate = (updateData.loadingDate as Date | undefined) ?? existingChallan.loadingDate;
+
     if (body.carrierRent !== undefined) {
       updateData.carrierRent = body.carrierRent;
     }
@@ -763,6 +770,7 @@ export async function PATCH(
           delta: carrierRentDelta,
           challanId: id,
           challanNo: existingChallan.challanNo,
+          challanLoadingDate: effectiveLoadingDate,
           biltyId: "",
           biltyNo: "",
           incomeOrExpenseAccountId: carrierRentExpenseAccountId!,

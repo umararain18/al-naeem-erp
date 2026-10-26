@@ -97,6 +97,11 @@ export interface BiltySettlementInput {
 export interface SettlementInput {
   challanId: string;
   challanNo: string;
+  // Settlement posting date = Challan date (Challan.loadingDate) -
+  // the main SETTLEMENT entry is dated this, not the moment Final
+  // Settlement is actually run. createdAt (audit "when was this
+  // actually posted") is untouched - only entryDate changes.
+  entryDate: Date;
   carrierRent: number | string | Decimal;
 
   // Only required when carrierRent > 0.
@@ -433,7 +438,7 @@ export function buildSettlementEntries(
   outstandingPayable = round2(outstandingPayable);
 
   const entry: JournalEntrySpec = {
-    entryDate: new Date(),
+    entryDate: input.entryDate,
     referenceType: "SETTLEMENT",
     referenceId: input.challanId,
     description: `Settlement - ${input.challanNo}`,

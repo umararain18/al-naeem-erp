@@ -259,7 +259,14 @@ export async function reverseChallanSettlementEntries(
 
     await tx.journalEntry.create({
       data: {
-        entryDate: new Date(),
+        // Settlement posting date = Challan date, and a reversal uses
+        // the SAME day as what it reverses (not today, not the
+        // Challan's possibly-since-edited CURRENT loadingDate) -
+        // copying the original entry's own already-posted entryDate
+        // is both correct and exactly what "do not re-date existing
+        // entries if the Challan date changes later" requires, with
+        // no separate Challan lookup needed.
+        entryDate: entry.entryDate,
         referenceType: SETTLEMENT_UNSETTLE_REVERSAL_REFERENCE_TYPE,
         referenceId: entry.referenceId,
         reversesEntryId: entry.id,

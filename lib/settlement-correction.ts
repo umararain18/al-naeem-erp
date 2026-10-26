@@ -373,6 +373,13 @@ interface ApplyCorrectionParams {
   delta: number; // newAmount - oldAmount
   challanId: string;
   challanNo: string;
+  // Settlement posting date = Challan date - used ONLY for the
+  // already-settled branch's SETTLEMENT_CORRECTION entry below; the
+  // not-yet-settled branch's CHALLAN_DISPATCH_CORRECTION/
+  // BILTY_BOOKING_CORRECTION keeps today's date (it is correcting a
+  // booking/dispatch entry, not a settlement one, regardless of
+  // whether this Challan happens to have a loadingDate at all).
+  challanLoadingDate: Date;
   biltyId: string;
   biltyNo: string;
   /** Booking Income account (COLLECTION) or the relevant Expense account (CARRIER_RENT / COMMISSION). */
@@ -408,6 +415,7 @@ export async function applySettlementCorrection(params: ApplyCorrectionParams): 
     delta,
     challanId,
     challanNo,
+    challanLoadingDate,
     biltyId,
     biltyNo,
     incomeOrExpenseAccountId,
@@ -491,7 +499,7 @@ export async function applySettlementCorrection(params: ApplyCorrectionParams): 
 
   await tx.journalEntry.create({
     data: {
-      entryDate: new Date(),
+      entryDate: challanLoadingDate,
       referenceType: "SETTLEMENT_CORRECTION",
       referenceId: challanId,
       description,
@@ -668,6 +676,10 @@ interface ApplyReassignmentParams {
   component: SettlementComponent;
   challanId: string;
   challanNo: string;
+  // Settlement posting date = Challan date - this reassignment only
+  // ever runs against an already-settled Challan (settlementJournalEntryId
+  // is required below), so it always applies.
+  challanLoadingDate: Date;
   /** null for CARRIER_RENT (challan-level, not per-bilty). */
   biltyId: string | null;
   biltyNo: string | null;
@@ -700,6 +712,7 @@ export async function applySettlementReassignment(
     component,
     challanId,
     challanNo,
+    challanLoadingDate,
     biltyId,
     biltyNo,
     incomeOrExpenseAccountId,
@@ -774,7 +787,7 @@ export async function applySettlementReassignment(
 
   await tx.journalEntry.create({
     data: {
-      entryDate: new Date(),
+      entryDate: challanLoadingDate,
       referenceType: "SETTLEMENT_CORRECTION",
       referenceId: challanId,
       description,
