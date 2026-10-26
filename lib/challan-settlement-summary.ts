@@ -69,6 +69,11 @@ export interface BiltySettlementSummary {
   paidVerified: number;
   paidUnverified: number;
   paidResponsiblePartyName: string | null;
+  // Additive - lib/challan-position.ts's own "Receivable ... (Bilty
+  // paid, not received)" line needs the ACCOUNT id (getBiltyPaidVerification
+  // already resolves it; previously dropped before reaching this
+  // struct, since nothing here needed it until now).
+  paidResponsiblePartyAccountId: string | null;
   paidIsInconsistent: boolean;
   toPay: ComponentSummary;
 }
@@ -330,6 +335,7 @@ export async function computeChallanSettlementSummaryBatch(
         paidVerified: pv?.verifiedReceivedAmount ?? 0,
         paidUnverified: pv?.unverifiedAmount ?? 0,
         paidResponsiblePartyName: pv?.responsiblePartyName ?? null,
+        paidResponsiblePartyAccountId: pv?.responsiblePartyAccountId ?? null,
         paidIsInconsistent: pv?.isInconsistent ?? false,
         toPay: toPaySummary,
       });

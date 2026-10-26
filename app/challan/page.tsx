@@ -112,6 +112,7 @@ type ChallanPositionLine = {
   direction: "RECEIVABLE" | "PAYABLE";
   amount: number;
   parties: ChallanPositionParty[];
+  note?: string;
 };
 
 type ChallanPositionBucket = "BEFORE_SETTLEMENT" | "RECEIVABLE" | "PAYABLE" | "RECEIVABLE_PAYABLE" | "CLEARED";
@@ -354,8 +355,8 @@ function PositionCell({ challan }: { challan: Challan }) {
 
   return (
     <div className="space-y-1.5">
-      {position.lines.map((line) => (
-        <div key={line.direction}>
+      {position.lines.map((line, i) => (
+        <div key={`${line.direction}-${i}`}>
           <span className={`inline-block rounded-full px-2 py-0.5 text-xs font-semibold whitespace-nowrap ${positionChipStyles[line.direction]}`}>
             {line.direction === "RECEIVABLE" ? "Receivable" : "Payable"} Rs. {line.amount.toLocaleString()}
           </span>
@@ -367,6 +368,7 @@ function PositionCell({ challan }: { challan: Challan }) {
             ) : (
               <span className="font-medium text-amber-600">Party not set</span>
             )}
+            {line.note ? <span className="text-gray-400"> ({line.note})</span> : null}
           </p>
         </div>
       ))}
