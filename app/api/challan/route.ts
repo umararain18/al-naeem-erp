@@ -8,7 +8,7 @@ import { computeChallanFinancialsBatch } from "@/lib/challan-financials";
 import { getGrossCarrierRentPayableAccountId } from "@/lib/gross-accounts";
 import { getChallanResponsiblePartiesBatch } from "@/lib/document-party-resolution";
 import { computeChallanSettlementSummaryBatch } from "@/lib/challan-settlement-summary";
-import { computeChallanPositionsBatch, type ChallanPosition } from "@/lib/challan-position";
+import { computeChallanPositionsBatch, resolvePaidUnverifiedEntries, type ChallanPosition } from "@/lib/challan-position";
 import { SettlementPaymentError } from "@/lib/settlement-payments";
 import { recognizeBiltyBookingIncome, BiltyRevenueRecognitionError } from "@/lib/bilty-revenue-recognition";
 import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
@@ -180,8 +180,8 @@ export async function GET(request: NextRequest) {
               include: {
                 fromLocation: { select: { id: true, name: true } },
                 toLocation: { select: { id: true, name: true } },
-                consignorParty: { select: { id: true, partyName: true } },
-                consigneeParty: { select: { id: true, partyName: true } },
+                consignorParty: { select: { id: true, partyName: true, account: { select: { id: true } } } },
+                consigneeParty: { select: { id: true, partyName: true, account: { select: { id: true } } } },
                 clearingAgentParty: { select: { id: true, partyName: true } },
                 agentParty: { select: { id: true, partyName: true } },
               },
@@ -256,6 +256,7 @@ export async function GET(request: NextRequest) {
               ? { partyId: cb.bilty.consigneeParty.id, partyName: cb.bilty.consigneeParty.partyName }
               : null,
           })),
+          paidUnverified: resolvePaidUnverifiedEntries(c.bilties, summary),
         };
       })
     );

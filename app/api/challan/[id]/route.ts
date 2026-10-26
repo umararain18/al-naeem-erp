@@ -4,7 +4,7 @@ import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { Prisma } from "@prisma/client";
 import { computeChallanFinancialsBatch } from "@/lib/challan-financials";
-import { computeChallanPosition } from "@/lib/challan-position";
+import { computeChallanPosition, resolvePaidUnverifiedEntries } from "@/lib/challan-position";
 import {
   applySettlementCorrection,
   getSettledPartyAccountIdsBatch,
@@ -112,8 +112,8 @@ export async function GET(
               include: {
                 fromLocation: { select: { id: true, name: true } },
                 toLocation: { select: { id: true, name: true } },
-                consignorParty: { select: { id: true, partyName: true } },
-                consigneeParty: { select: { id: true, partyName: true } },
+                consignorParty: { select: { id: true, partyName: true, account: { select: { id: true } } } },
+                consigneeParty: { select: { id: true, partyName: true, account: { select: { id: true } } } },
                 clearingAgentParty: {
                   select: {
                     id: true,
@@ -240,6 +240,7 @@ export async function GET(
           ? { partyId: cb.bilty.consigneeParty.id, partyName: cb.bilty.consigneeParty.partyName }
           : null,
       })),
+      paidUnverified: resolvePaidUnverifiedEntries(challan.bilties, settlementSummary),
     });
 
     // Per-component current responsibility (Collection/Commission
