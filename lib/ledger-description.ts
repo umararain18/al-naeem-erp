@@ -154,11 +154,15 @@ export interface DisplayLedgerRow {
   isRemoved: boolean;
   /**
    * True for a line/grouped-bucket row that is one half of an exact
-   * Unsettle original/reversal pair (see extractReversedPairs below) -
-   * pure metadata, computed unconditionally regardless of whether any
-   * caller asks to hide it. AccountLedgerOptions.hideReversedEntries
-   * decides whether this flag is actually ACTED on (filtered out of
-   * the final `ledger` array); nothing here changes any balance.
+   * cancelling pair: an Unsettle original/reversal pair (see
+   * extractReversedPairs below), or a removed/reassigned
+   * SettlementPayment's orphaned establishment line and its matching
+   * removal/reassignment-correction line (see
+   * extractRemovedSettlementPairs below) - pure metadata, computed
+   * unconditionally regardless of whether any caller asks to hide it.
+   * AccountLedgerOptions.hideReversedEntries decides whether this
+   * flag is actually ACTED on (filtered out of the final `ledger`
+   * array); nothing here changes any balance.
    */
   isReversedPairMember: boolean;
   moneyType: MoneyType;
@@ -745,6 +749,103 @@ function extractReversedPairs(
   return { hiddenLineIds, hiddenBucketKeys };
 }
 
+/**
+ * Finds every pair where a SettlementPayment's ORIGINAL establishment
+ * line (still tagged referenceType "SETTLEMENT_PAYMENT", but no
+ * longer resolvable into its own "sp:<id>" bucket for THIS account -
+ * see groupSettlementPaymentLines' journalEntryId lookup, which only
+ * succeeds while the row both still exists AND is still owned by
+ * this account) is exactly cancelled by one of:
+ *
+ *  (a) a "removed" bucket - the row was deleted (deleteSettlementPayment,
+ *      lib/settlement-payments.ts), whose own reversal/correction
+ *      lines land in a SEPARATE "sp:<rowId>" bucket (keyed by the
+ *      ROW's id, not the document id the creation line itself
+ *      carries - see groupSettlementPaymentLines), with a nonzero net
+ *      of their own; or
+ *  (b) a standalone PAID_RESPONSIBILITY_REASSIGNMENT line - the row's
+ *      PAID responsibility moved to a different payer
+ *      (reassignPaidResponsibility), so for THIS (old payer's)
+ *      account the row's own current payerAccountId no longer
+ *      matches, and its reassignment-correction line is a plain
+ *      standalone line of its own, never part of any bucket.
+ *
+ * Both halves are DIFFERENT referenceType/sourceType shapes by
+ * construction, so they can never be found by type, and can land on
+ * different dates (an amendment or Unsettle-adjacent correction may
+ * separate them further) - so the only reliable link is the ONE
+ * field createSettlementPayment()/deleteSettlementPayment()/
+ * reassignPaidResponsibility() all independently derive from the SAME
+ * underlying document (challanId ?? biltyId) and persist onto their
+ * own JournalEntry.referenceId, combined with an exact amount
+ * negation (same precedent as extractReversedPairs above) - never
+ * amount/date guessing alone, never matched by moneyType/document
+ * grouping (which is exactly what already fails to reconnect these,
+ * since the orphaned creation line keeps its real document details
+ * while the bucket/standalone correction side does not).
+ */
+function extractRemovedSettlementPairs(
+  buckets: Map<string, Bucket>,
+  standaloneLines: RawLedgerLine[]
+): { hiddenLineIds: Set<string>; hiddenBucketKeys: Set<string> } {
+  const hiddenLineIds = new Set<string>();
+  const hiddenBucketKeys = new Set<string>();
+
+  const creationCandidatesByReferenceId = new Map<string, RawLedgerLine[]>();
+  for (const line of standaloneLines) {
+    if (line.referenceType !== "SETTLEMENT_PAYMENT" || !line.referenceId) continue;
+    const arr = creationCandidatesByReferenceId.get(line.referenceId) || [];
+    arr.push(line);
+    creationCandidatesByReferenceId.set(line.referenceId, arr);
+  }
+  if (creationCandidatesByReferenceId.size === 0) return { hiddenLineIds, hiddenBucketKeys };
+
+  const consumed = new Set<string>();
+
+  function findAndConsumeMatch(referenceIds: Iterable<string>, targetNet: number): RawLedgerLine | null {
+    for (const referenceId of referenceIds) {
+      const candidates = creationCandidatesByReferenceId.get(referenceId) || [];
+      const match = candidates.find((l) => !consumed.has(l.id) && round2(l.debit - l.credit) === round2(targetNet));
+      if (match) {
+        consumed.add(match.id);
+        return match;
+      }
+    }
+    return null;
+  }
+
+  // (a) "removed" buckets (deletion) - net across the bucket's own
+  // lines (already correctly combines a create + any later amendment
+  // corrections + the final deletion reversal, all sharing the row's
+  // own sourceId) negated against an orphaned creation line sharing
+  // the SAME document referenceId.
+  for (const [bucketKey, bucket] of buckets) {
+    if (bucket.payment) continue; // active bucket - not eligible, nothing removed here.
+    const net = round2(bucket.lines.reduce((s, l) => s + l.debit - l.credit, 0));
+    if (Math.abs(net) < 0.01) continue; // already nets to zero within its own bucket - nothing orphaned to pair.
+    const referenceIds = new Set(bucket.lines.map((l) => l.referenceId).filter((id): id is string => !!id));
+    const match = findAndConsumeMatch(referenceIds, -net);
+    if (!match) continue;
+    hiddenLineIds.add(match.id);
+    hiddenBucketKeys.add(bucketKey);
+  }
+
+  // (b) standalone PAID_RESPONSIBILITY_REASSIGNMENT corrections -
+  // same document referenceId (always the biltyId for this
+  // referenceType), exact negation, no bucket involved at all.
+  for (const line of standaloneLines) {
+    if (line.referenceType !== "PAID_RESPONSIBILITY_REASSIGNMENT" || !line.referenceId) continue;
+    const net = round2(line.debit - line.credit);
+    if (Math.abs(net) < 0.01) continue;
+    const match = findAndConsumeMatch([line.referenceId], -net);
+    if (!match) continue;
+    hiddenLineIds.add(match.id);
+    hiddenLineIds.add(line.id);
+  }
+
+  return { hiddenLineIds, hiddenBucketKeys };
+}
+
 function toHistoryItem(line: RawLedgerLine): DisplayHistoryItem {
   return {
     date: line.entryDate.toISOString(),
@@ -774,7 +875,10 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
   const { buckets, standalone } = groupSettlementPaymentLines(lines, settlementPayments);
   const { remaining, suppressed } = extractHousekeepingNoise(standalone);
   void suppressed; // fully-zero-net internal plumbing - intentionally not rendered, never deleted from the database
-  const { hiddenLineIds: reversedPairLineIds, hiddenBucketKeys: reversedPairBucketKeys } = extractReversedPairs(buckets, remaining);
+  const { hiddenLineIds: unsettlePairLineIds, hiddenBucketKeys: unsettlePairBucketKeys } = extractReversedPairs(buckets, remaining);
+  const { hiddenLineIds: removedPairLineIds, hiddenBucketKeys: removedPairBucketKeys } = extractRemovedSettlementPairs(buckets, remaining);
+  const reversedPairLineIds = new Set([...unsettlePairLineIds, ...removedPairLineIds]);
+  const reversedPairBucketKeys = new Set([...unsettlePairBucketKeys, ...removedPairBucketKeys]);
 
   // ----------------------------------------------------------
   // Collect every Bilty/Challan id this account's rows could need
@@ -1364,7 +1468,7 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
         moneyType: "OTHER",
         isGrouped: true,
         isRemoved: true,
-        isReversedPairMember: false,
+        isReversedPairMember: reversedPairBucketKeys.has(key),
         history,
         documentType: removedDocumentType,
         details: {},
@@ -1765,10 +1869,12 @@ export interface AccountLedgerOptions {
   includeOpeningBalanceRow?: boolean;
   /**
    * When true, hides a line or grouped bucket row and its exact
-   * Unsettle original/reversal pair (see
-   * DisplayLedgerRow.isReversedPairMember / extractReversedPairs) from
-   * the returned `ledger` array ONLY - display only, applied strictly
-   * AFTER every row's own
+   * cancelling counterpart - an Unsettle original/reversal pair, or a
+   * removed/reassigned SettlementPayment's orphaned establishment
+   * line and its removal/reassignment-correction line (see
+   * DisplayLedgerRow.isReversedPairMember / extractReversedPairs /
+   * extractRemovedSettlementPairs) - from the returned `ledger` array
+   * ONLY - display only, applied strictly AFTER every row's own
    * `balance` and the account's own summary (openingBalance/
    * periodDebit/periodCredit/closingBalance) are already computed from
    * the FULL, unfiltered set, so no balance is ever affected by this
@@ -1788,10 +1894,14 @@ export interface AccountLedgerOptions {
    * above) - a grouped row's `balance` is simply its latest member's
    * own already-correct value, so the closing balance is always
    * identical whether this is on or off. Also applies
-   * hideReversedEntries's own filtering first (redundant with this
-   * option's own net-zero drop for an EXACT Unsettle pair, but a
-   * second, independent safety net for it, and the only thing that
-   * removes a pair with no document reference to group by at all).
+   * hideReversedEntries's own filtering first - the ONLY thing that
+   * removes an exact cancelling pair that never shares a document
+   * grouping key at all, which is exactly the shape of a removed/
+   * reassigned SettlementPayment's orphaned establishment line vs. its
+   * own removal/reassignment-correction line (see
+   * extractRemovedSettlementPairs) - this filtering step is what
+   * makes both halves of such a pair disappear entirely, not merely
+   * net to a zero-amount row.
    * Opt-in and default false/omitted so every existing caller
    * (General Ledger, PDF/Excel exports that don't ask for it) keeps
    * its exact current row list.
