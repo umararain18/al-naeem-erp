@@ -797,6 +797,7 @@ export async function PATCH(
     let activeChallanContext: {
       challanId: string;
       challanNo: string;
+      challanLoadingDate: Date;
       isSettled: boolean;
       settlementJournalEntryId: string | null;
     } | null = null;
@@ -812,6 +813,7 @@ export async function PATCH(
             select: {
               id: true,
               challanNo: true,
+              loadingDate: true,
               isSettled: true,
               settlementJournalEntryId: true,
             },
@@ -823,6 +825,7 @@ export async function PATCH(
         activeChallanContext = {
           challanId: activeLink.challan.id,
           challanNo: activeLink.challan.challanNo,
+          challanLoadingDate: activeLink.challan.loadingDate,
           isSettled: activeLink.challan.isSettled,
           settlementJournalEntryId: activeLink.challan.settlementJournalEntryId,
         };
@@ -1002,6 +1005,7 @@ export async function PATCH(
           delta: totalDelta,
           challanId: activeChallanContext?.challanId || "",
           challanNo: activeChallanContext?.challanNo || "",
+          challanLoadingDate: activeChallanContext?.challanLoadingDate ?? new Date(),
           biltyId: id,
           biltyNo: data.biltyNo ?? existingBilty.biltyNo,
           incomeOrExpenseAccountId: collectionCorrectionAccountId,
@@ -1019,6 +1023,7 @@ export async function PATCH(
           delta: commissionDelta,
           challanId: activeChallanContext?.challanId || "",
           challanNo: activeChallanContext?.challanNo || "",
+          challanLoadingDate: activeChallanContext?.challanLoadingDate ?? new Date(),
           biltyId: id,
           biltyNo: data.biltyNo ?? existingBilty.biltyNo,
           incomeOrExpenseAccountId: commissionExpenseAccountId!,

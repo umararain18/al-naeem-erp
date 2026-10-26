@@ -132,6 +132,15 @@ const EPS = 0.009;
 interface ComponentContext {
   challanId: string | null;
   challanNo: string | null;
+  // Settlement posting date = Challan date (Challan.loadingDate) -
+  // null only for PAID (no Challan involved at all; those entries
+  // keep today's date - see reassignPaidResponsibility, which does
+  // not go through this context at all). Every JournalEntry this
+  // module posts for CARRIER_RENT/COLLECTION uses this instead of
+  // `new Date()`, so a Challan settled today for a load from last
+  // week posts dated last week, matching Final Settlement's own main
+  // entry (see lib/settlement-accounting.ts).
+  challanLoadingDate: Date | null;
   settlementJournalEntryId: string | null;
   biltyId: string | null;
   biltyNo: string | null;
@@ -192,6 +201,7 @@ async function resolveComponentContext(
     return {
       challanId: null,
       challanNo: null,
+      challanLoadingDate: null,
       settlementJournalEntryId: null,
       biltyId: bilty.id,
       biltyNo: bilty.biltyNo,
@@ -211,6 +221,7 @@ async function resolveComponentContext(
     select: {
       id: true,
       challanNo: true,
+      loadingDate: true,
       isDeleted: true,
       isSettled: true,
       carrierRent: true,
@@ -246,6 +257,7 @@ async function resolveComponentContext(
     return {
       challanId: challan.id,
       challanNo: challan.challanNo,
+      challanLoadingDate: challan.loadingDate,
       settlementJournalEntryId: challan.settlementJournalEntryId,
       biltyId: null,
       biltyNo: null,
@@ -287,6 +299,7 @@ async function resolveComponentContext(
   return {
     challanId: challan.id,
     challanNo: challan.challanNo,
+    challanLoadingDate: challan.loadingDate,
     settlementJournalEntryId: challan.settlementJournalEntryId,
     biltyId: link.bilty.id,
     biltyNo: link.bilty.biltyNo,
@@ -356,7 +369,7 @@ async function syncCollectionFloorForNewEngineRows(
   const link = await tx.challanBilty.findFirst({
     where: { biltyId, challan: { isDeleted: false, status: { not: "CANCELLED" } } },
     select: {
-      challan: { select: { id: true, challanNo: true, isSettled: true, settlementJournalEntryId: true } },
+      challan: { select: { id: true, challanNo: true, loadingDate: true, isSettled: true, settlementJournalEntryId: true } },
       bilty: { select: { id: true, biltyNo: true, toPay: true, advance: true } },
     },
   });
@@ -375,6 +388,7 @@ async function syncCollectionFloorForNewEngineRows(
   const collectionContext: ComponentContext = {
     challanId: link.challan.id,
     challanNo: link.challan.challanNo,
+    challanLoadingDate: link.challan.loadingDate,
     settlementJournalEntryId: link.challan.settlementJournalEntryId,
     biltyId: link.bilty.id,
     biltyNo: link.bilty.biltyNo,
@@ -461,7 +475,7 @@ async function resolveCollectionFloorContext(
   const link = await tx.challanBilty.findFirst({
     where: { biltyId, challan: { isDeleted: false, status: { not: "CANCELLED" } } },
     select: {
-      challan: { select: { id: true, challanNo: true, isSettled: true, settlementJournalEntryId: true } },
+      challan: { select: { id: true, challanNo: true, loadingDate: true, isSettled: true, settlementJournalEntryId: true } },
       bilty: { select: { id: true, biltyNo: true, advance: true, total: true } },
     },
   });
@@ -497,6 +511,7 @@ async function resolveCollectionFloorContext(
   const context: ComponentContext = {
     challanId: link.challan.id,
     challanNo: link.challan.challanNo,
+    challanLoadingDate: link.challan.loadingDate,
     settlementJournalEntryId: link.challan.settlementJournalEntryId,
     biltyId: link.bilty.id,
     biltyNo: link.bilty.biltyNo,
@@ -615,7 +630,7 @@ export async function reconcileCollectionAttributionAtSettlement(
 
   const challan = await tx.challan.findUnique({
     where: { id: challanId },
-    select: { id: true, challanNo: true, settlementJournalEntryId: true },
+    select: { id: true, challanNo: true, loadingDate: true, settlementJournalEntryId: true },
   });
   if (!challan || !challan.settlementJournalEntryId) return;
 
@@ -625,6 +640,7 @@ export async function reconcileCollectionAttributionAtSettlement(
   const collectionContext: ComponentContext = {
     challanId: challan.id,
     challanNo: challan.challanNo,
+    challanLoadingDate: challan.loadingDate,
     settlementJournalEntryId: challan.settlementJournalEntryId,
     biltyId: bilty.id,
     biltyNo: bilty.biltyNo,
@@ -920,7 +936,9 @@ async function ensureOldAttributionWithinFloor(
 
   await tx.journalEntry.create({
     data: {
-      entryDate: new Date(),
+      // Settlement posting date = Challan date (always non-null here -
+      // CARRIER_RENT/COLLECTION always have a Challan).
+      entryDate: context.challanLoadingDate ?? new Date(),
       referenceType: releaseReferenceType,
       referenceId: sourceId,
       description,
@@ -1336,7 +1354,11 @@ export async function createSettlementPayment(
     await tx.journalEntry.create({
       data: {
         id: entryId,
-        entryDate: new Date(),
+        // Settlement posting date = Challan date for CARRIER_RENT/
+        // COLLECTION; PAID has no Challan (challanLoadingDate null),
+        // so it keeps today's date - Paid responsibility is resolved
+        // independently of any Challan/Settlement.
+        entryDate: context.challanLoadingDate ?? new Date(),
         referenceType: "SETTLEMENT_PAYMENT",
         referenceId,
         description,
@@ -1523,7 +1545,7 @@ export async function updateSettlementPaymentAmount(
 
       await tx.journalEntry.create({
         data: {
-          entryDate: new Date(),
+          entryDate: context.challanLoadingDate ?? new Date(),
           referenceType: "SETTLEMENT_PAYMENT_CORRECTION",
           referenceId,
           description,
@@ -1671,7 +1693,7 @@ export async function deleteSettlementPayment(
 
     await tx.journalEntry.create({
       data: {
-        entryDate: new Date(),
+        entryDate: context.challanLoadingDate ?? new Date(),
         referenceType: "SETTLEMENT_PAYMENT_REVERSAL",
         referenceId,
         description,

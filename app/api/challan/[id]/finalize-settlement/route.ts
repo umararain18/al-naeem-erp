@@ -383,6 +383,7 @@ export async function POST(
     const settlementResult = buildSettlementEntries({
       challanId: challan.id,
       challanNo: challan.challanNo,
+      entryDate: challan.loadingDate,
       carrierRent: carrierRentForDefault,
       carrierRentResponsibility,
       carrierRentPartyAccountId,
@@ -502,7 +503,7 @@ export async function POST(
           if (!primaryJournalEntryId) {
             const marker = await tx.journalEntry.create({
               data: {
-                entryDate: new Date(),
+                entryDate: challan.loadingDate,
                 referenceType: "SETTLEMENT",
                 referenceId: challan.id,
                 description: `Settlement - ${challan.challanNo} (fully covered by payment allocations)`,
