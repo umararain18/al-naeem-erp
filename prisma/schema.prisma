@@ -297,11 +297,29 @@ model JournalEntry {
   settledChallans   Challan[]          @relation("ChallanSettlement")
   settlementPayment SettlementPayment?
 
+  // Nullable, additive self-reference: when THIS entry is itself a
+  // reversal (e.g. referenceType "SETTLEMENT_UNSETTLE_REVERSAL" - see
+  // lib/challan-lifecycle.ts's reverseChallanSettlementEntries), this
+  // points at the EXACT JournalEntry it reverses - an exact,
+  // auditable "has entry X already been reversed" check
+  // (tx.journalEntry.findFirst({where:{reversesEntryId: X}})),
+  // replacing the old referenceId+referenceType text/shape scan that
+  // could not distinguish "already reversed" from "still live" and
+  // re-reversed already-cancelled entries on a 2nd+ Unsettle cycle.
+  // NULL on every entry created before this field existed and on
+  // every entry that is not itself a reversal - see
+  // scripts/backfill-reversal-links.ts for how historical reversal
+  // entries get this filled in (dry-run only, never auto-applied).
+  reversesEntryId String?
+  reversesEntry   JournalEntry?  @relation("JournalEntryReversal", fields: [reversesEntryId], references: [id], onDelete: SetNull)
+  reversedBy      JournalEntry[] @relation("JournalEntryReversal")
+
   @@index([entryDate])
   @@index([referenceType])
   @@index([referenceId])
   @@index([createdById])
   @@index([isDeleted])
+  @@index([reversesEntryId])
   @@index([deletedById])
 }
 

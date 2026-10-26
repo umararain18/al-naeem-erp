@@ -308,6 +308,15 @@ export async function getSettledPartyAccountIdsBatch(
 // stay stuck at its settled position even after Unsettle reversed
 // every one of these same-listed entries, since this function would
 // never see the reversing lines it just posted.
+// "SETTLEMENT_OVER_REVERSAL_CORRECTION" - scripts/correct-double-
+// reversed-settlements.ts's own one-off correcting entry for a
+// Challan over-reversed by a past Unsettle bug (lib/challan-
+// lifecycle.ts's reverseChallanSettlementEntries, fixed to reverse
+// each entry at most once - see that function's own doc comment).
+// Added here for the same reason SETTLEMENT_UNSETTLE_REVERSAL was:
+// without it, a corrected Challan's party-net would stay stuck at its
+// wrongly-over-reversed position, and a LATER Unsettle on that same
+// Challan would never find/reverse this correction either.
 export const SETTLEMENT_NET_REFERENCE_TYPES = [
   "SETTLEMENT",
   "SETTLEMENT_CORRECTION",
@@ -317,6 +326,7 @@ export const SETTLEMENT_NET_REFERENCE_TYPES = [
   "COLLECTION_MULTI_PAYER_TRANSITION",
   "CARRIER_RENT_MULTI_PAYER_TRANSITION",
   "SETTLEMENT_UNSETTLE_REVERSAL",
+  "SETTLEMENT_OVER_REVERSAL_CORRECTION",
 ];
 
 // Net (debit - credit) for a party account across the Challan's
