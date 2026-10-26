@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { auditUpdate, actorFromUser, requestContext } from "@/lib/audit-log";
@@ -123,39 +124,48 @@ export async function POST(
     let reversedCount = 0;
     let deactivatedPaymentRowCount = 0;
 
-    await prisma.$transaction(async (tx) => {
-      const result = await reverseChallanSettlementEntries(tx, {
-        challanId: id,
-        challanNo: challan.challanNo,
-        createdById: currentUser.userId,
-        reason: "Unsettle",
-      });
-      reversedCount = result.reversedCount;
-      deactivatedPaymentRowCount = result.deactivatedPaymentRowCount;
+    // SERIALIZABLE - same precedent as lib/settlement-payments.ts's
+    // own writes - so two concurrent Unsettle calls on this same
+    // Challan can never both read "not yet reversed" for the same
+    // entry before either posts; one is forced to retry against the
+    // other's committed result. Belt-and-suspenders alongside
+    // reverseChallanSettlementEntries' own per-entry existence check.
+    await prisma.$transaction(
+      async (tx) => {
+        const result = await reverseChallanSettlementEntries(tx, {
+          challanId: id,
+          challanNo: challan.challanNo,
+          createdById: currentUser.userId,
+          reason: "Unsettle",
+        });
+        reversedCount = result.reversedCount;
+        deactivatedPaymentRowCount = result.deactivatedPaymentRowCount;
 
-      await tx.challan.update({
-        where: { id },
-        data: {
-          isSettled: false,
-          settledAt: null,
-          settledById: null,
-          settlementJournalEntryId: null,
-          outstandingReceivable: 0,
-          outstandingPayable: 0,
-        },
-      });
+        await tx.challan.update({
+          where: { id },
+          data: {
+            isSettled: false,
+            settledAt: null,
+            settledById: null,
+            settlementJournalEntryId: null,
+            outstandingReceivable: 0,
+            outstandingPayable: 0,
+          },
+        });
 
-      await auditUpdate(tx, {
-        actor: actorFromUser(currentUser),
-        module: "CHALLAN",
-        entityType: "Challan",
-        entityId: id,
-        documentNo: challan.challanNo,
-        description: `Unsettled Challan ${challan.challanNo} - ${result.reversedCount} settlement JournalEntry(ies) reversed, ${result.deactivatedPaymentRowCount} settlement payment row(s) deactivated`,
-        changedFields: { isSettled: { old: true, new: false } },
-        ...requestContext(request),
-      });
-    });
+        await auditUpdate(tx, {
+          actor: actorFromUser(currentUser),
+          module: "CHALLAN",
+          entityType: "Challan",
+          entityId: id,
+          documentNo: challan.challanNo,
+          description: `Unsettled Challan ${challan.challanNo} - ${result.reversedCount} settlement JournalEntry(ies) reversed, ${result.deactivatedPaymentRowCount} settlement payment row(s) deactivated`,
+          changedFields: { isSettled: { old: true, new: false } },
+          ...requestContext(request),
+        });
+      },
+      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+    );
 
     return NextResponse.json({
       success: true,
@@ -163,6 +173,12 @@ export async function POST(
       challanId: id,
     });
   } catch (error) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2034") {
+      return NextResponse.json(
+        { success: false, message: "This Challan was modified concurrently. Please retry." },
+        { status: 409 }
+      );
+    }
     console.error("Unsettle challan error:", error);
     return NextResponse.json(
       { success: false, message: "Unable to unsettle challan" },
