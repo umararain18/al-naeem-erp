@@ -89,6 +89,19 @@ export interface ChallanPositionPartyNetEntry {
   partyId: string | null;
   partyName: string;
   direction: "RECEIVABLE" | "PAYABLE";
+  // The account's own signed net (debit - credit) across this
+  // Challan's settlement-side lines (PAID excluded) PLUS its own
+  // Daily-Posting-attributed contribution - lib/challan-settlement-
+  // summary.ts's PartyNetEntry.net, passed straight through by every
+  // caller already (app/api/challan/route.ts, .../[id]/route.ts just
+  // spread `summary.partyNet` in, so this field was always present on
+  // the real object - only now exposed on this type). Used as the
+  // AMOUNT for a tier-1-resolved line - see computeBasePosition()
+  // below for why the amount must always come from the SAME source
+  // as the party, never a separately-tracked blended field that can
+  // silently drift out of sync with it (the exact bug class that let
+  // a real, unpaid Carrier Rent Payable disappear).
+  net: number;
 }
 
 export interface ChallanPositionLine {
@@ -299,23 +312,71 @@ function groupPaidUnverified(
     }));
 }
 
-/** The Collection/Carrier-Rent-sourced position only - everything
- * this module computed BEFORE the Paid-unverified feature existed,
- * unchanged. Never returns null; `clearedPosition()` when both sides
- * are ~0. */
+/**
+ * The Collection/Carrier-Rent-sourced position only (the Paid-
+ * unverified lines are merged in separately, afterward - see
+ * mergePaidUnverified below). Never returns null; `clearedPosition()`
+ * when there is genuinely nothing outstanding.
+ *
+ * CORRECTNESS NOTE (previously wrong): this used to always take the
+ * AMOUNT from `computeChallanFinancialsBatch`'s blended, Challan-
+ * level outstandingReceivable/outstandingPayable fields while taking
+ * the PARTY from `partyNet` (tier 1) - two INDEPENDENTLY maintained
+ * sources that are supposed to agree but are not the same
+ * computation, and can drift apart (confirmed live on Challan 6486 -
+ * production evidence: the ledger correctly posts `Cr "Nasir And
+ * Sons" 55,000 / Dr Gross Carrier Rent Payable`, no Daily Posting
+ * activity exists at all, yet the Challan's own blended
+ * outstandingPayable read back as if nothing were owed, silently
+ * dropping the entire Payable line while the UNRELATED Bilty-Paid
+ * verification status happened to be the only thing that visibly
+ * correlated with it - the two are not actually connected; it is the
+ * same single underlying drift surfacing differently depending on
+ * what else that Challan's history contains).
+ *
+ * Fixed by using `partyNet` as the SINGLE source for BOTH the amount
+ * AND the party whenever it has any entry at all for this Challan -
+ * `net` is the account's own ledger-derived net (settlement-side,
+ * PAID always excluded, real Daily-Posting activity for that SAME
+ * account already folded in - see PartyNetEntry's own doc comment in
+ * lib/challan-settlement-summary.ts) - so the amount shown can never
+ * disagree with who it is shown against, and a real Payable can
+ * never silently vanish regardless of what else is or isn't true
+ * about an unrelated Bilty on the same Challan.
+ *
+ * `computeChallanFinancialsBatch`'s blended fields are now used ONLY
+ * as the historical fallback for the rare Challan where `partyNet`
+ * resolves NOTHING at all (no candidate account found by any
+ * mechanism - the original "Challan 6425" 3-tier design case), paired
+ * with tier 2/3 role-based party resolution, exactly as before.
+ */
 function computeBasePosition(
   inp: ChallanPositionInput,
   fin: { remainingReceivable: number; remainingPayable: number } | undefined
 ): ChallanPosition {
-  const remReceivable = round2(fin?.remainingReceivable || 0);
-  const remPayable = round2(fin?.remainingPayable || 0);
+  const receivableEntries = inp.partyNet.filter((p) => p.direction === "RECEIVABLE");
+  const payableEntries = inp.partyNet.filter((p) => p.direction === "PAYABLE");
+
+  let remReceivable: number;
+  let remPayable: number;
+  let rParties: ChallanPositionParty[];
+  let pParties: ChallanPositionParty[];
+
+  if (receivableEntries.length > 0 || payableEntries.length > 0) {
+    remReceivable = round2(receivableEntries.reduce((s, p) => s + Math.abs(p.net), 0));
+    remPayable = round2(payableEntries.reduce((s, p) => s + Math.abs(p.net), 0));
+    rParties = dedupeParties(receivableEntries.map(toPositionParty));
+    pParties = dedupeParties(payableEntries.map(toPositionParty));
+  } else {
+    remReceivable = round2(fin?.remainingReceivable || 0);
+    remPayable = round2(fin?.remainingPayable || 0);
+    rParties = resolveParties(inp, "RECEIVABLE"); // tier 1 is empty by construction here - tiers 2/3 only.
+    pParties = resolveParties(inp, "PAYABLE");
+  }
 
   if (remReceivable <= EPS && remPayable <= EPS) {
     return clearedPosition();
   }
-
-  const rParties = resolveParties(inp, "RECEIVABLE");
-  const pParties = resolveParties(inp, "PAYABLE");
 
   // Net ONLY when both sides are non-zero AND resolve to exactly the
   // same single party - anything more ambiguous (zero, several
@@ -325,7 +386,10 @@ function computeBasePosition(
   // resolveParties() above - so two DIFFERENT role-fallback parties
   // must never compare equal just because both have a null
   // accountId); falls back to accountId only when neither side has a
-  // partyId at all.
+  // partyId at all. (In practice this can only ever fire via the
+  // historical-fallback branch above now - a real `partyNet` entry
+  // is already one net figure per account, so the SAME account can
+  // never appear on both sides to begin with.)
   const rIdentity = rParties.length === 1 ? rParties[0].partyId || rParties[0].accountId : null;
   const pIdentity = pParties.length === 1 ? pParties[0].partyId || pParties[0].accountId : null;
   if (
