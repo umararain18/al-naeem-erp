@@ -83,6 +83,7 @@ export type Challan = {
   status: ChallanStatus;
   isDeleted: boolean;
   transporterParty: (PartyRef & { phone?: string | null; whatsapp?: string | null }) | null;
+  ownCarrier: { id: string; carrierNumber: string } | null;
   driverName: string | null;
   driverPhone: string | null;
   carrierNumber: string | null;
@@ -139,6 +140,9 @@ export type Challan = {
   // - the exact same shared calculation the Challan list's table,
   // filter, and summary cards read. Null only for a binned Challan.
   position?: ChallanPosition | null;
+  // Own Carrier dispatch only (see Challan.ownCarrierId's own schema
+  // doc comment) - true until the linking Trip is CLOSED.
+  incomePending?: boolean | null;
 };
 
 export type SettlementPayerBreakdown = {
@@ -562,12 +566,26 @@ export default function ChallanDetailPage({
   const [editChallanNo, setEditChallanNo] = useState("");
   const [editLoadingDate, setEditLoadingDate] = useState("");
   const [editTransporterPartyId, setEditTransporterPartyId] = useState("");
+  const [editOwnCarrierId, setEditOwnCarrierId] = useState("");
   const [editDriverName, setEditDriverName] = useState("");
   const [editDriverPhone, setEditDriverPhone] = useState("");
   const [editCarrierNumber, setEditCarrierNumber] = useState("");
   const [editCarrierRent, setEditCarrierRent] = useState("");
   const [editRemarks, setEditRemarks] = useState("");
   const [transporters, setTransporters] = useState<{ id: string; partyName: string }[]>([]);
+  const [ownCarriers, setOwnCarriers] = useState<{ id: string; carrierNumber: string }[]>([]);
+
+  const editCarrierPickerValue = editOwnCarrierId ? `oc:${editOwnCarrierId}` : editTransporterPartyId;
+  function handleEditCarrierPickerChange(value: string) {
+    if (value.startsWith("oc:")) {
+      setEditOwnCarrierId(value.slice(3));
+      setEditTransporterPartyId("");
+      setEditCarrierRent("");
+    } else {
+      setEditOwnCarrierId("");
+      setEditTransporterPartyId(value);
+    }
+  }
 
   const [biltySearchTerm, setBiltySearchTerm] = useState("");
   const [biltySearchResults, setBiltySearchResults] = useState<Bilty[]>([]);
@@ -628,6 +646,7 @@ export default function ChallanDetailPage({
         paidVerification: data.paidVerification,
         settlementSummary: data.settlementSummary,
         position: data.position,
+        incomePending: data.incomePending,
       });
       setCanRestore(!!data.capabilities?.canRestore);
       setCanBin(!!data.capabilities?.canBin);
@@ -694,6 +713,21 @@ export default function ChallanDetailPage({
     }
   }
 
+  async function loadOwnCarriers() {
+    try {
+      const response = await fetch("/api/own-carrier");
+      const data = await response.json();
+      if (!response.ok || !data.success) return;
+      setOwnCarriers(
+        (data.items || [])
+          .filter((c: { isActive: boolean }) => c.isActive)
+          .map((c: { id: string; carrierNumber: string }) => ({ id: c.id, carrierNumber: c.carrierNumber }))
+      );
+    } catch {
+      // silent
+    }
+  }
+
   async function loadPartyAccountOptions() {
     try {
       const response = await fetch("/api/parties");
@@ -721,6 +755,7 @@ export default function ChallanDetailPage({
     setEditChallanNo(challan.challanNo);
     setEditLoadingDate(toBusinessDateInputValue(challan.loadingDate));
     setEditTransporterPartyId(challan.transporterParty?.id || "");
+    setEditOwnCarrierId(challan.ownCarrier?.id || "");
     setEditDriverName(challan.driverName || "");
     setEditDriverPhone(challan.driverPhone || "");
     setEditCarrierNumber(challan.carrierNumber || "");
@@ -737,6 +772,7 @@ export default function ChallanDetailPage({
     setEditError("");
     setShowEditForm(true);
     loadTransporters();
+    loadOwnCarriers();
     loadPartyAccountOptions();
   }
 
@@ -795,11 +831,12 @@ export default function ChallanDetailPage({
         body: JSON.stringify({
           challanNo: editChallanNo,
           loadingDate: editLoadingDate,
-          transporterPartyId: editTransporterPartyId || "",
+          transporterPartyId: editOwnCarrierId ? "" : editTransporterPartyId || "",
+          ownCarrierId: editOwnCarrierId || "",
           driverName: editDriverName || "",
           driverPhone: editDriverPhone || "",
           carrierNumber: editCarrierNumber || "",
-          carrierRent: editCarrierRent === "" ? 0 : Number(editCarrierRent),
+          carrierRent: editOwnCarrierId ? 0 : editCarrierRent === "" ? 0 : Number(editCarrierRent),
           remarks: editRemarks || "",
           addBiltyIds: biltiesToAdd.map((b) => b.id),
           removeBiltyIds: [...biltyIdsToRemove],
@@ -1118,7 +1155,20 @@ export default function ChallanDetailPage({
             <div className="space-y-3 text-sm">
               <div>
                 <p className="text-gray-500">Transporter</p>
-                <p className="font-medium">{challan.transporterParty?.partyName || "—"}</p>
+                <p className="font-medium">
+                  {challan.ownCarrier ? (
+                    <Link href={`/own-carrier/${challan.ownCarrier.id}`} className="text-blue-600 hover:underline">
+                      {challan.ownCarrier.carrierNumber} (Own Carrier)
+                    </Link>
+                  ) : (
+                    challan.transporterParty?.partyName || "—"
+                  )}
+                </p>
+                {challan.ownCarrier && challan.incomePending && (
+                  <p className="mt-1 inline-block rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-medium text-amber-700">
+                    Income pending (Trip slip not closed)
+                  </p>
+                )}
               </div>
               <div>
                 <p className="text-gray-500">Driver</p>
@@ -1322,10 +1372,10 @@ export default function ChallanDetailPage({
                 />
               </div>
               <div>
-                <label className="block text-sm font-medium mb-1">Transporter</label>
+                <label className="block text-sm font-medium mb-1">Transporter / Own Carrier</label>
                 <select
-                  value={editTransporterPartyId}
-                  onChange={(e) => setEditTransporterPartyId(e.target.value)}
+                  value={editCarrierPickerValue}
+                  onChange={(e) => handleEditCarrierPickerChange(e.target.value)}
                   className="w-full border rounded-lg px-3 py-2"
                 >
                   <option value="">Select Transporter</option>
@@ -1334,6 +1384,15 @@ export default function ChallanDetailPage({
                       {t.partyName}
                     </option>
                   ))}
+                  {ownCarriers.length > 0 && (
+                    <optgroup label="Own Carrier">
+                      {ownCarriers.map((c) => (
+                        <option key={c.id} value={`oc:${c.id}`}>
+                          {c.carrierNumber}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
                 </select>
               </div>
               <div>
@@ -1369,9 +1428,11 @@ export default function ChallanDetailPage({
                   type="number"
                   min="0"
                   step="0.01"
-                  value={editCarrierRent}
+                  value={editOwnCarrierId ? "" : editCarrierRent}
                   onChange={(e) => setEditCarrierRent(e.target.value)}
-                  className="w-full border rounded-lg px-3 py-2"
+                  disabled={Boolean(editOwnCarrierId)}
+                  placeholder={editOwnCarrierId ? "Entered on the Trip slip" : undefined}
+                  className="w-full border rounded-lg px-3 py-2 disabled:bg-gray-100 disabled:text-gray-400"
                 />
                 {needsCarrierRentResponsibility && (
                   <div className="mt-3 rounded-lg border border-amber-300 bg-amber-50 p-4">

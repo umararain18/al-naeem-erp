@@ -25,7 +25,15 @@ type Trip = {
   carrier: { id: string; carrierNumber: string; driverName: string | null };
 };
 
-type DocumentLink = { id: string; documentType: string; documentId: string; label: string; linkedAt: string };
+type DocumentLink = {
+  id: string;
+  documentType: string;
+  documentId: string;
+  label: string;
+  linkedAt: string;
+  carrierRentAmount: number;
+  isOwnCarrierChallan: boolean;
+};
 
 type CashBookRow = {
   id: string;
@@ -41,14 +49,33 @@ type CashBookRow = {
 
 type CashBook = { openingBalance: number; rows: CashBookRow[]; closingBalance: number };
 
+// Keyed by the REAL posted CarrierTripLineType (used for the Cash
+// Book's own reversal-confirm text) - "Expense"/"Diesel" are UI-only
+// groupings over EXPENSE_CASH/EXPENSE_OFFICE/EXPENSE_CREDIT, chosen by
+// LineDrawer's own "Payment Source" selector (see that component).
 const LINE_TYPE_LABELS: Record<string, string> = {
   COLLECTION: "Collection (against Challan/Phonch/Private Phonch)",
   CASH_FROM_OFFICE: "Office gives cash to Driver",
-  EXPENSE_CASH: "Expense (paid by Driver, cash)",
+  EXPENSE_CASH: "Expense (Driver Cash)",
+  EXPENSE_OFFICE: "Expense (Office Account)",
   EXPENSE_CREDIT: "Expense (Udhaar/credit to Vendor)",
   DRIVER_SALARY: "Driver Salary",
   DEPOSIT_TO_OFFICE: "Driver deposits cash to Office",
 };
+
+// The 6 action buttons shown on an OPEN Trip. "EXPENSE"/"DIESEL" are
+// NOT real CarrierTripLineType values - LineDrawer resolves each to
+// EXPENSE_CASH/EXPENSE_OFFICE/EXPENSE_CREDIT itself, from its own
+// Payment Source selector, exactly like Diesel's own spec ("Add line
+// type EXPENSE_OFFICE ... usable for diesel and any expense").
+const ACTION_BUTTONS: { kind: string; label: string }[] = [
+  { kind: "COLLECTION", label: LINE_TYPE_LABELS.COLLECTION },
+  { kind: "CASH_FROM_OFFICE", label: LINE_TYPE_LABELS.CASH_FROM_OFFICE },
+  { kind: "EXPENSE", label: "Expense (Driver Cash / Office / Udhaar)" },
+  { kind: "DIESEL", label: "Diesel" },
+  { kind: "DRIVER_SALARY", label: LINE_TYPE_LABELS.DRIVER_SALARY },
+  { kind: "DEPOSIT_TO_OFFICE", label: LINE_TYPE_LABELS.DEPOSIT_TO_OFFICE },
+];
 
 export default function CarrierTripDetailPage() {
   const params = useParams();
@@ -91,6 +118,25 @@ export default function CarrierTripDetailPage() {
 
   function refresh() {
     setRefreshToken((k) => k + 1);
+  }
+
+  async function handleSaveCarrierRent(link: DocumentLink, value: string) {
+    const amount = Number(value);
+    if (!Number.isFinite(amount) || amount < 0) {
+      alert("Carrier Rent must be a non-negative number.");
+      return;
+    }
+    const res = await fetch(`/api/own-carrier/${carrierId}/trips/${tripId}/documents/${link.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ carrierRentAmount: amount }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.success) {
+      alert(data.message || "Unable to update Carrier Rent.");
+      return;
+    }
+    refresh();
   }
 
   async function handleUnlink(link: DocumentLink) {
@@ -188,13 +234,18 @@ export default function CarrierTripDetailPage() {
           ) : (
             <div className="divide-y">
               {documents.map((d) => (
-                <div key={d.id} className="flex items-center justify-between px-5 py-3 text-sm">
+                <div key={d.id} className="flex flex-wrap items-center justify-between gap-2 px-5 py-3 text-sm">
                   <span className="font-medium text-gray-900">{d.label}</span>
-                  {canAct && (
-                    <button type="button" onClick={() => handleUnlink(d)} className="rounded-md border border-red-200 px-3 py-1 text-xs text-red-600 hover:bg-red-50">
-                      Unlink
-                    </button>
-                  )}
+                  <div className="flex items-center gap-3">
+                    {d.isOwnCarrierChallan && (
+                      <CarrierRentEditor link={d} canEdit={canAct} onSave={handleSaveCarrierRent} />
+                    )}
+                    {canAct && (
+                      <button type="button" onClick={() => handleUnlink(d)} className="rounded-md border border-red-200 px-3 py-1 text-xs text-red-600 hover:bg-red-50">
+                        Unlink
+                      </button>
+                    )}
+                  </div>
                 </div>
               ))}
             </div>
@@ -204,9 +255,9 @@ export default function CarrierTripDetailPage() {
         {/* ACTIONS */}
         {canAct && (
           <div className="mb-6 flex flex-wrap gap-2">
-            {Object.keys(LINE_TYPE_LABELS).map((type) => (
-              <button key={type} type="button" onClick={() => setLineDrawerType(type)} className="rounded-lg border px-4 py-2 text-sm hover:bg-gray-50">
-                + {LINE_TYPE_LABELS[type]}
+            {ACTION_BUTTONS.map(({ kind, label }) => (
+              <button key={kind} type="button" onClick={() => setLineDrawerType(kind)} className="rounded-lg border px-4 py-2 text-sm hover:bg-gray-50">
+                + {label}
               </button>
             ))}
           </div>
@@ -277,7 +328,7 @@ export default function CarrierTripDetailPage() {
         <LineDrawer
           carrierId={carrierId}
           tripId={tripId}
-          lineType={lineDrawerType}
+          kind={lineDrawerType}
           documents={documents}
           onClose={() => setLineDrawerType(null)}
           onSaved={() => {
@@ -326,21 +377,63 @@ function Drawer({ open, onClose, title, children }: { open: boolean; onClose: ()
 
 type AccountOption = { id: string; accountName: string; accountType: string; category: string };
 
+function CarrierRentEditor({ link, canEdit, onSave }: { link: DocumentLink; canEdit: boolean; onSave: (link: DocumentLink, value: string) => Promise<void> }) {
+  const [value, setValue] = useState(String(link.carrierRentAmount));
+  const [saving, setSaving] = useState(false);
+
+  if (!canEdit) {
+    return <span className="text-xs text-gray-500">Carrier Rent: Rs. {formatMoney(link.carrierRentAmount)}</span>;
+  }
+
+  return (
+    <div className="flex items-center gap-1.5">
+      <span className="text-xs text-gray-500">Carrier Rent Rs.</span>
+      <input
+        type="number"
+        min="0"
+        step="0.01"
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        className="w-28 rounded-md border border-gray-300 px-2 py-1 text-xs outline-none focus:border-blue-500"
+      />
+      <button
+        type="button"
+        disabled={saving}
+        onClick={async () => {
+          setSaving(true);
+          await onSave(link, value);
+          setSaving(false);
+        }}
+        className="rounded-md border px-2 py-1 text-xs hover:bg-gray-50 disabled:opacity-50"
+      >
+        {saving ? "..." : "Save"}
+      </button>
+    </div>
+  );
+}
+
+// "Payment Source" for an EXPENSE/DIESEL line - resolves to the real
+// CarrierTripLineType posted (see this module's own ACTION_BUTTONS
+// doc comment).
+type PaymentSource = "DRIVER_CASH" | "OFFICE" | "UDHAAR";
+
 function LineDrawer({
   carrierId,
   tripId,
-  lineType,
+  kind,
   documents,
   onClose,
   onSaved,
 }: {
   carrierId: string;
   tripId: string;
-  lineType: string;
+  kind: string;
   documents: DocumentLink[];
   onClose: () => void;
   onSaved: () => void;
 }) {
+  const isExpenseKind = kind === "EXPENSE" || kind === "DIESEL";
+
   const [date, setDate] = useState(todayYMD());
   const [amount, setAmount] = useState("");
   const [description, setDescription] = useState("");
@@ -349,6 +442,9 @@ function LineDrawer({
   const [expenseAccountId, setExpenseAccountId] = useState("");
   const [vendorPartyId, setVendorPartyId] = useState("");
   const [employeeId, setEmployeeId] = useState("");
+  const [paymentSource, setPaymentSource] = useState<PaymentSource>("DRIVER_CASH");
+  const [pump, setPump] = useState("");
+  const [liters, setLiters] = useState("");
   const [accounts, setAccounts] = useState<AccountOption[]>([]);
   const [parties, setParties] = useState<{ id: string; partyName: string; account: { id: string } | null }[]>([]);
   const [employees, setEmployees] = useState<{ id: string; name: string; employeeCode: string }[]>([]);
@@ -385,6 +481,18 @@ function LineDrawer({
   );
   const employeeOptions = useMemo(() => employees.map((e) => ({ value: e.id, label: e.name, secondary: e.employeeCode })), [employees]);
 
+  // The REAL CarrierTripLineType this drawer will post.
+  const resolvedLineType =
+    kind === "COLLECTION" || kind === "CASH_FROM_OFFICE" || kind === "DEPOSIT_TO_OFFICE" || kind === "DRIVER_SALARY"
+      ? kind
+      : paymentSource === "DRIVER_CASH"
+        ? "EXPENSE_CASH"
+        : paymentSource === "OFFICE"
+          ? "EXPENSE_OFFICE"
+          : "EXPENSE_CREDIT";
+
+  const title = kind === "EXPENSE" ? "Expense" : kind === "DIESEL" ? "Diesel" : LINE_TYPE_LABELS[kind] || kind;
+
   async function handleSave() {
     setError("");
     const amt = Number(amount);
@@ -392,9 +500,15 @@ function LineDrawer({
       setError("Amount must be greater than zero.");
       return;
     }
-    const payload: Record<string, unknown> = { lineType, date, amount: amt, description: description.trim() || undefined };
 
-    if (lineType === "COLLECTION") {
+    let description_ = description.trim();
+    if (kind === "DIESEL" && !description_) {
+      description_ = ["Diesel", pump.trim() || null, liters.trim() ? `${liters.trim()}L` : null].filter(Boolean).join(" - ");
+    }
+
+    const payload: Record<string, unknown> = { lineType: resolvedLineType, date, amount: amt, description: description_ || undefined };
+
+    if (kind === "COLLECTION") {
       const link = documents.find((d) => d.id === documentLinkId);
       if (!link) {
         setError("Select a linked document.");
@@ -402,26 +516,32 @@ function LineDrawer({
       }
       payload.documentType = link.documentType;
       payload.documentId = link.documentId;
-    } else if (lineType === "CASH_FROM_OFFICE" || lineType === "DEPOSIT_TO_OFFICE") {
+    } else if (kind === "CASH_FROM_OFFICE" || kind === "DEPOSIT_TO_OFFICE") {
       if (!officeAccountId) {
         setError("Select an office account.");
         return;
       }
       payload.officeAccountId = officeAccountId;
-    } else if (lineType === "EXPENSE_CASH" || lineType === "EXPENSE_CREDIT") {
+    } else if (isExpenseKind) {
       if (!expenseAccountId) {
         setError("Select an expense account.");
         return;
       }
       payload.expenseAccountId = expenseAccountId;
-      if (lineType === "EXPENSE_CREDIT") {
+      if (paymentSource === "OFFICE") {
+        if (!officeAccountId) {
+          setError("Select an office account.");
+          return;
+        }
+        payload.officeAccountId = officeAccountId;
+      } else if (paymentSource === "UDHAAR") {
         if (!vendorPartyId) {
           setError("Select a vendor party.");
           return;
         }
         payload.vendorPartyId = vendorPartyId;
       }
-    } else if (lineType === "DRIVER_SALARY") {
+    } else if (kind === "DRIVER_SALARY") {
       if (!employeeId) {
         setError("Select an employee.");
         return;
@@ -447,7 +567,7 @@ function LineDrawer({
   }
 
   return (
-    <Drawer open onClose={onClose} title={LINE_TYPE_LABELS[lineType] || lineType}>
+    <Drawer open onClose={onClose} title={title}>
       <div className="space-y-4">
         {error && <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>}
         <div className="grid grid-cols-2 gap-3">
@@ -461,7 +581,7 @@ function LineDrawer({
           </div>
         </div>
 
-        {lineType === "COLLECTION" && (
+        {kind === "COLLECTION" && (
           <div>
             <label className="mb-1 block text-xs font-medium text-gray-600">Linked Document *</label>
             <select value={documentLinkId} onChange={(e) => setDocumentLinkId(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500">
@@ -475,28 +595,59 @@ function LineDrawer({
           </div>
         )}
 
-        {(lineType === "CASH_FROM_OFFICE" || lineType === "DEPOSIT_TO_OFFICE") && (
+        {(kind === "CASH_FROM_OFFICE" || kind === "DEPOSIT_TO_OFFICE") && (
           <div>
             <label className="mb-1 block text-xs font-medium text-gray-600">Office Account *</label>
             <SearchableSelect value={officeAccountId} options={officeAccountOptions} placeholder="Select office account..." onChange={setOfficeAccountId} />
           </div>
         )}
 
-        {(lineType === "EXPENSE_CASH" || lineType === "EXPENSE_CREDIT") && (
-          <div>
-            <label className="mb-1 block text-xs font-medium text-gray-600">Expense Account *</label>
-            <SearchableSelect value={expenseAccountId} options={expenseAccountOptions} placeholder="Select expense account..." onChange={setExpenseAccountId} />
-          </div>
+        {isExpenseKind && (
+          <>
+            {kind === "DIESEL" && (
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-gray-600">Pump / Vendor</label>
+                  <input type="text" value={pump} onChange={(e) => setPump(e.target.value)} placeholder="e.g. Attock" className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
+                </div>
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-gray-600">Liters</label>
+                  <input type="number" value={liters} onChange={(e) => setLiters(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
+                </div>
+              </div>
+            )}
+            <div>
+              <label className="mb-1 block text-xs font-medium text-gray-600">Expense Account *</label>
+              <SearchableSelect value={expenseAccountId} options={expenseAccountOptions} placeholder="Select expense account..." onChange={setExpenseAccountId} />
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-gray-600">Payment Source *</label>
+              <select
+                value={paymentSource}
+                onChange={(e) => setPaymentSource(e.target.value as PaymentSource)}
+                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
+              >
+                <option value="DRIVER_CASH">Driver Cash</option>
+                <option value="OFFICE">Office Account (Cash/Bank)</option>
+                <option value="UDHAAR">Udhaar (Vendor Payable)</option>
+              </select>
+            </div>
+            {paymentSource === "OFFICE" && (
+              <div>
+                <label className="mb-1 block text-xs font-medium text-gray-600">Office Account *</label>
+                <SearchableSelect value={officeAccountId} options={officeAccountOptions} placeholder="Select office account..." onChange={setOfficeAccountId} />
+              </div>
+            )}
+            {paymentSource === "UDHAAR" && (
+              <div>
+                <label className="mb-1 block text-xs font-medium text-gray-600">Vendor Party *</label>
+                <SearchableSelect value={vendorPartyId} options={vendorPartyOptions} placeholder="Select vendor party..." onChange={setVendorPartyId} />
+              </div>
+            )}
+          </>
         )}
 
-        {lineType === "EXPENSE_CREDIT" && (
-          <div>
-            <label className="mb-1 block text-xs font-medium text-gray-600">Vendor Party *</label>
-            <SearchableSelect value={vendorPartyId} options={vendorPartyOptions} placeholder="Select vendor party..." onChange={setVendorPartyId} />
-          </div>
-        )}
-
-        {lineType === "DRIVER_SALARY" && (
+        {kind === "DRIVER_SALARY" && (
           <div>
             <label className="mb-1 block text-xs font-medium text-gray-600">Employee *</label>
             <SearchableSelect value={employeeId} options={employeeOptions} placeholder="Select employee..." onChange={setEmployeeId} />
@@ -645,11 +796,15 @@ function LinkDocumentsDrawer({ carrierId, tripId, onClose, onLinked }: { carrier
 // PROFIT REPORT DRAWER
 // ============================================================
 type ProfitReport = {
-  income: { documentType: string; documentId: string; label: string; amount: number }[];
-  totalIncome: number;
-  expenses: { lineId: string; description: string; amount: number }[];
-  totalExpenses: number;
-  netProfit: number;
+  previousBalance: number;
+  challanIncome: { documentId: string; label: string; biltyRent: number; carrierRent: number; bookingIncome: number }[];
+  otherIncome: { documentType: string; documentId: string; label: string; amount: number }[];
+  totalBiltyRent: number;
+  totalCarrierRent: number;
+  totalBookingIncome: number;
+  expenses: { lineId: string; lineType: string; description: string; amount: number }[];
+  totalCarrierExpense: number;
+  ownCarrierProfit: number;
 };
 
 function ProfitReportDrawer({ carrierId, tripId, onClose }: { carrierId: string; tripId: string; onClose: () => void }) {
@@ -681,27 +836,52 @@ function ProfitReportDrawer({ carrierId, tripId, onClose }: { carrierId: string;
         <p className="text-sm text-red-700">{error || "Unable to load report"}</p>
       ) : (
         <div className="space-y-5 text-sm">
+          <div className="flex justify-between rounded-lg bg-gray-50 px-4 py-3 font-semibold">
+            <span>Previous Balance (carried from last closed Trip)</span>
+            <span>Rs. {formatMoney(report.previousBalance)}</span>
+          </div>
+
           <div>
-            <h4 className="mb-2 font-semibold text-gray-700">Income</h4>
-            {report.income.length === 0 ? (
-              <p className="text-gray-500">No linked documents.</p>
+            <h4 className="mb-2 font-semibold text-gray-700">Challan Income (Own Carrier)</h4>
+            {report.challanIncome.length === 0 ? (
+              <p className="text-gray-500">No own-carrier Challan linked.</p>
             ) : (
+              <div className="space-y-2">
+                {report.challanIncome.map((c) => (
+                  <div key={c.documentId} className="rounded-md border px-3 py-2">
+                    <p className="font-medium text-gray-900">{c.label}</p>
+                    <div className="mt-1 grid grid-cols-3 gap-1 text-xs text-gray-600">
+                      <span>Bilty Rent: Rs. {formatMoney(c.biltyRent)}</span>
+                      <span>Carrier Rent: Rs. {formatMoney(c.carrierRent)}</span>
+                      <span>Booking Income: Rs. {formatMoney(c.bookingIncome)}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div className="mt-2 grid grid-cols-3 gap-1 border-t pt-2 text-xs font-semibold">
+              <span>Total Bilty Rent: Rs. {formatMoney(report.totalBiltyRent)}</span>
+              <span>Total Carrier Rent: Rs. {formatMoney(report.totalCarrierRent)}</span>
+              <span>Total Booking Income: Rs. {formatMoney(report.totalBookingIncome)}</span>
+            </div>
+          </div>
+
+          {report.otherIncome.length > 0 && (
+            <div>
+              <h4 className="mb-2 font-semibold text-gray-700">Other Income (Phonch / Private Phonch)</h4>
               <div className="space-y-1">
-                {report.income.map((i) => (
+                {report.otherIncome.map((i) => (
                   <div key={`${i.documentType}-${i.documentId}`} className="flex justify-between">
                     <span className="text-gray-600">{i.label}</span>
                     <span className="font-medium">Rs. {formatMoney(i.amount)}</span>
                   </div>
                 ))}
               </div>
-            )}
-            <div className="mt-2 flex justify-between border-t pt-2 font-semibold">
-              <span>Total Income</span>
-              <span>Rs. {formatMoney(report.totalIncome)}</span>
             </div>
-          </div>
+          )}
+
           <div>
-            <h4 className="mb-2 font-semibold text-gray-700">Expenses</h4>
+            <h4 className="mb-2 font-semibold text-gray-700">Carrier Expense (diesel + expenses + driver salary)</h4>
             {report.expenses.length === 0 ? (
               <p className="text-gray-500">No expenses recorded.</p>
             ) : (
@@ -715,13 +895,14 @@ function ProfitReportDrawer({ carrierId, tripId, onClose }: { carrierId: string;
               </div>
             )}
             <div className="mt-2 flex justify-between border-t pt-2 font-semibold">
-              <span>Total Expenses</span>
-              <span>Rs. {formatMoney(report.totalExpenses)}</span>
+              <span>Total Carrier Expense</span>
+              <span>Rs. {formatMoney(report.totalCarrierExpense)}</span>
             </div>
           </div>
+
           <div className="flex justify-between rounded-lg bg-gray-50 px-4 py-3 text-base font-bold">
-            <span>Net Profit (estimate)</span>
-            <span className={report.netProfit >= 0 ? "text-green-700" : "text-red-700"}>Rs. {formatMoney(report.netProfit)}</span>
+            <span>Own Carrier Profit (Carrier Rent - Carrier Expense)</span>
+            <span className={report.ownCarrierProfit >= 0 ? "text-green-700" : "text-red-700"}>Rs. {formatMoney(report.ownCarrierProfit)}</span>
           </div>
         </div>
       )}

@@ -44,6 +44,14 @@ const createChallanSchema = z.object({
     .optional()
     .or(z.literal("")),
 
+  // Mutually exclusive with transporterPartyId - see Challan.
+  // ownCarrierId's own schema doc comment for the full "Own Carrier
+  // Dispatch" accounting rationale this triggers below.
+  ownCarrierId: z
+    .string()
+    .optional()
+    .or(z.literal("")),
+
   driverName: z
     .string()
     .optional()
@@ -174,6 +182,12 @@ export async function GET(request: NextRequest) {
             partyName: true,
           },
         },
+        ownCarrier: {
+          select: {
+            id: true,
+            carrierNumber: true,
+          },
+        },
         bilties: {
           include: {
             bilty: {
@@ -201,6 +215,35 @@ export async function GET(request: NextRequest) {
     // non-deleted Challan - so a stable, full in-memory sort is safe
     // and correct here, never partial/page-dependent).
     challans.sort((a, b) => compareChallanNoDesc(a.challanNo, b.challanNo) || b.createdAt.getTime() - a.createdAt.getTime());
+
+    // "Income pending (Trip slip not closed)" - own-carrier Challans
+    // only (see Challan.ownCarrierId's own schema doc comment). Net
+    // count (recognized - reversed) per Challan, batched in two
+    // groupBy queries rather than one call per Challan - same
+    // idempotency semantics as lib/carrier-trip.ts's own
+    // getChallanCloseRecognitionNet, just batched for a list.
+    const ownCarrierChallanIds = challans.filter((c) => c.ownCarrierId).map((c) => c.id);
+    const incomePendingSet = new Set<string>();
+    if (ownCarrierChallanIds.length > 0) {
+      const [recognized, reversed] = await Promise.all([
+        prisma.journalEntry.groupBy({
+          by: ["referenceId"],
+          where: { referenceType: "CARRIER_TRIP_CLOSE", referenceId: { in: ownCarrierChallanIds }, isDeleted: false },
+          _count: { _all: true },
+        }),
+        prisma.journalEntry.groupBy({
+          by: ["referenceId"],
+          where: { referenceType: "CARRIER_TRIP_CLOSE_REVERSAL", referenceId: { in: ownCarrierChallanIds }, isDeleted: false },
+          _count: { _all: true },
+        }),
+      ]);
+      const recognizedMap = new Map(recognized.map((r) => [r.referenceId as string, r._count._all]));
+      const reversedMap = new Map(reversed.map((r) => [r.referenceId as string, r._count._all]));
+      for (const id of ownCarrierChallanIds) {
+        const net = (recognizedMap.get(id) || 0) - (reversedMap.get(id) || 0);
+        if (net <= 0) incomePendingSet.add(id);
+      }
+    }
 
     const financialsMap = await computeChallanFinancialsBatch(
       challans.map((c) => ({
@@ -267,6 +310,7 @@ export async function GET(request: NextRequest) {
       responsibleParties: responsiblePartiesMap[c.id],
       settlementSummary: settlementSummaryMap[c.id],
       position: positionsMap[c.id],
+      incomePending: incomePendingSet.has(c.id),
     }));
 
     // "financial" (RECEIVABLE/PAYABLE/RECEIVABLE_PAYABLE/CLEARED/...)
@@ -352,6 +396,25 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    const ownCarrierId = data.ownCarrierId || null;
+
+    if (ownCarrierId && data.transporterPartyId) {
+      return NextResponse.json(
+        { success: false, message: "Select either a Transporter or an Own Carrier, not both" },
+        { status: 400 }
+      );
+    }
+
+    if (ownCarrierId) {
+      const ownCarrier = await prisma.ownCarrier.findUnique({ where: { id: ownCarrierId }, select: { isDeleted: true } });
+      if (!ownCarrier || ownCarrier.isDeleted) {
+        return NextResponse.json(
+          { success: false, message: "Selected Own Carrier was not found" },
+          { status: 400 }
+        );
+      }
+    }
+
     // challanNo is no longer a plain DB-level @unique (see prisma/
     // schema.prisma's own comment) - a Bin'd Challan's number is
     // reusable, so this check (and the one inside the transaction
@@ -425,9 +488,16 @@ export async function POST(request: NextRequest) {
     // not yet known, so the offsetting side is a gross clearing
     // account that Settlement will later reclassify into the
     // real party. See lib/gross-accounts.ts.
+    //
+    // NEVER for an Own Carrier dispatch (ownCarrierId set) - that
+    // Carrier Rent instead lives on CarrierTripDocument.
+    // carrierRentAmount, entered manually per Trip-linked-Challan
+    // (see Challan.ownCarrierId's own schema doc comment) - forced to
+    // 0 here regardless of what was submitted, never trusting the
+    // client to have left it blank.
     // ------------------------------------------------
 
-    const carrierRentAmount = data.carrierRent ?? 0;
+    const carrierRentAmount = ownCarrierId ? 0 : data.carrierRent ?? 0;
     let carrierRentExpenseAccountId: string | null = null;
 
     if (carrierRentAmount > 0) {
@@ -505,7 +575,8 @@ export async function POST(request: NextRequest) {
         data: {
           challanNo: data.challanNo,
           loadingDate,
-          transporterPartyId: data.transporterPartyId || undefined,
+          transporterPartyId: ownCarrierId ? undefined : data.transporterPartyId || undefined,
+          ownCarrierId: ownCarrierId || undefined,
           driverName: data.driverName || undefined,
           driverPhone: data.driverPhone || undefined,
           carrierNumber: data.carrierNumber || undefined,
@@ -518,6 +589,12 @@ export async function POST(request: NextRequest) {
             select: {
               id: true,
               partyName: true,
+            },
+          },
+          ownCarrier: {
+            select: {
+              id: true,
+              carrierNumber: true,
             },
           },
         },
@@ -550,12 +627,20 @@ export async function POST(request: NextRequest) {
       // pre-transaction `bilties` so this reads the SAME race-checked
       // `total` the PENDING/already-assigned re-validation above just
       // confirmed.
-      for (const bilty of freshBilties) {
-        await recognizeBiltyBookingIncome(tx, bilty, {
-          entryDate: loadingDate,
-          challanNo: createdChallan.challanNo,
-          createdById: currentUser.userId,
-        });
+      //
+      // SKIPPED ENTIRELY for an Own Carrier dispatch - each Bilty's
+      // rent deliberately stays in Unearned Revenue until the linking
+      // Carrier Trip is CLOSED (see lib/carrier-trip.ts's
+      // recognizeCarrierTripChallanIncome and Challan.ownCarrierId's
+      // own schema doc comment).
+      if (!ownCarrierId) {
+        for (const bilty of freshBilties) {
+          await recognizeBiltyBookingIncome(tx, bilty, {
+            entryDate: loadingDate,
+            challanNo: createdChallan.challanNo,
+            createdById: currentUser.userId,
+          });
+        }
       }
 
       if (carrierRentAmount > 0 && carrierRentExpenseAccountId) {

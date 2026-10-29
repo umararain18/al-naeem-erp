@@ -36,6 +36,15 @@ type Carrier = {
   currentDriver: { id: string; name: string; employeeCode: string } | null;
 };
 
+type AllTripsSummary = {
+  tripCount: number;
+  totalBiltyRent: number;
+  totalCarrierRent: number;
+  totalBookingIncome: number;
+  totalCarrierExpense: number;
+  totalOwnCarrierProfit: number;
+};
+
 type TripItem = {
   id: string;
   tripNo: string;
@@ -53,6 +62,7 @@ export default function OwnCarrierDetailPage() {
 
   const [carrier, setCarrier] = useState<Carrier | null>(null);
   const [driverCashBalance, setDriverCashBalance] = useState(0);
+  const [allTripsSummary, setAllTripsSummary] = useState<AllTripsSummary | null>(null);
   const [trips, setTrips] = useState<TripItem[]>([]);
   const [capabilities, setCapabilities] = useState({ canEdit: false, canBin: false });
   const [loading, setLoading] = useState(true);
@@ -69,6 +79,7 @@ export default function OwnCarrierDetailPage() {
       if (!res.ok || !data.success) throw new Error(data.message || "Unable to load carrier");
       setCarrier(data.carrier);
       setDriverCashBalance(data.driverCashBalance || 0);
+      setAllTripsSummary(data.allTripsSummary || null);
       setTrips(data.trips || []);
       setCapabilities(data.capabilities || { canEdit: false, canBin: false });
     } catch (err) {
@@ -129,6 +140,33 @@ export default function OwnCarrierDetailPage() {
             <p className="text-xl font-bold text-gray-900">Rs. {formatMoney(driverCashBalance)}</p>
           </div>
         </div>
+
+        {allTripsSummary && (
+          <div className="mb-6 grid grid-cols-2 gap-3 rounded-xl border bg-white p-4 shadow-sm sm:grid-cols-5">
+            <div>
+              <p className="text-xs text-gray-500">Bilty Rent ({allTripsSummary.tripCount} trips)</p>
+              <p className="text-base font-semibold text-gray-900">Rs. {formatMoney(allTripsSummary.totalBiltyRent)}</p>
+            </div>
+            <div>
+              <p className="text-xs text-gray-500">Carrier Rent</p>
+              <p className="text-base font-semibold text-gray-900">Rs. {formatMoney(allTripsSummary.totalCarrierRent)}</p>
+            </div>
+            <div>
+              <p className="text-xs text-gray-500">Booking Income</p>
+              <p className="text-base font-semibold text-gray-900">Rs. {formatMoney(allTripsSummary.totalBookingIncome)}</p>
+            </div>
+            <div>
+              <p className="text-xs text-gray-500">Carrier Expense</p>
+              <p className="text-base font-semibold text-gray-900">Rs. {formatMoney(allTripsSummary.totalCarrierExpense)}</p>
+            </div>
+            <div>
+              <p className="text-xs text-gray-500">Own Carrier Profit</p>
+              <p className={`text-base font-semibold ${allTripsSummary.totalOwnCarrierProfit >= 0 ? "text-green-700" : "text-red-700"}`}>
+                Rs. {formatMoney(allTripsSummary.totalOwnCarrierProfit)}
+              </p>
+            </div>
+          </div>
+        )}
 
         <div className="mb-4 flex items-center justify-between">
           <h2 className="text-lg font-semibold text-gray-900">Trips</h2>

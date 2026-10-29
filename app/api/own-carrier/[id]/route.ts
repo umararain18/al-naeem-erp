@@ -4,6 +4,7 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { getDriverCashBalance } from "@/lib/own-carrier";
+import { getCarrierAllTripsSummary } from "@/lib/carrier-trip";
 import { auditUpdate, auditDelete, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 
 export async function GET(
@@ -54,9 +55,10 @@ export async function GET(
       });
     }
 
-    const driverCashBalance = carrier.driverCashAccount
-      ? await getDriverCashBalance(prisma, carrier.driverCashAccount.id)
-      : 0;
+    const [driverCashBalance, allTripsSummary] = await Promise.all([
+      carrier.driverCashAccount ? getDriverCashBalance(prisma, carrier.driverCashAccount.id) : Promise.resolve(0),
+      getCarrierAllTripsSummary(prisma, id),
+    ]);
 
     const trips = carrier.trips.map((t) => ({
       id: t.id,
@@ -74,6 +76,7 @@ export async function GET(
       carrier: { ...carrier, trips: undefined },
       trips,
       driverCashBalance,
+      allTripsSummary,
       capabilities: {
         canEdit: hasPermission(currentUser, "ownCarrier.edit"),
         canBin: hasPermission(currentUser, "ownCarrier.bin"),

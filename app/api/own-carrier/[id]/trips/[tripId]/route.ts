@@ -3,18 +3,22 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
-import { getTripCashBook, CarrierTripError } from "@/lib/carrier-trip";
+import { getTripCashBook, closeCarrierTrip, reopenCarrierTrip, CarrierTripError } from "@/lib/carrier-trip";
 import { auditUpdate, auditDelete, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 
 async function loadDocumentLabels(
-  documents: { id: string; documentType: string; documentId: string; linkedAt: Date }[]
+  documents: { id: string; documentType: string; documentId: string; linkedAt: Date; carrierRentAmount: Prisma.Decimal }[]
 ) {
   return Promise.all(
     documents.map(async (doc) => {
       let label = `${doc.documentType} ${doc.documentId}`;
+      let isOwnCarrierChallan = false;
       if (doc.documentType === "CHALLAN") {
-        const d = await prisma.challan.findUnique({ where: { id: doc.documentId }, select: { challanNo: true } });
-        if (d) label = `Challan ${d.challanNo}`;
+        const d = await prisma.challan.findUnique({ where: { id: doc.documentId }, select: { challanNo: true, ownCarrierId: true } });
+        if (d) {
+          label = `Challan ${d.challanNo}`;
+          isOwnCarrierChallan = Boolean(d.ownCarrierId);
+        }
       } else if (doc.documentType === "PHONCH") {
         const d = await prisma.phonch.findUnique({ where: { id: doc.documentId }, select: { phonchNo: true } });
         if (d) label = `Phonch ${d.phonchNo}`;
@@ -22,7 +26,15 @@ async function loadDocumentLabels(
         const d = await prisma.privatePhonch.findUnique({ where: { id: doc.documentId }, select: { phonchNo: true } });
         if (d) label = `Private Phonch ${d.phonchNo}`;
       }
-      return { id: doc.id, documentType: doc.documentType, documentId: doc.documentId, linkedAt: doc.linkedAt, label };
+      return {
+        id: doc.id,
+        documentType: doc.documentType,
+        documentId: doc.documentId,
+        linkedAt: doc.linkedAt,
+        label,
+        carrierRentAmount: Number(doc.carrierRentAmount),
+        isOwnCarrierChallan,
+      };
     })
   );
 }
@@ -151,21 +163,40 @@ export async function PATCH(
         updateData.dateTo = dateTo;
       }
     }
+    // STATUS (Close/Reopen) is handled separately via the dedicated
+    // closeCarrierTrip/reopenCarrierTrip orchestration below - NOT a
+    // plain column write - since Close recognizes (and Reopen
+    // reverses) every linked own-carrier Challan's income (see
+    // lib/carrier-trip.ts's own module comment). A same-value submit
+    // (body.status === existing.status) is treated as "not changing
+    // status at all", never re-running Close/Reopen's own side
+    // effects idempotently-but-pointlessly.
+    let targetStatus: "OPEN" | "CLOSED" | undefined;
     if (body.status !== undefined) {
       if (body.status !== "OPEN" && body.status !== "CLOSED") {
         return NextResponse.json({ success: false, message: "Invalid status" }, { status: 400 });
       }
-      updateData.status = body.status;
+      if (body.status !== existing.status) targetStatus = body.status;
     }
 
     try {
       const updated = await prisma.$transaction(async (tx) => {
-        const updatedTrip = await tx.carrierTrip.update({ where: { id: tripId }, data: updateData });
+        if (Object.keys(updateData).length > 1) {
+          await tx.carrierTrip.update({ where: { id: tripId }, data: updateData });
+        }
+
+        let updatedTrip = await tx.carrierTrip.findUniqueOrThrow({ where: { id: tripId } });
+
+        if (targetStatus === "CLOSED") {
+          updatedTrip = await closeCarrierTrip(tx, { tripId, updatedById: currentUser.userId });
+        } else if (targetStatus === "OPEN") {
+          updatedTrip = await reopenCarrierTrip(tx, { tripId, updatedById: currentUser.userId, reason: body.reason });
+        }
 
         const changedFields = diffFields(
           existing as unknown as Record<string, unknown>,
-          updateData as Record<string, unknown>,
-          Object.keys(updateData).filter((k) => k !== "updatedById") as (keyof typeof existing)[]
+          { ...updateData, ...(targetStatus ? { status: targetStatus, dateTo: updatedTrip.dateTo } : {}) } as Record<string, unknown>,
+          [...Object.keys(updateData).filter((k) => k !== "updatedById"), ...(targetStatus ? ["status", "dateTo"] : [])] as (keyof typeof existing)[]
         );
         if (Object.keys(changedFields).length > 0) {
           const summary = Object.entries(changedFields).map(([f, { old, new: nv }]) => `${f} ${old ?? "—"} → ${nv ?? "—"}`).join("; ");
@@ -188,6 +219,9 @@ export async function PATCH(
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
         return NextResponse.json({ success: false, message: "This Trip No. already exists for this carrier" }, { status: 409 });
+      }
+      if (error instanceof CarrierTripError) {
+        return NextResponse.json({ success: false, message: error.message }, { status: 400 });
       }
       throw error;
     }

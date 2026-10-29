@@ -63,6 +63,8 @@ type Challan = {
   createdAt: string;
   status: ChallanStatus;
   transporterParty: { id: string; partyName: string } | null;
+  ownCarrier: { id: string; carrierNumber: string } | null;
+  incomePending?: boolean;
   driverName: string | null;
   driverPhone: string | null;
   carrierNumber: string | null;
@@ -456,6 +458,7 @@ export default function ChallanPage() {
   const [challanNo, setChallanNo] = useState("");
   const [loadingDate, setLoadingDate] = useState("");
   const [transporterPartyId, setTransporterPartyId] = useState("");
+  const [ownCarrierId, setOwnCarrierId] = useState("");
   const [driverName, setDriverName] = useState("");
   const [driverPhone, setDriverPhone] = useState("");
   const [carrierNumber, setCarrierNumber] = useState("");
@@ -468,6 +471,23 @@ export default function ChallanPage() {
   const [loadingBilties, setLoadingBilties] = useState(false);
   const [transporters, setTransporters] = useState<Transporter[]>([]);
   const [loadingTransporters, setLoadingTransporters] = useState(false);
+  const [ownCarriers, setOwnCarriers] = useState<{ id: string; carrierNumber: string }[]>([]);
+
+  // One combined <select> offers both Transporter Parties and Own
+  // Carriers - "oc:<id>" vs the bare Party id tells handleCreateChallan
+  // which of transporterPartyId/ownCarrierId to send (mutually
+  // exclusive - see Challan.ownCarrierId's own schema doc comment).
+  const carrierPickerValue = ownCarrierId ? `oc:${ownCarrierId}` : transporterPartyId;
+  function handleCarrierPickerChange(value: string) {
+    if (value.startsWith("oc:")) {
+      setOwnCarrierId(value.slice(3));
+      setTransporterPartyId("");
+      setCarrierRent("");
+    } else {
+      setOwnCarrierId("");
+      setTransporterPartyId(value);
+    }
+  }
 
   const filteredChallans = useMemo(() => {
     const filtered = challans.filter((challan) => {
@@ -591,6 +611,21 @@ export default function ChallanPage() {
     }
   }
 
+  async function loadOwnCarriers() {
+    try {
+      const response = await fetch("/api/own-carrier");
+      const data = await response.json();
+      if (!response.ok || !data.success) return;
+      setOwnCarriers(
+        (data.items || [])
+          .filter((c: { isActive: boolean }) => c.isActive)
+          .map((c: { id: string; carrierNumber: string }) => ({ id: c.id, carrierNumber: c.carrierNumber }))
+      );
+    } catch {
+      // silent
+    }
+  }
+
   async function loadNextChallanNo() {
     try {
       const response = await fetch("/api/challan/next-number");
@@ -626,6 +661,7 @@ export default function ChallanPage() {
 
   useEffect(() => {
     loadTransporters();
+    loadOwnCarriers();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -647,6 +683,7 @@ export default function ChallanPage() {
     setChallanNo("");
     setLoadingDate("");
     setTransporterPartyId("");
+    setOwnCarrierId("");
     setDriverName("");
     setDriverPhone("");
     setCarrierNumber("");
@@ -681,11 +718,12 @@ export default function ChallanPage() {
         body: JSON.stringify({
           challanNo,
           loadingDate,
-          transporterPartyId: transporterPartyId || undefined,
+          transporterPartyId: ownCarrierId ? undefined : transporterPartyId || undefined,
+          ownCarrierId: ownCarrierId || undefined,
           driverName: driverName || undefined,
           driverPhone: driverPhone || undefined,
           carrierNumber: carrierNumber || undefined,
-          carrierRent: carrierRent === "" ? 0 : Number(carrierRent),
+          carrierRent: ownCarrierId ? 0 : carrierRent === "" ? 0 : Number(carrierRent),
           remarks: remarks || undefined,
           biltyIds: selectedBilties.map((b) => b.id),
         }),
@@ -813,10 +851,10 @@ export default function ChallanPage() {
                   />
                 </div>
                 <div>
-                  <label className="block text-sm font-medium mb-1">Transporter</label>
+                  <label className="block text-sm font-medium mb-1">Transporter / Own Carrier</label>
                   <select
-                    value={transporterPartyId}
-                    onChange={(e) => setTransporterPartyId(e.target.value)}
+                    value={carrierPickerValue}
+                    onChange={(e) => handleCarrierPickerChange(e.target.value)}
                     className="w-full border rounded-lg px-3 py-2"
                     disabled={loadingTransporters}
                   >
@@ -826,6 +864,15 @@ export default function ChallanPage() {
                         {t.partyName}
                       </option>
                     ))}
+                    {ownCarriers.length > 0 && (
+                      <optgroup label="Own Carrier">
+                        {ownCarriers.map((c) => (
+                          <option key={c.id} value={`oc:${c.id}`}>
+                            {c.carrierNumber}
+                          </option>
+                        ))}
+                      </optgroup>
+                    )}
                   </select>
                 </div>
                 <div>
@@ -834,9 +881,11 @@ export default function ChallanPage() {
                     type="number"
                     min="0"
                     step="0.01"
-                    value={carrierRent}
+                    value={ownCarrierId ? "" : carrierRent}
                     onChange={(e) => setCarrierRent(e.target.value)}
-                    className="w-full border rounded-lg px-3 py-2"
+                    disabled={Boolean(ownCarrierId)}
+                    placeholder={ownCarrierId ? "Entered on the Trip slip" : undefined}
+                    className="w-full border rounded-lg px-3 py-2 disabled:bg-gray-100 disabled:text-gray-400"
                   />
                 </div>
                 <div>
@@ -1113,7 +1162,11 @@ export default function ChallanPage() {
                           </td>
                           <td className="px-4 py-2.5" onClick={(e) => e.stopPropagation()}>
                             <p>
-                              {challan.transporterParty ? (
+                              {challan.ownCarrier ? (
+                                <Link href={`/own-carrier/${challan.ownCarrier.id}`} className="text-blue-600 hover:underline">
+                                  {challan.ownCarrier.carrierNumber} (Own)
+                                </Link>
+                              ) : challan.transporterParty ? (
                                 <Link href={`/parties/${challan.transporterParty.id}/ledger`} className="text-blue-600 hover:underline">
                                   {challan.transporterParty.partyName}
                                 </Link>
@@ -1122,6 +1175,9 @@ export default function ChallanPage() {
                               )}
                             </p>
                             <p className="text-xs text-gray-500">{challan.carrierNumber || "—"}</p>
+                            {challan.incomePending && (
+                              <p className="mt-0.5 text-xs font-medium text-amber-600">Income pending</p>
+                            )}
                           </td>
                           <td className="px-4 py-2.5 text-right whitespace-nowrap">
                             <p>Rs. {biltyRentTotal(challan).toLocaleString()}</p>
@@ -1180,7 +1236,11 @@ export default function ChallanPage() {
                         <div>
                           <p className="text-xs text-gray-500">Transporter</p>
                           <p>
-                            {challan.transporterParty ? (
+                            {challan.ownCarrier ? (
+                              <Link href={`/own-carrier/${challan.ownCarrier.id}`} className="text-blue-600 hover:underline">
+                                {challan.ownCarrier.carrierNumber} (Own)
+                              </Link>
+                            ) : challan.transporterParty ? (
                               <Link href={`/parties/${challan.transporterParty.id}/ledger`} className="text-blue-600 hover:underline">
                                 {challan.transporterParty.partyName}
                               </Link>
@@ -1189,6 +1249,9 @@ export default function ChallanPage() {
                             )}
                           </p>
                           <p className="text-xs text-gray-500">{challan.carrierNumber || "—"}</p>
+                          {challan.incomePending && (
+                            <p className="mt-0.5 text-xs font-medium text-amber-600">Income pending</p>
+                          )}
                         </div>
                       </div>
                       <div className="mt-3 flex items-end justify-between gap-2">

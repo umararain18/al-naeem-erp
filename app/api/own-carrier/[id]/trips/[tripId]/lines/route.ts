@@ -7,6 +7,7 @@ import {
   postCollectionLine,
   postCashFromOfficeLine,
   postExpenseCashLine,
+  postExpenseOfficeLine,
   postExpenseCreditLine,
   postDriverSalaryLine,
   postDepositToOfficeLine,
@@ -14,7 +15,7 @@ import {
 } from "@/lib/carrier-trip";
 import { auditPost, actorFromUser, requestContext } from "@/lib/audit-log";
 
-const LINE_TYPES = ["COLLECTION", "CASH_FROM_OFFICE", "EXPENSE_CASH", "EXPENSE_CREDIT", "DRIVER_SALARY", "DEPOSIT_TO_OFFICE"] as const;
+const LINE_TYPES = ["COLLECTION", "CASH_FROM_OFFICE", "EXPENSE_CASH", "EXPENSE_OFFICE", "EXPENSE_CREDIT", "DRIVER_SALARY", "DEPOSIT_TO_OFFICE"] as const;
 
 export async function POST(
   request: NextRequest,
@@ -78,6 +79,10 @@ export async function POST(
           case "EXPENSE_CASH":
             if (!body.expenseAccountId) throw new CarrierTripError("MISSING_ACCOUNT", "Expense account is required.");
             return postExpenseCashLine(tx, { ...base, expenseAccountId: body.expenseAccountId });
+          case "EXPENSE_OFFICE":
+            if (!body.expenseAccountId) throw new CarrierTripError("MISSING_ACCOUNT", "Expense account is required.");
+            if (!body.officeAccountId) throw new CarrierTripError("MISSING_ACCOUNT", "Office account is required.");
+            return postExpenseOfficeLine(tx, { ...base, expenseAccountId: body.expenseAccountId, officeAccountId: body.officeAccountId });
           case "EXPENSE_CREDIT":
             if (!body.expenseAccountId) throw new CarrierTripError("MISSING_ACCOUNT", "Expense account is required.");
             if (!body.vendorPartyId) throw new CarrierTripError("MISSING_VENDOR", "Vendor party is required for a credit expense.");

@@ -180,15 +180,29 @@ model Account {
   partyId            String?             @unique
   employeeId         String?             @unique
   // 1:1 with OwnCarrier's own dedicated "Driver Cash" account - same
-  // nullable-unique-FK precedent as partyId/employeeId above.
+  // nullable-unique-FK precedent as partyId/employeeId above. Named
+  // explicitly ("OwnCarrierDriverCashAccount") because Account now has
+  // a SECOND, independent 1:1 relation to OwnCarrier below (the Own
+  // Carrier Income account) - Prisma requires every relation between
+  // the same two models to be named once there is more than one.
   ownCarrierId       String?             @unique
+  // 1:1 with OwnCarrier's own dedicated "<carrier> — Own Carrier
+  // Income" account (INCOME/CARRIER_INCOME) - created alongside Driver
+  // Cash at carrier creation (see lib/own-carrier.ts's
+  // createOwnCarrierWithAccount). Credited only at Trip CLOSE, for the
+  // manually-entered Carrier Rent on each linked own-carrier Challan
+  // (see lib/carrier-trip.ts's recognizeCarrierTripChallanIncome) -
+  // never at dispatch, unlike every other income account in this
+  // schema.
+  ownCarrierIncomeId String?             @unique
   createdAt          DateTime            @default(now())
   updatedAt          DateTime            @updatedAt
   parent             Account?            @relation("AccountHierarchy", fields: [parentId], references: [id], onDelete: Restrict)
   children           Account[]           @relation("AccountHierarchy")
   party              Party?              @relation(fields: [partyId], references: [id])
   employee           Employee?           @relation(fields: [employeeId], references: [id])
-  ownCarrier         OwnCarrier?         @relation(fields: [ownCarrierId], references: [id])
+  ownCarrier         OwnCarrier?         @relation("OwnCarrierDriverCashAccount", fields: [ownCarrierId], references: [id])
+  ownCarrierIncomeFor OwnCarrier?        @relation("OwnCarrierIncomeAccount", fields: [ownCarrierIncomeId], references: [id])
   ledgerEntries      JournalLine[]
   settlementPayments SettlementPayment[]
   carrierTripExpenseLines CarrierTripLine[] @relation("CarrierTripLineExpenseAccount")
@@ -579,6 +593,43 @@ model Challan {
   driverPhone        String?
   carrierNumber      String?
 
+  // ============================================================
+  // OWN CARRIER DISPATCH - mutually exclusive with transporterPartyId
+  // (application-enforced, same convention as every other "exactly
+  // one of several optional FKs" rule in this schema - never both set
+  // at once). When set, this Challan was carried by ANC's OWN fleet,
+  // not an external Transporter, and dispatch/edit (app/api/challan/
+  // route.ts, app/api/challan/[id]/route.ts) deliberately SKIP every
+  // normal dispatch-time accounting effect for it:
+  //   - NO Bilty revenue recognition (lib/bilty-revenue-recognition.ts)
+  //     - each dispatched Bilty's rent stays in Unearned Revenue.
+  //   - NO Carrier Rent expense / Gross Carrier Rent Payable posting -
+  //     carrierRent on THIS Challan is therefore always kept at 0 for
+  //     an own-carrier Challan (enforced at the API layer); the real
+  //     Carrier Rent figure instead lives on CarrierTripDocument.
+  //     carrierRentAmount, entered manually per Trip-linked-Challan,
+  //     editable until that Trip closes.
+  //   - Settlement therefore has nothing to reclassify for Carrier
+  //     Rent either (the existing `Number(challan.carrierRent) > 0`
+  //     guards throughout lib/challan-settlement-summary.ts and
+  //     app/api/challan/[id]/route.ts already skip it for free) - "no
+  //     transporter payable" falls out of this naturally.
+  // Income is instead recognized exactly once, at the linked Carrier
+  // Trip's CLOSE (lib/carrier-trip.ts's
+  // recognizeCarrierTripChallanIncome - referenceType
+  // CARRIER_TRIP_CLOSE): Dr Unearned Revenue (this Challan's total
+  // Bilty rent) / Cr Booking Income (Bilty rent - Carrier Rent) / Cr
+  // the carrier's own "<carrier> — Own Carrier Income" account
+  // (Carrier Rent). Reopening that Trip reverses this via
+  // reversesEntryId; re-closing posts fresh - never more than once
+  // live at a time (same net-count idempotency as
+  // lib/bilty-revenue-recognition.ts). Unlinking this Challan from an
+  // already-CLOSED Trip is blocked (lib/carrier-trip.ts's
+  // unlinkDocumentFromTrip).
+  // ============================================================
+  ownCarrierId String?
+  ownCarrier   OwnCarrier? @relation(fields: [ownCarrierId], references: [id], onDelete: SetNull)
+
   // Financial
   carrierRent Decimal @default(0) @db.Decimal(15, 2)
   remarks     String?
@@ -621,6 +672,7 @@ model Challan {
   @@index([status])
   @@index([isDeleted, deletedAt])
   @@index([challanNo])
+  @@index([ownCarrierId])
 }
 
 model ChallanBilty {
@@ -1350,7 +1402,8 @@ model OwnCarrier {
   currentDriverId String?
   currentDriver   Employee? @relation("OwnCarrierCurrentDriver", fields: [currentDriverId], references: [id], onDelete: SetNull)
 
-  driverCashAccount Account?
+  driverCashAccount    Account? @relation("OwnCarrierDriverCashAccount")
+  ownCarrierIncomeAccount Account? @relation("OwnCarrierIncomeAccount")
 
   // Bin
   isDeleted   Boolean   @default(false)
@@ -1367,7 +1420,13 @@ model OwnCarrier {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  trips CarrierTrip[]
+  trips    CarrierTrip[]
+  // Challans dispatched under this carrier instead of an external
+  // Transporter Party - see model Challan's own "OWN CARRIER
+  // DISPATCH" doc comment for the full accounting rationale (no
+  // income recognition, no carrier rent expense, no transporter
+  // payable at dispatch; deferred to Trip CLOSE instead).
+  challans Challan[]
 
   @@index([isActive])
   @@index([isDeleted])
@@ -1457,6 +1516,16 @@ model CarrierTripDocument {
   unlinkedById String?
   unlinkedBy   User?     @relation("CarrierTripDocumentUnlinkedBy", fields: [unlinkedById], references: [id], onDelete: SetNull)
 
+  // CHALLAN links only, and only when that Challan is itself an
+  // Own Carrier dispatch (Challan.ownCarrierId set) - the manually-
+  // entered Carrier Rent for THIS specific Challan on THIS specific
+  // Trip, editable until the Trip closes (see CarrierTrip.status's
+  // own doc comment). Meaningless (left at its 0 default) for a
+  // PHONCH/PRIVATE_PHONCH link, or a CHALLAN link to a regular
+  // (non-own-carrier) Challan - neither of those is ever read by
+  // lib/carrier-trip.ts's recognizeCarrierTripChallanIncome.
+  carrierRentAmount Decimal @default(0) @db.Decimal(15, 2)
+
   @@index([tripId])
   @@index([documentType, documentId])
 }
@@ -1465,6 +1534,7 @@ enum CarrierTripLineType {
   COLLECTION // IN - driver/office collected against a linked document.
   CASH_FROM_OFFICE // IN - office hands cash to the driver.
   EXPENSE_CASH // OUT - trip expense, paid by the driver from Driver Cash.
+  EXPENSE_OFFICE // OUT - trip expense (e.g. diesel), paid directly from an office Cash/Bank account - never touches Driver Cash.
   EXPENSE_CREDIT // OUT - trip expense, Udhaar (credit) to a Vendor Party.
   DRIVER_SALARY // OUT - salary paid to an Employee from Driver Cash.
   DEPOSIT_TO_OFFICE // OUT - driver hands cash back to an office account.
@@ -1491,9 +1561,11 @@ model CarrierTripLine {
   documentType String?
   documentId   String?
 
-  // EXPENSE_CASH / EXPENSE_CREDIT only - an EXISTING Expense-category
-  // Account, reusing the Accounts page's own picker as-is (never a
-  // new account-management feature).
+  // EXPENSE_CASH / EXPENSE_OFFICE / EXPENSE_CREDIT only - an EXISTING
+  // Expense-category Account, reusing the Accounts page's own picker
+  // as-is (never a new account-management feature). The Diesel UI
+  // section is not a distinct lineType - it is one of these three,
+  // pre-filled with liters/pump text folded into `description`.
   expenseAccountId String?
   expenseAccount   Account? @relation("CarrierTripLineExpenseAccount", fields: [expenseAccountId], references: [id], onDelete: Restrict)
 
@@ -1506,9 +1578,9 @@ model CarrierTripLine {
   employeeId String?
   employee   Employee? @relation("CarrierTripLineDriverSalary", fields: [employeeId], references: [id], onDelete: Restrict)
 
-  // CASH_FROM_OFFICE / DEPOSIT_TO_OFFICE only - the office-side Cash/
-  // Bank account (Office Cash, a Bank account, etc.) - reuses the
-  // Accounts picker, same as expenseAccountId.
+  // CASH_FROM_OFFICE / DEPOSIT_TO_OFFICE / EXPENSE_OFFICE only - the
+  // office-side Cash/Bank account (Office Cash, a Bank account, etc.)
+  // - reuses the Accounts picker, same as expenseAccountId.
   officeAccountId String?
   officeAccount   Account? @relation("CarrierTripLineOfficeAccount", fields: [officeAccountId], references: [id], onDelete: Restrict)
 

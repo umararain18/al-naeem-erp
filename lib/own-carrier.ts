@@ -20,11 +20,16 @@ export class OwnCarrierError extends Error {
 
 /**
  * Creates exactly one OwnCarrier + exactly one dedicated Driver Cash
- * Account (ASSET/CASH, isSystem: false) in the SAME transaction -
- * mirroring app/api/parties/route.ts and app/api/employees/route.ts's
- * own Party+Account / Employee+Account creation pattern exactly, so a
- * carrier can never exist without its account and never end up with
- * more than one (Account.ownCarrierId is @unique).
+ * Account (ASSET/CASH, isSystem: false) + exactly one dedicated Own
+ * Carrier Income Account (INCOME/CARRIER_INCOME, isSystem: false) in
+ * the SAME transaction - mirroring app/api/parties/route.ts and
+ * app/api/employees/route.ts's own Party+Account / Employee+Account
+ * creation pattern exactly, so a carrier can never exist without
+ * either account and never end up with more than one of each
+ * (Account.ownCarrierId / ownCarrierIncomeId are both @unique). The
+ * income account is credited only at Trip CLOSE (see
+ * lib/carrier-trip.ts's recognizeCarrierTripChallanIncome) - never at
+ * dispatch, unlike every other income account in this schema.
  */
 export async function createOwnCarrierWithAccount(
   tx: Tx,
@@ -61,7 +66,19 @@ export async function createOwnCarrierWithAccount(
     },
   });
 
-  return { carrier, account };
+  const incomeAccount = await tx.account.create({
+    data: {
+      accountName: `${carrier.carrierNumber} — Own Carrier Income`,
+      accountType: "INCOME",
+      category: "CARRIER_INCOME",
+      description: `Automatic Own Carrier Income account for own carrier: ${carrier.carrierNumber} - credited only when a Trip linking one of this carrier's own-carrier Challans is closed.`,
+      ownCarrierIncomeId: carrier.id,
+      isSystem: false,
+      isActive: true,
+    },
+  });
+
+  return { carrier, account, incomeAccount };
 }
 
 /**
@@ -84,10 +101,44 @@ export async function getDriverCashBalance(tx: Tx, accountId: string): Promise<n
 export async function getOwnCarrierOrThrow(tx: Tx, carrierId: string) {
   const carrier = await tx.ownCarrier.findUnique({
     where: { id: carrierId },
-    include: { driverCashAccount: true, currentDriver: { select: { id: true, name: true } } },
+    include: {
+      driverCashAccount: true,
+      ownCarrierIncomeAccount: true,
+      currentDriver: { select: { id: true, name: true } },
+    },
   });
   if (!carrier || carrier.isDeleted) {
     throw new OwnCarrierError("OWN_CARRIER_NOT_FOUND", "Own Carrier not found.");
   }
   return carrier;
+}
+
+/**
+ * Lazy find-or-create for a carrier's own "<carrier> — Own Carrier
+ * Income" account - the normal path is createOwnCarrierWithAccount()
+ * creating it up front, but this exists as a defensive fallback (same
+ * "never hard-fail on a missing system account" precedent as
+ * lib/gross-accounts.ts's getOrCreateSystemAccount) for any carrier
+ * row that predates this account existing.
+ */
+export async function getOrCreateOwnCarrierIncomeAccountId(tx: Tx, carrierId: string): Promise<string> {
+  const existing = await tx.account.findUnique({ where: { ownCarrierIncomeId: carrierId }, select: { id: true } });
+  if (existing) return existing.id;
+
+  const carrier = await tx.ownCarrier.findUnique({ where: { id: carrierId }, select: { carrierNumber: true } });
+  if (!carrier) throw new OwnCarrierError("OWN_CARRIER_NOT_FOUND", "Own Carrier not found.");
+
+  const created = await tx.account.create({
+    data: {
+      accountName: `${carrier.carrierNumber} — Own Carrier Income`,
+      accountType: "INCOME",
+      category: "CARRIER_INCOME",
+      description: `Automatic Own Carrier Income account for own carrier: ${carrier.carrierNumber} - credited only when a Trip linking one of this carrier's own-carrier Challans is closed.`,
+      ownCarrierIncomeId: carrierId,
+      isSystem: false,
+      isActive: true,
+    },
+    select: { id: true },
+  });
+  return created.id;
 }

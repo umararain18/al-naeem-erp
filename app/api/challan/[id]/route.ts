@@ -18,6 +18,7 @@ import { computeChallanSettlementSummary } from "@/lib/challan-settlement-summar
 import { recognizeBiltyBookingIncome, reverseBiltyBookingIncome, BiltyRevenueRecognitionError } from "@/lib/bilty-revenue-recognition";
 import { auditUpdate, auditDelete, auditRestore, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 import { assertSuperAdmin, biltyHasPhonchOrBillReference, ChallanLifecycleError } from "@/lib/challan-lifecycle";
+import { isCarrierTripChallanIncomeRecognized } from "@/lib/carrier-trip";
 
 function round2(value: number): number {
   return Math.round(value * 100) / 100;
@@ -106,6 +107,12 @@ export async function GET(
             account: { select: { id: true, accountName: true } },
           },
         },
+        ownCarrier: {
+          select: {
+            id: true,
+            carrierNumber: true,
+          },
+        },
         bilties: {
           include: {
             bilty: {
@@ -175,6 +182,7 @@ export async function GET(
       return NextResponse.json({
         success: true,
         challan,
+        incomePending: null,
         financials: null,
         responsibleParties: null,
         settlementBreakdown: null,
@@ -184,6 +192,11 @@ export async function GET(
         capabilities: { canRestore: currentUser.role === "SUPER_ADMIN", canBin: false },
       });
     }
+
+    // "Income pending (Trip slip not closed)" - see Challan.
+    // ownCarrierId's own schema doc comment. Always false for a
+    // regular (non-own-carrier) Challan.
+    const incomePending = challan.ownCarrierId ? !(await isCarrierTripChallanIncomeRecognized(prisma, challan.id)) : false;
 
     const financials = (
       await computeChallanFinancialsBatch([
@@ -346,6 +359,7 @@ export async function GET(
     return NextResponse.json({
       success: true,
       challan,
+      incomePending,
       financials,
       responsibleParties,
       settlementBreakdown,
@@ -587,6 +601,53 @@ export async function PATCH(
       updateData.transporterPartyId = body.transporterPartyId || undefined;
     }
 
+    // ========================================================
+    // OWN CARRIER <-> TRANSPORTER (mutually exclusive - see Challan.
+    // ownCarrierId's own schema doc comment). A single combined
+    // picker in the UI sends EITHER transporterPartyId OR
+    // ownCarrierId when the user picks one option, so whichever one
+    // was actually sent this request wins and clears the other -
+    // never both at once, regardless of what the other field's
+    // CURRENT value already is.
+    // ========================================================
+    let finalOwnCarrierId = existingChallan.ownCarrierId;
+
+    if (body.ownCarrierId !== undefined && body.ownCarrierId) {
+      finalOwnCarrierId = body.ownCarrierId;
+      updateData.transporterPartyId = null;
+    } else if (body.transporterPartyId) {
+      finalOwnCarrierId = null;
+    } else if (body.ownCarrierId !== undefined && !body.ownCarrierId) {
+      finalOwnCarrierId = null;
+    }
+
+    const becomingOwnCarrier = finalOwnCarrierId !== existingChallan.ownCarrierId && Boolean(finalOwnCarrierId);
+    const leavingOwnCarrier = Boolean(existingChallan.ownCarrierId) && finalOwnCarrierId !== existingChallan.ownCarrierId;
+
+    if (becomingOwnCarrier) {
+      const ownCarrier = await prisma.ownCarrier.findUnique({ where: { id: finalOwnCarrierId! }, select: { isDeleted: true } });
+      if (!ownCarrier || ownCarrier.isDeleted) {
+        return NextResponse.json(
+          { success: false, message: "Selected Own Carrier was not found" },
+          { status: 400 }
+        );
+      }
+    }
+
+    if (leavingOwnCarrier && (await isCarrierTripChallanIncomeRecognized(prisma, id))) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: "This Challan's income was already recognized via a closed Trip - reopen that Trip before changing it off Own Carrier.",
+        },
+        { status: 400 }
+      );
+    }
+
+    if (finalOwnCarrierId !== existingChallan.ownCarrierId) {
+      updateData.ownCarrierId = finalOwnCarrierId;
+    }
+
     if (body.driverName !== undefined) {
       updateData.driverName = body.driverName || undefined;
     }
@@ -641,8 +702,16 @@ export async function PATCH(
     // never overwrite history. See lib/settlement-correction.ts.
     // ========================================================
 
+    // An Own Carrier Challan (final state, after this edit) never
+    // carries a carrierRent of its own - that figure instead lives on
+    // CarrierTripDocument.carrierRentAmount per linked Trip (see
+    // Challan.ownCarrierId's own schema doc comment). Forced to 0
+    // here regardless of what was submitted - this also correctly
+    // posts the balanced correction that zeroes out any amount a
+    // regular Transporter Challan already had, the moment it becomes
+    // an Own Carrier one.
     const oldCarrierRent = Number(existingChallan.carrierRent);
-    const newCarrierRent = body.carrierRent !== undefined ? Number(body.carrierRent) : oldCarrierRent;
+    const newCarrierRent = finalOwnCarrierId ? 0 : body.carrierRent !== undefined ? Number(body.carrierRent) : oldCarrierRent;
     const carrierRentDelta = Number((newCarrierRent - oldCarrierRent).toFixed(2));
 
     // Settlement posting date = Challan date - if THIS SAME request
@@ -652,8 +721,8 @@ export async function PATCH(
     // which only ever affects future writes, never past ones).
     const effectiveLoadingDate = (updateData.loadingDate as Date | undefined) ?? existingChallan.loadingDate;
 
-    if (body.carrierRent !== undefined) {
-      updateData.carrierRent = body.carrierRent;
+    if (carrierRentDelta !== 0 || body.carrierRent !== undefined) {
+      updateData.carrierRent = newCarrierRent;
     }
 
     let carrierRentExpenseAccountId: string | undefined;
@@ -841,15 +910,65 @@ export async function PATCH(
         // inside this transaction (never the pre-transaction
         // `biltiesToAdd` above) so the amount recognized is always the
         // one actually being committed.
-        const addedBilties = await tx.bilty.findMany({
-          where: { id: { in: addBiltyIds } },
-        });
-        for (const bilty of addedBilties) {
-          await recognizeBiltyBookingIncome(tx, bilty, {
-            entryDate: new Date(),
-            challanNo: existingChallan.challanNo,
-            createdById: currentUser.userId,
+        // SKIPPED for an Own Carrier Challan (final state) - a newly
+        // added Bilty's rent stays in Unearned Revenue exactly like
+        // every other Bilty on this Challan, pending the linking Trip
+        // CLOSE (see Challan.ownCarrierId's own schema doc comment).
+        if (!finalOwnCarrierId) {
+          const addedBilties = await tx.bilty.findMany({
+            where: { id: { in: addBiltyIds } },
           });
+          for (const bilty of addedBilties) {
+            await recognizeBiltyBookingIncome(tx, bilty, {
+              entryDate: new Date(),
+              challanNo: existingChallan.challanNo,
+              createdById: currentUser.userId,
+            });
+          }
+        }
+      }
+
+      // ========================================================
+      // OWN CARRIER TRANSITION - reconcile already-existing Bilty
+      // income recognition against the NEW final state. Scoped to
+      // every Bilty CURRENTLY on this Challan (addBiltyIds already
+      // handled its own Bilties just above; removeBiltyIds's own
+      // Bilties were already reversed above too, so excluded here to
+      // avoid a redundant second call).
+      // ========================================================
+      if (becomingOwnCarrier || leavingOwnCarrier) {
+        const removedSet = new Set(removeBiltyIds);
+        const stillLinkedBiltyIds = existingChallan.bilties.map((b) => b.biltyId).filter((bid) => !removedSet.has(bid));
+        const stillLinkedBilties = await tx.bilty.findMany({ where: { id: { in: stillLinkedBiltyIds } } });
+
+        if (becomingOwnCarrier) {
+          // Already-dispatched Bilties on a Challan that is NOW an
+          // Own Carrier dispatch must move their income back into
+          // Unearned Revenue - it is no longer recognized until the
+          // linking Trip closes. Safe no-op for any Bilty never
+          // actually recognized in the first place.
+          for (const bilty of stillLinkedBilties) {
+            await reverseBiltyBookingIncome(tx, bilty, {
+              entryDate: new Date(),
+              reason: `Challan ${existingChallan.challanNo} switched to Own Carrier`,
+              createdById: currentUser.userId,
+            });
+          }
+        } else {
+          // Switching OFF Own Carrier (leavingOwnCarrier) - this
+          // Challan is now dispatched under a regular Transporter, so
+          // its Bilties are recognized immediately, exactly like a
+          // normal dispatch. Blocked earlier (before this transaction)
+          // if a Trip CLOSE had already recognized this Challan's
+          // income, so this path only ever runs for a Challan whose
+          // Bilties are still genuinely sitting in Unearned Revenue.
+          for (const bilty of stillLinkedBilties) {
+            await recognizeBiltyBookingIncome(tx, bilty, {
+              entryDate: effectiveLoadingDate,
+              challanNo: existingChallan.challanNo,
+              createdById: currentUser.userId,
+            });
+          }
         }
       }
 
