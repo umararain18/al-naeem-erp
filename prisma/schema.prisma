@@ -43,6 +43,17 @@ model User {
   updatedBills                  Bill[]              @relation("BillUpdatedBy")
   deletedBills                  Bill[]              @relation("BillDeletedBy")
   updatedBusinessSettings       BusinessSettings[]  @relation("BusinessSettingsUpdatedBy")
+
+  createdOwnCarriers         OwnCarrier[]          @relation("OwnCarrierCreatedBy")
+  updatedOwnCarriers         OwnCarrier[]          @relation("OwnCarrierUpdatedBy")
+  deletedOwnCarriers         OwnCarrier[]          @relation("OwnCarrierDeletedBy")
+  createdCarrierTrips        CarrierTrip[]         @relation("CarrierTripCreatedBy")
+  updatedCarrierTrips        CarrierTrip[]         @relation("CarrierTripUpdatedBy")
+  deletedCarrierTrips        CarrierTrip[]         @relation("CarrierTripDeletedBy")
+  linkedCarrierTripDocuments CarrierTripDocument[] @relation("CarrierTripDocumentLinkedBy")
+  unlinkedCarrierTripDocuments CarrierTripDocument[] @relation("CarrierTripDocumentUnlinkedBy")
+  createdCarrierTripLines    CarrierTripLine[]     @relation("CarrierTripLineCreatedBy")
+  deletedCarrierTripLines    CarrierTripLine[]     @relation("CarrierTripLineDeletedBy")
 }
 
 model Party {
@@ -74,6 +85,8 @@ model Party {
   privatePhonchVehicleClearingAgentLines PrivatePhonchVehicle[] @relation("PrivatePhonchVehicleClearingAgent")
 
   bills Bill[] @relation("BillClientParty")
+
+  carrierTripVendorLines CarrierTripLine[] @relation("CarrierTripLineVendor")
 }
 
 // ============================================================
@@ -120,6 +133,9 @@ model Employee {
   account   Account?
   payslips  Payslip[]
 
+  currentDriverOfCarriers OwnCarrier[]      @relation("OwnCarrierCurrentDriver")
+  carrierTripSalaryLines  CarrierTripLine[] @relation("CarrierTripLineDriverSalary")
+
   @@index([isActive])
   @@index([isDeleted])
 }
@@ -163,14 +179,20 @@ model Account {
   parentId           String?
   partyId            String?             @unique
   employeeId         String?             @unique
+  // 1:1 with OwnCarrier's own dedicated "Driver Cash" account - same
+  // nullable-unique-FK precedent as partyId/employeeId above.
+  ownCarrierId       String?             @unique
   createdAt          DateTime            @default(now())
   updatedAt          DateTime            @updatedAt
   parent             Account?            @relation("AccountHierarchy", fields: [parentId], references: [id], onDelete: Restrict)
   children           Account[]           @relation("AccountHierarchy")
   party              Party?              @relation(fields: [partyId], references: [id])
   employee           Employee?           @relation(fields: [employeeId], references: [id])
+  ownCarrier         OwnCarrier?         @relation(fields: [ownCarrierId], references: [id])
   ledgerEntries      JournalLine[]
   settlementPayments SettlementPayment[]
+  carrierTripExpenseLines CarrierTripLine[] @relation("CarrierTripLineExpenseAccount")
+  carrierTripOfficeLines  CarrierTripLine[] @relation("CarrierTripLineOfficeAccount")
 
   @@index([accountType])
   @@index([category])
@@ -296,6 +318,7 @@ model JournalEntry {
   lines             JournalLine[]
   settledChallans   Challan[]          @relation("ChallanSettlement")
   settlementPayment SettlementPayment?
+  carrierTripLine   CarrierTripLine?
 
   // Nullable, additive self-reference: when THIS entry is itself a
   // reversal (e.g. referenceType "SETTLEMENT_UNSETTLE_REVERSAL" - see
@@ -1256,4 +1279,255 @@ model AuditLog {
   @@index([module])
   @@index([entityType, entityId])
   @@index([documentNo])
+}
+
+// ============================================================
+// OWN CARRIER (own-fleet trips) - a vehicle ANC itself owns, as
+// opposed to Challan.transporterPartyId (an EXTERNAL Transporter
+// paid Carrier Rent, a payable). An OwnCarrier never appears as a
+// Challan's own Transporter and is never paid Carrier Rent - it
+// instead runs Trips that may link to an EXISTING Challan/Phonch/
+// Private Phonch (whose own Booking Income / Carrier Rent expense is
+// ALREADY recognized by that document - linking a Trip to it must
+// NEVER create new Income; it only tags the document to the Trip for
+// profit reporting and, if the driver collects cash on ANC's behalf,
+// reclassifies that document's own outstanding balance - exactly the
+// same party-resolution rules app/api/daily-posting/route.ts already
+// applies for a Challan/Phonch/Private-Phonch-linked receipt, reused
+// directly via lib/document-party-resolution.ts's
+// resolveDocumentPartyAccount()/get*EligiblePartyAccountIds(), never
+// re-derived).
+//
+// Each OwnCarrier has exactly one dedicated "Driver Cash" Account
+// (ASSET/CASH, Account.ownCarrierId - same 1:1-via-nullable-unique-FK
+// precedent as Account.partyId/employeeId) - the carrier's own
+// physical cash-in-hand, exactly like Office Cash is ANC's. EVERY
+// CarrierTripLine below posts exactly one real, balanced JournalEntry
+// touching this account - there is no second, independently-tracked
+// balance; "cash with the driver" is always the Driver Cash account's
+// own ledger balance, derived live, never stored.
+//
+// A CarrierTrip is the operational unit ("Trip 1", "Trip 2"...,
+// tripNo auto-suggested as last+1 but user-editable and unique per
+// carrier - same convention as Challan No). CarrierTripDocument links
+// a Trip to AT MOST ONE Challan/Phonch/Private Phonch document and a
+// document to AT MOST ONE *currently active* Trip (enforced by a
+// partial unique index on (documentType, documentId) WHERE
+// "unlinkedAt" IS NULL - the exact same pattern Challan.challanNo's
+// own partial unique index already established, see that field's own
+// comment - Prisma cannot express a partial unique index
+// declaratively). Unlinking (only while the owning Trip is still
+// OPEN) never deletes the row - it timestamps unlinkedAt, so the
+// document can be relinked to a LATER Trip of the same carrier and
+// the full link history stays auditable; collections already posted
+// against that document stay exactly where they were posted
+// (JournalLine.sourceType/sourceId, untouched by unlinking).
+//
+// CarrierTripLine is ONE cash-book row = ONE real JournalEntry
+// (journalEntryId @unique - same "one row, one entry" precedent
+// SettlementPayment already established, not Daily Posting's own
+// multi-line-voucher shape, because every line here is independently
+// reversible). Reversing a line (Bin) never edits/deletes that
+// JournalEntry - it posts a NEW entry with
+// JournalEntry.reversesEntryId pointing at it (the exact mechanism
+// lib/challan-lifecycle.ts's Unsettle already uses) and flips
+// CarrierTripLine.isDeleted.
+// ============================================================
+
+model OwnCarrier {
+  id            String  @id @default(cuid())
+  carrierNumber String  @unique
+  driverName    String?
+  driverPhone   String?
+  notes         String?
+  isActive      Boolean @default(true)
+
+  // Optional CURRENT driver - informational / a convenience default
+  // for a new DRIVER_SALARY line, never required and never assumed
+  // by a salary line itself (each line picks its own employeeId
+  // explicitly, since the driver can change over the carrier's life -
+  // see this model's own module comment).
+  currentDriverId String?
+  currentDriver   Employee? @relation("OwnCarrierCurrentDriver", fields: [currentDriverId], references: [id], onDelete: SetNull)
+
+  driverCashAccount Account?
+
+  // Bin
+  isDeleted   Boolean   @default(false)
+  deletedAt   DateTime?
+  deletedById String?
+  deletedBy   User?     @relation("OwnCarrierDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+
+  // Audit
+  createdById String?
+  createdBy   User?   @relation("OwnCarrierCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?
+  updatedBy   User?   @relation("OwnCarrierUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  trips CarrierTrip[]
+
+  @@index([isActive])
+  @@index([isDeleted])
+}
+
+enum CarrierTripStatus {
+  OPEN
+  CLOSED
+}
+
+model CarrierTrip {
+  id        String     @id @default(cuid())
+  carrierId String
+  carrier   OwnCarrier @relation(fields: [carrierId], references: [id], onDelete: Restrict)
+
+  // User-typed, auto-suggested as (highest existing tripNo for this
+  // carrier) + 1 by the creation route - never a DB-level sequence.
+  // Uniqueness is the real guarantee below (@@unique), caught as a
+  // Prisma P2002 by the creation route - same convention as Bilty
+  // No/Challan No/Payslip No.
+  tripNo String
+
+  route    String?
+  dateFrom DateTime
+  dateTo   DateTime?
+  notes    String?
+
+  // OPEN -> CLOSED is a status/reporting flag only (closing balance =
+  // whatever Driver Cash's own ledger balance already is at that
+  // moment - never a separately stored number) - it additionally
+  // blocks new CarrierTripLine rows and CarrierTripDocument
+  // unlink/relink against this Trip (re-opening lifts both). Driver
+  // Cash itself is one continuous ledger across every Trip, never
+  // reset per Trip.
+  status CarrierTripStatus @default(OPEN)
+
+  // Bin
+  isDeleted   Boolean   @default(false)
+  deletedAt   DateTime?
+  deletedById String?
+  deletedBy   User?     @relation("CarrierTripDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+
+  // Audit
+  createdById String?
+  createdBy   User?   @relation("CarrierTripCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  updatedById String?
+  updatedBy   User?   @relation("CarrierTripUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  documents CarrierTripDocument[]
+  lines     CarrierTripLine[]
+
+  @@unique([carrierId, tripNo])
+  @@index([carrierId])
+  @@index([isDeleted])
+}
+
+// Links a Trip to an EXISTING Challan/Phonch/Private Phonch - a pure
+// tag, never itself a JournalEntry (see this module's own header
+// comment). "documentType" uses the SAME "CHALLAN"/"PHONCH"/
+// "PRIVATE_PHONCH" vocabulary JournalLine.sourceType already uses -
+// deliberately NOT an enum, for the same reason JournalLine.sourceType
+// isn't (see that field's own comment).
+model CarrierTripDocument {
+  id     String      @id @default(cuid())
+  tripId String
+  trip   CarrierTrip @relation(fields: [tripId], references: [id], onDelete: Restrict)
+
+  documentType String
+  documentId   String
+
+  linkedAt   DateTime @default(now())
+  linkedById String?
+  linkedBy   User?    @relation("CarrierTripDocumentLinkedBy", fields: [linkedById], references: [id], onDelete: SetNull)
+
+  // NULL = currently active link. Set (never cleared) when unlinked -
+  // see this module's own header comment for why the row is kept,
+  // never deleted. A partial UNIQUE INDEX on (documentType,
+  // documentId) WHERE "unlinkedAt" IS NULL (added by this feature's
+  // own migration, not expressible declaratively here - same
+  // precedent as Challan.challanNo's own partial unique index) is
+  // the real "one ACTIVE Trip per document" guarantee; this plain
+  // index just keeps lookups fast.
+  unlinkedAt   DateTime?
+  unlinkedById String?
+  unlinkedBy   User?     @relation("CarrierTripDocumentUnlinkedBy", fields: [unlinkedById], references: [id], onDelete: SetNull)
+
+  @@index([tripId])
+  @@index([documentType, documentId])
+}
+
+enum CarrierTripLineType {
+  COLLECTION // IN - driver/office collected against a linked document.
+  CASH_FROM_OFFICE // IN - office hands cash to the driver.
+  EXPENSE_CASH // OUT - trip expense, paid by the driver from Driver Cash.
+  EXPENSE_CREDIT // OUT - trip expense, Udhaar (credit) to a Vendor Party.
+  DRIVER_SALARY // OUT - salary paid to an Employee from Driver Cash.
+  DEPOSIT_TO_OFFICE // OUT - driver hands cash back to an office account.
+}
+
+// ONE row = ONE real JournalEntry (journalEntryId, @unique) - see
+// this module's own header comment for why this is SettlementPayment's
+// "one row, one entry" shape, not Daily Posting's multi-line-voucher
+// one. Every column below besides the shared ones is nullable and
+// meaningful only for specific lineType values (mirrors
+// JournalLine.sourceType/sourceId's own "mutually exclusive by tag"
+// precedent) - enforced at the application layer, same as everywhere
+// else in this schema.
+model CarrierTripLine {
+  id          String              @id @default(cuid())
+  tripId      String
+  trip        CarrierTrip         @relation(fields: [tripId], references: [id], onDelete: Restrict)
+  lineType    CarrierTripLineType
+  date        DateTime
+  description String?
+  amount      Decimal             @db.Decimal(15, 2)
+
+  // COLLECTION only.
+  documentType String?
+  documentId   String?
+
+  // EXPENSE_CASH / EXPENSE_CREDIT only - an EXISTING Expense-category
+  // Account, reusing the Accounts page's own picker as-is (never a
+  // new account-management feature).
+  expenseAccountId String?
+  expenseAccount   Account? @relation("CarrierTripLineExpenseAccount", fields: [expenseAccountId], references: [id], onDelete: Restrict)
+
+  // EXPENSE_CREDIT only - the Vendor Party now owed this amount.
+  vendorPartyId String?
+  vendorParty   Party?  @relation("CarrierTripLineVendor", fields: [vendorPartyId], references: [id], onDelete: Restrict)
+
+  // DRIVER_SALARY only - explicit every time (never silently assumed
+  // from OwnCarrier.currentDriverId - see that field's own comment).
+  employeeId String?
+  employee   Employee? @relation("CarrierTripLineDriverSalary", fields: [employeeId], references: [id], onDelete: Restrict)
+
+  // CASH_FROM_OFFICE / DEPOSIT_TO_OFFICE only - the office-side Cash/
+  // Bank account (Office Cash, a Bank account, etc.) - reuses the
+  // Accounts picker, same as expenseAccountId.
+  officeAccountId String?
+  officeAccount   Account? @relation("CarrierTripLineOfficeAccount", fields: [officeAccountId], references: [id], onDelete: Restrict)
+
+  journalEntryId String       @unique
+  journalEntry   JournalEntry @relation(fields: [journalEntryId], references: [id], onDelete: Restrict)
+
+  // Bin - reversal (see this module's own header comment), never a
+  // silent delete.
+  isDeleted   Boolean   @default(false)
+  deletedAt   DateTime?
+  deletedById String?
+  deletedBy   User?     @relation("CarrierTripLineDeletedBy", fields: [deletedById], references: [id], onDelete: SetNull)
+
+  createdById String?
+  createdBy   User?    @relation("CarrierTripLineCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt   DateTime @default(now())
+
+  @@index([tripId])
+  @@index([lineType])
+  @@index([documentType, documentId])
+  @@index([isDeleted])
 }
