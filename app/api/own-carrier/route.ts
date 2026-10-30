@@ -6,6 +6,32 @@ import { hasPermission } from "@/lib/permissions";
 import { createOwnCarrierWithAccount, getDriverCashBalance } from "@/lib/own-carrier";
 import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
 
+/**
+ * Turns an unexpected (not already-specifically-handled) error into a
+ * short, real diagnostic for the response message - never the opaque
+ * "Unable to..." fallback alone. The full error is still always
+ * console.error'd separately for the server log; this is only about
+ * what the UI shows, so a genuine failure (bad data, a stale/broken
+ * Prisma Client, a missing required account, etc.) is visible
+ * immediately instead of needing a server-log lookup every time.
+ */
+function describeError(error: unknown): string {
+  if (error instanceof Prisma.PrismaClientValidationError) {
+    // Prisma's own message is a multi-line dump of the generated query
+    // object - the actual reason ("Unknown argument `x`.", "Argument
+    // `y` is missing.", etc.) is always the last non-empty line.
+    const lines = error.message.split("\n").map((l) => l.trim()).filter(Boolean);
+    return lines[lines.length - 1] || "A database validation error occurred.";
+  }
+  if (error instanceof Prisma.PrismaClientKnownRequestError) {
+    return `${error.message.split("\n")[0].trim()} (code ${error.code})`;
+  }
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return "An unknown error occurred.";
+}
+
 // ============================================================
 // OWN CARRIER - LIST + CREATE
 //
@@ -79,7 +105,7 @@ export async function GET(request: NextRequest) {
     });
   } catch (error) {
     console.error("Get own carriers error:", error);
-    return NextResponse.json({ success: false, message: "Unable to load Own Carriers" }, { status: 500 });
+    return NextResponse.json({ success: false, message: `Unable to load Own Carriers: ${describeError(error)}` }, { status: 500 });
   }
 }
 
@@ -174,6 +200,6 @@ export async function POST(request: NextRequest) {
     }
   } catch (error) {
     console.error("Create own carrier error:", error);
-    return NextResponse.json({ success: false, message: "Unable to create Own Carrier" }, { status: 500 });
+    return NextResponse.json({ success: false, message: `Unable to create Own Carrier: ${describeError(error)}` }, { status: 500 });
   }
 }
