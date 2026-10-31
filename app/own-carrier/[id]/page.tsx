@@ -9,6 +9,13 @@ function formatMoney(value: number) {
   return new Intl.NumberFormat("en-PK", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(Math.abs(value));
 }
 
+// See app/own-carrier/[id]/trip/[tripId]/page.tsx's own formatSignedMoney
+// comment - Driver Cash balance and Own Carrier Profit can genuinely go
+// negative; formatMoney() alone would silently hide that.
+function formatSignedMoney(value: number) {
+  return `${value < 0 ? "-" : ""}Rs. ${formatMoney(value)}`;
+}
+
 function Drawer({ open, onClose, title, children }: { open: boolean; onClose: () => void; title: string; children: React.ReactNode }) {
   if (!open) return null;
   return (
@@ -137,7 +144,7 @@ export default function OwnCarrierDetailPage() {
           </div>
           <div className="rounded-xl border bg-white px-5 py-3 text-right shadow-sm">
             <p className="text-xs text-gray-500">Driver Cash Balance</p>
-            <p className="text-xl font-bold text-gray-900">Rs. {formatMoney(driverCashBalance)}</p>
+            <p className={`text-xl font-bold ${driverCashBalance < 0 ? "text-red-700" : "text-gray-900"}`}>{formatSignedMoney(driverCashBalance)}</p>
           </div>
         </div>
 
@@ -162,7 +169,7 @@ export default function OwnCarrierDetailPage() {
             <div>
               <p className="text-xs text-gray-500">Own Carrier Profit</p>
               <p className={`text-base font-semibold ${allTripsSummary.totalOwnCarrierProfit >= 0 ? "text-green-700" : "text-red-700"}`}>
-                Rs. {formatMoney(allTripsSummary.totalOwnCarrierProfit)}
+                {formatSignedMoney(allTripsSummary.totalOwnCarrierProfit)}
               </p>
             </div>
           </div>

@@ -8,6 +8,13 @@ function formatMoney(value: number) {
   return new Intl.NumberFormat("en-PK", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(Math.abs(value));
 }
 
+// See app/own-carrier/[id]/trip/[tripId]/page.tsx's own formatSignedMoney
+// comment - Driver Cash balance can genuinely go negative; formatMoney()
+// alone would silently hide that.
+function formatSignedMoney(value: number) {
+  return `${value < 0 ? "-" : ""}Rs. ${formatMoney(value)}`;
+}
+
 function Drawer({ open, onClose, title, children }: { open: boolean; onClose: () => void; title: string; children: React.ReactNode }) {
   if (!open) return null;
   return (
@@ -166,7 +173,7 @@ export default function OwnCarrierListPage() {
                       <td className="px-4 py-3 font-medium text-gray-900">{item.carrierNumber}</td>
                       <td className="px-4 py-3 text-gray-600">{item.currentDriver?.name || item.driverName || "—"}</td>
                       <td className="px-4 py-3 text-right">{item.tripCount}</td>
-                      <td className="px-4 py-3 text-right font-semibold text-gray-900">Rs. {formatMoney(item.driverCashBalance)}</td>
+                      <td className={`px-4 py-3 text-right font-semibold ${item.driverCashBalance < 0 ? "text-red-700" : "text-gray-900"}`}>{formatSignedMoney(item.driverCashBalance)}</td>
                       <td className="px-4 py-3">
                         <span className={`inline-block rounded-full px-2.5 py-0.5 text-xs font-medium ${item.isActive ? "bg-green-100 text-green-700" : "bg-gray-100 text-gray-600"}`}>
                           {item.isActive ? "Active" : "Inactive"}

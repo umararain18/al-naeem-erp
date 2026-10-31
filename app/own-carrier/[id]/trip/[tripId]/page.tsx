@@ -10,6 +10,17 @@ function formatMoney(value: number) {
   return new Intl.NumberFormat("en-PK", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(Math.abs(value));
 }
 
+// formatMoney() always shows a plain magnitude (same convention as
+// every other formatMoney in this codebase) - fine for an In/Out
+// amount or a Bilty/Carrier Rent figure, which are never negative in
+// this domain, but a running Cash Book balance and Own Carrier Profit
+// genuinely CAN go negative, and silently dropping the sign there
+// made a deeply negative Driver Cash balance look like it was
+// growing positively. Used ONLY for those two signed figures.
+function formatSignedMoney(value: number) {
+  return `${value < 0 ? "-" : ""}Rs. ${formatMoney(value)}`;
+}
+
 function todayYMD(): string {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Karachi", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
 }
@@ -285,7 +296,7 @@ export default function CarrierTripDetailPage() {
                   <td className="px-4 py-2 text-gray-500" colSpan={canAct ? 4 : 4}>
                     Opening Balance
                   </td>
-                  <td className="px-4 py-2 text-right font-semibold text-gray-900">Rs. {formatMoney(cashBook?.openingBalance || 0)}</td>
+                  <td className="px-4 py-2 text-right font-semibold text-gray-900">{formatSignedMoney(cashBook?.openingBalance || 0)}</td>
                   {canAct && <td />}
                 </tr>
                 {(cashBook?.rows || []).map((row) => (
@@ -294,7 +305,7 @@ export default function CarrierTripDetailPage() {
                     <td className="px-4 py-3 text-gray-900">{row.description}</td>
                     <td className="px-4 py-3 text-right text-green-700">{row.in > 0 ? `Rs. ${formatMoney(row.in)}` : "—"}</td>
                     <td className="px-4 py-3 text-right text-red-700">{row.out > 0 ? `Rs. ${formatMoney(row.out)}` : "—"}</td>
-                    <td className="px-4 py-3 text-right font-semibold text-gray-900">Rs. {formatMoney(row.balance)}</td>
+                    <td className={`px-4 py-3 text-right font-semibold ${row.balance < 0 ? "text-red-700" : "text-gray-900"}`}>{formatSignedMoney(row.balance)}</td>
                     {canAct && (
                       <td className="px-4 py-3">
                         <button type="button" onClick={() => handleReverseLine(row)} className="rounded-md border border-red-200 px-3 py-1 text-xs text-red-600 hover:bg-red-50">
@@ -315,7 +326,7 @@ export default function CarrierTripDetailPage() {
                   <td className="px-4 py-2 font-semibold text-gray-900" colSpan={canAct ? 4 : 4}>
                     Closing Balance
                   </td>
-                  <td className="px-4 py-2 text-right font-bold text-gray-900">Rs. {formatMoney(cashBook?.closingBalance || 0)}</td>
+                  <td className={`px-4 py-2 text-right font-bold ${(cashBook?.closingBalance || 0) < 0 ? "text-red-700" : "text-gray-900"}`}>{formatSignedMoney(cashBook?.closingBalance || 0)}</td>
                   {canAct && <td />}
                 </tr>
               </tbody>
@@ -838,7 +849,7 @@ function ProfitReportDrawer({ carrierId, tripId, onClose }: { carrierId: string;
         <div className="space-y-5 text-sm">
           <div className="flex justify-between rounded-lg bg-gray-50 px-4 py-3 font-semibold">
             <span>Previous Balance (carried from last closed Trip)</span>
-            <span>Rs. {formatMoney(report.previousBalance)}</span>
+            <span className={report.previousBalance < 0 ? "text-red-700" : undefined}>{formatSignedMoney(report.previousBalance)}</span>
           </div>
 
           <div>
@@ -902,7 +913,7 @@ function ProfitReportDrawer({ carrierId, tripId, onClose }: { carrierId: string;
 
           <div className="flex justify-between rounded-lg bg-gray-50 px-4 py-3 text-base font-bold">
             <span>Own Carrier Profit (Carrier Rent - Carrier Expense)</span>
-            <span className={report.ownCarrierProfit >= 0 ? "text-green-700" : "text-red-700"}>Rs. {formatMoney(report.ownCarrierProfit)}</span>
+            <span className={report.ownCarrierProfit >= 0 ? "text-green-700" : "text-red-700"}>{formatSignedMoney(report.ownCarrierProfit)}</span>
           </div>
         </div>
       )}
