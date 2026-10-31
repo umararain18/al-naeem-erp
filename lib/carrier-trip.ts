@@ -106,6 +106,61 @@ export async function getTripOrThrow(tx: Tx, tripId: string) {
 }
 
 /**
+ * "Outstanding" for ONE linked document - a pure, read-only prefill
+ * convenience for the Cash Book's quick-entry Collection row (never a
+ * cap enforced at write time; the existing per-type assert* checks in
+ * lib/phonch-accounting.ts / lib/private-phonch-accounting.ts remain
+ * the only real validation, unchanged). Deliberately self-contained
+ * rather than reusing those modules' own getPhonchPaymentState/
+ * getPrivatePhonchPaymentState (which only see Daily Posting receipts,
+ * not this Trip's own COLLECTION lines) or
+ * getPrivatePhonchEligibleParties (a genuinely multi-party Clearing
+ * Agent/Transporter split not worth replicating for a prefill):
+ *   - CHALLAN: sum(bilty.toPay) across its Bilties - every COLLECTION
+ *     ever posted against this exact document (any Trip, not just
+ *     this one, since a document can only ever have one ACTIVE link
+ *     at a time but may have been partly collected on an earlier one).
+ *   - PHONCH: its own total (deliveryCharges + otherExpense + claim,
+ *     the same figure the Phonch model's own total already is) minus
+ *     every COLLECTION ever posted against it.
+ *   - PRIVATE_PHONCH: not computed (returns null) - its Carrier
+ *     Payable/Clearing Agent/Delivery Recovery split is genuinely
+ *     multi-party; the quick-entry row leaves Amount blank for it
+ *     rather than guess.
+ * Never negative - a document already fully (or over-) collected
+ * returns 0, not a sign-flipped figure.
+ */
+export async function getDocumentOutstandingAmount(
+  tx: Tx,
+  documentType: CarrierTripDocumentType,
+  documentId: string
+): Promise<number | null> {
+  const collectedAgg = await tx.carrierTripLine.aggregate({
+    where: { lineType: "COLLECTION", documentType, documentId, isDeleted: false },
+    _sum: { amount: true },
+  });
+  const collected = round2(Number(collectedAgg._sum.amount || 0));
+
+  if (documentType === "CHALLAN") {
+    const bilties = await tx.challanBilty.findMany({ where: { challanId: documentId }, select: { bilty: { select: { toPay: true } } } });
+    const total = round2(bilties.reduce((s, b) => s + Number(b.bilty.toPay), 0));
+    return Math.max(0, round2(total - collected));
+  }
+
+  if (documentType === "PHONCH") {
+    const phonch = await tx.phonch.findUnique({
+      where: { id: documentId },
+      select: { vehicles: { select: { deliveryCharges: true, otherExpenseAmount: true, claimAmount: true } } },
+    });
+    if (!phonch) return null;
+    const total = round2(phonch.vehicles.reduce((s, v) => s + Number(v.deliveryCharges) + Number(v.otherExpenseAmount) + Number(v.claimAmount), 0));
+    return Math.max(0, round2(total - collected));
+  }
+
+  return null;
+}
+
+/**
  * Links a Trip to an EXISTING Challan/Phonch/Private Phonch - a pure
  * tag, never a JournalEntry (see this module's own header comment).
  * Rejects when the Trip is CLOSED, the document doesn't exist, or the
@@ -569,6 +624,101 @@ export async function postDepositToOfficeLine(tx: Tx, input: PostOfficeTransferI
   );
 }
 
+export const TRIP_LINE_TYPES = ["COLLECTION", "CASH_FROM_OFFICE", "EXPENSE_CASH", "EXPENSE_OFFICE", "EXPENSE_CREDIT", "DRIVER_SALARY", "DEPOSIT_TO_OFFICE"] as const;
+export type TripLineType = (typeof TRIP_LINE_TYPES)[number];
+
+/**
+ * Single type-dispatch shared by the create route
+ * (app/api/own-carrier/[id]/trips/[tripId]/lines/route.ts POST) and
+ * the edit-via-reverse-and-repost route (that same directory's
+ * [lineId]/route.ts PATCH) - both need the EXACT same "which
+ * type-specific fields does this lineType require" logic, and this
+ * is the one place it is written. `rawInput` is the raw request body
+ * (or an existing line's own saved fields, re-shaped the same way) -
+ * only the fields relevant to `lineType` are read from it.
+ */
+export async function postTripLineByType(
+  tx: Tx,
+  lineType: TripLineType,
+  base: { tripId: string; date: Date; description: string | null; amount: number; createdById: string },
+  rawInput: Record<string, unknown>
+) {
+  switch (lineType) {
+    case "COLLECTION": {
+      const documentType = rawInput.documentType as CarrierTripDocumentType;
+      if (!rawInput.documentId || !documentType) {
+        throw new CarrierTripError("MISSING_DOCUMENT", "A linked document is required for a Collection line.");
+      }
+      return postCollectionLine(tx, {
+        ...base,
+        documentType,
+        documentId: rawInput.documentId as string,
+        counterAccountId: (rawInput.counterAccountId as string) || null,
+      });
+    }
+    case "CASH_FROM_OFFICE":
+      if (!rawInput.officeAccountId) throw new CarrierTripError("MISSING_ACCOUNT", "Office account is required.");
+      return postCashFromOfficeLine(tx, { ...base, officeAccountId: rawInput.officeAccountId as string });
+    case "DEPOSIT_TO_OFFICE":
+      if (!rawInput.officeAccountId) throw new CarrierTripError("MISSING_ACCOUNT", "Office account is required.");
+      return postDepositToOfficeLine(tx, { ...base, officeAccountId: rawInput.officeAccountId as string });
+    case "EXPENSE_CASH":
+      if (!rawInput.expenseAccountId) throw new CarrierTripError("MISSING_ACCOUNT", "Expense account is required.");
+      return postExpenseCashLine(tx, { ...base, expenseAccountId: rawInput.expenseAccountId as string });
+    case "EXPENSE_OFFICE":
+      if (!rawInput.expenseAccountId) throw new CarrierTripError("MISSING_ACCOUNT", "Expense account is required.");
+      if (!rawInput.officeAccountId) throw new CarrierTripError("MISSING_ACCOUNT", "Office account is required.");
+      return postExpenseOfficeLine(tx, { ...base, expenseAccountId: rawInput.expenseAccountId as string, officeAccountId: rawInput.officeAccountId as string });
+    case "EXPENSE_CREDIT":
+      if (!rawInput.expenseAccountId) throw new CarrierTripError("MISSING_ACCOUNT", "Expense account is required.");
+      if (!rawInput.vendorPartyId) throw new CarrierTripError("MISSING_VENDOR", "Vendor party is required for a credit expense.");
+      return postExpenseCreditLine(tx, { ...base, expenseAccountId: rawInput.expenseAccountId as string, vendorPartyId: rawInput.vendorPartyId as string });
+    case "DRIVER_SALARY":
+      if (!rawInput.employeeId) throw new CarrierTripError("MISSING_EMPLOYEE", "Employee is required for a salary line.");
+      return postDriverSalaryLine(tx, { ...base, employeeId: rawInput.employeeId as string });
+    default:
+      throw new CarrierTripError("INVALID_LINE_TYPE", "Invalid line type.");
+  }
+}
+
+/**
+ * Edits a line "in place" from the UI's point of view - under the
+ * hood this is NEVER a mutation of the existing row: it reverses the
+ * existing line (reverseCarrierTripLine - same reversesEntryId
+ * mechanism as every other correction in this schema) and posts a
+ * brand new one via postTripLineByType, in ONE transaction, so there
+ * is never a moment with neither line live. The lineType itself is
+ * NOT editable this way (the new line must be the SAME type as the
+ * one being replaced) - switching types is a delete-and-recreate the
+ * UI does explicitly, never an implicit side effect of an edit.
+ */
+export async function editCarrierTripLine(
+  tx: Tx,
+  input: {
+    lineId: string;
+    deletedById: string;
+    reason?: string;
+    date: Date;
+    description: string | null;
+    amount: number;
+    rawInput: Record<string, unknown>;
+  }
+) {
+  const existing = await tx.carrierTripLine.findUnique({ where: { id: input.lineId }, select: { tripId: true, lineType: true, isDeleted: true } });
+  if (!existing || existing.isDeleted) {
+    throw new CarrierTripError("LINE_NOT_FOUND", "This line was not found or is already reversed.");
+  }
+
+  await reverseCarrierTripLine(tx, { lineId: input.lineId, deletedById: input.deletedById, reason: input.reason || "edited" });
+
+  return postTripLineByType(
+    tx,
+    existing.lineType as TripLineType,
+    { tripId: existing.tripId, date: input.date, description: input.description, amount: input.amount, createdById: input.deletedById },
+    input.rawInput
+  );
+}
+
 /**
  * Reverses one CarrierTripLine - NEVER edits/deletes its JournalEntry;
  * posts a NEW entry with reversesEntryId pointing at it (same
@@ -871,6 +1021,15 @@ export interface TripCashBookRow {
   balance: number;
   documentType: string | null;
   documentId: string | null;
+  // Type-specific fields, exposed only so the Cash Book's inline Edit
+  // can re-populate a line's own original fields without a second
+  // fetch - every write path still only ever reads these from
+  // CarrierTripLine itself via lib/carrier-trip.ts's own post*Line
+  // functions, never from this read-only row shape.
+  expenseAccountId: string | null;
+  officeAccountId: string | null;
+  vendorPartyId: string | null;
+  employeeId: string | null;
 }
 
 /** EXPENSE_CREDIT/EXPENSE_OFFICE never move Driver Cash (neither is a
@@ -927,6 +1086,10 @@ export async function getTripCashBook(tx: Tx, tripId: string): Promise<{ opening
       balance,
       documentType: l.documentType,
       documentId: l.documentId,
+      expenseAccountId: l.expenseAccountId,
+      officeAccountId: l.officeAccountId,
+      vendorPartyId: l.vendorPartyId,
+      employeeId: l.employeeId,
     };
   });
 

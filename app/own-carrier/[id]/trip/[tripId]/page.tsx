@@ -1,10 +1,9 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import { formatBusinessDate } from "@/lib/date-range";
-import { SearchableSelect } from "@/app/daily-posting/SearchableSelect";
 
 function formatMoney(value: number) {
   return new Intl.NumberFormat("en-PK", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(Math.abs(value));
@@ -23,6 +22,10 @@ function formatSignedMoney(value: number) {
 
 function todayYMD(): string {
   return new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Karachi", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+}
+
+function toYMD(iso: string): string {
+  return iso.slice(0, 10);
 }
 
 type Trip = {
@@ -44,6 +47,7 @@ type DocumentLink = {
   linkedAt: string;
   carrierRentAmount: number;
   isOwnCarrierChallan: boolean;
+  outstanding: number | null;
 };
 
 type CashBookRow = {
@@ -56,37 +60,30 @@ type CashBookRow = {
   balance: number;
   documentType: string | null;
   documentId: string | null;
+  expenseAccountId: string | null;
+  officeAccountId: string | null;
+  vendorPartyId: string | null;
+  employeeId: string | null;
 };
 
 type CashBook = { openingBalance: number; rows: CashBookRow[]; closingBalance: number };
 
-// Keyed by the REAL posted CarrierTripLineType (used for the Cash
-// Book's own reversal-confirm text) - "Expense"/"Diesel" are UI-only
-// groupings over EXPENSE_CASH/EXPENSE_OFFICE/EXPENSE_CREDIT, chosen by
-// LineDrawer's own "Payment Source" selector (see that component).
+// Keyed by the REAL posted CarrierTripLineType - used for the Reverse
+// confirm text. The quick-entry row's own Type buttons (QUICK_TYPES
+// below) are a separate, UI-only taxonomy layered on top of these.
 const LINE_TYPE_LABELS: Record<string, string> = {
-  COLLECTION: "Collection (against Challan/Phonch/Private Phonch)",
-  CASH_FROM_OFFICE: "Office gives cash to Driver",
+  COLLECTION: "Collection (Wasooli)",
+  CASH_FROM_OFFICE: "Office se cash",
   EXPENSE_CASH: "Expense (Driver Cash)",
   EXPENSE_OFFICE: "Expense (Office Account)",
-  EXPENSE_CREDIT: "Expense (Udhaar/credit to Vendor)",
-  DRIVER_SALARY: "Driver Salary",
-  DEPOSIT_TO_OFFICE: "Driver deposits cash to Office",
+  EXPENSE_CREDIT: "Expense (Udhaar)",
+  DRIVER_SALARY: "Salary",
+  DEPOSIT_TO_OFFICE: "Office mein jama",
 };
 
-// The 6 action buttons shown on an OPEN Trip. "EXPENSE"/"DIESEL" are
-// NOT real CarrierTripLineType values - LineDrawer resolves each to
-// EXPENSE_CASH/EXPENSE_OFFICE/EXPENSE_CREDIT itself, from its own
-// Payment Source selector, exactly like Diesel's own spec ("Add line
-// type EXPENSE_OFFICE ... usable for diesel and any expense").
-const ACTION_BUTTONS: { kind: string; label: string }[] = [
-  { kind: "COLLECTION", label: LINE_TYPE_LABELS.COLLECTION },
-  { kind: "CASH_FROM_OFFICE", label: LINE_TYPE_LABELS.CASH_FROM_OFFICE },
-  { kind: "EXPENSE", label: "Expense (Driver Cash / Office / Udhaar)" },
-  { kind: "DIESEL", label: "Diesel" },
-  { kind: "DRIVER_SALARY", label: LINE_TYPE_LABELS.DRIVER_SALARY },
-  { kind: "DEPOSIT_TO_OFFICE", label: LINE_TYPE_LABELS.DEPOSIT_TO_OFFICE },
-];
+function isDieselRow(description: string): boolean {
+  return description.trim().toLowerCase().startsWith("diesel");
+}
 
 export default function CarrierTripDetailPage() {
   const params = useParams();
@@ -100,9 +97,10 @@ export default function CarrierTripDetailPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [refreshToken, setRefreshToken] = useState(0);
-  const [lineDrawerType, setLineDrawerType] = useState<string | null>(null);
   const [linkDocsOpen, setLinkDocsOpen] = useState(false);
   const [reportOpen, setReportOpen] = useState(false);
+  const [editingLine, setEditingLine] = useState<CashBookRow | null>(null);
+  const [lastDate, setLastDate] = useState<string | null>(null);
 
   async function load() {
     try {
@@ -174,6 +172,7 @@ export default function CarrierTripDetailPage() {
       alert(data.message || "Unable to reverse line.");
       return;
     }
+    if (editingLine?.id === row.id) setEditingLine(null);
     refresh();
   }
 
@@ -192,6 +191,32 @@ export default function CarrierTripDetailPage() {
     }
     refresh();
   }
+
+  // ------------------------------------------------------------
+  // Summary bar + IN/OUT/Diesel split - pure, read-only derivations
+  // over the authoritative cashBook.rows / openingBalance /
+  // closingBalance already computed server-side (lib/carrier-trip.ts's
+  // getTripCashBook) - nothing here recomputes a balance. Diesel is
+  // identified by description ("Diesel - ...", the same prefix the
+  // quick-entry row always writes for a Diesel line - see
+  // buildDieselDescription below) rather than by lineType, since
+  // Diesel can be posted as EXPENSE_CASH/EXPENSE_OFFICE/EXPENSE_CREDIT
+  // depending on payment source. "Total OUT (driver cash)" and
+  // "Diesel total" are deliberately two independent, non-summing
+  // subtotals (a driver-cash-paid Diesel line counts in Diesel total,
+  // NOT in Total OUT (driver cash) - it is still correctly reflected
+  // in Remaining With Driver via the authoritative closingBalance).
+  // ------------------------------------------------------------
+  const rows = cashBook?.rows || [];
+  const inRows = useMemo(() => rows.filter((r) => r.in > 0), [rows]);
+  const dieselRows = useMemo(() => rows.filter((r) => r.out > 0 && isDieselRow(r.description)), [rows]);
+  const outRows = useMemo(() => rows.filter((r) => r.out > 0 && !isDieselRow(r.description)), [rows]);
+  const totalIn = useMemo(() => round2(inRows.reduce((s, r) => s + r.in, 0)), [inRows]);
+  const totalOutDriverCash = useMemo(
+    () => round2(outRows.filter((r) => r.lineType === "EXPENSE_CASH" || r.lineType === "DRIVER_SALARY" || r.lineType === "DEPOSIT_TO_OFFICE").reduce((s, r) => s + r.out, 0)),
+    [outRows]
+  );
+  const dieselTotal = useMemo(() => round2(dieselRows.reduce((s, r) => s + r.out, 0)), [dieselRows]);
 
   if (loading) {
     return <div className="min-h-screen bg-gray-50 p-6 text-sm text-gray-500">Loading...</div>;
@@ -246,7 +271,10 @@ export default function CarrierTripDetailPage() {
             <div className="divide-y">
               {documents.map((d) => (
                 <div key={d.id} className="flex flex-wrap items-center justify-between gap-2 px-5 py-3 text-sm">
-                  <span className="font-medium text-gray-900">{d.label}</span>
+                  <div>
+                    <span className="font-medium text-gray-900">{d.label}</span>
+                    {d.outstanding != null && <span className="ml-2 text-xs text-gray-500">Outstanding: Rs. {formatMoney(d.outstanding)}</span>}
+                  </div>
                   <div className="flex items-center gap-3">
                     {d.isOwnCarrierChallan && (
                       <CarrierRentEditor link={d} canEdit={canAct} onSave={handleSaveCarrierRent} />
@@ -263,91 +291,107 @@ export default function CarrierTripDetailPage() {
           )}
         </div>
 
-        {/* ACTIONS */}
+        {/* QUICK ENTRY */}
         {canAct && (
-          <div className="mb-6 flex flex-wrap gap-2">
-            {ACTION_BUTTONS.map(({ kind, label }) => (
-              <button key={kind} type="button" onClick={() => setLineDrawerType(kind)} className="rounded-lg border px-4 py-2 text-sm hover:bg-gray-50">
-                + {label}
-              </button>
-            ))}
-          </div>
+          <QuickEntryRow
+            carrierId={carrierId}
+            tripId={tripId}
+            documents={documents}
+            tripDateFrom={trip.dateFrom}
+            tripDateTo={trip.dateTo}
+            lastDate={lastDate}
+            onDateUsed={setLastDate}
+            editingLine={editingLine}
+            onCancelEdit={() => setEditingLine(null)}
+            onSaved={() => {
+              setEditingLine(null);
+              refresh();
+            }}
+          />
         )}
 
-        {/* CASH BOOK */}
-        <div className="overflow-hidden rounded-xl border bg-white shadow-sm">
+        {/* SUMMARY BAR */}
+        <div className="mb-6 grid grid-cols-2 gap-3 rounded-xl border bg-white p-4 shadow-sm sm:grid-cols-5">
+          <SummaryStat label="Previous Balance" value={formatSignedMoney(cashBook?.openingBalance || 0)} negative={(cashBook?.openingBalance || 0) < 0} />
+          <SummaryStat label="Total IN" value={`Rs. ${formatMoney(totalIn)}`} className="text-green-700" />
+          <SummaryStat label="Total OUT (Driver Cash)" value={`Rs. ${formatMoney(totalOutDriverCash)}`} className="text-red-700" />
+          <SummaryStat label="Diesel Total" value={`Rs. ${formatMoney(dieselTotal)}`} className="text-orange-700" />
+          <SummaryStat label="Remaining With Driver" value={formatSignedMoney(cashBook?.closingBalance || 0)} negative={(cashBook?.closingBalance || 0) < 0} bold />
+        </div>
+
+        {/* IN / OUT two-column layout (stacks on mobile) */}
+        <div className="mb-6 grid grid-cols-1 gap-4 md:grid-cols-2">
+          <CashList
+            title="IN"
+            rows={inRows}
+            amountKey="in"
+            amountClassName="text-green-700"
+            canAct={canAct}
+            onEdit={setEditingLine}
+            onReverse={handleReverseLine}
+          />
+          <CashList
+            title="OUT"
+            rows={outRows}
+            amountKey="out"
+            amountClassName="text-red-700"
+            canAct={canAct}
+            onEdit={setEditingLine}
+            onReverse={handleReverseLine}
+          />
+        </div>
+
+        {/* DIESEL BOX */}
+        <div className="mb-6 overflow-hidden rounded-xl border bg-white shadow-sm">
           <div className="border-b px-5 py-3">
-            <h2 className="text-sm font-semibold text-gray-900">Cash Book</h2>
+            <h2 className="text-sm font-semibold text-gray-900">Diesel</h2>
           </div>
-          <div className="overflow-x-auto">
-            <table className="min-w-[900px] w-full text-sm">
-              <thead className="bg-gray-50 text-left text-xs font-semibold uppercase text-gray-500">
-                <tr>
-                  <th className="px-4 py-3">Date</th>
-                  <th className="px-4 py-3">Description</th>
-                  <th className="px-4 py-3 text-right">In</th>
-                  <th className="px-4 py-3 text-right">Out</th>
-                  <th className="px-4 py-3 text-right">Balance</th>
-                  {canAct && <th className="px-4 py-3">Action</th>}
-                </tr>
-              </thead>
-              <tbody className="divide-y">
-                <tr className="bg-gray-50">
-                  <td className="px-4 py-2 text-gray-500" colSpan={canAct ? 4 : 4}>
-                    Opening Balance
-                  </td>
-                  <td className="px-4 py-2 text-right font-semibold text-gray-900">{formatSignedMoney(cashBook?.openingBalance || 0)}</td>
-                  {canAct && <td />}
-                </tr>
-                {(cashBook?.rows || []).map((row) => (
-                  <tr key={row.id} className="hover:bg-gray-50">
-                    <td className="px-4 py-3 text-gray-600">{formatBusinessDate(row.date)}</td>
-                    <td className="px-4 py-3 text-gray-900">{row.description}</td>
-                    <td className="px-4 py-3 text-right text-green-700">{row.in > 0 ? `Rs. ${formatMoney(row.in)}` : "—"}</td>
-                    <td className="px-4 py-3 text-right text-red-700">{row.out > 0 ? `Rs. ${formatMoney(row.out)}` : "—"}</td>
-                    <td className={`px-4 py-3 text-right font-semibold ${row.balance < 0 ? "text-red-700" : "text-gray-900"}`}>{formatSignedMoney(row.balance)}</td>
-                    {canAct && (
-                      <td className="px-4 py-3">
-                        <button type="button" onClick={() => handleReverseLine(row)} className="rounded-md border border-red-200 px-3 py-1 text-xs text-red-600 hover:bg-red-50">
-                          Reverse
-                        </button>
-                      </td>
-                    )}
-                  </tr>
-                ))}
-                {(!cashBook || cashBook.rows.length === 0) && (
+          {dieselRows.length === 0 ? (
+            <div className="px-5 py-6 text-center text-sm text-gray-500">No diesel entries yet.</div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="min-w-[700px] w-full text-sm">
+                <thead className="bg-gray-50 text-left text-xs font-semibold uppercase text-gray-500">
                   <tr>
-                    <td colSpan={canAct ? 6 : 5} className="px-4 py-8 text-center text-sm text-gray-500">
-                      No transactions yet.
-                    </td>
+                    <th className="px-4 py-2">Date</th>
+                    <th className="px-4 py-2">Pump / Vendor</th>
+                    <th className="px-4 py-2 text-right">Liters</th>
+                    <th className="px-4 py-2 text-right">Amount</th>
+                    <th className="px-4 py-2">Paid From</th>
+                    {canAct && <th className="px-4 py-2">Action</th>}
                   </tr>
-                )}
-                <tr className="bg-gray-50">
-                  <td className="px-4 py-2 font-semibold text-gray-900" colSpan={canAct ? 4 : 4}>
-                    Closing Balance
-                  </td>
-                  <td className={`px-4 py-2 text-right font-bold ${(cashBook?.closingBalance || 0) < 0 ? "text-red-700" : "text-gray-900"}`}>{formatSignedMoney(cashBook?.closingBalance || 0)}</td>
-                  {canAct && <td />}
-                </tr>
-              </tbody>
-            </table>
-          </div>
+                </thead>
+                <tbody className="divide-y">
+                  {dieselRows.map((row) => {
+                    const parsed = parseDieselDescription(row.description);
+                    return (
+                      <tr key={row.id} className="hover:bg-gray-50">
+                        <td className="px-4 py-2 text-gray-600">{formatBusinessDate(row.date)}</td>
+                        <td className="px-4 py-2 text-gray-900">{parsed.pump || "—"}</td>
+                        <td className="px-4 py-2 text-right text-gray-600">{parsed.liters || "—"}</td>
+                        <td className="px-4 py-2 text-right font-medium text-orange-700">Rs. {formatMoney(row.out)}</td>
+                        <td className="px-4 py-2 text-gray-600">{paidFromLabel(row.lineType)}</td>
+                        {canAct && (
+                          <td className="px-4 py-2">
+                            <div className="flex gap-1.5">
+                              <button type="button" onClick={() => setEditingLine(row)} className="rounded-md border px-2 py-1 text-xs hover:bg-gray-50">
+                                Edit
+                              </button>
+                              <button type="button" onClick={() => handleReverseLine(row)} className="rounded-md border border-red-200 px-2 py-1 text-xs text-red-600 hover:bg-red-50">
+                                Reverse
+                              </button>
+                            </div>
+                          </td>
+                        )}
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
         </div>
       </div>
-
-      {lineDrawerType && (
-        <LineDrawer
-          carrierId={carrierId}
-          tripId={tripId}
-          kind={lineDrawerType}
-          documents={documents}
-          onClose={() => setLineDrawerType(null)}
-          onSaved={() => {
-            setLineDrawerType(null);
-            refresh();
-          }}
-        />
-      )}
 
       {linkDocsOpen && (
         <LinkDocumentsDrawer
@@ -366,8 +410,89 @@ export default function CarrierTripDetailPage() {
   );
 }
 
+function round2(n: number): number {
+  return Math.round((n + Number.EPSILON) * 100) / 100;
+}
+
+function paidFromLabel(lineType: string): string {
+  if (lineType === "EXPENSE_OFFICE") return "Office";
+  if (lineType === "EXPENSE_CREDIT") return "Udhaar";
+  return "Driver Cash";
+}
+
+/** Reads back the "Diesel - {pump} - {liters}L[ - note]" shape the
+ * quick-entry row always writes (see buildDieselDescription) - best-
+ * effort only, falls back to blanks for a line whose description was
+ * hand-edited away from that shape. */
+function parseDieselDescription(description: string): { pump: string; liters: string } {
+  const match = description.match(/^Diesel(?:\s*-\s*([^-]+?))?(?:\s*-\s*([\d.]+)\s*L)?(?:\s*-.*)?$/i);
+  return { pump: match?.[1]?.trim() || "", liters: match?.[2]?.trim() || "" };
+}
+
+function SummaryStat({ label, value, className, negative, bold }: { label: string; value: string; className?: string; negative?: boolean; bold?: boolean }) {
+  return (
+    <div>
+      <p className="text-xs text-gray-500">{label}</p>
+      <p className={`${bold ? "text-lg" : "text-base"} font-semibold ${negative ? "text-red-700" : className || "text-gray-900"}`}>{value}</p>
+    </div>
+  );
+}
+
+function CashList({
+  title,
+  rows,
+  amountKey,
+  amountClassName,
+  canAct,
+  onEdit,
+  onReverse,
+}: {
+  title: string;
+  rows: CashBookRow[];
+  amountKey: "in" | "out";
+  amountClassName: string;
+  canAct: boolean;
+  onEdit: (row: CashBookRow) => void;
+  onReverse: (row: CashBookRow) => void;
+}) {
+  return (
+    <div className="overflow-hidden rounded-xl border bg-white shadow-sm">
+      <div className="border-b px-5 py-3">
+        <h2 className="text-sm font-semibold text-gray-900">{title}</h2>
+      </div>
+      {rows.length === 0 ? (
+        <div className="px-5 py-6 text-center text-sm text-gray-500">No {title.toLowerCase()} entries yet.</div>
+      ) : (
+        <div className="divide-y">
+          {rows.map((row) => (
+            <div key={row.id} className="flex items-center justify-between gap-2 px-5 py-2.5 text-sm">
+              <div className="min-w-0">
+                <p className="truncate text-gray-900">{row.description}</p>
+                <p className="text-xs text-gray-500">{formatBusinessDate(row.date)}</p>
+              </div>
+              <div className="flex shrink-0 items-center gap-2">
+                <span className={`font-medium ${amountClassName}`}>Rs. {formatMoney(row[amountKey])}</span>
+                {canAct && (
+                  <div className="flex gap-1">
+                    <button type="button" onClick={() => onEdit(row)} className="rounded-md border px-2 py-1 text-xs hover:bg-gray-50">
+                      Edit
+                    </button>
+                    <button type="button" onClick={() => onReverse(row)} className="rounded-md border border-red-200 px-2 py-1 text-xs text-red-600 hover:bg-red-50">
+                      Reverse
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ============================================================
-// LINE DRAWER - one form per lineType, Decision table from the plan.
+// DRAWER (still used by Link Document + Profit Report)
 // ============================================================
 function Drawer({ open, onClose, title, children }: { open: boolean; onClose: () => void; title: string; children: React.ReactNode }) {
   if (!open) return null;
@@ -423,37 +548,65 @@ function CarrierRentEditor({ link, canEdit, onSave }: { link: DocumentLink; canE
   );
 }
 
-// "Payment Source" for an EXPENSE/DIESEL line - resolves to the real
-// CarrierTripLineType posted (see this module's own ACTION_BUTTONS
-// doc comment).
+// ============================================================
+// QUICK ENTRY ROW - replaces the old 6-drawer flow. One row posts (or,
+// in edit mode, replaces-via-reverse-and-repost) a single
+// CarrierTripLine. Wrapped in a real <form> so Enter submits and Tab
+// moves between fields using nothing but the browser's own native
+// behavior - no custom keyboard-handling code needed for either.
+// ============================================================
+
+type QuickTypeKey = "WASOOLI" | "DIESEL" | "TOLL" | "KHANA" | "MARAMMAT" | "OTHER_EXPENSE" | "SALARY" | "OFFICE_CASH" | "OFFICE_DEPOSIT";
+type QuickKind = "COLLECTION" | "EXPENSE" | "DRIVER_SALARY" | "CASH_FROM_OFFICE" | "DEPOSIT_TO_OFFICE";
 type PaymentSource = "DRIVER_CASH" | "OFFICE" | "UDHAAR";
 
-function LineDrawer({
+const QUICK_TYPES: { key: QuickTypeKey; label: string; kind: QuickKind; defaultCategory?: string; defaultNameMatch?: string }[] = [
+  { key: "WASOOLI", label: "Wasooli", kind: "COLLECTION" },
+  { key: "DIESEL", label: "Diesel", kind: "EXPENSE", defaultCategory: "FUEL" },
+  { key: "TOLL", label: "Toll", kind: "EXPENSE", defaultNameMatch: "toll" },
+  { key: "KHANA", label: "Khana", kind: "EXPENSE", defaultCategory: "TEA_REFRESHMENT" },
+  { key: "MARAMMAT", label: "Marammat", kind: "EXPENSE", defaultCategory: "REPAIR_MAINTENANCE" },
+  { key: "OTHER_EXPENSE", label: "Other expense", kind: "EXPENSE", defaultCategory: "OTHER_EXPENSE" },
+  { key: "SALARY", label: "Salary", kind: "DRIVER_SALARY" },
+  { key: "OFFICE_CASH", label: "Office se cash", kind: "CASH_FROM_OFFICE" },
+  { key: "OFFICE_DEPOSIT", label: "Office mein jama", kind: "DEPOSIT_TO_OFFICE" },
+];
+
+function buildDieselDescription(pump: string, liters: string, note: string): string {
+  return ["Diesel", pump.trim() || null, liters.trim() ? `${liters.trim()}L` : null, note.trim() || null].filter(Boolean).join(" - ");
+}
+
+function QuickEntryRow({
   carrierId,
   tripId,
-  kind,
   documents,
-  onClose,
+  tripDateFrom,
+  tripDateTo,
+  lastDate,
+  onDateUsed,
+  editingLine,
+  onCancelEdit,
   onSaved,
 }: {
   carrierId: string;
   tripId: string;
-  kind: string;
   documents: DocumentLink[];
-  onClose: () => void;
+  tripDateFrom: string;
+  tripDateTo: string | null;
+  lastDate: string | null;
+  onDateUsed: (date: string) => void;
+  editingLine: CashBookRow | null;
+  onCancelEdit: () => void;
   onSaved: () => void;
 }) {
-  const isExpenseKind = kind === "EXPENSE" || kind === "DIESEL";
-
-  const [date, setDate] = useState(todayYMD());
+  const [quickTypeKey, setQuickTypeKey] = useState<QuickTypeKey>("WASOOLI");
+  const [date, setDate] = useState(lastDate || toYMD(tripDateFrom));
+  const [itemValue, setItemValue] = useState("");
   const [amount, setAmount] = useState("");
-  const [description, setDescription] = useState("");
-  const [documentLinkId, setDocumentLinkId] = useState("");
-  const [officeAccountId, setOfficeAccountId] = useState("");
-  const [expenseAccountId, setExpenseAccountId] = useState("");
-  const [vendorPartyId, setVendorPartyId] = useState("");
-  const [employeeId, setEmployeeId] = useState("");
+  const [note, setNote] = useState("");
   const [paymentSource, setPaymentSource] = useState<PaymentSource>("DRIVER_CASH");
+  const [officeAccountId, setOfficeAccountId] = useState("");
+  const [vendorPartyId, setVendorPartyId] = useState("");
   const [pump, setPump] = useState("");
   const [liters, setLiters] = useState("");
   const [accounts, setAccounts] = useState<AccountOption[]>([]);
@@ -461,6 +614,7 @@ function LineDrawer({
   const [employees, setEmployees] = useState<{ id: string; name: string; employeeCode: string }[]>([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  const itemRef = useRef<HTMLSelectElement>(null);
 
   useEffect(() => {
     (async () => {
@@ -478,33 +632,123 @@ function LineDrawer({
     })();
   }, []);
 
-  const officeAccountOptions = useMemo(
-    () => accounts.filter((a) => a.accountType !== "EXPENSE" && a.accountType !== "PARTY").map((a) => ({ value: a.id, label: a.accountName, secondary: a.category })),
-    [accounts]
-  );
-  const expenseAccountOptions = useMemo(
-    () => accounts.filter((a) => a.accountType === "EXPENSE").map((a) => ({ value: a.id, label: a.accountName, secondary: a.category })),
-    [accounts]
-  );
-  const vendorPartyOptions = useMemo(
-    () => parties.filter((p) => p.account).map((p) => ({ value: p.id, label: p.partyName })),
-    [parties]
-  );
-  const employeeOptions = useMemo(() => employees.map((e) => ({ value: e.id, label: e.name, secondary: e.employeeCode })), [employees]);
+  const expenseAccounts = useMemo(() => accounts.filter((a) => a.accountType === "EXPENSE"), [accounts]);
+  const officeAccounts = useMemo(() => accounts.filter((a) => a.accountType !== "EXPENSE" && a.accountType !== "PARTY"), [accounts]);
+  const vendorParties = useMemo(() => parties.filter((p) => p.account), [parties]);
 
-  // The REAL CarrierTripLineType this drawer will post.
+  const quickType = QUICK_TYPES.find((t) => t.key === quickTypeKey)!;
+
+  // Pre-fill the top row from an existing line when "Edit" is clicked
+  // on a Cash Book / Diesel row - best-effort reconstruction of which
+  // quick-type button produced it (see this module's own
+  // parseDieselDescription for the Diesel case); every OTHER field
+  // (account/vendor/employee/document id) is read directly off the
+  // line's own saved columns, never guessed.
+  useEffect(() => {
+    if (!editingLine) {
+      // Returning from Edit (Cancel, or after a successful save) -
+      // never leave the row showing a stale edited line's fields.
+      resetForFreshRow(false);
+      return;
+    }
+    setDate(toYMD(editingLine.date));
+    setAmount(String(editingLine.in || editingLine.out));
+    const lt = editingLine.lineType;
+    if (lt === "COLLECTION") {
+      setQuickTypeKey("WASOOLI");
+      const link = documents.find((d) => d.documentType === editingLine.documentType && d.documentId === editingLine.documentId);
+      setItemValue(link?.id || "");
+      setNote("");
+    } else if (lt === "CASH_FROM_OFFICE") {
+      setQuickTypeKey("OFFICE_CASH");
+      setItemValue(editingLine.officeAccountId || "");
+      setNote("");
+    } else if (lt === "DEPOSIT_TO_OFFICE") {
+      setQuickTypeKey("OFFICE_DEPOSIT");
+      setItemValue(editingLine.officeAccountId || "");
+      setNote("");
+    } else if (lt === "DRIVER_SALARY") {
+      setQuickTypeKey("SALARY");
+      setItemValue(editingLine.employeeId || "");
+      setNote("");
+    } else {
+      // EXPENSE_CASH / EXPENSE_OFFICE / EXPENSE_CREDIT
+      setPaymentSource(lt === "EXPENSE_OFFICE" ? "OFFICE" : lt === "EXPENSE_CREDIT" ? "UDHAAR" : "DRIVER_CASH");
+      setOfficeAccountId(editingLine.officeAccountId || "");
+      setVendorPartyId(editingLine.vendorPartyId || "");
+      setItemValue(editingLine.expenseAccountId || "");
+      if (isDieselRow(editingLine.description)) {
+        const parsed = parseDieselDescription(editingLine.description);
+        setQuickTypeKey("DIESEL");
+        setPump(parsed.pump);
+        setLiters(parsed.liters);
+        setNote("");
+      } else {
+        setQuickTypeKey("OTHER_EXPENSE");
+        setNote(editingLine.description || "");
+      }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editingLine?.id]);
+
+  function resetForFreshRow(keepType: boolean) {
+    setAmount("");
+    setNote("");
+    setPump("");
+    setLiters("");
+    if (!keepType) {
+      setItemValue("");
+      setPaymentSource("DRIVER_CASH");
+      setOfficeAccountId("");
+      setVendorPartyId("");
+    } else {
+      // Collection/office/salary Item is document/account-specific per
+      // entry - always cleared; expense account + payment source are
+      // kept (the common case is several of the same expense in a
+      // row), vendor/office sub-pickers cleared with it.
+      if (quickType.kind === "COLLECTION" || quickType.kind === "CASH_FROM_OFFICE" || quickType.kind === "DEPOSIT_TO_OFFICE" || quickType.kind === "DRIVER_SALARY") {
+        setItemValue("");
+      }
+    }
+    window.setTimeout(() => itemRef.current?.focus(), 0);
+  }
+
+  function applyQuickType(key: QuickTypeKey) {
+    const type = QUICK_TYPES.find((t) => t.key === key)!;
+    setQuickTypeKey(key);
+    setAmount("");
+    setNote("");
+    setPump("");
+    setLiters("");
+    setVendorPartyId("");
+    setOfficeAccountId("");
+    setPaymentSource("DRIVER_CASH");
+    if (type.kind === "EXPENSE") {
+      const match = type.defaultCategory
+        ? expenseAccounts.find((a) => a.category === type.defaultCategory)
+        : type.defaultNameMatch
+          ? expenseAccounts.find((a) => a.accountName.toLowerCase().includes(type.defaultNameMatch!))
+          : undefined;
+      setItemValue(match?.id || "");
+    } else {
+      setItemValue("");
+    }
+    window.setTimeout(() => itemRef.current?.focus(), 0);
+  }
+
   const resolvedLineType =
-    kind === "COLLECTION" || kind === "CASH_FROM_OFFICE" || kind === "DEPOSIT_TO_OFFICE" || kind === "DRIVER_SALARY"
-      ? kind
+    quickType.kind === "COLLECTION" || quickType.kind === "CASH_FROM_OFFICE" || quickType.kind === "DEPOSIT_TO_OFFICE" || quickType.kind === "DRIVER_SALARY"
+      ? quickType.kind
       : paymentSource === "DRIVER_CASH"
         ? "EXPENSE_CASH"
         : paymentSource === "OFFICE"
           ? "EXPENSE_OFFICE"
           : "EXPENSE_CREDIT";
 
-  const title = kind === "EXPENSE" ? "Expense" : kind === "DIESEL" ? "Diesel" : LINE_TYPE_LABELS[kind] || kind;
+  const dateOutOfRange = date && (date < toYMD(tripDateFrom) || (tripDateTo ? date > toYMD(tripDateTo) : false));
 
-  async function handleSave() {
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
     setError("");
     const amt = Number(amount);
     if (!Number.isFinite(amt) || amt <= 0) {
@@ -512,33 +756,36 @@ function LineDrawer({
       return;
     }
 
-    let description_ = description.trim();
-    if (kind === "DIESEL" && !description_) {
-      description_ = ["Diesel", pump.trim() || null, liters.trim() ? `${liters.trim()}L` : null].filter(Boolean).join(" - ");
-    }
+    const description = quickTypeKey === "DIESEL" ? buildDieselDescription(pump, liters, note) : note.trim() || undefined;
+    const payload: Record<string, unknown> = { lineType: resolvedLineType, date, amount: amt, description };
 
-    const payload: Record<string, unknown> = { lineType: resolvedLineType, date, amount: amt, description: description_ || undefined };
-
-    if (kind === "COLLECTION") {
-      const link = documents.find((d) => d.id === documentLinkId);
+    if (quickType.kind === "COLLECTION") {
+      const link = documents.find((d) => d.id === itemValue);
       if (!link) {
-        setError("Select a linked document.");
+        setError("Select a document.");
         return;
       }
       payload.documentType = link.documentType;
       payload.documentId = link.documentId;
-    } else if (kind === "CASH_FROM_OFFICE" || kind === "DEPOSIT_TO_OFFICE") {
-      if (!officeAccountId) {
+    } else if (quickType.kind === "CASH_FROM_OFFICE" || quickType.kind === "DEPOSIT_TO_OFFICE") {
+      if (!itemValue) {
         setError("Select an office account.");
         return;
       }
-      payload.officeAccountId = officeAccountId;
-    } else if (isExpenseKind) {
-      if (!expenseAccountId) {
+      payload.officeAccountId = itemValue;
+    } else if (quickType.kind === "DRIVER_SALARY") {
+      if (!itemValue) {
+        setError("Select an employee.");
+        return;
+      }
+      payload.employeeId = itemValue;
+    } else {
+      // EXPENSE
+      if (!itemValue) {
         setError("Select an expense account.");
         return;
       }
-      payload.expenseAccountId = expenseAccountId;
+      payload.expenseAccountId = itemValue;
       if (paymentSource === "OFFICE") {
         if (!officeAccountId) {
           setError("Select an office account.");
@@ -552,140 +799,216 @@ function LineDrawer({
         }
         payload.vendorPartyId = vendorPartyId;
       }
-    } else if (kind === "DRIVER_SALARY") {
-      if (!employeeId) {
-        setError("Select an employee.");
-        return;
-      }
-      payload.employeeId = employeeId;
     }
 
     try {
       setSaving(true);
-      const res = await fetch(`/api/own-carrier/${carrierId}/trips/${tripId}/lines`, {
-        method: "POST",
+      const url = editingLine
+        ? `/api/own-carrier/${carrierId}/trips/${tripId}/lines/${editingLine.id}`
+        : `/api/own-carrier/${carrierId}/trips/${tripId}/lines`;
+      const res = await fetch(url, {
+        method: editingLine ? "PATCH" : "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
       const data = await res.json();
-      if (!res.ok || !data.success) throw new Error(data.message || "Unable to post line.");
+      if (!res.ok || !data.success) throw new Error(data.message || "Unable to save line.");
+      onDateUsed(date);
+      resetForFreshRow(true);
       onSaved();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to post line.");
+      setError(err instanceof Error ? err.message : "Unable to save line.");
     } finally {
       setSaving(false);
     }
   }
 
   return (
-    <Drawer open onClose={onClose} title={title}>
-      <div className="space-y-4">
-        {error && <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>}
-        <div className="grid grid-cols-2 gap-3">
-          <div>
-            <label className="mb-1 block text-xs font-medium text-gray-600">Date</label>
-            <input type="date" value={date} onChange={(e) => setDate(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
-          </div>
-          <div>
-            <label className="mb-1 block text-xs font-medium text-gray-600">Amount *</label>
-            <input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
-          </div>
-        </div>
-
-        {kind === "COLLECTION" && (
-          <div>
-            <label className="mb-1 block text-xs font-medium text-gray-600">Linked Document *</label>
-            <select value={documentLinkId} onChange={(e) => setDocumentLinkId(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500">
-              <option value="">Select document...</option>
-              {documents.map((d) => (
-                <option key={d.id} value={d.id}>
-                  {d.label}
-                </option>
-              ))}
-            </select>
-          </div>
-        )}
-
-        {(kind === "CASH_FROM_OFFICE" || kind === "DEPOSIT_TO_OFFICE") && (
-          <div>
-            <label className="mb-1 block text-xs font-medium text-gray-600">Office Account *</label>
-            <SearchableSelect value={officeAccountId} options={officeAccountOptions} placeholder="Select office account..." onChange={setOfficeAccountId} />
-          </div>
-        )}
-
-        {isExpenseKind && (
-          <>
-            {kind === "DIESEL" && (
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="mb-1 block text-xs font-medium text-gray-600">Pump / Vendor</label>
-                  <input type="text" value={pump} onChange={(e) => setPump(e.target.value)} placeholder="e.g. Attock" className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
-                </div>
-                <div>
-                  <label className="mb-1 block text-xs font-medium text-gray-600">Liters</label>
-                  <input type="number" value={liters} onChange={(e) => setLiters(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
-                </div>
-              </div>
-            )}
-            <div>
-              <label className="mb-1 block text-xs font-medium text-gray-600">Expense Account *</label>
-              <SearchableSelect value={expenseAccountId} options={expenseAccountOptions} placeholder="Select expense account..." onChange={setExpenseAccountId} />
-            </div>
-            <div>
-              <label className="mb-1 block text-xs font-medium text-gray-600">Payment Source *</label>
-              <select
-                value={paymentSource}
-                onChange={(e) => setPaymentSource(e.target.value as PaymentSource)}
-                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
-              >
-                <option value="DRIVER_CASH">Driver Cash</option>
-                <option value="OFFICE">Office Account (Cash/Bank)</option>
-                <option value="UDHAAR">Udhaar (Vendor Payable)</option>
-              </select>
-            </div>
-            {paymentSource === "OFFICE" && (
-              <div>
-                <label className="mb-1 block text-xs font-medium text-gray-600">Office Account *</label>
-                <SearchableSelect value={officeAccountId} options={officeAccountOptions} placeholder="Select office account..." onChange={setOfficeAccountId} />
-              </div>
-            )}
-            {paymentSource === "UDHAAR" && (
-              <div>
-                <label className="mb-1 block text-xs font-medium text-gray-600">Vendor Party *</label>
-                <SearchableSelect value={vendorPartyId} options={vendorPartyOptions} placeholder="Select vendor party..." onChange={setVendorPartyId} />
-              </div>
-            )}
-          </>
-        )}
-
-        {kind === "DRIVER_SALARY" && (
-          <div>
-            <label className="mb-1 block text-xs font-medium text-gray-600">Employee *</label>
-            <SearchableSelect value={employeeId} options={employeeOptions} placeholder="Select employee..." onChange={setEmployeeId} />
-          </div>
-        )}
-
-        <div>
-          <label className="mb-1 block text-xs font-medium text-gray-600">Description</label>
-          <input type="text" value={description} onChange={(e) => setDescription(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
-        </div>
-
-        <div className="flex justify-end gap-2 border-t pt-4">
-          <button type="button" onClick={onClose} className="rounded-lg border px-4 py-2 text-sm hover:bg-gray-50">
-            Cancel
+    <div className="mb-6 rounded-xl border bg-white shadow-sm">
+      <div className="flex items-center justify-between border-b px-5 py-3">
+        <h2 className="text-sm font-semibold text-gray-900">{editingLine ? `Editing ${LINE_TYPE_LABELS[editingLine.lineType] || editingLine.lineType} line` : "Quick Entry"}</h2>
+        {editingLine && (
+          <button type="button" onClick={onCancelEdit} className="text-xs text-gray-500 hover:underline">
+            Cancel edit
           </button>
-          <button type="button" disabled={saving} onClick={handleSave} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700 disabled:opacity-50">
-            {saving ? "Posting..." : "Post"}
-          </button>
+        )}
+      </div>
+      <div className="px-5 pt-3">
+        <div className="flex flex-wrap gap-1.5">
+          {QUICK_TYPES.map((t) => (
+            <button
+              key={t.key}
+              type="button"
+              onClick={() => applyQuickType(t.key)}
+              disabled={Boolean(editingLine)}
+              className={`rounded-full border px-3 py-1 text-xs font-medium disabled:cursor-not-allowed disabled:opacity-40 ${
+                quickTypeKey === t.key ? "border-blue-500 bg-blue-50 text-blue-700" : "border-gray-300 text-gray-600 hover:bg-gray-50"
+              }`}
+            >
+              {t.label}
+            </button>
+          ))}
         </div>
       </div>
-    </Drawer>
+
+      <form onSubmit={handleSubmit} className="p-5">
+        {error && <div className="mb-3 rounded-lg border border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700">{error}</div>}
+        <div className="flex flex-wrap items-end gap-3">
+          <div className="w-36">
+            <label className="mb-1 block text-xs font-medium text-gray-600">Date</label>
+            <input type="date" value={date} onChange={(e) => setDate(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
+            {dateOutOfRange && <p className="mt-1 text-xs text-amber-600">Outside Trip&apos;s date range</p>}
+          </div>
+
+          {quickType.kind === "COLLECTION" && (
+            <div className="min-w-[220px] flex-1">
+              <label className="mb-1 block text-xs font-medium text-gray-600">Document</label>
+              <select
+                ref={itemRef}
+                value={itemValue}
+                onChange={(e) => {
+                  setItemValue(e.target.value);
+                  const link = documents.find((d) => d.id === e.target.value);
+                  if (link?.outstanding != null && !amount) setAmount(String(link.outstanding));
+                }}
+                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
+              >
+                <option value="">Select document...</option>
+                {documents.map((d) => (
+                  <option key={d.id} value={d.id}>
+                    {d.label}
+                    {d.outstanding != null ? ` (outstanding Rs. ${formatMoney(d.outstanding)})` : ""}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          {(quickType.kind === "CASH_FROM_OFFICE" || quickType.kind === "DEPOSIT_TO_OFFICE") && (
+            <div className="min-w-[200px] flex-1">
+              <label className="mb-1 block text-xs font-medium text-gray-600">Office Account</label>
+              <select ref={itemRef} value={itemValue} onChange={(e) => setItemValue(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500">
+                <option value="">Select account...</option>
+                {officeAccounts.map((a) => (
+                  <option key={a.id} value={a.id}>
+                    {a.accountName}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          {quickType.kind === "DRIVER_SALARY" && (
+            <div className="min-w-[200px] flex-1">
+              <label className="mb-1 block text-xs font-medium text-gray-600">Employee</label>
+              <select ref={itemRef} value={itemValue} onChange={(e) => setItemValue(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500">
+                <option value="">Select employee...</option>
+                {employees.map((e) => (
+                  <option key={e.id} value={e.id}>
+                    {e.name} ({e.employeeCode})
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          {quickType.kind === "EXPENSE" && (
+            <>
+              <div className="min-w-[180px] flex-1">
+                <label className="mb-1 block text-xs font-medium text-gray-600">Expense Account</label>
+                <select ref={itemRef} value={itemValue} onChange={(e) => setItemValue(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500">
+                  <option value="">Select account...</option>
+                  {expenseAccounts.map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.accountName}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              {quickTypeKey === "DIESEL" && (
+                <>
+                  <div className="w-36">
+                    <label className="mb-1 block text-xs font-medium text-gray-600">Pump / Vendor</label>
+                    <input type="text" value={pump} onChange={(e) => setPump(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
+                  </div>
+                  <div className="w-24">
+                    <label className="mb-1 block text-xs font-medium text-gray-600">Liters</label>
+                    <input type="number" value={liters} onChange={(e) => setLiters(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
+                  </div>
+                </>
+              )}
+            </>
+          )}
+
+          <div className="w-32">
+            <label className="mb-1 block text-xs font-medium text-gray-600">Amount</label>
+            <input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
+          </div>
+
+          {quickType.kind === "EXPENSE" && (
+            <>
+              <div className="w-44">
+                <label className="mb-1 block text-xs font-medium text-gray-600">
+                  Paid From
+                  {editingLine && <span className="font-normal text-gray-400"> (locked while editing)</span>}
+                </label>
+                <select
+                  value={paymentSource}
+                  disabled={Boolean(editingLine)}
+                  onChange={(e) => setPaymentSource(e.target.value as PaymentSource)}
+                  className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500 disabled:bg-gray-100 disabled:text-gray-400"
+                >
+                  <option value="DRIVER_CASH">Driver Cash</option>
+                  <option value="OFFICE">Office Account</option>
+                  <option value="UDHAAR">Udhaar</option>
+                </select>
+              </div>
+              {paymentSource === "OFFICE" && (
+                <div className="min-w-[180px] flex-1">
+                  <label className="mb-1 block text-xs font-medium text-gray-600">Office Account</label>
+                  <select value={officeAccountId} onChange={(e) => setOfficeAccountId(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500">
+                    <option value="">Select account...</option>
+                    {officeAccounts.map((a) => (
+                      <option key={a.id} value={a.id}>
+                        {a.accountName}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              {paymentSource === "UDHAAR" && (
+                <div className="min-w-[180px] flex-1">
+                  <label className="mb-1 block text-xs font-medium text-gray-600">Vendor Party</label>
+                  <select value={vendorPartyId} onChange={(e) => setVendorPartyId(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500">
+                    <option value="">Select vendor...</option>
+                    {vendorParties.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.partyName}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+            </>
+          )}
+
+          <div className="min-w-[160px] flex-1">
+            <label className="mb-1 block text-xs font-medium text-gray-600">Note</label>
+            <input type="text" value={note} onChange={(e) => setNote(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
+          </div>
+
+          <button type="submit" disabled={saving} className="rounded-lg bg-blue-600 px-5 py-2 text-sm font-semibold text-white hover:bg-blue-700 disabled:opacity-50">
+            {saving ? "Saving..." : editingLine ? "Save Edit" : "Save (Enter)"}
+          </button>
+        </div>
+      </form>
+    </div>
   );
 }
 
 // ============================================================
 // LINK DOCUMENTS DRAWER - search Challan/Phonch/Private Phonch by
-// number, multi-select, link in one call (Decision 3).
+// number, multi-select, link in one call.
 // ============================================================
 function LinkDocumentsDrawer({ carrierId, tripId, onClose, onLinked }: { carrierId: string; tripId: string; onClose: () => void; onLinked: () => void }) {
   const [documentType, setDocumentType] = useState<"CHALLAN" | "PHONCH" | "PRIVATE_PHONCH">("CHALLAN");

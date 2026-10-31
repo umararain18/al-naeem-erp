@@ -3,7 +3,7 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
-import { getTripCashBook, closeCarrierTrip, reopenCarrierTrip, CarrierTripError } from "@/lib/carrier-trip";
+import { getTripCashBook, closeCarrierTrip, reopenCarrierTrip, getDocumentOutstandingAmount, CarrierTripError } from "@/lib/carrier-trip";
 import { auditUpdate, auditDelete, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 
 async function loadDocumentLabels(
@@ -26,6 +26,11 @@ async function loadDocumentLabels(
         const d = await prisma.privatePhonch.findUnique({ where: { id: doc.documentId }, select: { phonchNo: true } });
         if (d) label = `Private Phonch ${d.phonchNo}`;
       }
+      // Pure prefill convenience for the Cash Book quick-entry row's
+      // Collection item - see getDocumentOutstandingAmount's own doc
+      // comment for exactly what this is (and is not).
+      const outstanding = await getDocumentOutstandingAmount(prisma, doc.documentType as "CHALLAN" | "PHONCH" | "PRIVATE_PHONCH", doc.documentId);
+
       return {
         id: doc.id,
         documentType: doc.documentType,
@@ -34,6 +39,7 @@ async function loadDocumentLabels(
         label,
         carrierRentAmount: Number(doc.carrierRentAmount),
         isOwnCarrierChallan,
+        outstanding,
       };
     })
   );
