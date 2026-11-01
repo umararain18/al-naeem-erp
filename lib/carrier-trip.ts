@@ -60,6 +60,76 @@ export async function suggestNextTripNo(tx: Tx, carrierId: string): Promise<stri
   return String(max + 1);
 }
 
+export interface CarrierTripLineTemplate {
+  lineType: "EXPENSE_CASH" | "EXPENSE_OFFICE" | "EXPENSE_CREDIT" | "DRIVER_SALARY";
+  expenseAccountId: string | null;
+  expenseAccountName: string | null;
+  vendorPartyId: string | null;
+  vendorPartyName: string | null;
+  officeAccountId: string | null;
+  officeAccountName: string | null;
+  employeeId: string | null;
+  employeeName: string | null;
+  description: string | null;
+  isDieselLike: boolean;
+}
+
+/**
+ * "Previous slip expenses as blank drafts" - the carrier's own most
+ * recent OTHER Trip's recurring expense/salary lines (EXPENSE_CASH/
+ * EXPENSE_OFFICE/EXPENSE_CREDIT/DRIVER_SALARY only - COLLECTION/
+ * CASH_FROM_OFFICE/DEPOSIT_TO_OFFICE are one-off cash movements, never
+ * a recurring pattern worth re-offering), as pure templates: every
+ * field EXCEPT amount/liters, which the UI leaves blank for the user
+ * to fill. A pure read - this never creates anything; the resulting
+ * draft rows this feeds are UI-only state (localStorage) until each
+ * is actually saved through the normal lines POST/PATCH endpoints, so
+ * they can never create a JournalEntry by themselves. isDieselLike is
+ * the CURRENT description-prefix heuristic (see this module's own
+ * CARRIER_TRIP_LINE_TYPES doc comments) - once CarrierTripLine gets a
+ * real isDiesel column this switches to reading that instead, with no
+ * change to this function's callers.
+ */
+export async function getPreviousTripExpenseTemplates(
+  tx: Tx,
+  carrierId: string,
+  currentTripId: string
+): Promise<{ previousTripId: string; previousTripNo: string; templates: CarrierTripLineTemplate[] } | null> {
+  const previousTrip = await tx.carrierTrip.findFirst({
+    where: { carrierId, isDeleted: false, id: { not: currentTripId } },
+    orderBy: [{ dateFrom: "desc" }, { createdAt: "desc" }],
+    select: { id: true, tripNo: true },
+  });
+  if (!previousTrip) return null;
+
+  const lines = await tx.carrierTripLine.findMany({
+    where: { tripId: previousTrip.id, isDeleted: false, lineType: { in: ["EXPENSE_CASH", "EXPENSE_OFFICE", "EXPENSE_CREDIT", "DRIVER_SALARY"] } },
+    orderBy: [{ date: "asc" }, { createdAt: "asc" }],
+    include: {
+      expenseAccount: { select: { accountName: true } },
+      vendorParty: { select: { partyName: true } },
+      officeAccount: { select: { accountName: true } },
+      employee: { select: { name: true } },
+    },
+  });
+
+  const templates: CarrierTripLineTemplate[] = lines.map((l) => ({
+    lineType: l.lineType as CarrierTripLineTemplate["lineType"],
+    expenseAccountId: l.expenseAccountId,
+    expenseAccountName: l.expenseAccount?.accountName || null,
+    vendorPartyId: l.vendorPartyId,
+    vendorPartyName: l.vendorParty?.partyName || null,
+    officeAccountId: l.officeAccountId,
+    officeAccountName: l.officeAccount?.accountName || null,
+    employeeId: l.employeeId,
+    employeeName: l.employee?.name || null,
+    description: l.description,
+    isDieselLike: (l.description || "").trim().toLowerCase().startsWith("diesel"),
+  }));
+
+  return { previousTripId: previousTrip.id, previousTripNo: previousTrip.tripNo, templates };
+}
+
 async function assertDocumentExists(
   tx: Tx,
   documentType: CarrierTripDocumentType,
@@ -201,6 +271,45 @@ export async function linkDocumentToTrip(
       linkedById: input.linkedById,
     },
   });
+}
+
+/** The carrier's own currently-OPEN Trip, most recent first - the
+ * SAME "latest" ordering suggestNextTripNo/the Trip list already use
+ * (dateFrom desc, createdAt desc tiebreak). Null when none is open. */
+export async function getLatestOpenTrip(tx: Tx, carrierId: string) {
+  return tx.carrierTrip.findFirst({
+    where: { carrierId, isDeleted: false, status: "OPEN" },
+    orderBy: [{ dateFrom: "desc" }, { createdAt: "desc" }],
+  });
+}
+
+/**
+ * Auto-links a freshly own-carrier Challan to its carrier's latest
+ * OPEN Trip - called from app/api/challan/route.ts (create) and
+ * app/api/challan/[id]/route.ts (edit, only on the unset -> set
+ * transition) right after ownCarrierId is actually committed. A
+ * no-op, never a thrown error, when there is no open Trip (the
+ * Challan simply stays unlinked - the UI shows "Not linked - no open
+ * Trip") or when the Challan is somehow already linked (should never
+ * happen for a Challan that was not own-carrier a moment ago, but
+ * this is a convenience auto-link, never worth failing the whole
+ * Challan write over). Carrier Rent on the new link is deliberately
+ * left at its schema default (0 / empty in the UI) - never prefilled.
+ */
+export async function autoLinkOwnCarrierChallan(
+  tx: Tx,
+  input: { challanId: string; ownCarrierId: string; linkedById: string }
+): Promise<{ tripId: string; tripNo: string } | null> {
+  const trip = await getLatestOpenTrip(tx, input.ownCarrierId);
+  if (!trip) return null;
+
+  try {
+    await linkDocumentToTrip(tx, { tripId: trip.id, documentType: "CHALLAN", documentId: input.challanId, linkedById: input.linkedById });
+    return { tripId: trip.id, tripNo: trip.tripNo };
+  } catch (error) {
+    if (error instanceof CarrierTripError) return null;
+    throw error;
+  }
 }
 
 export async function unlinkDocumentFromTrip(tx: Tx, input: { tripDocumentId: string; unlinkedById: string }) {

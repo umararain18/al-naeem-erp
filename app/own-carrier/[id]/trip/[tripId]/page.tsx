@@ -85,6 +85,105 @@ function isDieselRow(description: string): boolean {
   return description.trim().toLowerCase().startsWith("diesel");
 }
 
+/**
+ * Fast keyboard entry: "20k" -> 20000, "1.5L" -> 150000 (Lakh, the
+ * common Pakistani/Indian shorthand - NOT liters, which is its own,
+ * separate field), and "+"-joined terms sum ("500+700+300" -> 1500),
+ * each term allowed its own k/L suffix. Returns null (never NaN/0)
+ * for anything that doesn't parse, so the caller can tell "empty" and
+ * "typo" apart from a genuine zero.
+ */
+function parseAmountExpression(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+  const terms = trimmed.split("+");
+  let total = 0;
+  for (const term of terms) {
+    const match = term.trim().match(/^(\d+(?:\.\d+)?)\s*([kKlL]?)$/);
+    if (!match) return null;
+    const value = Number(match[1]);
+    const suffix = match[2].toLowerCase();
+    total += suffix === "k" ? value * 1000 : suffix === "l" ? value * 100000 : value;
+  }
+  return Math.round((total + Number.EPSILON) * 100) / 100;
+}
+
+type DraftRow = {
+  id: string;
+  lineType: "EXPENSE_CASH" | "EXPENSE_OFFICE" | "EXPENSE_CREDIT" | "DRIVER_SALARY";
+  expenseAccountId: string | null;
+  expenseAccountName: string | null;
+  vendorPartyId: string | null;
+  vendorPartyName: string | null;
+  officeAccountId: string | null;
+  officeAccountName: string | null;
+  employeeId: string | null;
+  employeeName: string | null;
+  isDieselLike: boolean;
+  pump: string;
+  liters: string;
+  amount: string;
+  note: string;
+};
+
+function draftsStorageKey(tripId: string): string {
+  return `oc-drafts-${tripId}`;
+}
+
+function loadDraftsFromStorage(tripId: string): DraftRow[] {
+  try {
+    const raw = window.localStorage.getItem(draftsStorageKey(tripId));
+    return raw ? JSON.parse(raw) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveDraftsToStorage(tripId: string, drafts: DraftRow[]) {
+  try {
+    window.localStorage.setItem(draftsStorageKey(tripId), JSON.stringify(drafts));
+  } catch {
+    // per-viewer convenience only - never required to persist
+  }
+}
+
+function templateToDraft(t: {
+  lineType: DraftRow["lineType"];
+  expenseAccountId: string | null;
+  expenseAccountName: string | null;
+  vendorPartyId: string | null;
+  vendorPartyName: string | null;
+  officeAccountId: string | null;
+  officeAccountName: string | null;
+  employeeId: string | null;
+  employeeName: string | null;
+  description: string | null;
+  isDieselLike: boolean;
+}): DraftRow {
+  const pumpMatch = t.isDieselLike ? t.description?.match(/^Diesel\s*-\s*([^-]+?)\s*-/i) : null;
+  return {
+    id: `draft-${Math.random().toString(36).slice(2)}`,
+    lineType: t.lineType,
+    expenseAccountId: t.expenseAccountId,
+    expenseAccountName: t.expenseAccountName,
+    vendorPartyId: t.vendorPartyId,
+    vendorPartyName: t.vendorPartyName,
+    officeAccountId: t.officeAccountId,
+    officeAccountName: t.officeAccountName,
+    employeeId: t.employeeId,
+    employeeName: t.employeeName,
+    isDieselLike: t.isDieselLike,
+    pump: pumpMatch?.[1]?.trim() || "",
+    liters: "",
+    amount: "",
+    note: t.isDieselLike ? "" : t.description || "",
+  };
+}
+
+function paidFromStorageKey(tripId: string, quickTypeKey: string): string {
+  return `oc-paidfrom-${tripId}-${quickTypeKey}`;
+}
+
 export default function CarrierTripDetailPage() {
   const params = useParams();
   const carrierId = params.id as string;
@@ -101,6 +200,92 @@ export default function CarrierTripDetailPage() {
   const [reportOpen, setReportOpen] = useState(false);
   const [editingLine, setEditingLine] = useState<CashBookRow | null>(null);
   const [lastDate, setLastDate] = useState<string | null>(null);
+  const [drafts, setDrafts] = useState<DraftRow[]>([]);
+  const [draftsSeeded, setDraftsSeeded] = useState(false);
+  const [draftDate, setDraftDate] = useState<string | null>(null);
+  const [pasteOpen, setPasteOpen] = useState(false);
+
+  async function copyFromPreviousTrip(options: { replace: boolean; silent: boolean }) {
+    const res = await fetch(`/api/own-carrier/${carrierId}/trips/${tripId}/previous-expenses`, { cache: "no-store" });
+    const data = await res.json();
+    if (!res.ok || !data.success) {
+      if (!options.silent) alert(data.message || "Unable to load previous Trip's expenses.");
+      return;
+    }
+    if (!data.previousTripNo) {
+      if (!options.silent) alert("This carrier has no previous Trip to copy from.");
+      return;
+    }
+    const copied: DraftRow[] = data.templates.map(templateToDraft);
+    setDrafts((prev) => {
+      const next = options.replace ? copied : [...prev, ...copied];
+      saveDraftsToStorage(tripId, next);
+      return next;
+    });
+  }
+
+  function removeDraft(draftId: string) {
+    setDrafts((prev) => {
+      const next = prev.filter((d) => d.id !== draftId);
+      saveDraftsToStorage(tripId, next);
+      return next;
+    });
+  }
+
+  async function saveDraft(draft: DraftRow, date: string): Promise<string | null> {
+    const amount = parseAmountExpression(draft.amount);
+    if (!amount || amount <= 0) return "Enter a valid amount.";
+
+    const description = draft.isDieselLike ? buildDieselDescription(draft.pump, draft.liters, draft.note) : draft.note.trim() || undefined;
+    const payload: Record<string, unknown> = { lineType: draft.lineType, date, amount, description };
+    if (draft.lineType === "EXPENSE_OFFICE") payload.officeAccountId = draft.officeAccountId;
+    if (draft.lineType === "EXPENSE_CREDIT") payload.vendorPartyId = draft.vendorPartyId;
+    if (draft.lineType === "EXPENSE_CASH" || draft.lineType === "EXPENSE_OFFICE" || draft.lineType === "EXPENSE_CREDIT") {
+      payload.expenseAccountId = draft.expenseAccountId;
+    }
+    if (draft.lineType === "DRIVER_SALARY") payload.employeeId = draft.employeeId;
+
+    const res = await fetch(`/api/own-carrier/${carrierId}/trips/${tripId}/lines`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.success) return data.message || "Unable to save draft.";
+
+    removeDraft(draft.id);
+    refresh();
+    return null;
+  }
+
+  function updateDraft(draftId: string, patch: Partial<DraftRow>) {
+    setDrafts((prev) => {
+      const next = prev.map((d) => (d.id === draftId ? { ...d, ...patch } : d));
+      saveDraftsToStorage(tripId, next);
+      return next;
+    });
+  }
+
+  // "When a new Trip is created ... copy the previous trip's expense
+  // lines ... as DRAFT rows" - fires once, only for a genuinely fresh
+  // Trip (zero posted lines yet) that has no drafts already saved
+  // locally (a reload of an in-progress Trip must never re-seed on
+  // top of what the user already has). The explicit "Copy from
+  // previous trip" button (copyFromPreviousTrip(true)) works anytime,
+  // independent of this auto-seed.
+  useEffect(() => {
+    if (!cashBook || draftsSeeded) return;
+    setDraftsSeeded(true);
+    const stored = loadDraftsFromStorage(tripId);
+    if (stored.length > 0) {
+      setDrafts(stored);
+      return;
+    }
+    if (cashBook.rows.length === 0) {
+      copyFromPreviousTrip({ replace: true, silent: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cashBook, draftsSeeded]);
 
   async function load() {
     try {
@@ -310,6 +495,43 @@ export default function CarrierTripDetailPage() {
           />
         )}
 
+        {/* DRAFTS - "previous slip" expense templates, empty amount until filled+saved */}
+        {canAct && (
+          <DraftsPanel
+            drafts={drafts}
+            draftDate={draftDate || lastDate || toYMD(trip.dateFrom)}
+            onDateChange={setDraftDate}
+            onCopyFromPrevious={() => copyFromPreviousTrip({ replace: false, silent: false })}
+            onRemove={removeDraft}
+            onUpdate={updateDraft}
+            onSave={saveDraft}
+          />
+        )}
+
+        {/* PASTE LIST - bulk entry, nothing posts before "Save all" */}
+        {canAct && (
+          <div className="mb-6 rounded-xl border bg-white shadow-sm">
+            <div className="flex items-center justify-between border-b px-5 py-3">
+              <h2 className="text-sm font-semibold text-gray-900">Paste List</h2>
+              <button type="button" onClick={() => setPasteOpen((v) => !v)} className="text-xs text-blue-600 hover:underline">
+                {pasteOpen ? "Hide" : "Paste multiple lines"}
+              </button>
+            </div>
+            {pasteOpen && (
+              <PasteListBox
+                carrierId={carrierId}
+                tripId={tripId}
+                documents={documents}
+                defaultDate={draftDate || lastDate || toYMD(trip.dateFrom)}
+                onSaved={() => {
+                  setPasteOpen(false);
+                  refresh();
+                }}
+              />
+            )}
+          </div>
+        )}
+
         {/* SUMMARY BAR */}
         <div className="mb-6 grid grid-cols-2 gap-3 rounded-xl border bg-white p-4 shadow-sm sm:grid-cols-5">
           <SummaryStat label="Previous Balance" value={formatSignedMoney(cashBook?.openingBalance || 0)} negative={(cashBook?.openingBalance || 0) < 0} />
@@ -514,11 +736,15 @@ function Drawer({ open, onClose, title, children }: { open: boolean; onClose: ()
 type AccountOption = { id: string; accountName: string; accountType: string; category: string };
 
 function CarrierRentEditor({ link, canEdit, onSave }: { link: DocumentLink; canEdit: boolean; onSave: (link: DocumentLink, value: string) => Promise<void> }) {
-  const [value, setValue] = useState(String(link.carrierRentAmount));
+  // 0 reads as "never entered yet" here (per spec: Carrier Rent stays
+  // EMPTY for the user to enter, never prefilled) - shown as a blank
+  // input, not a literal "0", same convention as every other
+  // never-yet-set amount field in this module.
+  const [value, setValue] = useState(link.carrierRentAmount ? String(link.carrierRentAmount) : "");
   const [saving, setSaving] = useState(false);
 
   if (!canEdit) {
-    return <span className="text-xs text-gray-500">Carrier Rent: Rs. {formatMoney(link.carrierRentAmount)}</span>;
+    return <span className="text-xs text-gray-500">Carrier Rent: {link.carrierRentAmount ? `Rs. ${formatMoney(link.carrierRentAmount)}` : "not entered"}</span>;
   }
 
   return (
@@ -528,6 +754,7 @@ function CarrierRentEditor({ link, canEdit, onSave }: { link: DocumentLink; canE
         type="number"
         min="0"
         step="0.01"
+        placeholder="not entered"
         value={value}
         onChange={(e) => setValue(e.target.value)}
         className="w-28 rounded-md border border-gray-300 px-2 py-1 text-xs outline-none focus:border-blue-500"
@@ -632,6 +859,33 @@ function QuickEntryRow({
     })();
   }, []);
 
+  // Keys 1-9 pick a quick type - but only when focus isn't already in
+  // an editable field (typing "20000" into Amount must never get read
+  // as "press 2"), and never while editing an existing line (its type
+  // is locked, same as Paid From).
+  useEffect(() => {
+    function handleKeyDown(e: KeyboardEvent) {
+      if (editingLine) return;
+      const tag = (document.activeElement?.tagName || "").toLowerCase();
+      if (tag === "input" || tag === "select" || tag === "textarea") return;
+      const index = Number(e.key) - 1;
+      if (Number.isInteger(index) && index >= 0 && index < QUICK_TYPES.length) {
+        e.preventDefault();
+        applyQuickType(QUICK_TYPES[index].key);
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editingLine]);
+
+  // Wasooli's own document list: outstanding-bearing documents first
+  // (still-to-collect ones are what the driver is actually chasing),
+  // fully-collected ones after - never a second, separate list.
+  const sortedDocuments = useMemo(
+    () => [...documents].sort((a, b) => (b.outstanding || 0) - (a.outstanding || 0)),
+    [documents]
+  );
   const expenseAccounts = useMemo(() => accounts.filter((a) => a.accountType === "EXPENSE"), [accounts]);
   const officeAccounts = useMemo(() => accounts.filter((a) => a.accountType !== "EXPENSE" && a.accountType !== "PARTY"), [accounts]);
   const vendorParties = useMemo(() => parties.filter((p) => p.account), [parties]);
@@ -722,7 +976,17 @@ function QuickEntryRow({
     setLiters("");
     setVendorPartyId("");
     setOfficeAccountId("");
-    setPaymentSource("DRIVER_CASH");
+    // "Remember last Paid from per type in the trip" - per quick-type,
+    // not a global default, since Diesel and Toll are often paid
+    // differently.
+    let remembered: PaymentSource = "DRIVER_CASH";
+    try {
+      const stored = window.localStorage.getItem(paidFromStorageKey(tripId, key));
+      if (stored === "DRIVER_CASH" || stored === "OFFICE" || stored === "UDHAAR") remembered = stored;
+    } catch {
+      // per-viewer convenience only
+    }
+    setPaymentSource(remembered);
     if (type.kind === "EXPENSE") {
       const match = type.defaultCategory
         ? expenseAccounts.find((a) => a.category === type.defaultCategory)
@@ -750,9 +1014,9 @@ function QuickEntryRow({
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError("");
-    const amt = Number(amount);
-    if (!Number.isFinite(amt) || amt <= 0) {
-      setError("Amount must be greater than zero.");
+    const amt = parseAmountExpression(amount);
+    if (!amt || amt <= 0) {
+      setError('Amount must be greater than zero (e.g. 20000, "20k", "1.5L", or "500+700+300").');
       return;
     }
 
@@ -814,6 +1078,13 @@ function QuickEntryRow({
       const data = await res.json();
       if (!res.ok || !data.success) throw new Error(data.message || "Unable to save line.");
       onDateUsed(date);
+      if (quickType.kind === "EXPENSE" && !editingLine) {
+        try {
+          window.localStorage.setItem(paidFromStorageKey(tripId, quickTypeKey), paymentSource);
+        } catch {
+          // per-viewer convenience only
+        }
+      }
       resetForFreshRow(true);
       onSaved();
     } catch (err) {
@@ -874,7 +1145,7 @@ function QuickEntryRow({
                 className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
               >
                 <option value="">Select document...</option>
-                {documents.map((d) => (
+                {sortedDocuments.map((d) => (
                   <option key={d.id} value={d.id}>
                     {d.label}
                     {d.outstanding != null ? ` (outstanding Rs. ${formatMoney(d.outstanding)})` : ""}
@@ -1002,6 +1273,401 @@ function QuickEntryRow({
           </button>
         </div>
       </form>
+    </div>
+  );
+}
+
+// ============================================================
+// DRAFTS PANEL - "previous slip" expenses copied in as blank-amount
+// templates (see getPreviousTripExpenseTemplates in lib/carrier-trip.ts
+// and templateToDraft above). Pure client-side state (localStorage)
+// until a draft is actually saved - never a JournalEntry, never even
+// a server round-trip, until that happens.
+// ============================================================
+function DraftsPanel({
+  drafts,
+  draftDate,
+  onDateChange,
+  onCopyFromPrevious,
+  onRemove,
+  onUpdate,
+  onSave,
+}: {
+  drafts: DraftRow[];
+  draftDate: string;
+  onDateChange: (date: string) => void;
+  onCopyFromPrevious: () => void;
+  onRemove: (id: string) => void;
+  onUpdate: (id: string, patch: Partial<DraftRow>) => void;
+  onSave: (draft: DraftRow, date: string) => Promise<string | null>;
+}) {
+  const [savingId, setSavingId] = useState<string | null>(null);
+  const [errorId, setErrorId] = useState<string | null>(null);
+  const [errorMsg, setErrorMsg] = useState("");
+
+  async function handleSave(draft: DraftRow, focusNextAmountId?: string) {
+    setSavingId(draft.id);
+    setErrorId(null);
+    const err = await onSave(draft, draftDate);
+    setSavingId(null);
+    if (err) {
+      setErrorId(draft.id);
+      setErrorMsg(err);
+      return;
+    }
+    if (focusNextAmountId) {
+      window.setTimeout(() => document.getElementById(`draft-amount-${focusNextAmountId}`)?.focus(), 0);
+    }
+  }
+
+  function itemLabel(d: DraftRow): string {
+    if (d.lineType === "DRIVER_SALARY") return d.employeeName || "Employee";
+    if (d.lineType === "EXPENSE_CREDIT") return `${d.expenseAccountName || "Expense"} (Udhaar - ${d.vendorPartyName || "Vendor"})`;
+    if (d.lineType === "EXPENSE_OFFICE") return `${d.expenseAccountName || "Expense"} (Office)`;
+    return d.expenseAccountName || "Expense";
+  }
+
+  return (
+    <div className="mb-6 rounded-xl border bg-white shadow-sm">
+      <div className="flex flex-wrap items-center justify-between gap-2 border-b px-5 py-3">
+        <h2 className="text-sm font-semibold text-gray-900">Drafts (previous Trip&apos;s expenses)</h2>
+        <div className="flex items-center gap-3">
+          <label className="flex items-center gap-1.5 text-xs text-gray-600">
+            Date for saved drafts
+            <input type="date" value={draftDate} onChange={(e) => onDateChange(e.target.value)} className="rounded-md border border-gray-300 px-2 py-1 text-xs outline-none focus:border-blue-500" />
+          </label>
+          <button type="button" onClick={onCopyFromPrevious} className="rounded-md border border-blue-200 px-3 py-1.5 text-xs font-medium text-blue-600 hover:bg-blue-50">
+            Copy from previous Trip
+          </button>
+        </div>
+      </div>
+      {drafts.length === 0 ? (
+        <div className="px-5 py-5 text-center text-sm text-gray-500">No drafts. Use &quot;Copy from previous Trip&quot; to bring in last Trip&apos;s recurring expenses.</div>
+      ) : (
+        <div className="divide-y">
+          {drafts.map((d) => (
+            <div key={d.id} className="flex flex-wrap items-center gap-2 px-5 py-2.5 text-sm">
+              <span className="min-w-[160px] flex-1 font-medium text-gray-900">{itemLabel(d)}</span>
+              {d.isDieselLike && (
+                <>
+                  <input
+                    value={d.pump}
+                    onChange={(e) => onUpdate(d.id, { pump: e.target.value })}
+                    placeholder="Pump"
+                    className="w-28 rounded-md border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-blue-500"
+                  />
+                  <input
+                    value={d.liters}
+                    onChange={(e) => onUpdate(d.id, { liters: e.target.value })}
+                    placeholder="Liters"
+                    className="w-20 rounded-md border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-blue-500"
+                  />
+                </>
+              )}
+              <input
+                id={`draft-amount-${d.id}`}
+                value={d.amount}
+                onChange={(e) => onUpdate(d.id, { amount: e.target.value })}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    const nextId = drafts[drafts.indexOf(d) + 1]?.id;
+                    handleSave(d, nextId);
+                  }
+                }}
+                placeholder="Amount (Enter to save)"
+                className="w-40 rounded-md border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-blue-500"
+              />
+              <button type="button" disabled={savingId === d.id} onClick={() => handleSave(d)} className="rounded-md border border-green-200 px-2.5 py-1.5 text-xs font-medium text-green-700 hover:bg-green-50 disabled:opacity-50">
+                {savingId === d.id ? "..." : "Save"}
+              </button>
+              <button type="button" onClick={() => onRemove(d.id)} className="rounded-md border border-red-200 px-2.5 py-1.5 text-xs text-red-600 hover:bg-red-50">
+                Remove
+              </button>
+              {errorId === d.id && <span className="w-full text-xs text-red-600">{errorMsg}</span>}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ============================================================
+// PASTE LIST BOX - bulk entry. "Toll 500", "Khana 1200",
+// "Diesel 205L 50000 Attock", "Wasooli 4025 25000" -> an editable
+// preview, invalid rows highlighted; nothing posts until Save All.
+// ============================================================
+
+type PasteRowKind = "COLLECTION" | "DIESEL" | "EXPENSE" | "SALARY" | "OFFICE_CASH" | "OFFICE_DEPOSIT";
+
+type PasteRow = {
+  id: string;
+  raw: string;
+  kind: PasteRowKind | null;
+  documentLabel?: string;
+  documentLinkId?: string;
+  pump?: string;
+  liters?: string;
+  amount: string;
+  note?: string;
+  expenseAccountId?: string;
+  error: string | null;
+};
+
+// kind=EXPENSE/DIESEL need a real expense account, resolved from the
+// SAME keyword -> category defaults as the quick-entry row's own
+// QUICK_TYPES (see applyQuickType) - kept here as its own small table
+// since the paste grammar's keyword set doesn't line up 1:1 with
+// QuickTypeKey (e.g. "expense"/"other" both mean OTHER_EXPENSE here).
+const PASTE_KEYWORDS: { re: RegExp; kind: PasteRowKind; defaultCategory?: string; defaultNameMatch?: string }[] = [
+  { re: /^wasooli$/i, kind: "COLLECTION" },
+  { re: /^diesel$/i, kind: "DIESEL", defaultCategory: "FUEL" },
+  { re: /^toll$/i, kind: "EXPENSE", defaultNameMatch: "toll" },
+  { re: /^khana$/i, kind: "EXPENSE", defaultCategory: "TEA_REFRESHMENT" },
+  { re: /^marammat$/i, kind: "EXPENSE", defaultCategory: "REPAIR_MAINTENANCE" },
+  { re: /^(expense|other)$/i, kind: "EXPENSE", defaultCategory: "OTHER_EXPENSE" },
+  { re: /^salary$/i, kind: "SALARY" },
+  { re: /^officecash$/i, kind: "OFFICE_CASH" },
+  { re: /^officejama$/i, kind: "OFFICE_DEPOSIT" },
+];
+
+function resolveDefaultExpenseAccount(
+  keyword: { defaultCategory?: string; defaultNameMatch?: string },
+  expenseAccounts: AccountOption[]
+): AccountOption | undefined {
+  if (keyword.defaultCategory) return expenseAccounts.find((a) => a.category === keyword.defaultCategory);
+  if (keyword.defaultNameMatch) return expenseAccounts.find((a) => a.accountName.toLowerCase().includes(keyword.defaultNameMatch!));
+  return undefined;
+}
+
+function parsePasteLine(raw: string, documents: DocumentLink[], expenseAccounts: AccountOption[]): PasteRow {
+  const base: PasteRow = { id: `paste-${Math.random().toString(36).slice(2)}`, raw, kind: null, amount: "", error: null };
+  const tokens = raw.trim().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return { ...base, error: "Empty line" };
+
+  const keyword = PASTE_KEYWORDS.find((k) => k.re.test(tokens[0]));
+  if (!keyword) return { ...base, error: `Unrecognized type "${tokens[0]}"` };
+  const rest = tokens.slice(1);
+
+  if (keyword.kind === "COLLECTION") {
+    // Wasooli <fragment> <amount>
+    if (rest.length < 2) return { ...base, kind: "COLLECTION", error: "Expected: Wasooli <document> <amount>" };
+    const amountToken = rest[rest.length - 1];
+    const amount = parseAmountExpression(amountToken);
+    const fragment = rest.slice(0, -1).join(" ");
+    const match = documents.find((d) => d.label.toLowerCase().includes(fragment.toLowerCase()));
+    if (!match) return { ...base, kind: "COLLECTION", amount: amountToken, error: `No linked document matches "${fragment}"` };
+    if (amount == null || amount <= 0) return { ...base, kind: "COLLECTION", documentLabel: match.label, documentLinkId: match.id, error: "Invalid amount" };
+    return { ...base, kind: "COLLECTION", documentLabel: match.label, documentLinkId: match.id, amount: amountToken };
+  }
+
+  if (keyword.kind === "DIESEL") {
+    // Diesel <liters>L <amount> [pump...]
+    const account = resolveDefaultExpenseAccount(keyword, expenseAccounts);
+    if (rest.length < 2) return { ...base, kind: "DIESEL", expenseAccountId: account?.id, error: "Expected: Diesel <liters>L <amount> [pump]" };
+    const litersMatch = rest[0].match(/^(\d+(?:\.\d+)?)\s*[lL]?$/);
+    if (!litersMatch) return { ...base, kind: "DIESEL", expenseAccountId: account?.id, error: `Could not read liters from "${rest[0]}"` };
+    const amount = parseAmountExpression(rest[1]);
+    if (amount == null || amount <= 0) return { ...base, kind: "DIESEL", liters: litersMatch[1], expenseAccountId: account?.id, error: `Could not read amount from "${rest[1]}"` };
+    const pump = rest.slice(2).join(" ");
+    const error = account ? null : "No matching expense account - pick one";
+    return { ...base, kind: "DIESEL", liters: litersMatch[1], amount: rest[1], pump, expenseAccountId: account?.id, error };
+  }
+
+  if (keyword.kind === "EXPENSE") {
+    // <Keyword> <amount> [note...] - the keyword itself becomes the note/search hint.
+    const account = resolveDefaultExpenseAccount(keyword, expenseAccounts);
+    if (rest.length < 1) return { ...base, kind: "EXPENSE", expenseAccountId: account?.id, error: "Expected an amount" };
+    const amount = parseAmountExpression(rest[0]);
+    if (amount == null || amount <= 0) return { ...base, kind: "EXPENSE", expenseAccountId: account?.id, error: `Could not read amount from "${rest[0]}"` };
+    const note = [tokens[0], ...rest.slice(1)].join(" ");
+    const error = account ? null : "No matching expense account - pick one";
+    return { ...base, kind: "EXPENSE", amount: rest[0], note, expenseAccountId: account?.id, error };
+  }
+
+  if (keyword.kind === "SALARY" || keyword.kind === "OFFICE_CASH" || keyword.kind === "OFFICE_DEPOSIT") {
+    // Needs a specific employee/office account the paste grammar
+    // can't safely guess - parsed far enough to show the amount, but
+    // always flagged for the user to finish in Quick Entry instead.
+    if (rest.length < 1) return { ...base, kind: keyword.kind, error: "Expected an amount" };
+    const amount = parseAmountExpression(rest[0]);
+    const note = [tokens[0], ...rest.slice(1)].join(" ");
+    return { ...base, kind: keyword.kind, amount: rest[0], note, error: amount != null && amount > 0 ? "Use Quick Entry for this type - needs a specific employee/account" : `Could not read amount from "${rest[0]}"` };
+  }
+
+  return { ...base, error: "Unrecognized line" };
+}
+
+function PasteListBox({
+  carrierId,
+  tripId,
+  documents,
+  defaultDate,
+  onSaved,
+}: {
+  carrierId: string;
+  tripId: string;
+  documents: DocumentLink[];
+  defaultDate: string;
+  onSaved: () => void;
+}) {
+  const [text, setText] = useState("");
+  const [preview, setPreview] = useState<PasteRow[] | null>(null);
+  const [accounts, setAccounts] = useState<AccountOption[]>([]);
+  const [saving, setSaving] = useState(false);
+  const [resultMsg, setResultMsg] = useState("");
+
+  useEffect(() => {
+    (async () => {
+      const res = await fetch("/api/accounts");
+      const data = await res.json();
+      if (res.ok && data.success !== false) setAccounts(data.accounts || []);
+    })();
+  }, []);
+
+  const expenseAccounts = useMemo(() => accounts.filter((a) => a.accountType === "EXPENSE"), [accounts]);
+
+  function handlePreview() {
+    const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+    setPreview(lines.map((l) => parsePasteLine(l, documents, expenseAccounts)));
+    setResultMsg("");
+  }
+
+  function updateRow(id: string, patch: Partial<PasteRow>) {
+    setPreview((prev) => (prev ? prev.map((r) => (r.id === id ? { ...r, ...patch } : r)) : prev));
+  }
+
+  function clearRowError(id: string) {
+    setPreview((prev) => (prev ? prev.map((r) => (r.id === id ? { ...r, error: null } : r)) : prev));
+  }
+
+  function removeRow(id: string) {
+    setPreview((prev) => (prev ? prev.filter((r) => r.id !== id) : prev));
+  }
+
+  async function handleSaveAll() {
+    if (!preview) return;
+    setSaving(true);
+    let saved = 0;
+    let failed = 0;
+    for (const row of preview) {
+      if (row.error || !row.kind || row.kind === "SALARY" || row.kind === "OFFICE_CASH" || row.kind === "OFFICE_DEPOSIT") {
+        failed++;
+        continue;
+      }
+      const amount = parseAmountExpression(row.amount);
+      if (!amount || amount <= 0) {
+        failed++;
+        continue;
+      }
+      const payload: Record<string, unknown> = { date: defaultDate, amount };
+      if (row.kind === "COLLECTION") {
+        const link = documents.find((d) => d.id === row.documentLinkId);
+        if (!link) {
+          failed++;
+          continue;
+        }
+        payload.lineType = "COLLECTION";
+        payload.documentType = link.documentType;
+        payload.documentId = link.documentId;
+      } else if (row.kind === "DIESEL") {
+        if (!row.expenseAccountId) {
+          failed++;
+          continue;
+        }
+        payload.lineType = "EXPENSE_CASH";
+        payload.expenseAccountId = row.expenseAccountId;
+        payload.description = buildDieselDescription(row.pump || "", row.liters || "", "");
+        // Paste-list Diesel defaults to Driver Cash - edit the row
+        // afterward (inline Edit on the Diesel box) if it was
+        // actually paid via Office/Udhaar.
+      } else {
+        if (!row.expenseAccountId) {
+          failed++;
+          continue;
+        }
+        payload.lineType = "EXPENSE_CASH";
+        payload.expenseAccountId = row.expenseAccountId;
+        payload.description = row.note || undefined;
+      }
+
+      const res = await fetch(`/api/own-carrier/${carrierId}/trips/${tripId}/lines`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (res.ok && data.success) saved++;
+      else failed++;
+    }
+    setSaving(false);
+    setResultMsg(`Saved ${saved}, skipped ${failed}.`);
+    if (saved > 0) onSaved();
+  }
+
+  return (
+    <div className="p-5">
+      <p className="mb-2 text-xs text-gray-500">
+        One line each, e.g. <code className="rounded bg-gray-100 px-1">Toll 500</code>, <code className="rounded bg-gray-100 px-1">Khana 1200</code>,{" "}
+        <code className="rounded bg-gray-100 px-1">Diesel 205L 50000 Attock</code>, <code className="rounded bg-gray-100 px-1">Wasooli 4025 25000</code>. Nothing posts until Save All. Salary and
+        Office se cash/jama need Quick Entry (a specific employee/account).
+      </p>
+      <textarea
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        rows={5}
+        placeholder={"Toll 500\nKhana 1200\nDiesel 205L 50000 Attock\nWasooli 4025 25000"}
+        className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
+      />
+      <div className="mt-2 flex justify-end">
+        <button type="button" onClick={handlePreview} className="rounded-lg border px-4 py-2 text-sm hover:bg-gray-50">
+          Preview
+        </button>
+      </div>
+
+      {preview && (
+        <div className="mt-4 space-y-2">
+          {preview.map((row) => (
+            <div key={row.id} className={`flex flex-wrap items-center gap-2 rounded-lg border px-3 py-2 text-sm ${row.error ? "border-red-300 bg-red-50" : "border-gray-200"}`}>
+              <span className="w-24 shrink-0 font-medium text-gray-700">{row.kind || "?"}</span>
+              <span className="min-w-[100px] flex-1 truncate text-gray-600">{row.documentLabel || row.note || row.raw}</span>
+              {(row.kind === "EXPENSE" || row.kind === "DIESEL") && (
+                <select
+                  value={row.expenseAccountId || ""}
+                  onChange={(e) => {
+                    updateRow(row.id, { expenseAccountId: e.target.value });
+                    clearRowError(row.id);
+                  }}
+                  className="w-36 rounded-md border border-gray-300 px-2 py-1 text-xs outline-none focus:border-blue-500"
+                >
+                  <option value="">Select account...</option>
+                  {expenseAccounts.map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.accountName}
+                    </option>
+                  ))}
+                </select>
+              )}
+              <input
+                value={row.amount}
+                onChange={(e) => updateRow(row.id, { amount: e.target.value })}
+                className="w-28 rounded-md border border-gray-300 px-2 py-1 text-xs outline-none focus:border-blue-500"
+              />
+              {row.error && <span className="w-full text-xs font-medium text-red-600">{row.error}</span>}
+              <button type="button" onClick={() => removeRow(row.id)} className="rounded-md border border-red-200 px-2 py-1 text-xs text-red-600 hover:bg-red-50">
+                Remove
+              </button>
+            </div>
+          ))}
+          <div className="flex items-center justify-between pt-2">
+            {resultMsg && <span className="text-xs text-gray-600">{resultMsg}</span>}
+            <button type="button" disabled={saving || preview.length === 0} onClick={handleSaveAll} className="ml-auto rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700 disabled:opacity-50">
+              {saving ? "Saving..." : "Save All"}
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

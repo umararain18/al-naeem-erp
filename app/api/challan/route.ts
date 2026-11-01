@@ -11,6 +11,7 @@ import { computeChallanSettlementSummaryBatch } from "@/lib/challan-settlement-s
 import { computeChallanPositionsBatch, resolvePaidUnverifiedEntries, type ChallanPosition } from "@/lib/challan-position";
 import { SettlementPaymentError } from "@/lib/settlement-payments";
 import { recognizeBiltyBookingIncome, BiltyRevenueRecognitionError } from "@/lib/bilty-revenue-recognition";
+import { autoLinkOwnCarrierChallan } from "@/lib/carrier-trip";
 import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
 
 // Re-check status codes for the in-transaction Bilty-availability
@@ -599,6 +600,17 @@ export async function POST(request: NextRequest) {
           },
         },
       });
+
+      // AUTO-LINK - an own-carrier Challan is auto-linked to its
+      // carrier's latest OPEN Trip (never a new one created for it) -
+      // a convenience only, never failing Challan creation itself if
+      // there is no open Trip or the link somehow can't be made (see
+      // autoLinkOwnCarrierChallan's own doc comment). Carrier Rent on
+      // the new link is left at its empty default for the user to
+      // enter on the Trip slip.
+      if (ownCarrierId) {
+        await autoLinkOwnCarrierChallan(tx, { challanId: createdChallan.id, ownCarrierId, linkedById: currentUser.userId });
+      }
 
       for (const biltyId of data.biltyIds) {
         await tx.challanBilty.create({

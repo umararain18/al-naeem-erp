@@ -143,6 +143,7 @@ export type Challan = {
   // Own Carrier dispatch only (see Challan.ownCarrierId's own schema
   // doc comment) - true until the linking Trip is CLOSED.
   incomePending?: boolean | null;
+  linkedToTrip?: boolean | null;
 };
 
 export type SettlementPayerBreakdown = {
@@ -647,6 +648,7 @@ export default function ChallanDetailPage({
         settlementSummary: data.settlementSummary,
         position: data.position,
         incomePending: data.incomePending,
+        linkedToTrip: data.linkedToTrip,
       });
       setCanRestore(!!data.capabilities?.canRestore);
       setCanBin(!!data.capabilities?.canBin);
@@ -1164,6 +1166,11 @@ export default function ChallanDetailPage({
                     challan.transporterParty?.partyName || "—"
                   )}
                 </p>
+                {challan.ownCarrier && challan.linkedToTrip === false && (
+                  <p className="mt-1 inline-block rounded-full bg-gray-100 px-2.5 py-0.5 text-xs font-medium text-gray-600">
+                    Not linked — no open Trip
+                  </p>
+                )}
                 {challan.ownCarrier && challan.incomePending && (
                   <p className="mt-1 inline-block rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-medium text-amber-700">
                     Income pending (Trip slip not closed)

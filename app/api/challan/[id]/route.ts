@@ -18,7 +18,7 @@ import { computeChallanSettlementSummary } from "@/lib/challan-settlement-summar
 import { recognizeBiltyBookingIncome, reverseBiltyBookingIncome, BiltyRevenueRecognitionError } from "@/lib/bilty-revenue-recognition";
 import { auditUpdate, auditDelete, auditRestore, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 import { assertSuperAdmin, biltyHasPhonchOrBillReference, ChallanLifecycleError } from "@/lib/challan-lifecycle";
-import { isCarrierTripChallanIncomeRecognized } from "@/lib/carrier-trip";
+import { isCarrierTripChallanIncomeRecognized, autoLinkOwnCarrierChallan } from "@/lib/carrier-trip";
 
 function round2(value: number): number {
   return Math.round(value * 100) / 100;
@@ -183,6 +183,7 @@ export async function GET(
         success: true,
         challan,
         incomePending: null,
+        linkedToTrip: null,
         financials: null,
         responsibleParties: null,
         settlementBreakdown: null,
@@ -197,6 +198,14 @@ export async function GET(
     // ownCarrierId's own schema doc comment. Always false for a
     // regular (non-own-carrier) Challan.
     const incomePending = challan.ownCarrierId ? !(await isCarrierTripChallanIncomeRecognized(prisma, challan.id)) : false;
+
+    // "Not linked - no open Trip" - an own-carrier Challan that
+    // autoLinkOwnCarrierChallan() could not auto-link at create/edit
+    // time (the carrier had no OPEN Trip then) and nobody has linked
+    // manually since. Always false for a regular Challan.
+    const linkedToTrip = challan.ownCarrierId
+      ? Boolean(await prisma.carrierTripDocument.findFirst({ where: { documentType: "CHALLAN", documentId: challan.id, unlinkedAt: null }, select: { id: true } }))
+      : true;
 
     const financials = (
       await computeChallanFinancialsBatch([
@@ -360,6 +369,7 @@ export async function GET(
       success: true,
       challan,
       incomePending,
+      linkedToTrip,
       financials,
       responsibleParties,
       settlementBreakdown,
@@ -954,6 +964,11 @@ export async function PATCH(
               createdById: currentUser.userId,
             });
           }
+
+          // AUTO-LINK - same convenience as the create route's own
+          // identical call, for a Challan that only just became
+          // own-carrier via this edit.
+          await autoLinkOwnCarrierChallan(tx, { challanId: id, ownCarrierId: finalOwnCarrierId!, linkedById: currentUser.userId });
         } else {
           // Switching OFF Own Carrier (leavingOwnCarrier) - this
           // Challan is now dispatched under a regular Transporter, so
