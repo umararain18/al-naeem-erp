@@ -71,6 +71,8 @@ export async function GET(
             defaultPumpPartyId: true,
             defaultPaidFrom: true,
             defaultPumpParty: { select: { id: true, partyName: true } },
+            currentDriverId: true,
+            currentDriver: { select: { id: true, name: true } },
           },
         },
         documents: { where: { unlinkedAt: null }, orderBy: { linkedAt: "asc" } },

@@ -20,16 +20,25 @@ export class OwnCarrierError extends Error {
 
 /**
  * Creates exactly one OwnCarrier + exactly one dedicated Driver Cash
- * Account (ASSET/CASH, isSystem: false) + exactly one dedicated Own
- * Carrier Income Account (INCOME/CARRIER_INCOME, isSystem: false) in
+ * Account (ASSET/CASH, isSystem: false) + exactly one dedicated
+ * Carrier Profit Account (INCOME/CARRIER_INCOME, isSystem: false) in
  * the SAME transaction - mirroring app/api/parties/route.ts and
  * app/api/employees/route.ts's own Party+Account / Employee+Account
  * creation pattern exactly, so a carrier can never exist without
  * either account and never end up with more than one of each
- * (Account.ownCarrierId / ownCarrierIncomeId are both @unique). The
- * income account is credited only at Trip CLOSE (see
- * lib/carrier-trip.ts's recognizeCarrierTripChallanIncome) - never at
- * dispatch, unlike every other income account in this schema.
+ * (Account.ownCarrierId / ownCarrierIncomeId are both @unique - the
+ * Prisma field/relation names were never renamed when this became
+ * "Carrier Profit" instead of "Own Carrier Income", only the account's
+ * own display name/description and what posts to it - see
+ * lib/carrier-trip.ts's own module comment for the current design).
+ * ONE account nets the whole carrier's profit: credited with Carrier
+ * Rent at Trip CLOSE (lib/carrier-trip.ts's
+ * recognizeCarrierTripChallanIncome), debited with every trip expense
+ * and driver salary (postExpenseCashLine/postExpenseOfficeLine/
+ * postExpenseCreditLine/postDriverSalaryLine) - its own net balance
+ * IS the carrier's profit, and (being accountType INCOME) already
+ * shows as its own P&L line via the existing, fully generic
+ * app/api/reports/profit-loss/route.ts, no report code required.
  */
 export async function createOwnCarrierWithAccount(
   tx: Tx,
@@ -70,19 +79,19 @@ export async function createOwnCarrierWithAccount(
     },
   });
 
-  const incomeAccount = await tx.account.create({
+  const profitAccount = await tx.account.create({
     data: {
-      accountName: `${carrier.carrierNumber} — Own Carrier Income`,
+      accountName: `${carrier.carrierNumber} — Carrier Profit`,
       accountType: "INCOME",
       category: "CARRIER_INCOME",
-      description: `Automatic Own Carrier Income account for own carrier: ${carrier.carrierNumber} - credited only when a Trip linking one of this carrier's own-carrier Challans is closed.`,
+      description: `Automatic Carrier Profit account for own carrier: ${carrier.carrierNumber} - credited with Carrier Rent at Trip close, debited with every trip expense and driver salary. Its own net balance IS this carrier's profit.`,
       ownCarrierIncomeId: carrier.id,
       isSystem: false,
       isActive: true,
     },
   });
 
-  return { carrier, account, incomeAccount };
+  return { carrier, account, profitAccount };
 }
 
 /**
@@ -118,14 +127,14 @@ export async function getOwnCarrierOrThrow(tx: Tx, carrierId: string) {
 }
 
 /**
- * Lazy find-or-create for a carrier's own "<carrier> — Own Carrier
- * Income" account - the normal path is createOwnCarrierWithAccount()
+ * Lazy find-or-create for a carrier's own "<carrier> — Carrier
+ * Profit" account - the normal path is createOwnCarrierWithAccount()
  * creating it up front, but this exists as a defensive fallback (same
  * "never hard-fail on a missing system account" precedent as
  * lib/gross-accounts.ts's getOrCreateSystemAccount) for any carrier
  * row that predates this account existing.
  */
-export async function getOrCreateOwnCarrierIncomeAccountId(tx: Tx, carrierId: string): Promise<string> {
+export async function getOrCreateCarrierProfitAccountId(tx: Tx, carrierId: string): Promise<string> {
   const existing = await tx.account.findUnique({ where: { ownCarrierIncomeId: carrierId }, select: { id: true } });
   if (existing) return existing.id;
 
@@ -134,10 +143,10 @@ export async function getOrCreateOwnCarrierIncomeAccountId(tx: Tx, carrierId: st
 
   const created = await tx.account.create({
     data: {
-      accountName: `${carrier.carrierNumber} — Own Carrier Income`,
+      accountName: `${carrier.carrierNumber} — Carrier Profit`,
       accountType: "INCOME",
       category: "CARRIER_INCOME",
-      description: `Automatic Own Carrier Income account for own carrier: ${carrier.carrierNumber} - credited only when a Trip linking one of this carrier's own-carrier Challans is closed.`,
+      description: `Automatic Carrier Profit account for own carrier: ${carrier.carrierNumber} - credited with Carrier Rent at Trip close, debited with every trip expense and driver salary.`,
       ownCarrierIncomeId: carrierId,
       isSystem: false,
       isActive: true,

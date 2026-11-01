@@ -52,6 +52,16 @@ type AllTripsSummary = {
   totalOwnCarrierProfit: number;
 };
 
+type CarrierSummary = {
+  driverCashBalance: number;
+  vendorsPayable: { partyId: string; partyName: string; balance: number }[];
+  totalVendorsPayable: number;
+  challanReceivable: number;
+  carrierProfit: number;
+};
+
+type UnlinkedChallan = { id: string; challanNo: string; loadingDate: string };
+
 type TripItem = {
   id: string;
   tripNo: string;
@@ -70,12 +80,16 @@ export default function OwnCarrierDetailPage() {
   const [carrier, setCarrier] = useState<Carrier | null>(null);
   const [driverCashBalance, setDriverCashBalance] = useState(0);
   const [allTripsSummary, setAllTripsSummary] = useState<AllTripsSummary | null>(null);
+  const [carrierSummary, setCarrierSummary] = useState<CarrierSummary | null>(null);
+  const [unlinkedChallans, setUnlinkedChallans] = useState<UnlinkedChallan[]>([]);
+  const [latestOpenTripId, setLatestOpenTripId] = useState<string | null>(null);
   const [trips, setTrips] = useState<TripItem[]>([]);
   const [capabilities, setCapabilities] = useState({ canEdit: false, canBin: false });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [refreshToken, setRefreshToken] = useState(0);
   const [newTripOpen, setNewTripOpen] = useState(false);
+  const [linkingChallanId, setLinkingChallanId] = useState<string | null>(null);
 
   async function load() {
     try {
@@ -87,12 +101,37 @@ export default function OwnCarrierDetailPage() {
       setCarrier(data.carrier);
       setDriverCashBalance(data.driverCashBalance || 0);
       setAllTripsSummary(data.allTripsSummary || null);
+      setCarrierSummary(data.carrierSummary || null);
+      setUnlinkedChallans(data.unlinkedChallans || []);
+      setLatestOpenTripId(data.latestOpenTripId || null);
       setTrips(data.trips || []);
       setCapabilities(data.capabilities || { canEdit: false, canBin: false });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to load carrier");
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function handleLinkChallan(challan: UnlinkedChallan) {
+    if (!latestOpenTripId) {
+      alert("No open Trip for this carrier - open (or reopen) a Trip first, then link this Challan to it.");
+      return;
+    }
+    try {
+      setLinkingChallanId(challan.id);
+      const res = await fetch(`/api/own-carrier/${carrierId}/trips/${latestOpenTripId}/documents`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ documentType: "CHALLAN", documentIds: [challan.id] }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) throw new Error(data.message || "Unable to link Challan.");
+      refresh();
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "Unable to link Challan.");
+    } finally {
+      setLinkingChallanId(null);
     }
   }
 
@@ -145,8 +184,64 @@ export default function OwnCarrierDetailPage() {
           <div className="rounded-xl border bg-white px-5 py-3 text-right shadow-sm">
             <p className="text-xs text-gray-500">Driver Cash Balance</p>
             <p className={`text-xl font-bold ${driverCashBalance < 0 ? "text-red-700" : "text-gray-900"}`}>{formatSignedMoney(driverCashBalance)}</p>
+            {driverCashBalance < 0 && <p className="text-[11px] text-red-600">payable to driver</p>}
           </div>
         </div>
+
+        {carrierSummary && (
+          <div className="mb-6 grid grid-cols-2 gap-3 rounded-xl border bg-white p-4 shadow-sm sm:grid-cols-4">
+            <div>
+              <p className="text-xs text-gray-500">Driver Cash</p>
+              <p className={`text-base font-semibold ${carrierSummary.driverCashBalance < 0 ? "text-red-700" : "text-gray-900"}`}>
+                {formatSignedMoney(carrierSummary.driverCashBalance)}
+              </p>
+              {carrierSummary.driverCashBalance < 0 && <p className="text-[11px] text-red-600">payable to driver</p>}
+            </div>
+            <div>
+              <p className="text-xs text-gray-500">Vendors Payable {carrierSummary.vendorsPayable.length > 0 ? `(${carrierSummary.vendorsPayable.length})` : ""}</p>
+              <p className="text-base font-semibold text-gray-900">Rs. {formatMoney(carrierSummary.totalVendorsPayable)}</p>
+              {carrierSummary.vendorsPayable.length > 0 && (
+                <p className="mt-0.5 truncate text-[11px] text-gray-500" title={carrierSummary.vendorsPayable.map((v) => `${v.partyName}: Rs. ${formatMoney(v.balance)}`).join(", ")}>
+                  {carrierSummary.vendorsPayable.map((v) => v.partyName).join(", ")}
+                </p>
+              )}
+            </div>
+            <div>
+              <p className="text-xs text-gray-500">Challan Receivable</p>
+              <p className="text-base font-semibold text-gray-900">Rs. {formatMoney(carrierSummary.challanReceivable)}</p>
+            </div>
+            <div>
+              <p className="text-xs text-gray-500">Carrier Profit (all trips)</p>
+              <p className={`text-base font-semibold ${carrierSummary.carrierProfit >= 0 ? "text-green-700" : "text-red-700"}`}>
+                {formatSignedMoney(carrierSummary.carrierProfit)}
+              </p>
+            </div>
+          </div>
+        )}
+
+        {unlinkedChallans.length > 0 && (
+          <div className="mb-6 rounded-xl border border-amber-200 bg-amber-50 p-4 shadow-sm">
+            <p className="mb-2 text-xs font-semibold uppercase text-amber-700">Unlinked own-carrier Challans</p>
+            <div className="space-y-2">
+              {unlinkedChallans.map((c) => (
+                <div key={c.id} className="flex items-center justify-between gap-3 rounded-lg border border-amber-200 bg-white px-3 py-2">
+                  <div className="text-sm">
+                    <span className="font-medium text-gray-900">Challan {c.challanNo}</span>
+                    <span className="ml-2 text-xs text-gray-500">{formatBusinessDate(c.loadingDate)}</span>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={linkingChallanId === c.id}
+                    onClick={() => handleLinkChallan(c)}
+                    className="rounded-md border border-amber-300 bg-amber-100 px-3 py-1 text-xs font-medium text-amber-800 hover:bg-amber-200 disabled:opacity-50"
+                  >
+                    {linkingChallanId === c.id ? "Linking..." : latestOpenTripId ? "Link to open Trip" : "No open Trip"}
+                  </button>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         {allTripsSummary && (
           <div className="mb-6 grid grid-cols-2 gap-3 rounded-xl border bg-white p-4 shadow-sm sm:grid-cols-5">

@@ -43,6 +43,8 @@ type Trip = {
     defaultPumpPartyId: string | null;
     defaultPaidFrom: string | null;
     defaultPumpParty: { id: string; partyName: string } | null;
+    currentDriverId: string | null;
+    currentDriver: { id: string; name: string } | null;
   };
 };
 
@@ -67,7 +69,7 @@ type CashBookRow = {
   balance: number;
   documentType: string | null;
   documentId: string | null;
-  expenseAccountId: string | null;
+  category: string | null;
   officeAccountId: string | null;
   vendorPartyId: string | null;
   employeeId: string | null;
@@ -79,6 +81,23 @@ type CashBookRow = {
 };
 
 type CashBook = { openingBalance: number; rows: CashBookRow[]; closingBalance: number };
+
+// Category labels - mirrors lib/carrier-trip.ts's own categoryLabel()
+// exactly (DIESEL/TOLL/KHANA/MARAMMAT/SALARY/OTHER) - every
+// expense/salary line debits the SAME Carrier Profit account now, so
+// this is the one thing that still varies per-line, and the only
+// thing drafts/lists ever show for it (never an account name).
+function categoryLabel(category: string | null | undefined): string {
+  switch (category) {
+    case "DIESEL": return "Diesel";
+    case "TOLL": return "Toll";
+    case "KHANA": return "Khana";
+    case "MARAMMAT": return "Marammat";
+    case "SALARY": return "Salary";
+    case "OTHER": return "Other";
+    default: return "Expense";
+  }
+}
 
 // Keyed by the REAL posted CarrierTripLineType - used for the Reverse
 // confirm text. The quick-entry row's own Type buttons (QUICK_TYPES
@@ -119,8 +138,7 @@ function parseAmountExpression(raw: string): number | null {
 type DraftRow = {
   id: string;
   lineType: "EXPENSE_CASH" | "EXPENSE_OFFICE" | "EXPENSE_CREDIT" | "DRIVER_SALARY";
-  expenseAccountId: string | null;
-  expenseAccountName: string | null;
+  category: string | null;
   vendorPartyId: string | null;
   vendorPartyName: string | null;
   officeAccountId: string | null;
@@ -159,8 +177,7 @@ function saveDraftsToStorage(tripId: string, drafts: DraftRow[]) {
 
 function templateToDraft(t: {
   lineType: DraftRow["lineType"];
-  expenseAccountId: string | null;
-  expenseAccountName: string | null;
+  category: string | null;
   vendorPartyId: string | null;
   vendorPartyName: string | null;
   officeAccountId: string | null;
@@ -175,8 +192,7 @@ function templateToDraft(t: {
   return {
     id: `draft-${Math.random().toString(36).slice(2)}`,
     lineType: t.lineType,
-    expenseAccountId: t.expenseAccountId,
-    expenseAccountName: t.expenseAccountName,
+    category: t.category,
     vendorPartyId: t.vendorPartyId,
     vendorPartyName: t.vendorPartyName,
     officeAccountId: t.officeAccountId,
@@ -277,9 +293,16 @@ export default function CarrierTripDetailPage() {
     if (draft.lineType === "EXPENSE_OFFICE") payload.officeAccountId = draft.officeAccountId;
     if (draft.lineType === "EXPENSE_CREDIT") payload.vendorPartyId = draft.vendorPartyId;
     if (draft.lineType === "EXPENSE_CASH" || draft.lineType === "EXPENSE_OFFICE" || draft.lineType === "EXPENSE_CREDIT") {
-      payload.expenseAccountId = draft.expenseAccountId;
+      payload.category = draft.category;
     }
-    if (draft.lineType === "DRIVER_SALARY") payload.employeeId = draft.employeeId;
+    if (draft.lineType === "DRIVER_SALARY") {
+      // Driver = carrier's CURRENT driver, resolved fresh at save time
+      // - never the old template's employeeId (the driver may have
+      // changed since the previous Trip) - see item 9's own "prefilled,
+      // only amount needed" design.
+      if (!trip?.carrier.currentDriverId) return "Set this carrier's current driver first (Carrier Settings).";
+      payload.employeeId = trip.carrier.currentDriverId;
+    }
     if (draft.isDiesel) {
       payload.isDiesel = true;
       payload.liters = draft.liters.trim() ? Number(draft.liters) : undefined;
@@ -533,7 +556,12 @@ export default function CarrierTripDetailPage() {
               setEditingLine(null);
               refresh();
             }}
-            carrierDefaults={{ defaultPumpPartyId: trip.carrier.defaultPumpPartyId, defaultPaidFrom: trip.carrier.defaultPaidFrom }}
+            carrierDefaults={{
+              defaultPumpPartyId: trip.carrier.defaultPumpPartyId,
+              defaultPaidFrom: trip.carrier.defaultPaidFrom,
+              currentDriverId: trip.carrier.currentDriverId,
+              currentDriverName: trip.carrier.currentDriver?.name || null,
+            }}
           />
         )}
 
@@ -565,6 +593,7 @@ export default function CarrierTripDetailPage() {
                 tripId={tripId}
                 documents={documents}
                 defaultDate={draftDate || lastDate || toYMD(trip.dateFrom)}
+                currentDriverId={trip.carrier.currentDriverId}
                 onSaved={() => {
                   setPasteOpen(false);
                   refresh();
@@ -820,17 +849,31 @@ type QuickTypeKey = "WASOOLI" | "DIESEL" | "TOLL" | "KHANA" | "MARAMMAT" | "OTHE
 type QuickKind = "COLLECTION" | "EXPENSE" | "DRIVER_SALARY" | "CASH_FROM_OFFICE" | "DEPOSIT_TO_OFFICE";
 type PaymentSource = "DRIVER_CASH" | "OFFICE" | "UDHAAR";
 
-const QUICK_TYPES: { key: QuickTypeKey; label: string; kind: QuickKind; defaultCategory?: string; defaultNameMatch?: string }[] = [
+// Category chip + Amount + Note - no account picker any more (every
+// expense/salary line debits the SAME Carrier Profit account, see
+// lib/carrier-trip.ts's own module comment); `category` is the one
+// real column that distinguishes these, set 1:1 from the chip itself.
+const QUICK_TYPES: { key: QuickTypeKey; label: string; kind: QuickKind; category?: string }[] = [
   { key: "WASOOLI", label: "Wasooli", kind: "COLLECTION" },
-  { key: "DIESEL", label: "Diesel", kind: "EXPENSE", defaultCategory: "FUEL" },
-  { key: "TOLL", label: "Toll", kind: "EXPENSE", defaultNameMatch: "toll" },
-  { key: "KHANA", label: "Khana", kind: "EXPENSE", defaultCategory: "TEA_REFRESHMENT" },
-  { key: "MARAMMAT", label: "Marammat", kind: "EXPENSE", defaultCategory: "REPAIR_MAINTENANCE" },
-  { key: "OTHER_EXPENSE", label: "Other expense", kind: "EXPENSE", defaultCategory: "OTHER_EXPENSE" },
+  { key: "DIESEL", label: "Diesel", kind: "EXPENSE", category: "DIESEL" },
+  { key: "TOLL", label: "Toll", kind: "EXPENSE", category: "TOLL" },
+  { key: "KHANA", label: "Khana", kind: "EXPENSE", category: "KHANA" },
+  { key: "MARAMMAT", label: "Marammat", kind: "EXPENSE", category: "MARAMMAT" },
+  { key: "OTHER_EXPENSE", label: "Other", kind: "EXPENSE", category: "OTHER" },
   { key: "SALARY", label: "Salary", kind: "DRIVER_SALARY" },
   { key: "OFFICE_CASH", label: "Office se cash", kind: "CASH_FROM_OFFICE" },
   { key: "OFFICE_DEPOSIT", label: "Office mein jama", kind: "DEPOSIT_TO_OFFICE" },
 ];
+
+// category -> QuickTypeKey, for re-deriving the chip when prefilling
+// Edit mode from an existing (non-Diesel) expense line's own saved
+// category column.
+const CATEGORY_TO_QUICK_KEY: Record<string, QuickTypeKey> = {
+  TOLL: "TOLL",
+  KHANA: "KHANA",
+  MARAMMAT: "MARAMMAT",
+  OTHER: "OTHER_EXPENSE",
+};
 
 function buildDieselDescription(pump: string, liters: string, note: string): string {
   return ["Diesel", pump.trim() || null, liters.trim() ? `${liters.trim()}L` : null, note.trim() || null].filter(Boolean).join(" - ");
@@ -859,7 +902,7 @@ function QuickEntryRow({
   editingLine: CashBookRow | null;
   onCancelEdit: () => void;
   onSaved: () => void;
-  carrierDefaults: { defaultPumpPartyId: string | null; defaultPaidFrom: string | null };
+  carrierDefaults: { defaultPumpPartyId: string | null; defaultPaidFrom: string | null; currentDriverId: string | null; currentDriverName: string | null };
 }) {
   const [quickTypeKey, setQuickTypeKey] = useState<QuickTypeKey>("WASOOLI");
   const [date, setDate] = useState(lastDate || toYMD(tripDateFrom));
@@ -874,24 +917,18 @@ function QuickEntryRow({
   const [ratePerLiter, setRatePerLiter] = useState("");
   const [accounts, setAccounts] = useState<AccountOption[]>([]);
   const [parties, setParties] = useState<{ id: string; partyName: string; account: { id: string } | null }[]>([]);
-  const [employees, setEmployees] = useState<{ id: string; name: string; employeeCode: string }[]>([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const itemRef = useRef<HTMLSelectElement>(null);
+  const amountRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     (async () => {
-      const [accRes, partyRes, empRes] = await Promise.all([
-        fetch("/api/accounts"),
-        fetch("/api/parties"),
-        fetch("/api/employees?status=ACTIVE"),
-      ]);
+      const [accRes, partyRes] = await Promise.all([fetch("/api/accounts"), fetch("/api/parties")]);
       const accJson = await accRes.json();
       if (accRes.ok && accJson.success !== false) setAccounts(accJson.accounts || []);
       const partyJson = await partyRes.json();
       if (partyRes.ok && partyJson.success) setParties(partyJson.parties || []);
-      const empJson = await empRes.json();
-      if (empRes.ok && empJson.success) setEmployees(empJson.items || []);
     })();
   }, []);
 
@@ -922,7 +959,6 @@ function QuickEntryRow({
     () => [...documents].sort((a, b) => (b.outstanding || 0) - (a.outstanding || 0)),
     [documents]
   );
-  const expenseAccounts = useMemo(() => accounts.filter((a) => a.accountType === "EXPENSE"), [accounts]);
   const officeAccounts = useMemo(() => accounts.filter((a) => a.accountType !== "EXPENSE" && a.accountType !== "PARTY"), [accounts]);
   const vendorParties = useMemo(() => parties.filter((p) => p.account), [parties]);
   // Pump/vendor is purely informational (CarrierTripLine.pumpPartyId's
@@ -960,15 +996,18 @@ function QuickEntryRow({
       setItemValue(editingLine.officeAccountId || "");
       setNote("");
     } else if (lt === "DRIVER_SALARY") {
+      // Driver is never picked any more (item 9: carrier's current
+      // driver, prefilled) - editingLine.employeeId is kept only for
+      // display elsewhere, never re-shown as a picker here.
       setQuickTypeKey("SALARY");
-      setItemValue(editingLine.employeeId || "");
-      setNote("");
+      setItemValue("");
+      setNote(editingLine.description || "");
     } else {
       // EXPENSE_CASH / EXPENSE_OFFICE / EXPENSE_CREDIT
       setPaymentSource(lt === "EXPENSE_OFFICE" ? "OFFICE" : lt === "EXPENSE_CREDIT" ? "UDHAAR" : "DRIVER_CASH");
       setOfficeAccountId(editingLine.officeAccountId || "");
       setVendorPartyId(editingLine.vendorPartyId || "");
-      setItemValue(editingLine.expenseAccountId || "");
+      setItemValue("");
       if (editingLine.isDiesel) {
         setQuickTypeKey("DIESEL");
         setPumpPartyId(editingLine.pumpPartyId || "");
@@ -976,12 +1015,19 @@ function QuickEntryRow({
         setRatePerLiter(editingLine.ratePerLiter != null ? String(editingLine.ratePerLiter) : "");
         setNote("");
       } else {
-        setQuickTypeKey("OTHER_EXPENSE");
+        setQuickTypeKey(CATEGORY_TO_QUICK_KEY[editingLine.category || "OTHER"] || "OTHER_EXPENSE");
         setNote(editingLine.description || "");
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editingLine?.id]);
+
+  function focusFirstField() {
+    window.setTimeout(() => {
+      if (itemRef.current) itemRef.current.focus();
+      else amountRef.current?.focus();
+    }, 0);
+  }
 
   function resetForFreshRow(keepType: boolean) {
     setAmount("");
@@ -995,30 +1041,31 @@ function QuickEntryRow({
       setPumpPartyId("");
       setRatePerLiter("");
     } else {
-      // Collection/office/salary Item is document/account-specific per
-      // entry - always cleared; expense account + payment source are
-      // kept (the common case is several of the same expense in a
-      // row), vendor/office sub-pickers cleared with it.
-      if (quickType.kind === "COLLECTION" || quickType.kind === "CASH_FROM_OFFICE" || quickType.kind === "DEPOSIT_TO_OFFICE" || quickType.kind === "DRIVER_SALARY") {
+      // Collection/office Item is document/account-specific per entry
+      // - always cleared; payment source (and, for Diesel, the pump/
+      // vendor/rate) are kept, since the common case is several of
+      // the same category in a row.
+      if (quickType.kind === "COLLECTION" || quickType.kind === "CASH_FROM_OFFICE" || quickType.kind === "DEPOSIT_TO_OFFICE") {
         setItemValue("");
       }
     }
-    window.setTimeout(() => itemRef.current?.focus(), 0);
+    focusFirstField();
   }
 
   function applyQuickType(key: QuickTypeKey) {
-    const type = QUICK_TYPES.find((t) => t.key === key)!;
     setQuickTypeKey(key);
     setAmount("");
     setNote("");
     setLiters("");
-    setVendorPartyId("");
+    setItemValue("");
     setOfficeAccountId("");
-    // "Remember last Paid from per type in the trip" - per quick-type,
-    // not a global default, since Diesel and Toll are often paid
-    // differently. Falls back to the carrier's own default Paid From
-    // (Carrier Settings) only for Diesel, and only when this Trip has
-    // no remembered choice yet.
+
+    // Paid From default per category (item 8): Diesel -> Udhaar (the
+    // carrier's own default pump party); everything else -> Driver
+    // Cash. "Remembered last Paid From per type in the Trip"
+    // (localStorage) overrides this once the user has switched it
+    // once for this quick-type - Salary has no Paid From at all
+    // (always Driver Cash, see postDriverSalaryLine).
     let remembered: PaymentSource | null = null;
     try {
       const stored = window.localStorage.getItem(paidFromStorageKey(tripId, key));
@@ -1026,32 +1073,21 @@ function QuickEntryRow({
     } catch {
       // per-viewer convenience only
     }
-    if (!remembered && key === "DIESEL" && (carrierDefaults.defaultPaidFrom === "DRIVER_CASH" || carrierDefaults.defaultPaidFrom === "OFFICE" || carrierDefaults.defaultPaidFrom === "UDHAAR")) {
-      remembered = carrierDefaults.defaultPaidFrom;
-    }
-    setPaymentSource(remembered || "DRIVER_CASH");
-
-    if (type.kind === "EXPENSE") {
-      const match = type.defaultCategory
-        ? expenseAccounts.find((a) => a.category === type.defaultCategory)
-        : type.defaultNameMatch
-          ? expenseAccounts.find((a) => a.accountName.toLowerCase().includes(type.defaultNameMatch!))
-          : undefined;
-      setItemValue(match?.id || "");
-    } else {
-      setItemValue("");
-    }
+    const defaultSource: PaymentSource = key === "DIESEL" ? "UDHAAR" : "DRIVER_CASH";
+    setPaymentSource(remembered || defaultSource);
 
     if (key === "DIESEL") {
       const pump = carrierDefaults.defaultPumpPartyId || "";
       setPumpPartyId(pump);
+      setVendorPartyId(pump);
       setRatePerLiter(pump ? loadRememberedRate(pump) : "");
     } else {
       setPumpPartyId("");
+      setVendorPartyId("");
       setRatePerLiter("");
     }
 
-    window.setTimeout(() => itemRef.current?.focus(), 0);
+    focusFirstField();
   }
 
   const resolvedLineType =
@@ -1099,18 +1135,17 @@ function QuickEntryRow({
       }
       payload.officeAccountId = itemValue;
     } else if (quickType.kind === "DRIVER_SALARY") {
-      if (!itemValue) {
-        setError("Select an employee.");
+      // Driver = carrier's current driver, always (item 9) - no
+      // picker shown; a carrier with no current driver set simply
+      // can't post Salary until Carrier Settings sets one.
+      if (!carrierDefaults.currentDriverId) {
+        setError("Set this carrier's current driver first (Carrier Settings).");
         return;
       }
-      payload.employeeId = itemValue;
+      payload.employeeId = carrierDefaults.currentDriverId;
     } else {
-      // EXPENSE
-      if (!itemValue) {
-        setError("Select an expense account.");
-        return;
-      }
-      payload.expenseAccountId = itemValue;
+      // EXPENSE - category is the chip itself, never a picker.
+      payload.category = quickType.category;
       if (paymentSource === "OFFICE") {
         if (!officeAccountId) {
           setError("Select an office account.");
@@ -1194,26 +1229,31 @@ function QuickEntryRow({
           </div>
 
           {quickType.kind === "COLLECTION" && (
-            <div className="min-w-[220px] flex-1">
+            <div className="min-w-[260px] flex-1">
               <label className="mb-1 block text-xs font-medium text-gray-600">Document</label>
-              <select
-                ref={itemRef}
-                value={itemValue}
-                onChange={(e) => {
-                  setItemValue(e.target.value);
-                  const link = documents.find((d) => d.id === e.target.value);
-                  if (link?.outstanding != null && !amount) setAmount(String(link.outstanding));
-                }}
-                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
-              >
-                <option value="">Select document...</option>
-                {sortedDocuments.map((d) => (
-                  <option key={d.id} value={d.id}>
-                    {d.label}
-                    {d.outstanding != null ? ` (outstanding Rs. ${formatMoney(d.outstanding)})` : ""}
-                  </option>
-                ))}
-              </select>
+              {sortedDocuments.length === 0 ? (
+                <p className="text-xs text-gray-400">No linked documents on this Trip yet.</p>
+              ) : (
+                <div className="flex flex-wrap gap-1.5">
+                  {sortedDocuments.map((d) => (
+                    <button
+                      key={d.id}
+                      type="button"
+                      onClick={() => {
+                        setItemValue(d.id);
+                        if (d.outstanding != null) setAmount(String(d.outstanding));
+                        focusFirstField();
+                      }}
+                      className={`rounded-full border px-3 py-1.5 text-xs font-medium ${
+                        itemValue === d.id ? "border-blue-500 bg-blue-50 text-blue-700" : "border-gray-300 text-gray-600 hover:bg-gray-50"
+                      }`}
+                    >
+                      {d.label}
+                      {d.outstanding != null ? ` · ${formatMoney(d.outstanding)}` : ""}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 
@@ -1233,113 +1273,108 @@ function QuickEntryRow({
 
           {quickType.kind === "DRIVER_SALARY" && (
             <div className="min-w-[200px] flex-1">
-              <label className="mb-1 block text-xs font-medium text-gray-600">Employee</label>
-              <select ref={itemRef} value={itemValue} onChange={(e) => setItemValue(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500">
-                <option value="">Select employee...</option>
-                {employees.map((e) => (
-                  <option key={e.id} value={e.id}>
-                    {e.name} ({e.employeeCode})
-                  </option>
-                ))}
-              </select>
+              <label className="mb-1 block text-xs font-medium text-gray-600">Driver</label>
+              {carrierDefaults.currentDriverName ? (
+                <p className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-700">{carrierDefaults.currentDriverName}</p>
+              ) : (
+                <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">No current driver set - set one in Carrier Settings.</p>
+              )}
             </div>
           )}
 
-          {quickType.kind === "EXPENSE" && (
+          {quickType.kind === "EXPENSE" && quickTypeKey === "DIESEL" && (
             <>
-              <div className="min-w-[180px] flex-1">
-                <label className="mb-1 block text-xs font-medium text-gray-600">Expense Account</label>
-                <select ref={itemRef} value={itemValue} onChange={(e) => setItemValue(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500">
-                  <option value="">Select account...</option>
-                  {expenseAccounts.map((a) => (
-                    <option key={a.id} value={a.id}>
-                      {a.accountName}
+              <div className="w-40">
+                <label className="mb-1 block text-xs font-medium text-gray-600">Pump / Vendor</label>
+                <select
+                  ref={itemRef}
+                  value={pumpPartyId}
+                  disabled={Boolean(editingLine)}
+                  onChange={(e) => {
+                    const newPump = e.target.value;
+                    setPumpPartyId(newPump);
+                    if (paymentSource === "UDHAAR") setVendorPartyId(newPump);
+                    if (newPump) {
+                      const rememberedRate = loadRememberedRate(newPump);
+                      if (rememberedRate) setRatePerLiter(rememberedRate);
+                    }
+                  }}
+                  className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500 disabled:bg-gray-100"
+                >
+                  <option value="">Select pump/vendor...</option>
+                  {pumpParties.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.partyName}
                     </option>
                   ))}
                 </select>
               </div>
-              {quickTypeKey === "DIESEL" && (
-                <>
-                  <div className="w-40">
-                    <label className="mb-1 block text-xs font-medium text-gray-600">Pump / Vendor</label>
-                    <select
-                      value={pumpPartyId}
-                      disabled={Boolean(editingLine)}
-                      onChange={(e) => {
-                        const newPump = e.target.value;
-                        setPumpPartyId(newPump);
-                        if (newPump) {
-                          const rememberedRate = loadRememberedRate(newPump);
-                          if (rememberedRate) setRatePerLiter(rememberedRate);
-                        }
-                      }}
-                      className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500 disabled:bg-gray-100"
-                    >
-                      <option value="">Select pump/vendor...</option>
-                      {pumpParties.map((p) => (
-                        <option key={p.id} value={p.id}>
-                          {p.partyName}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  <div className="w-20">
-                    <label className="mb-1 block text-xs font-medium text-gray-600">Liters</label>
-                    <input
-                      type="number"
-                      value={liters}
-                      onChange={(e) => {
-                        const newLiters = e.target.value;
-                        setLiters(newLiters);
-                        const rate = Number(ratePerLiter);
-                        const litersNum = Number(newLiters);
-                        if (rate > 0 && litersNum > 0) setAmount(String(round2(rate * litersNum)));
-                      }}
-                      className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
-                    />
-                  </div>
-                  <div className="w-24">
-                    <label className="mb-1 block text-xs font-medium text-gray-600">Rate/Liter</label>
-                    <input
-                      type="number"
-                      value={ratePerLiter}
-                      onChange={(e) => {
-                        const newRate = e.target.value;
-                        setRatePerLiter(newRate);
-                        const rate = Number(newRate);
-                        const litersNum = Number(liters);
-                        if (rate > 0 && litersNum > 0) setAmount(String(round2(rate * litersNum)));
-                      }}
-                      className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
-                    />
-                  </div>
-                </>
-              )}
+              <div className="w-20">
+                <label className="mb-1 block text-xs font-medium text-gray-600">Liters</label>
+                <input
+                  type="number"
+                  value={liters}
+                  onChange={(e) => {
+                    const newLiters = e.target.value;
+                    setLiters(newLiters);
+                    const rate = Number(ratePerLiter);
+                    const litersNum = Number(newLiters);
+                    if (rate > 0 && litersNum > 0) setAmount(String(round2(rate * litersNum)));
+                  }}
+                  className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
+                />
+              </div>
+              <div className="w-24">
+                <label className="mb-1 block text-xs font-medium text-gray-600">Rate/Liter</label>
+                <input
+                  type="number"
+                  value={ratePerLiter}
+                  onChange={(e) => {
+                    const newRate = e.target.value;
+                    setRatePerLiter(newRate);
+                    const rate = Number(newRate);
+                    const litersNum = Number(liters);
+                    if (rate > 0 && litersNum > 0) setAmount(String(round2(rate * litersNum)));
+                  }}
+                  className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
+                />
+              </div>
             </>
           )}
 
           <div className="w-32">
             <label className="mb-1 block text-xs font-medium text-gray-600">Amount</label>
-            <input type="number" value={amount} onChange={(e) => setAmount(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
+            <input
+              ref={amountRef}
+              type="number"
+              value={amount}
+              onChange={(e) => setAmount(e.target.value)}
+              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
+            />
           </div>
 
           {quickType.kind === "EXPENSE" && (
             <>
-              <div className="w-44">
+              <div>
                 <label className="mb-1 block text-xs font-medium text-gray-600">
                   Paid From
                   {editingLine && <span className="font-normal text-gray-400"> (locked while editing)</span>}
                 </label>
-                <select
-                  value={paymentSource}
-                  disabled={Boolean(editingLine)}
-                  onChange={(e) => setPaymentSource(e.target.value as PaymentSource)}
-                  className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500 disabled:bg-gray-100 disabled:text-gray-400"
-                >
-                  <option value="DRIVER_CASH">Driver Cash</option>
-                  <option value="OFFICE">Office Account</option>
-                  <option value="UDHAAR">Udhaar</option>
-                </select>
+                <div className="flex gap-1">
+                  {(["DRIVER_CASH", "OFFICE", "UDHAAR"] as PaymentSource[]).map((src) => (
+                    <button
+                      key={src}
+                      type="button"
+                      disabled={Boolean(editingLine)}
+                      onClick={() => setPaymentSource(src)}
+                      className={`rounded-md border px-2.5 py-2 text-xs font-medium disabled:cursor-not-allowed disabled:opacity-40 ${
+                        paymentSource === src ? "border-blue-500 bg-blue-50 text-blue-700" : "border-gray-300 text-gray-600 hover:bg-gray-50"
+                      }`}
+                    >
+                      {src === "DRIVER_CASH" ? "Driver Cash" : src === "OFFICE" ? "Office" : "Udhaar"}
+                    </button>
+                  ))}
+                </div>
               </div>
               {paymentSource === "OFFICE" && (
                 <div className="min-w-[180px] flex-1">
@@ -1428,10 +1463,11 @@ function DraftsPanel({
   }
 
   function itemLabel(d: DraftRow): string {
-    if (d.lineType === "DRIVER_SALARY") return d.employeeName || "Employee";
-    if (d.lineType === "EXPENSE_CREDIT") return `${d.expenseAccountName || "Expense"} (Udhaar - ${d.vendorPartyName || "Vendor"})`;
-    if (d.lineType === "EXPENSE_OFFICE") return `${d.expenseAccountName || "Expense"} (Office)`;
-    return d.expenseAccountName || "Expense";
+    // category + description/note only - never an account name (item 11).
+    if (d.lineType === "DRIVER_SALARY") return "Salary";
+    if (d.lineType === "EXPENSE_CREDIT") return `${categoryLabel(d.category)} (Udhaar - ${d.vendorPartyName || "Vendor"})`;
+    if (d.lineType === "EXPENSE_OFFICE") return `${categoryLabel(d.category)} (Office)`;
+    return categoryLabel(d.category);
   }
 
   return (
@@ -1525,37 +1561,27 @@ type PasteRow = {
   liters?: string;
   amount: string;
   note?: string;
-  expenseAccountId?: string;
+  category?: string;
   error: string | null;
 };
 
-// kind=EXPENSE/DIESEL need a real expense account, resolved from the
-// SAME keyword -> category defaults as the quick-entry row's own
-// QUICK_TYPES (see applyQuickType) - kept here as its own small table
-// since the paste grammar's keyword set doesn't line up 1:1 with
-// QuickTypeKey (e.g. "expense"/"other" both mean OTHER_EXPENSE here).
-const PASTE_KEYWORDS: { re: RegExp; kind: PasteRowKind; defaultCategory?: string; defaultNameMatch?: string }[] = [
+// kind=EXPENSE/DIESEL map straight to a category now - no account to
+// resolve or guess any more (every expense line debits the SAME
+// Carrier Profit account, see lib/carrier-trip.ts's own module
+// comment), so unlike before this can never fail to find a match.
+const PASTE_KEYWORDS: { re: RegExp; kind: PasteRowKind; category?: string }[] = [
   { re: /^wasooli$/i, kind: "COLLECTION" },
-  { re: /^diesel$/i, kind: "DIESEL", defaultCategory: "FUEL" },
-  { re: /^toll$/i, kind: "EXPENSE", defaultNameMatch: "toll" },
-  { re: /^khana$/i, kind: "EXPENSE", defaultCategory: "TEA_REFRESHMENT" },
-  { re: /^marammat$/i, kind: "EXPENSE", defaultCategory: "REPAIR_MAINTENANCE" },
-  { re: /^(expense|other)$/i, kind: "EXPENSE", defaultCategory: "OTHER_EXPENSE" },
+  { re: /^diesel$/i, kind: "DIESEL", category: "DIESEL" },
+  { re: /^toll$/i, kind: "EXPENSE", category: "TOLL" },
+  { re: /^khana$/i, kind: "EXPENSE", category: "KHANA" },
+  { re: /^marammat$/i, kind: "EXPENSE", category: "MARAMMAT" },
+  { re: /^(expense|other)$/i, kind: "EXPENSE", category: "OTHER" },
   { re: /^salary$/i, kind: "SALARY" },
   { re: /^officecash$/i, kind: "OFFICE_CASH" },
   { re: /^officejama$/i, kind: "OFFICE_DEPOSIT" },
 ];
 
-function resolveDefaultExpenseAccount(
-  keyword: { defaultCategory?: string; defaultNameMatch?: string },
-  expenseAccounts: AccountOption[]
-): AccountOption | undefined {
-  if (keyword.defaultCategory) return expenseAccounts.find((a) => a.category === keyword.defaultCategory);
-  if (keyword.defaultNameMatch) return expenseAccounts.find((a) => a.accountName.toLowerCase().includes(keyword.defaultNameMatch!));
-  return undefined;
-}
-
-function parsePasteLine(raw: string, documents: DocumentLink[], expenseAccounts: AccountOption[]): PasteRow {
+function parsePasteLine(raw: string, documents: DocumentLink[]): PasteRow {
   const base: PasteRow = { id: `paste-${Math.random().toString(36).slice(2)}`, raw, kind: null, amount: "", error: null };
   const tokens = raw.trim().split(/\s+/).filter(Boolean);
   if (tokens.length === 0) return { ...base, error: "Empty line" };
@@ -1578,36 +1604,42 @@ function parsePasteLine(raw: string, documents: DocumentLink[], expenseAccounts:
 
   if (keyword.kind === "DIESEL") {
     // Diesel <liters>L <amount> [pump...]
-    const account = resolveDefaultExpenseAccount(keyword, expenseAccounts);
-    if (rest.length < 2) return { ...base, kind: "DIESEL", expenseAccountId: account?.id, error: "Expected: Diesel <liters>L <amount> [pump]" };
+    if (rest.length < 2) return { ...base, kind: "DIESEL", category: keyword.category, error: "Expected: Diesel <liters>L <amount> [pump]" };
     const litersMatch = rest[0].match(/^(\d+(?:\.\d+)?)\s*[lL]?$/);
-    if (!litersMatch) return { ...base, kind: "DIESEL", expenseAccountId: account?.id, error: `Could not read liters from "${rest[0]}"` };
+    if (!litersMatch) return { ...base, kind: "DIESEL", category: keyword.category, error: `Could not read liters from "${rest[0]}"` };
     const amount = parseAmountExpression(rest[1]);
-    if (amount == null || amount <= 0) return { ...base, kind: "DIESEL", liters: litersMatch[1], expenseAccountId: account?.id, error: `Could not read amount from "${rest[1]}"` };
+    if (amount == null || amount <= 0) return { ...base, kind: "DIESEL", liters: litersMatch[1], category: keyword.category, error: `Could not read amount from "${rest[1]}"` };
     const pump = rest.slice(2).join(" ");
-    const error = account ? null : "No matching expense account - pick one";
-    return { ...base, kind: "DIESEL", liters: litersMatch[1], amount: rest[1], pump, expenseAccountId: account?.id, error };
+    return { ...base, kind: "DIESEL", liters: litersMatch[1], amount: rest[1], pump, category: keyword.category, error: null };
   }
 
   if (keyword.kind === "EXPENSE") {
     // <Keyword> <amount> [note...] - the keyword itself becomes the note/search hint.
-    const account = resolveDefaultExpenseAccount(keyword, expenseAccounts);
-    if (rest.length < 1) return { ...base, kind: "EXPENSE", expenseAccountId: account?.id, error: "Expected an amount" };
+    if (rest.length < 1) return { ...base, kind: "EXPENSE", category: keyword.category, error: "Expected an amount" };
     const amount = parseAmountExpression(rest[0]);
-    if (amount == null || amount <= 0) return { ...base, kind: "EXPENSE", expenseAccountId: account?.id, error: `Could not read amount from "${rest[0]}"` };
+    if (amount == null || amount <= 0) return { ...base, kind: "EXPENSE", category: keyword.category, error: `Could not read amount from "${rest[0]}"` };
     const note = [tokens[0], ...rest.slice(1)].join(" ");
-    const error = account ? null : "No matching expense account - pick one";
-    return { ...base, kind: "EXPENSE", amount: rest[0], note, expenseAccountId: account?.id, error };
+    return { ...base, kind: "EXPENSE", amount: rest[0], note, category: keyword.category, error: null };
   }
 
-  if (keyword.kind === "SALARY" || keyword.kind === "OFFICE_CASH" || keyword.kind === "OFFICE_DEPOSIT") {
-    // Needs a specific employee/office account the paste grammar
-    // can't safely guess - parsed far enough to show the amount, but
-    // always flagged for the user to finish in Quick Entry instead.
+  if (keyword.kind === "SALARY") {
+    // Driver = carrier's current driver (item 9) - only the amount is
+    // needed; posting fails cleanly at Save All if no current driver
+    // is set, same as Quick Entry's own Salary chip.
+    if (rest.length < 1) return { ...base, kind: "SALARY", error: "Expected an amount" };
+    const amount = parseAmountExpression(rest[0]);
+    const note = rest.slice(1).join(" ");
+    return { ...base, kind: "SALARY", amount: rest[0], note, error: amount != null && amount > 0 ? null : `Could not read amount from "${rest[0]}"` };
+  }
+
+  if (keyword.kind === "OFFICE_CASH" || keyword.kind === "OFFICE_DEPOSIT") {
+    // Needs a specific office account the paste grammar can't safely
+    // guess - parsed far enough to show the amount, but always
+    // flagged for the user to finish in Quick Entry instead.
     if (rest.length < 1) return { ...base, kind: keyword.kind, error: "Expected an amount" };
     const amount = parseAmountExpression(rest[0]);
     const note = [tokens[0], ...rest.slice(1)].join(" ");
-    return { ...base, kind: keyword.kind, amount: rest[0], note, error: amount != null && amount > 0 ? "Use Quick Entry for this type - needs a specific employee/account" : `Could not read amount from "${rest[0]}"` };
+    return { ...base, kind: keyword.kind, amount: rest[0], note, error: amount != null && amount > 0 ? "Use Quick Entry for this type - needs a specific office account" : `Could not read amount from "${rest[0]}"` };
   }
 
   return { ...base, error: "Unrecognized line" };
@@ -1618,42 +1650,29 @@ function PasteListBox({
   tripId,
   documents,
   defaultDate,
+  currentDriverId,
   onSaved,
 }: {
   carrierId: string;
   tripId: string;
   documents: DocumentLink[];
   defaultDate: string;
+  currentDriverId: string | null;
   onSaved: () => void;
 }) {
   const [text, setText] = useState("");
   const [preview, setPreview] = useState<PasteRow[] | null>(null);
-  const [accounts, setAccounts] = useState<AccountOption[]>([]);
   const [saving, setSaving] = useState(false);
   const [resultMsg, setResultMsg] = useState("");
 
-  useEffect(() => {
-    (async () => {
-      const res = await fetch("/api/accounts");
-      const data = await res.json();
-      if (res.ok && data.success !== false) setAccounts(data.accounts || []);
-    })();
-  }, []);
-
-  const expenseAccounts = useMemo(() => accounts.filter((a) => a.accountType === "EXPENSE"), [accounts]);
-
   function handlePreview() {
     const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
-    setPreview(lines.map((l) => parsePasteLine(l, documents, expenseAccounts)));
+    setPreview(lines.map((l) => parsePasteLine(l, documents)));
     setResultMsg("");
   }
 
   function updateRow(id: string, patch: Partial<PasteRow>) {
     setPreview((prev) => (prev ? prev.map((r) => (r.id === id ? { ...r, ...patch } : r)) : prev));
-  }
-
-  function clearRowError(id: string) {
-    setPreview((prev) => (prev ? prev.map((r) => (r.id === id ? { ...r, error: null } : r)) : prev));
   }
 
   function removeRow(id: string) {
@@ -1666,7 +1685,7 @@ function PasteListBox({
     let saved = 0;
     let failed = 0;
     for (const row of preview) {
-      if (row.error || !row.kind || row.kind === "SALARY" || row.kind === "OFFICE_CASH" || row.kind === "OFFICE_DEPOSIT") {
+      if (row.error || !row.kind || row.kind === "OFFICE_CASH" || row.kind === "OFFICE_DEPOSIT") {
         failed++;
         continue;
       }
@@ -1686,12 +1705,8 @@ function PasteListBox({
         payload.documentType = link.documentType;
         payload.documentId = link.documentId;
       } else if (row.kind === "DIESEL") {
-        if (!row.expenseAccountId) {
-          failed++;
-          continue;
-        }
         payload.lineType = "EXPENSE_CASH";
-        payload.expenseAccountId = row.expenseAccountId;
+        payload.category = row.category;
         payload.description = buildDieselDescription(row.pump || "", row.liters || "", "");
         payload.isDiesel = true;
         if (row.liters) payload.liters = Number(row.liters);
@@ -1702,13 +1717,17 @@ function PasteListBox({
         // only Diesel line with no linked pump Party. Defaults to
         // Driver Cash - edit the row afterward (inline Edit on the
         // Diesel box) if it was actually paid via Office/Udhaar.
-      } else {
-        if (!row.expenseAccountId) {
+      } else if (row.kind === "SALARY") {
+        if (!currentDriverId) {
           failed++;
           continue;
         }
+        payload.lineType = "DRIVER_SALARY";
+        payload.employeeId = currentDriverId;
+        payload.description = row.note || undefined;
+      } else {
         payload.lineType = "EXPENSE_CASH";
-        payload.expenseAccountId = row.expenseAccountId;
+        payload.category = row.category;
         payload.description = row.note || undefined;
       }
 
@@ -1730,8 +1749,9 @@ function PasteListBox({
     <div className="p-5">
       <p className="mb-2 text-xs text-gray-500">
         One line each, e.g. <code className="rounded bg-gray-100 px-1">Toll 500</code>, <code className="rounded bg-gray-100 px-1">Khana 1200</code>,{" "}
-        <code className="rounded bg-gray-100 px-1">Diesel 205L 50000 Attock</code>, <code className="rounded bg-gray-100 px-1">Wasooli 4025 25000</code>. Nothing posts until Save All. Salary and
-        Office se cash/jama need Quick Entry (a specific employee/account).
+        <code className="rounded bg-gray-100 px-1">Diesel 205L 50000 Attock</code>, <code className="rounded bg-gray-100 px-1">Wasooli 4025 25000</code>,{" "}
+        <code className="rounded bg-gray-100 px-1">Salary 30000</code> (driver = carrier&apos;s current driver). Nothing posts until Save All. Office se cash/jama need Quick Entry (a specific
+        office account).
       </p>
       <textarea
         value={text}
@@ -1750,25 +1770,20 @@ function PasteListBox({
         <div className="mt-4 space-y-2">
           {preview.map((row) => (
             <div key={row.id} className={`flex flex-wrap items-center gap-2 rounded-lg border px-3 py-2 text-sm ${row.error ? "border-red-300 bg-red-50" : "border-gray-200"}`}>
-              <span className="w-24 shrink-0 font-medium text-gray-700">{row.kind || "?"}</span>
+              <span className="w-24 shrink-0 font-medium text-gray-700">
+                {row.kind === "SALARY"
+                  ? "Salary"
+                  : row.kind === "COLLECTION"
+                    ? "Wasooli"
+                    : row.kind === "OFFICE_CASH"
+                      ? "Office Cash"
+                      : row.kind === "OFFICE_DEPOSIT"
+                        ? "Office Jama"
+                        : row.kind
+                          ? categoryLabel(row.category)
+                          : "?"}
+              </span>
               <span className="min-w-[100px] flex-1 truncate text-gray-600">{row.documentLabel || row.note || row.raw}</span>
-              {(row.kind === "EXPENSE" || row.kind === "DIESEL") && (
-                <select
-                  value={row.expenseAccountId || ""}
-                  onChange={(e) => {
-                    updateRow(row.id, { expenseAccountId: e.target.value });
-                    clearRowError(row.id);
-                  }}
-                  className="w-36 rounded-md border border-gray-300 px-2 py-1 text-xs outline-none focus:border-blue-500"
-                >
-                  <option value="">Select account...</option>
-                  {expenseAccounts.map((a) => (
-                    <option key={a.id} value={a.id}>
-                      {a.accountName}
-                    </option>
-                  ))}
-                </select>
-              )}
               <input
                 value={row.amount}
                 onChange={(e) => updateRow(row.id, { amount: e.target.value })}
@@ -1922,9 +1937,10 @@ type ProfitReport = {
   totalBiltyRent: number;
   totalCarrierRent: number;
   totalBookingIncome: number;
-  expenses: { lineId: string; lineType: string; description: string; amount: number; isDiesel: boolean }[];
+  expenses: { lineId: string; lineType: string; category: string | null; description: string; amount: number; isDiesel: boolean }[];
   totalCarrierExpense: number;
   totalDiesel: number;
+  categoryBreakdown: { category: string; amount: number }[];
   ownCarrierProfit: number;
 };
 
@@ -2010,18 +2026,24 @@ function ProfitReportDrawer({ carrierId, tripId, onClose }: { carrierId: string;
                 {report.expenses.map((e) => (
                   <div key={e.lineId} className="flex justify-between">
                     <span className="text-gray-600">
+                      <span className="mr-1.5 inline-block rounded bg-gray-100 px-1.5 py-0.5 text-[11px] font-medium text-gray-600">{categoryLabel(e.category)}</span>
                       {e.description}
-                      {e.isDiesel && <span className="ml-1 text-xs text-orange-600">(Diesel)</span>}
                     </span>
                     <span className="font-medium">Rs. {formatMoney(e.amount)}</span>
                   </div>
                 ))}
               </div>
             )}
-            <div className="mt-2 flex justify-between text-xs text-orange-700">
-              <span>of which Diesel</span>
-              <span>Rs. {formatMoney(report.totalDiesel)}</span>
-            </div>
+            {report.categoryBreakdown.length > 0 && (
+              <div className="mt-2 space-y-0.5 border-t pt-2 text-xs text-gray-600">
+                {report.categoryBreakdown.map((c) => (
+                  <div key={c.category} className="flex justify-between">
+                    <span>{categoryLabel(c.category)}</span>
+                    <span>Rs. {formatMoney(c.amount)}</span>
+                  </div>
+                ))}
+              </div>
+            )}
             <div className="mt-1 flex justify-between border-t pt-2 font-semibold">
               <span>Total Carrier Expense</span>
               <span>Rs. {formatMoney(report.totalCarrierExpense)}</span>

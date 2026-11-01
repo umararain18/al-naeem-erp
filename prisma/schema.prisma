@@ -1554,6 +1554,23 @@ enum CarrierTripLineType {
   DEPOSIT_TO_OFFICE // OUT - driver hands cash back to an office account.
 }
 
+// Expense category - set on EXPENSE_CASH / EXPENSE_OFFICE /
+// EXPENSE_CREDIT / DRIVER_SALARY lines only (null for COLLECTION /
+// CASH_FROM_OFFICE / DEPOSIT_TO_OFFICE). Replaces expenseAccountId as
+// the primary breakdown key for the Trip report/carrier page - every
+// expense/salary line now debits the SAME Carrier Profit account
+// (see Account.ownCarrierIncomeId's own comment), so this column is
+// what distinguishes a Diesel purchase from a Toll payment, not which
+// account was picked.
+enum CarrierExpenseCategory {
+  DIESEL
+  TOLL
+  KHANA
+  MARAMMAT
+  SALARY
+  OTHER
+}
+
 // ONE row = ONE real JournalEntry (journalEntryId, @unique) - see
 // this module's own header comment for why this is SettlementPayment's
 // "one row, one entry" shape, not Daily Posting's multi-line-voucher
@@ -1570,6 +1587,10 @@ model CarrierTripLine {
   date        DateTime
   description String?
   amount      Decimal             @db.Decimal(15, 2)
+
+  // Set on EXPENSE_CASH / EXPENSE_OFFICE / EXPENSE_CREDIT / DRIVER_SALARY
+  // only (null otherwise) - see CarrierExpenseCategory's own comment.
+  category CarrierExpenseCategory?
 
   // COLLECTION only.
   documentType String?
@@ -1639,4 +1660,5 @@ model CarrierTripLine {
   @@index([documentType, documentId])
   @@index([isDeleted])
   @@index([isDiesel])
+  @@index([category])
 }

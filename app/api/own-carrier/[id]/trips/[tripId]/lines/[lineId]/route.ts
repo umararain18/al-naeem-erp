@@ -12,8 +12,8 @@ import { auditDelete, auditUpdate, actorFromUser, requestContext } from "@/lib/a
 // same append-only discipline as every other correction in this
 // schema. The lineType itself cannot change this way (see that
 // function's own doc comment) - the request body still carries every
-// type-specific field (documentId, expenseAccountId, etc.) the SAME
-// way POST .../lines does, since they are simply re-applied to the
+// type-specific field (documentId, category, etc.) the SAME way POST
+// .../lines does, since they are simply re-applied to the
 // freshly-posted line.
 export async function PATCH(
   request: NextRequest,

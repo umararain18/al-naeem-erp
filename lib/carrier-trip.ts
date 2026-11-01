@@ -9,8 +9,32 @@ import {
 } from "@/lib/document-party-resolution";
 import { assertPhonchReceiptNotExceeded } from "@/lib/phonch-accounting";
 import { assertPrivatePhonchPaymentNotExceeded } from "@/lib/private-phonch-accounting";
-import { getDriverCashBalance, getOrCreateOwnCarrierIncomeAccountId } from "@/lib/own-carrier";
+import { getDriverCashBalance, getOrCreateCarrierProfitAccountId } from "@/lib/own-carrier";
 import { getUnearnedRevenueAccountId } from "@/lib/gross-accounts";
+import { netIncome } from "@/lib/pnl";
+
+// Expense category - set on EXPENSE_CASH/EXPENSE_OFFICE/EXPENSE_CREDIT
+// lines (never DRIVER_SALARY, which is its own lineType already and
+// always implies category SALARY automatically - see
+// postDriverSalaryLine). This is the ONE thing that still varies
+// per-line now that every expense debits the same Carrier Profit
+// account (see Account.ownCarrierIncomeId's own schema comment) -
+// mirrors the Prisma-generated CarrierExpenseCategory enum exactly,
+// minus SALARY.
+export const EXPENSE_LINE_CATEGORIES = ["DIESEL", "TOLL", "KHANA", "MARAMMAT", "OTHER"] as const;
+export type ExpenseLineCategory = (typeof EXPENSE_LINE_CATEGORIES)[number];
+
+export function categoryLabel(category: string | null | undefined): string {
+  switch (category) {
+    case "DIESEL": return "Diesel";
+    case "TOLL": return "Toll";
+    case "KHANA": return "Khana";
+    case "MARAMMAT": return "Marammat";
+    case "SALARY": return "Salary";
+    case "OTHER": return "Other";
+    default: return "Expense";
+  }
+}
 
 // ============================================================
 // CARRIER TRIP - trip CRUD, document linking, and per-line posting.
@@ -62,8 +86,7 @@ export async function suggestNextTripNo(tx: Tx, carrierId: string): Promise<stri
 
 export interface CarrierTripLineTemplate {
   lineType: "EXPENSE_CASH" | "EXPENSE_OFFICE" | "EXPENSE_CREDIT" | "DRIVER_SALARY";
-  expenseAccountId: string | null;
-  expenseAccountName: string | null;
+  category: string | null;
   vendorPartyId: string | null;
   vendorPartyName: string | null;
   officeAccountId: string | null;
@@ -104,7 +127,6 @@ export async function getPreviousTripExpenseTemplates(
     where: { tripId: previousTrip.id, isDeleted: false, lineType: { in: ["EXPENSE_CASH", "EXPENSE_OFFICE", "EXPENSE_CREDIT", "DRIVER_SALARY"] } },
     orderBy: [{ date: "asc" }, { createdAt: "asc" }],
     include: {
-      expenseAccount: { select: { accountName: true } },
       vendorParty: { select: { partyName: true } },
       officeAccount: { select: { accountName: true } },
       employee: { select: { name: true } },
@@ -114,8 +136,7 @@ export async function getPreviousTripExpenseTemplates(
 
   const templates: CarrierTripLineTemplate[] = lines.map((l) => ({
     lineType: l.lineType as CarrierTripLineTemplate["lineType"],
-    expenseAccountId: l.expenseAccountId,
-    expenseAccountName: l.expenseAccount?.accountName || null,
+    category: l.category,
     vendorPartyId: l.vendorPartyId,
     vendorPartyName: l.vendorParty?.partyName || null,
     officeAccountId: l.officeAccountId,
@@ -418,11 +439,18 @@ function dieselLineData(input: DieselFields): Pick<Prisma.CarrierTripLineUncheck
 }
 
 export interface PostExpenseInput extends PostSimpleInput, DieselFields {
-  expenseAccountId: string;
+  category: ExpenseLineCategory;
 }
 
 export interface PostExpenseCreditInput extends PostExpenseInput {
   vendorPartyId: string;
+}
+
+function assertValidExpenseCategory(category: string): ExpenseLineCategory {
+  if (!EXPENSE_LINE_CATEGORIES.includes(category as ExpenseLineCategory)) {
+    throw new CarrierTripError("INVALID_CATEGORY", "Invalid expense category.");
+  }
+  return category as ExpenseLineCategory;
 }
 
 export interface PostSalaryInput extends PostSimpleInput {
@@ -575,22 +603,21 @@ export async function postCashFromOfficeLine(tx: Tx, input: PostOfficeTransferIn
   );
 }
 
-/** OUT - trip expense paid by the driver from Driver Cash. Dr Expense / Cr Driver Cash. */
+/** OUT - trip expense paid by the driver from Driver Cash. Dr this
+ * carrier's own Carrier Profit account / Cr Driver Cash - every
+ * expense/salary line debits the SAME account now (see
+ * Account.ownCarrierIncomeId's own schema comment), so `category` is
+ * what distinguishes a Diesel purchase from a Toll payment, never an
+ * account picker. */
 export async function postExpenseCashLine(tx: Tx, input: PostExpenseInput) {
   const trip = await getTripOrThrow(tx, input.tripId);
   if (trip.status !== "OPEN") throw new CarrierTripError("TRIP_CLOSED", "This Trip is closed.");
   if (input.amount <= 0) throw new CarrierTripError("INVALID_AMOUNT", "Amount must be greater than zero.");
-
-  const expenseAccount = await tx.account.findUnique({ where: { id: input.expenseAccountId } });
-  if (!expenseAccount || !expenseAccount.isActive) {
-    throw new CarrierTripError("INVALID_ACCOUNT", "Selected expense account was not found or is inactive.");
-  }
-  if (expenseAccount.accountType !== "EXPENSE") {
-    throw new CarrierTripError("INVALID_ACCOUNT_TYPE", "Selected account must be an Expense account.");
-  }
+  const category = assertValidExpenseCategory(input.category);
 
   const driverCashId = trip.carrier.driverCashAccount!.id;
-  const description = input.description?.trim() || expenseAccount.accountName;
+  const carrierProfitAccountId = await getOrCreateCarrierProfitAccountId(tx, trip.carrierId);
+  const description = input.description?.trim() || categoryLabel(category);
 
   return createTripLineEntry(
     tx,
@@ -600,37 +627,31 @@ export async function postExpenseCashLine(tx: Tx, input: PostExpenseInput) {
       createdById: input.createdById,
       description,
       lines: [
-        { accountId: input.expenseAccountId, debit: input.amount, credit: 0 },
+        { accountId: carrierProfitAccountId, debit: input.amount, credit: 0 },
         { accountId: driverCashId, debit: 0, credit: input.amount },
       ],
     },
-    { lineType: "EXPENSE_CASH", date: input.date, description, amount: input.amount, expenseAccountId: input.expenseAccountId, ...dieselLineData(input) }
+    { lineType: "EXPENSE_CASH", date: input.date, description, amount: input.amount, category, ...dieselLineData(input) }
   );
 }
 
 /** OUT - trip expense (e.g. Diesel paid via an office account) charged
- * directly to an office Cash/Bank account. Dr Expense / Cr office
- * account. Never touches Driver Cash - same "payment source never
- * moves Driver Cash" rule as EXPENSE_CREDIT. */
+ * directly to an office Cash/Bank account. Dr Carrier Profit / Cr
+ * office account. Never touches Driver Cash - same "payment source
+ * never moves Driver Cash" rule as EXPENSE_CREDIT. */
 export async function postExpenseOfficeLine(tx: Tx, input: PostExpenseInput & { officeAccountId: string }) {
   const trip = await getTripOrThrow(tx, input.tripId);
   if (trip.status !== "OPEN") throw new CarrierTripError("TRIP_CLOSED", "This Trip is closed.");
   if (input.amount <= 0) throw new CarrierTripError("INVALID_AMOUNT", "Amount must be greater than zero.");
-
-  const expenseAccount = await tx.account.findUnique({ where: { id: input.expenseAccountId } });
-  if (!expenseAccount || !expenseAccount.isActive) {
-    throw new CarrierTripError("INVALID_ACCOUNT", "Selected expense account was not found or is inactive.");
-  }
-  if (expenseAccount.accountType !== "EXPENSE") {
-    throw new CarrierTripError("INVALID_ACCOUNT_TYPE", "Selected account must be an Expense account.");
-  }
+  const category = assertValidExpenseCategory(input.category);
 
   const officeAccount = await tx.account.findUnique({ where: { id: input.officeAccountId } });
   if (!officeAccount || !officeAccount.isActive) {
     throw new CarrierTripError("INVALID_ACCOUNT", "Selected office account was not found or is inactive.");
   }
 
-  const description = input.description?.trim() || `${expenseAccount.accountName} (Office Account - ${officeAccount.accountName})`;
+  const carrierProfitAccountId = await getOrCreateCarrierProfitAccountId(tx, trip.carrierId);
+  const description = input.description?.trim() || `${categoryLabel(category)} (Office Account - ${officeAccount.accountName})`;
 
   return createTripLineEntry(
     tx,
@@ -640,34 +661,28 @@ export async function postExpenseOfficeLine(tx: Tx, input: PostExpenseInput & { 
       createdById: input.createdById,
       description,
       lines: [
-        { accountId: input.expenseAccountId, debit: input.amount, credit: 0 },
+        { accountId: carrierProfitAccountId, debit: input.amount, credit: 0 },
         { accountId: input.officeAccountId, debit: 0, credit: input.amount },
       ],
     },
-    { lineType: "EXPENSE_OFFICE", date: input.date, description, amount: input.amount, expenseAccountId: input.expenseAccountId, officeAccountId: input.officeAccountId, ...dieselLineData(input) }
+    { lineType: "EXPENSE_OFFICE", date: input.date, description, amount: input.amount, category, officeAccountId: input.officeAccountId, ...dieselLineData(input) }
   );
 }
 
-/** OUT - trip expense, Udhaar (credit) to a Vendor Party. Dr Expense / Cr Vendor. Never touches Driver Cash. */
+/** OUT - trip expense, Udhaar (credit) to a Vendor Party. Dr Carrier Profit / Cr Vendor. Never touches Driver Cash. */
 export async function postExpenseCreditLine(tx: Tx, input: PostExpenseCreditInput) {
   const trip = await getTripOrThrow(tx, input.tripId);
   if (trip.status !== "OPEN") throw new CarrierTripError("TRIP_CLOSED", "This Trip is closed.");
   if (input.amount <= 0) throw new CarrierTripError("INVALID_AMOUNT", "Amount must be greater than zero.");
-
-  const expenseAccount = await tx.account.findUnique({ where: { id: input.expenseAccountId } });
-  if (!expenseAccount || !expenseAccount.isActive) {
-    throw new CarrierTripError("INVALID_ACCOUNT", "Selected expense account was not found or is inactive.");
-  }
-  if (expenseAccount.accountType !== "EXPENSE") {
-    throw new CarrierTripError("INVALID_ACCOUNT_TYPE", "Selected account must be an Expense account.");
-  }
+  const category = assertValidExpenseCategory(input.category);
 
   const vendorParty = await tx.party.findUnique({ where: { id: input.vendorPartyId }, include: { account: true } });
   if (!vendorParty || !vendorParty.isActive || !vendorParty.account) {
     throw new CarrierTripError("INVALID_VENDOR", "Selected vendor party was not found or is inactive.");
   }
 
-  const description = input.description?.trim() || `${expenseAccount.accountName} (Udhaar - ${vendorParty.partyName})`;
+  const carrierProfitAccountId = await getOrCreateCarrierProfitAccountId(tx, trip.carrierId);
+  const description = input.description?.trim() || `${categoryLabel(category)} (Udhaar - ${vendorParty.partyName})`;
 
   return createTripLineEntry(
     tx,
@@ -677,7 +692,7 @@ export async function postExpenseCreditLine(tx: Tx, input: PostExpenseCreditInpu
       createdById: input.createdById,
       description,
       lines: [
-        { accountId: input.expenseAccountId, debit: input.amount, credit: 0 },
+        { accountId: carrierProfitAccountId, debit: input.amount, credit: 0 },
         { accountId: vendorParty.account.id, debit: 0, credit: input.amount },
       ],
     },
@@ -686,27 +701,32 @@ export async function postExpenseCreditLine(tx: Tx, input: PostExpenseCreditInpu
       date: input.date,
       description,
       amount: input.amount,
-      expenseAccountId: input.expenseAccountId,
+      category,
       vendorPartyId: input.vendorPartyId,
       ...dieselLineData(input),
     }
   );
 }
 
-/** OUT - salary paid to an Employee from Driver Cash. Dr Employee / Cr Driver Cash.
- * Reduces that Employee's own payable balance exactly like any other
- * payment to their account - no Payslip link assumed or required. */
+/** OUT - driver salary is a carrier expense now (never a Payslip/
+ * employee-account posting): Dr this carrier's own Carrier Profit
+ * account / Cr Driver Cash. No "employee must have a linked account"
+ * requirement any more - the Employee row only needs to exist and not
+ * be binned, since salary no longer touches that employee's own
+ * account at all. category is always "SALARY" - not user-supplied,
+ * since DRIVER_SALARY is its own distinct lineType already. */
 export async function postDriverSalaryLine(tx: Tx, input: PostSalaryInput) {
   const trip = await getTripOrThrow(tx, input.tripId);
   if (trip.status !== "OPEN") throw new CarrierTripError("TRIP_CLOSED", "This Trip is closed.");
   if (input.amount <= 0) throw new CarrierTripError("INVALID_AMOUNT", "Amount must be greater than zero.");
 
-  const employee = await tx.employee.findUnique({ where: { id: input.employeeId }, include: { account: true } });
-  if (!employee || employee.isDeleted || !employee.account) {
-    throw new CarrierTripError("INVALID_EMPLOYEE", "Selected employee was not found or has no linked account.");
+  const employee = await tx.employee.findUnique({ where: { id: input.employeeId } });
+  if (!employee || employee.isDeleted) {
+    throw new CarrierTripError("INVALID_EMPLOYEE", "Selected employee was not found.");
   }
 
   const driverCashId = trip.carrier.driverCashAccount!.id;
+  const carrierProfitAccountId = await getOrCreateCarrierProfitAccountId(tx, trip.carrierId);
   const description = input.description?.trim() || `Salary paid to ${employee.name}`;
 
   return createTripLineEntry(
@@ -717,11 +737,11 @@ export async function postDriverSalaryLine(tx: Tx, input: PostSalaryInput) {
       createdById: input.createdById,
       description,
       lines: [
-        { accountId: employee.account.id, debit: input.amount, credit: 0 },
+        { accountId: carrierProfitAccountId, debit: input.amount, credit: 0 },
         { accountId: driverCashId, debit: 0, credit: input.amount },
       ],
     },
-    { lineType: "DRIVER_SALARY", date: input.date, description, amount: input.amount, employeeId: input.employeeId }
+    { lineType: "DRIVER_SALARY", date: input.date, description, amount: input.amount, employeeId: input.employeeId, category: "SALARY" }
   );
 }
 
@@ -804,16 +824,16 @@ export async function postTripLineByType(
       if (!rawInput.officeAccountId) throw new CarrierTripError("MISSING_ACCOUNT", "Office account is required.");
       return postDepositToOfficeLine(tx, { ...base, officeAccountId: rawInput.officeAccountId as string });
     case "EXPENSE_CASH":
-      if (!rawInput.expenseAccountId) throw new CarrierTripError("MISSING_ACCOUNT", "Expense account is required.");
-      return postExpenseCashLine(tx, { ...base, expenseAccountId: rawInput.expenseAccountId as string, ...dieselFieldsFromRawInput(rawInput) });
+      if (!rawInput.category) throw new CarrierTripError("MISSING_CATEGORY", "Expense category is required.");
+      return postExpenseCashLine(tx, { ...base, category: rawInput.category as ExpenseLineCategory, ...dieselFieldsFromRawInput(rawInput) });
     case "EXPENSE_OFFICE":
-      if (!rawInput.expenseAccountId) throw new CarrierTripError("MISSING_ACCOUNT", "Expense account is required.");
+      if (!rawInput.category) throw new CarrierTripError("MISSING_CATEGORY", "Expense category is required.");
       if (!rawInput.officeAccountId) throw new CarrierTripError("MISSING_ACCOUNT", "Office account is required.");
-      return postExpenseOfficeLine(tx, { ...base, expenseAccountId: rawInput.expenseAccountId as string, officeAccountId: rawInput.officeAccountId as string, ...dieselFieldsFromRawInput(rawInput) });
+      return postExpenseOfficeLine(tx, { ...base, category: rawInput.category as ExpenseLineCategory, officeAccountId: rawInput.officeAccountId as string, ...dieselFieldsFromRawInput(rawInput) });
     case "EXPENSE_CREDIT":
-      if (!rawInput.expenseAccountId) throw new CarrierTripError("MISSING_ACCOUNT", "Expense account is required.");
+      if (!rawInput.category) throw new CarrierTripError("MISSING_CATEGORY", "Expense category is required.");
       if (!rawInput.vendorPartyId) throw new CarrierTripError("MISSING_VENDOR", "Vendor party is required for a credit expense.");
-      return postExpenseCreditLine(tx, { ...base, expenseAccountId: rawInput.expenseAccountId as string, vendorPartyId: rawInput.vendorPartyId as string, ...dieselFieldsFromRawInput(rawInput) });
+      return postExpenseCreditLine(tx, { ...base, category: rawInput.category as ExpenseLineCategory, vendorPartyId: rawInput.vendorPartyId as string, ...dieselFieldsFromRawInput(rawInput) });
     case "DRIVER_SALARY":
       if (!rawInput.employeeId) throw new CarrierTripError("MISSING_EMPLOYEE", "Employee is required for a salary line.");
       return postDriverSalaryLine(tx, { ...base, employeeId: rawInput.employeeId as string });
@@ -920,7 +940,7 @@ export async function reverseCarrierTripLine(tx: Tx, input: { lineId: string; de
 // Bilty rent sits untouched in Unearned Revenue from booking all the
 // way through dispatch; closing the Trip that links it is the ONE
 // moment its income is finally recognized, split between real
-// Booking Income and this carrier's own "Own Carrier Income" by the
+// Booking Income and this carrier's own "Carrier Profit" account by the
 // manually-entered CarrierTripDocument.carrierRentAmount.
 //
 // referenceType "CARRIER_TRIP_CLOSE", referenceId = the CHALLAN's own
@@ -997,10 +1017,10 @@ export async function recognizeCarrierTripChallanIncome(
   const carrierRentAmount = round2(Math.max(0, Number(link.carrierRentAmount)));
   const bookingIncomeAmount = round2(biltyRentTotal - carrierRentAmount);
 
-  const [unearnedRevenueAccountId, bookingIncomeAccountId, ownCarrierIncomeAccountId] = await Promise.all([
+  const [unearnedRevenueAccountId, bookingIncomeAccountId, carrierProfitAccountId] = await Promise.all([
     getUnearnedRevenueAccountId(tx),
     getActiveBookingIncomeAccountId(tx),
-    getOrCreateOwnCarrierIncomeAccountId(tx, link.trip.carrierId),
+    getOrCreateCarrierProfitAccountId(tx, link.trip.carrierId),
   ]);
 
   const description = `Trip ${input.tripNo} closed - Challan ${challan.challanNo} income recognized (Bilty Rent ${biltyRentTotal}, Carrier Rent ${carrierRentAmount})`;
@@ -1014,7 +1034,7 @@ export async function recognizeCarrierTripChallanIncome(
     lines.push({ accountId: bookingIncomeAccountId, debit: -bookingIncomeAmount, credit: 0, sourceType: "CHALLAN", sourceId: challan.id, sourceNumber: challan.challanNo });
   }
   if (carrierRentAmount > 0) {
-    lines.push({ accountId: ownCarrierIncomeAccountId, debit: 0, credit: carrierRentAmount, sourceType: "CHALLAN", sourceId: challan.id, sourceNumber: challan.challanNo });
+    lines.push({ accountId: carrierProfitAccountId, debit: 0, credit: carrierRentAmount, sourceType: "CHALLAN", sourceId: challan.id, sourceNumber: challan.challanNo });
   }
 
   await tx.journalEntry.create({
@@ -1167,7 +1187,7 @@ export interface TripCashBookRow {
   // fetch - every write path still only ever reads these from
   // CarrierTripLine itself via lib/carrier-trip.ts's own post*Line
   // functions, never from this read-only row shape.
-  expenseAccountId: string | null;
+  category: string | null;
   officeAccountId: string | null;
   vendorPartyId: string | null;
   employeeId: string | null;
@@ -1237,7 +1257,7 @@ export async function getTripCashBook(tx: Tx, tripId: string): Promise<{ opening
       balance,
       documentType: l.documentType,
       documentId: l.documentId,
-      expenseAccountId: l.expenseAccountId,
+      category: l.category,
       officeAccountId: l.officeAccountId,
       vendorPartyId: l.vendorPartyId,
       employeeId: l.employeeId,
@@ -1269,11 +1289,17 @@ export interface TripProfitReport {
    * it was paid through) + every other EXPENSE_CASH/EXPENSE_OFFICE/
    * EXPENSE_CREDIT + DRIVER_SALARY line - every real cost of running
    * the Trip, regardless of payment source. */
-  expenses: { lineId: string; lineType: string; description: string; amount: number; isDiesel: boolean }[];
+  expenses: { lineId: string; lineType: string; category: string | null; description: string; amount: number; isDiesel: boolean }[];
   totalCarrierExpense: number;
   /** The isDiesel subset of totalCarrierExpense - see CarrierTripLine.
    * isDiesel's own schema doc comment. Never description-text based. */
   totalDiesel: number;
+  /** Breakdown by CarrierExpenseCategory (DIESEL/TOLL/KHANA/MARAMMAT/
+   * SALARY/OTHER), derived straight from each line's own `category`
+   * column - never from which account it debited (every expense/
+   * salary line debits the same Carrier Profit account now, so an
+   * account-based breakdown would be meaningless). */
+  categoryBreakdown: { category: string; amount: number }[];
   /** Carrier Rent - Carrier Expense (NOT the same as totalBookingIncome
    * - that is ANC's own booking income, unrelated to this carrier's
    * own profit on the trip it ran). */
@@ -1332,13 +1358,20 @@ export async function getTripProfitReport(tx: Tx, tripId: string): Promise<TripP
     }
   }
 
-  const expenses = lines.map((l) => ({ lineId: l.id, lineType: l.lineType, description: l.description || l.lineType, amount: round2(Number(l.amount)), isDiesel: l.isDiesel }));
+  const expenses = lines.map((l) => ({ lineId: l.id, lineType: l.lineType, category: l.category, description: l.description || l.lineType, amount: round2(Number(l.amount)), isDiesel: l.isDiesel }));
 
   const totalBiltyRent = round2(challanIncome.reduce((s, c) => s + c.biltyRent, 0));
   const totalCarrierRent = round2(challanIncome.reduce((s, c) => s + c.carrierRent, 0));
   const totalBookingIncome = round2(challanIncome.reduce((s, c) => s + c.bookingIncome, 0));
   const totalCarrierExpense = round2(expenses.reduce((s, e) => s + e.amount, 0));
   const totalDiesel = round2(expenses.filter((e) => e.isDiesel).reduce((s, e) => s + e.amount, 0));
+
+  const categoryTotals = new Map<string, number>();
+  for (const e of expenses) {
+    const key = e.category || "OTHER";
+    categoryTotals.set(key, round2((categoryTotals.get(key) || 0) + e.amount));
+  }
+  const categoryBreakdown = Array.from(categoryTotals.entries()).map(([category, amount]) => ({ category, amount }));
 
   return {
     previousBalance,
@@ -1350,6 +1383,7 @@ export async function getTripProfitReport(tx: Tx, tripId: string): Promise<TripP
     expenses,
     totalCarrierExpense,
     totalDiesel,
+    categoryBreakdown,
     ownCarrierProfit: round2(totalCarrierRent - totalCarrierExpense),
   };
 }
@@ -1391,4 +1425,120 @@ export async function getCarrierAllTripsSummary(tx: Tx, carrierId: string): Prom
     totalCarrierExpense,
     totalOwnCarrierProfit: round2(totalCarrierRent - totalCarrierExpense),
   };
+}
+
+// ============================================================
+// CARRIER PAGE SUMMARY + UNLINKED CHALLANS
+// ============================================================
+
+export interface CarrierPageSummary {
+  /** Driver Cash's own live ledger balance - negative means the
+   * carrier/driver is OWED this much (payable to driver), never
+   * sign-flipped for display - see formatSignedMoney() at the UI
+   * layer for how that's rendered. */
+  driverCashBalance: number;
+  /** This carrier's own Udhaar vendors only (every vendorPartyId ever
+   * used on one of this carrier's EXPENSE_CREDIT lines) - each
+   * vendor's own real Account balance (credit - debit, i.e. the SAME
+   * convention lib/receivable-payable.ts's getReceivablePayable()
+   * already uses), so this carrier's own vendors still show up in the
+   * global Payable report/ledgers too - never a second, independent
+   * number. */
+  vendorsPayable: { partyId: string; partyName: string; balance: number }[];
+  totalVendorsPayable: number;
+  /** Sum of getDocumentOutstandingAmount() across every one of this
+   * carrier's own-carrier Challans (CHALLAN only - Phonch/Private
+   * Phonch outstanding is not computed here, same scope
+   * getDocumentOutstandingAmount itself already limits to), trip-link
+   * state irrelevant - an uncollected Challan is still receivable
+   * whether or not it is currently linked to an open Trip. */
+  challanReceivable: number;
+  /** This carrier's own Carrier Profit account's own net ledger
+   * balance (credit - debit, lib/pnl.ts's netIncome convention) -
+   * ALL trips, open and closed alike. The exact same number that
+   * shows as this carrier's own line on the P&L report. */
+  carrierProfit: number;
+}
+
+export async function getCarrierPageSummary(tx: Tx, carrierId: string): Promise<CarrierPageSummary> {
+  const carrier = await tx.ownCarrier.findUnique({
+    where: { id: carrierId },
+    include: { driverCashAccount: true, ownCarrierIncomeAccount: true },
+  });
+  if (!carrier) throw new CarrierTripError("OWN_CARRIER_NOT_FOUND", "Own Carrier not found.");
+
+  const driverCashBalance = carrier.driverCashAccount ? await getDriverCashBalance(tx, carrier.driverCashAccount.id) : 0;
+
+  let carrierProfit = 0;
+  if (carrier.ownCarrierIncomeAccount) {
+    const agg = await tx.journalLine.aggregate({
+      where: { accountId: carrier.ownCarrierIncomeAccount.id, journalEntry: { isDeleted: false } },
+      _sum: { debit: true, credit: true },
+    });
+    carrierProfit = round2(netIncome({ debit: Number(agg._sum.debit || 0), credit: Number(agg._sum.credit || 0) }));
+  }
+
+  const vendorLines = await tx.carrierTripLine.findMany({
+    where: { trip: { carrierId }, lineType: "EXPENSE_CREDIT", isDeleted: false, vendorPartyId: { not: null } },
+    select: { vendorPartyId: true },
+    distinct: ["vendorPartyId"],
+  });
+  const vendorIds = vendorLines.map((l) => l.vendorPartyId!).filter(Boolean);
+
+  const vendorsPayable: CarrierPageSummary["vendorsPayable"] = [];
+  if (vendorIds.length > 0) {
+    const vendors = await tx.party.findMany({
+      where: { id: { in: vendorIds } },
+      include: { account: true },
+    });
+    for (const vendor of vendors) {
+      if (!vendor.account) continue;
+      const agg = await tx.journalLine.aggregate({
+        where: { accountId: vendor.account.id, journalEntry: { isDeleted: false } },
+        _sum: { debit: true, credit: true },
+      });
+      const balance = round2(Number(agg._sum.debit || 0) - Number(agg._sum.credit || 0));
+      if (balance < 0) {
+        vendorsPayable.push({ partyId: vendor.id, partyName: vendor.partyName, balance: round2(Math.abs(balance)) });
+      }
+    }
+    vendorsPayable.sort((a, b) => b.balance - a.balance);
+  }
+  const totalVendorsPayable = round2(vendorsPayable.reduce((s, v) => s + v.balance, 0));
+
+  const challans = await tx.challan.findMany({ where: { ownCarrierId: carrierId, isDeleted: false }, select: { id: true } });
+  let challanReceivable = 0;
+  for (const c of challans) {
+    const outstanding = await getDocumentOutstandingAmount(tx, "CHALLAN", c.id);
+    challanReceivable = round2(challanReceivable + (outstanding || 0));
+  }
+
+  return { driverCashBalance, vendorsPayable, totalVendorsPayable, challanReceivable, carrierProfit };
+}
+
+/**
+ * This carrier's own own-carrier Challans with NO currently-active
+ * Trip link - either dispatched while no Trip was OPEN
+ * (autoLinkOwnCarrierChallan's own no-op case), or unlinked since.
+ * The carrier page surfaces these with a "Link" action so they don't
+ * silently sit unlinked forever.
+ */
+export async function getUnlinkedOwnCarrierChallans(
+  tx: Tx,
+  carrierId: string
+): Promise<{ id: string; challanNo: string; loadingDate: Date }[]> {
+  const challans = await tx.challan.findMany({
+    where: { ownCarrierId: carrierId, isDeleted: false },
+    select: { id: true, challanNo: true, loadingDate: true },
+    orderBy: { loadingDate: "desc" },
+  });
+  if (challans.length === 0) return [];
+
+  const activeLinks = await tx.carrierTripDocument.findMany({
+    where: { documentType: "CHALLAN", documentId: { in: challans.map((c) => c.id) }, unlinkedAt: null },
+    select: { documentId: true },
+  });
+  const linkedIds = new Set(activeLinks.map((l) => l.documentId));
+
+  return challans.filter((c) => !linkedIds.has(c.id));
 }
