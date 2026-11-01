@@ -143,6 +143,10 @@ export async function POST(request: NextRequest) {
       }
     }
 
+    if (body.defaultPaidFrom && !["DRIVER_CASH", "OFFICE", "UDHAAR"].includes(body.defaultPaidFrom)) {
+      return NextResponse.json({ success: false, message: "Invalid default Paid From" }, { status: 400 });
+    }
+
     try {
       const { carrier } = await prisma.$transaction(
         async (tx) => {
@@ -163,6 +167,8 @@ export async function POST(request: NextRequest) {
             driverPhone: body.driverPhone,
             notes: body.notes,
             currentDriverId: body.currentDriverId,
+            defaultPumpPartyId: body.defaultPumpPartyId,
+            defaultPaidFrom: body.defaultPaidFrom,
             createdById: currentUser.userId,
           });
 

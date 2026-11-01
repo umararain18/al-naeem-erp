@@ -63,7 +63,16 @@ export async function GET(
     const trip = await prisma.carrierTrip.findUnique({
       where: { id: tripId },
       include: {
-        carrier: { select: { id: true, carrierNumber: true, driverName: true } },
+        carrier: {
+          select: {
+            id: true,
+            carrierNumber: true,
+            driverName: true,
+            defaultPumpPartyId: true,
+            defaultPaidFrom: true,
+            defaultPumpParty: { select: { id: true, partyName: true } },
+          },
+        },
         documents: { where: { unlinkedAt: null }, orderBy: { linkedAt: "asc" } },
         deletedBy: { select: { id: true, fullName: true, username: true } },
       },

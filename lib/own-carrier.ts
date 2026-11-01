@@ -39,6 +39,8 @@ export async function createOwnCarrierWithAccount(
     driverPhone?: string | null;
     notes?: string | null;
     currentDriverId?: string | null;
+    defaultPumpPartyId?: string | null;
+    defaultPaidFrom?: string | null;
     createdById: string;
   }
 ) {
@@ -49,6 +51,8 @@ export async function createOwnCarrierWithAccount(
       driverPhone: input.driverPhone || null,
       notes: input.notes || null,
       currentDriverId: input.currentDriverId || null,
+      defaultPumpPartyId: input.defaultPumpPartyId || null,
+      defaultPaidFrom: input.defaultPaidFrom || null,
       isActive: true,
       createdById: input.createdById,
     },

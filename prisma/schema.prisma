@@ -87,6 +87,8 @@ model Party {
   bills Bill[] @relation("BillClientParty")
 
   carrierTripVendorLines CarrierTripLine[] @relation("CarrierTripLineVendor")
+  carrierTripPumpLines   CarrierTripLine[] @relation("CarrierTripLinePump")
+  ownCarrierDefaultPumpFor OwnCarrier[]    @relation("OwnCarrierDefaultPump")
 }
 
 // ============================================================
@@ -1402,6 +1404,18 @@ model OwnCarrier {
   currentDriverId String?
   currentDriver   Employee? @relation("OwnCarrierCurrentDriver", fields: [currentDriverId], references: [id], onDelete: SetNull)
 
+  // Carrier settings - pure UI prefill defaults for a new Diesel
+  // quick-entry/draft/paste-list row (see app/own-carrier/[id]/trip/
+  // [tripId]/page.tsx), never required and never assumed by any
+  // posting function itself (each Diesel line still carries its own
+  // pumpPartyId/paid-from explicitly - same "never silently assumed"
+  // discipline as currentDriverId above). defaultPaidFrom is
+  // deliberately a plain string ("DRIVER_CASH"/"OFFICE"/"UDHAAR"), not
+  // an enum - same precedent as JournalLine.sourceType.
+  defaultPumpPartyId String?
+  defaultPumpParty   Party?  @relation("OwnCarrierDefaultPump", fields: [defaultPumpPartyId], references: [id], onDelete: SetNull)
+  defaultPaidFrom    String?
+
   driverCashAccount    Account? @relation("OwnCarrierDriverCashAccount")
   ownCarrierIncomeAccount Account? @relation("OwnCarrierIncomeAccount")
 
@@ -1565,13 +1579,35 @@ model CarrierTripLine {
   // Expense-category Account, reusing the Accounts page's own picker
   // as-is (never a new account-management feature). The Diesel UI
   // section is not a distinct lineType - it is one of these three,
-  // pre-filled with liters/pump text folded into `description`.
+  // flagged by isDiesel below (never by sniffing `description` text,
+  // once this field exists - see this field's own comment).
   expenseAccountId String?
   expenseAccount   Account? @relation("CarrierTripLineExpenseAccount", fields: [expenseAccountId], references: [id], onDelete: Restrict)
 
   // EXPENSE_CREDIT only - the Vendor Party now owed this amount.
   vendorPartyId String?
   vendorParty   Party?  @relation("CarrierTripLineVendor", fields: [vendorPartyId], references: [id], onDelete: Restrict)
+
+  // ============================================================
+  // DIESEL STRUCTURED FIELDS - Diesel is still not a distinct
+  // lineType (it is EXPENSE_CASH/EXPENSE_OFFICE/EXPENSE_CREDIT by
+  // payment source, same as before); isDiesel just flags which of
+  // those rows IS a Diesel purchase, so the Trip page's own Diesel
+  // box/total and the Profit Report can filter/sum by this column
+  // instead of sniffing a "Diesel - ..." prefix out of `description`.
+  // liters/ratePerLiter/pumpPartyId are meaningful ONLY when
+  // isDiesel is true - amount is still the one real posted value
+  // (liters * ratePerLiter when both are present, entered manually
+  // otherwise); pumpPartyId is informational (onDelete: SetNull) and
+  // independent of vendorPartyId above, which is only ever the real
+  // Udhaar payable party for an EXPENSE_CREDIT line - a Diesel
+  // purchase on Udhaar carries BOTH (the same Party, typically).
+  // ============================================================
+  isDiesel     Boolean  @default(false)
+  liters       Decimal? @db.Decimal(10, 2)
+  ratePerLiter Decimal? @db.Decimal(10, 2)
+  pumpPartyId  String?
+  pumpParty    Party?   @relation("CarrierTripLinePump", fields: [pumpPartyId], references: [id], onDelete: SetNull)
 
   // DRIVER_SALARY only - explicit every time (never silently assumed
   // from OwnCarrier.currentDriverId - see that field's own comment).
@@ -1602,4 +1638,5 @@ model CarrierTripLine {
   @@index([lineType])
   @@index([documentType, documentId])
   @@index([isDeleted])
+  @@index([isDiesel])
 }

@@ -207,7 +207,10 @@ function CarrierDrawer({ state, onClose, onSaved }: { state: { mode: "new" | "ed
   const [notes, setNotes] = useState("");
   const [currentDriverId, setCurrentDriverId] = useState("");
   const [isActive, setIsActive] = useState(true);
+  const [defaultPumpPartyId, setDefaultPumpPartyId] = useState("");
+  const [defaultPaidFrom, setDefaultPaidFrom] = useState("");
   const [employees, setEmployees] = useState<{ id: string; name: string; employeeCode: string }[]>([]);
+  const [parties, setParties] = useState<{ id: string; partyName: string }[]>([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
@@ -216,6 +219,9 @@ function CarrierDrawer({ state, onClose, onSaved }: { state: { mode: "new" | "ed
       const res = await fetch("/api/employees?status=ACTIVE");
       const json = await res.json();
       if (res.ok && json.success) setEmployees(json.items || []);
+      const partyRes = await fetch("/api/parties");
+      const partyJson = await partyRes.json();
+      if (partyRes.ok && partyJson.success) setParties(partyJson.parties || []);
     })();
   }, []);
 
@@ -229,6 +235,8 @@ function CarrierDrawer({ state, onClose, onSaved }: { state: { mode: "new" | "ed
       setNotes("");
       setCurrentDriverId("");
       setIsActive(true);
+      setDefaultPumpPartyId("");
+      setDefaultPaidFrom("");
     } else if (state.id) {
       (async () => {
         const res = await fetch(`/api/own-carrier/${state.id}`);
@@ -241,6 +249,8 @@ function CarrierDrawer({ state, onClose, onSaved }: { state: { mode: "new" | "ed
           setNotes(c.notes || "");
           setCurrentDriverId(c.currentDriverId || "");
           setIsActive(c.isActive);
+          setDefaultPumpPartyId(c.defaultPumpPartyId || "");
+          setDefaultPaidFrom(c.defaultPaidFrom || "");
         }
       })();
     }
@@ -260,6 +270,8 @@ function CarrierDrawer({ state, onClose, onSaved }: { state: { mode: "new" | "ed
         driverPhone: driverPhone.trim() || undefined,
         notes: notes.trim() || undefined,
         currentDriverId: currentDriverId || null,
+        defaultPumpPartyId: defaultPumpPartyId || null,
+        defaultPaidFrom: defaultPaidFrom || null,
         ...(state?.mode === "edit" ? { isActive } : {}),
       };
       const url = state?.mode === "edit" ? `/api/own-carrier/${state.id}` : "/api/own-carrier";
@@ -276,6 +288,7 @@ function CarrierDrawer({ state, onClose, onSaved }: { state: { mode: "new" | "ed
   }
 
   const employeeOptions = employees.map((e) => ({ value: e.id, label: e.name, secondary: e.employeeCode }));
+  const partyOptions = parties.map((p) => ({ value: p.id, label: p.partyName }));
 
   return (
     <Drawer open={!!state} onClose={onClose} title={state?.mode === "edit" ? "Edit Carrier" : "New Carrier"}>
@@ -300,6 +313,24 @@ function CarrierDrawer({ state, onClose, onSaved }: { state: { mode: "new" | "ed
         <div>
           <label className="mb-1 block text-xs font-medium text-gray-600">Notes</label>
           <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={3} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
+        </div>
+        <div className="border-t pt-4">
+          <p className="mb-3 text-xs font-semibold uppercase tracking-wide text-gray-400">Diesel defaults (Trip quick entry)</p>
+          <div className="space-y-4">
+            <div>
+              <label className="mb-1 block text-xs font-medium text-gray-600">Default Pump</label>
+              <SearchableSelect value={defaultPumpPartyId} options={partyOptions} placeholder="Select pump/vendor (optional)..." onChange={setDefaultPumpPartyId} />
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-gray-600">Default Paid From</label>
+              <select value={defaultPaidFrom} onChange={(e) => setDefaultPaidFrom(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500">
+                <option value="">Not set</option>
+                <option value="DRIVER_CASH">Driver Cash</option>
+                <option value="OFFICE">Office Account</option>
+                <option value="UDHAAR">Udhaar</option>
+              </select>
+            </div>
+          </div>
         </div>
         {state?.mode === "edit" && (
           <label className="flex items-center gap-2 text-sm text-gray-700">

@@ -30,6 +30,7 @@ export async function GET(
       include: {
         driverCashAccount: { select: { id: true, accountName: true } },
         currentDriver: { select: { id: true, name: true, employeeCode: true } },
+        defaultPumpParty: { select: { id: true, partyName: true } },
         deletedBy: { select: { id: true, fullName: true, username: true } },
         trips: {
           where: { isDeleted: false },
@@ -147,6 +148,23 @@ export async function PATCH(
         }
       }
       updateData.currentDriverId = body.currentDriverId || null;
+    }
+
+    if (body.defaultPumpPartyId !== undefined) {
+      if (body.defaultPumpPartyId) {
+        const party = await prisma.party.findUnique({ where: { id: body.defaultPumpPartyId }, select: { isActive: true } });
+        if (!party || !party.isActive) {
+          return NextResponse.json({ success: false, message: "Selected default pump party was not found" }, { status: 400 });
+        }
+      }
+      updateData.defaultPumpPartyId = body.defaultPumpPartyId || null;
+    }
+
+    if (body.defaultPaidFrom !== undefined) {
+      if (body.defaultPaidFrom && !["DRIVER_CASH", "OFFICE", "UDHAAR"].includes(body.defaultPaidFrom)) {
+        return NextResponse.json({ success: false, message: "Invalid default Paid From" }, { status: 400 });
+      }
+      updateData.defaultPaidFrom = body.defaultPaidFrom || null;
     }
 
     try {

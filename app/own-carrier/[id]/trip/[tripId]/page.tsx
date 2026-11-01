@@ -36,7 +36,14 @@ type Trip = {
   dateTo: string | null;
   notes: string | null;
   status: "OPEN" | "CLOSED";
-  carrier: { id: string; carrierNumber: string; driverName: string | null };
+  carrier: {
+    id: string;
+    carrierNumber: string;
+    driverName: string | null;
+    defaultPumpPartyId: string | null;
+    defaultPaidFrom: string | null;
+    defaultPumpParty: { id: string; partyName: string } | null;
+  };
 };
 
 type DocumentLink = {
@@ -64,6 +71,11 @@ type CashBookRow = {
   officeAccountId: string | null;
   vendorPartyId: string | null;
   employeeId: string | null;
+  isDiesel: boolean;
+  liters: number | null;
+  ratePerLiter: number | null;
+  pumpPartyId: string | null;
+  pumpPartyName: string | null;
 };
 
 type CashBook = { openingBalance: number; rows: CashBookRow[]; closingBalance: number };
@@ -80,10 +92,6 @@ const LINE_TYPE_LABELS: Record<string, string> = {
   DRIVER_SALARY: "Salary",
   DEPOSIT_TO_OFFICE: "Office mein jama",
 };
-
-function isDieselRow(description: string): boolean {
-  return description.trim().toLowerCase().startsWith("diesel");
-}
 
 /**
  * Fast keyboard entry: "20k" -> 20000, "1.5L" -> 150000 (Lakh, the
@@ -119,9 +127,11 @@ type DraftRow = {
   officeAccountName: string | null;
   employeeId: string | null;
   employeeName: string | null;
-  isDieselLike: boolean;
-  pump: string;
+  isDiesel: boolean;
+  pumpPartyId: string | null;
+  pumpPartyName: string | null;
   liters: string;
+  ratePerLiter: string;
   amount: string;
   note: string;
 };
@@ -158,9 +168,10 @@ function templateToDraft(t: {
   employeeId: string | null;
   employeeName: string | null;
   description: string | null;
-  isDieselLike: boolean;
+  isDiesel: boolean;
+  pumpPartyId: string | null;
+  pumpPartyName: string | null;
 }): DraftRow {
-  const pumpMatch = t.isDieselLike ? t.description?.match(/^Diesel\s*-\s*([^-]+?)\s*-/i) : null;
   return {
     id: `draft-${Math.random().toString(36).slice(2)}`,
     lineType: t.lineType,
@@ -172,16 +183,41 @@ function templateToDraft(t: {
     officeAccountName: t.officeAccountName,
     employeeId: t.employeeId,
     employeeName: t.employeeName,
-    isDieselLike: t.isDieselLike,
-    pump: pumpMatch?.[1]?.trim() || "",
+    isDiesel: t.isDiesel,
+    pumpPartyId: t.pumpPartyId,
+    pumpPartyName: t.pumpPartyName,
     liters: "",
+    ratePerLiter: "",
     amount: "",
-    note: t.isDieselLike ? "" : t.description || "",
+    note: t.isDiesel ? "" : t.description || "",
   };
 }
 
 function paidFromStorageKey(tripId: string, quickTypeKey: string): string {
   return `oc-paidfrom-${tripId}-${quickTypeKey}`;
+}
+
+// "Rate remembered per pump" - deliberately carrier-wide (not scoped
+// to one Trip), since a pump's diesel price is a real-world fact that
+// outlives any one Trip.
+function dieselRateStorageKey(pumpPartyId: string): string {
+  return `oc-dieselrate-${pumpPartyId}`;
+}
+
+function loadRememberedRate(pumpPartyId: string): string {
+  try {
+    return window.localStorage.getItem(dieselRateStorageKey(pumpPartyId)) || "";
+  } catch {
+    return "";
+  }
+}
+
+function saveRememberedRate(pumpPartyId: string, rate: string) {
+  try {
+    if (rate) window.localStorage.setItem(dieselRateStorageKey(pumpPartyId), rate);
+  } catch {
+    // per-viewer convenience only
+  }
 }
 
 export default function CarrierTripDetailPage() {
@@ -236,7 +272,7 @@ export default function CarrierTripDetailPage() {
     const amount = parseAmountExpression(draft.amount);
     if (!amount || amount <= 0) return "Enter a valid amount.";
 
-    const description = draft.isDieselLike ? buildDieselDescription(draft.pump, draft.liters, draft.note) : draft.note.trim() || undefined;
+    const description = draft.isDiesel ? buildDieselDescription(draft.pumpPartyName || "", draft.liters, draft.note) : draft.note.trim() || undefined;
     const payload: Record<string, unknown> = { lineType: draft.lineType, date, amount, description };
     if (draft.lineType === "EXPENSE_OFFICE") payload.officeAccountId = draft.officeAccountId;
     if (draft.lineType === "EXPENSE_CREDIT") payload.vendorPartyId = draft.vendorPartyId;
@@ -244,6 +280,12 @@ export default function CarrierTripDetailPage() {
       payload.expenseAccountId = draft.expenseAccountId;
     }
     if (draft.lineType === "DRIVER_SALARY") payload.employeeId = draft.employeeId;
+    if (draft.isDiesel) {
+      payload.isDiesel = true;
+      payload.liters = draft.liters.trim() ? Number(draft.liters) : undefined;
+      payload.ratePerLiter = draft.ratePerLiter.trim() ? Number(draft.ratePerLiter) : undefined;
+      payload.pumpPartyId = draft.pumpPartyId || undefined;
+    }
 
     const res = await fetch(`/api/own-carrier/${carrierId}/trips/${tripId}/lines`, {
       method: "POST",
@@ -382,9 +424,8 @@ export default function CarrierTripDetailPage() {
   // over the authoritative cashBook.rows / openingBalance /
   // closingBalance already computed server-side (lib/carrier-trip.ts's
   // getTripCashBook) - nothing here recomputes a balance. Diesel is
-  // identified by description ("Diesel - ...", the same prefix the
-  // quick-entry row always writes for a Diesel line - see
-  // buildDieselDescription below) rather than by lineType, since
+  // identified by the real isDiesel column (CarrierTripLine.isDiesel's
+  // own schema doc comment) rather than by description text, since
   // Diesel can be posted as EXPENSE_CASH/EXPENSE_OFFICE/EXPENSE_CREDIT
   // depending on payment source. "Total OUT (driver cash)" and
   // "Diesel total" are deliberately two independent, non-summing
@@ -394,8 +435,8 @@ export default function CarrierTripDetailPage() {
   // ------------------------------------------------------------
   const rows = cashBook?.rows || [];
   const inRows = useMemo(() => rows.filter((r) => r.in > 0), [rows]);
-  const dieselRows = useMemo(() => rows.filter((r) => r.out > 0 && isDieselRow(r.description)), [rows]);
-  const outRows = useMemo(() => rows.filter((r) => r.out > 0 && !isDieselRow(r.description)), [rows]);
+  const dieselRows = useMemo(() => rows.filter((r) => r.out > 0 && r.isDiesel), [rows]);
+  const outRows = useMemo(() => rows.filter((r) => r.out > 0 && !r.isDiesel), [rows]);
   const totalIn = useMemo(() => round2(inRows.reduce((s, r) => s + r.in, 0)), [inRows]);
   const totalOutDriverCash = useMemo(
     () => round2(outRows.filter((r) => r.lineType === "EXPENSE_CASH" || r.lineType === "DRIVER_SALARY" || r.lineType === "DEPOSIT_TO_OFFICE").reduce((s, r) => s + r.out, 0)),
@@ -492,6 +533,7 @@ export default function CarrierTripDetailPage() {
               setEditingLine(null);
               refresh();
             }}
+            carrierDefaults={{ defaultPumpPartyId: trip.carrier.defaultPumpPartyId, defaultPaidFrom: trip.carrier.defaultPaidFrom }}
           />
         )}
 
@@ -585,12 +627,11 @@ export default function CarrierTripDetailPage() {
                 </thead>
                 <tbody className="divide-y">
                   {dieselRows.map((row) => {
-                    const parsed = parseDieselDescription(row.description);
                     return (
                       <tr key={row.id} className="hover:bg-gray-50">
                         <td className="px-4 py-2 text-gray-600">{formatBusinessDate(row.date)}</td>
-                        <td className="px-4 py-2 text-gray-900">{parsed.pump || "—"}</td>
-                        <td className="px-4 py-2 text-right text-gray-600">{parsed.liters || "—"}</td>
+                        <td className="px-4 py-2 text-gray-900">{row.pumpPartyName || "—"}</td>
+                        <td className="px-4 py-2 text-right text-gray-600">{row.liters ?? "—"}</td>
                         <td className="px-4 py-2 text-right font-medium text-orange-700">Rs. {formatMoney(row.out)}</td>
                         <td className="px-4 py-2 text-gray-600">{paidFromLabel(row.lineType)}</td>
                         {canAct && (
@@ -642,14 +683,6 @@ function paidFromLabel(lineType: string): string {
   return "Driver Cash";
 }
 
-/** Reads back the "Diesel - {pump} - {liters}L[ - note]" shape the
- * quick-entry row always writes (see buildDieselDescription) - best-
- * effort only, falls back to blanks for a line whose description was
- * hand-edited away from that shape. */
-function parseDieselDescription(description: string): { pump: string; liters: string } {
-  const match = description.match(/^Diesel(?:\s*-\s*([^-]+?))?(?:\s*-\s*([\d.]+)\s*L)?(?:\s*-.*)?$/i);
-  return { pump: match?.[1]?.trim() || "", liters: match?.[2]?.trim() || "" };
-}
 
 function SummaryStat({ label, value, className, negative, bold }: { label: string; value: string; className?: string; negative?: boolean; bold?: boolean }) {
   return (
@@ -814,6 +847,7 @@ function QuickEntryRow({
   editingLine,
   onCancelEdit,
   onSaved,
+  carrierDefaults,
 }: {
   carrierId: string;
   tripId: string;
@@ -825,6 +859,7 @@ function QuickEntryRow({
   editingLine: CashBookRow | null;
   onCancelEdit: () => void;
   onSaved: () => void;
+  carrierDefaults: { defaultPumpPartyId: string | null; defaultPaidFrom: string | null };
 }) {
   const [quickTypeKey, setQuickTypeKey] = useState<QuickTypeKey>("WASOOLI");
   const [date, setDate] = useState(lastDate || toYMD(tripDateFrom));
@@ -834,8 +869,9 @@ function QuickEntryRow({
   const [paymentSource, setPaymentSource] = useState<PaymentSource>("DRIVER_CASH");
   const [officeAccountId, setOfficeAccountId] = useState("");
   const [vendorPartyId, setVendorPartyId] = useState("");
-  const [pump, setPump] = useState("");
+  const [pumpPartyId, setPumpPartyId] = useState("");
   const [liters, setLiters] = useState("");
+  const [ratePerLiter, setRatePerLiter] = useState("");
   const [accounts, setAccounts] = useState<AccountOption[]>([]);
   const [parties, setParties] = useState<{ id: string; partyName: string; account: { id: string } | null }[]>([]);
   const [employees, setEmployees] = useState<{ id: string; name: string; employeeCode: string }[]>([]);
@@ -889,15 +925,17 @@ function QuickEntryRow({
   const expenseAccounts = useMemo(() => accounts.filter((a) => a.accountType === "EXPENSE"), [accounts]);
   const officeAccounts = useMemo(() => accounts.filter((a) => a.accountType !== "EXPENSE" && a.accountType !== "PARTY"), [accounts]);
   const vendorParties = useMemo(() => parties.filter((p) => p.account), [parties]);
+  // Pump/vendor is purely informational (CarrierTripLine.pumpPartyId's
+  // own schema doc comment) - unlike the Udhaar vendor above, it never
+  // needs a real ledger account, so every Party is offered.
+  const pumpParties = parties;
 
   const quickType = QUICK_TYPES.find((t) => t.key === quickTypeKey)!;
 
   // Pre-fill the top row from an existing line when "Edit" is clicked
-  // on a Cash Book / Diesel row - best-effort reconstruction of which
-  // quick-type button produced it (see this module's own
-  // parseDieselDescription for the Diesel case); every OTHER field
-  // (account/vendor/employee/document id) is read directly off the
-  // line's own saved columns, never guessed.
+  // on a Cash Book / Diesel row - every field (account/vendor/
+  // employee/document id/isDiesel/liters/ratePerLiter/pumpPartyId) is
+  // read directly off the line's own saved columns, never guessed.
   useEffect(() => {
     if (!editingLine) {
       // Returning from Edit (Cancel, or after a successful save) -
@@ -931,11 +969,11 @@ function QuickEntryRow({
       setOfficeAccountId(editingLine.officeAccountId || "");
       setVendorPartyId(editingLine.vendorPartyId || "");
       setItemValue(editingLine.expenseAccountId || "");
-      if (isDieselRow(editingLine.description)) {
-        const parsed = parseDieselDescription(editingLine.description);
+      if (editingLine.isDiesel) {
         setQuickTypeKey("DIESEL");
-        setPump(parsed.pump);
-        setLiters(parsed.liters);
+        setPumpPartyId(editingLine.pumpPartyId || "");
+        setLiters(editingLine.liters != null ? String(editingLine.liters) : "");
+        setRatePerLiter(editingLine.ratePerLiter != null ? String(editingLine.ratePerLiter) : "");
         setNote("");
       } else {
         setQuickTypeKey("OTHER_EXPENSE");
@@ -948,13 +986,14 @@ function QuickEntryRow({
   function resetForFreshRow(keepType: boolean) {
     setAmount("");
     setNote("");
-    setPump("");
     setLiters("");
     if (!keepType) {
       setItemValue("");
       setPaymentSource("DRIVER_CASH");
       setOfficeAccountId("");
       setVendorPartyId("");
+      setPumpPartyId("");
+      setRatePerLiter("");
     } else {
       // Collection/office/salary Item is document/account-specific per
       // entry - always cleared; expense account + payment source are
@@ -972,21 +1011,26 @@ function QuickEntryRow({
     setQuickTypeKey(key);
     setAmount("");
     setNote("");
-    setPump("");
     setLiters("");
     setVendorPartyId("");
     setOfficeAccountId("");
     // "Remember last Paid from per type in the trip" - per quick-type,
     // not a global default, since Diesel and Toll are often paid
-    // differently.
-    let remembered: PaymentSource = "DRIVER_CASH";
+    // differently. Falls back to the carrier's own default Paid From
+    // (Carrier Settings) only for Diesel, and only when this Trip has
+    // no remembered choice yet.
+    let remembered: PaymentSource | null = null;
     try {
       const stored = window.localStorage.getItem(paidFromStorageKey(tripId, key));
       if (stored === "DRIVER_CASH" || stored === "OFFICE" || stored === "UDHAAR") remembered = stored;
     } catch {
       // per-viewer convenience only
     }
-    setPaymentSource(remembered);
+    if (!remembered && key === "DIESEL" && (carrierDefaults.defaultPaidFrom === "DRIVER_CASH" || carrierDefaults.defaultPaidFrom === "OFFICE" || carrierDefaults.defaultPaidFrom === "UDHAAR")) {
+      remembered = carrierDefaults.defaultPaidFrom;
+    }
+    setPaymentSource(remembered || "DRIVER_CASH");
+
     if (type.kind === "EXPENSE") {
       const match = type.defaultCategory
         ? expenseAccounts.find((a) => a.category === type.defaultCategory)
@@ -997,6 +1041,16 @@ function QuickEntryRow({
     } else {
       setItemValue("");
     }
+
+    if (key === "DIESEL") {
+      const pump = carrierDefaults.defaultPumpPartyId || "";
+      setPumpPartyId(pump);
+      setRatePerLiter(pump ? loadRememberedRate(pump) : "");
+    } else {
+      setPumpPartyId("");
+      setRatePerLiter("");
+    }
+
     window.setTimeout(() => itemRef.current?.focus(), 0);
   }
 
@@ -1020,8 +1074,15 @@ function QuickEntryRow({
       return;
     }
 
-    const description = quickTypeKey === "DIESEL" ? buildDieselDescription(pump, liters, note) : note.trim() || undefined;
+    const pumpPartyName = parties.find((p) => p.id === pumpPartyId)?.partyName || "";
+    const description = quickTypeKey === "DIESEL" ? buildDieselDescription(pumpPartyName, liters, note) : note.trim() || undefined;
     const payload: Record<string, unknown> = { lineType: resolvedLineType, date, amount: amt, description };
+    if (quickTypeKey === "DIESEL") {
+      payload.isDiesel = true;
+      payload.liters = liters.trim() ? Number(liters) : undefined;
+      payload.ratePerLiter = ratePerLiter.trim() ? Number(ratePerLiter) : undefined;
+      payload.pumpPartyId = pumpPartyId || undefined;
+    }
 
     if (quickType.kind === "COLLECTION") {
       const link = documents.find((d) => d.id === itemValue);
@@ -1084,6 +1145,7 @@ function QuickEntryRow({
         } catch {
           // per-viewer convenience only
         }
+        if (quickTypeKey === "DIESEL" && pumpPartyId) saveRememberedRate(pumpPartyId, ratePerLiter);
       }
       resetForFreshRow(true);
       onSaved();
@@ -1198,13 +1260,58 @@ function QuickEntryRow({
               </div>
               {quickTypeKey === "DIESEL" && (
                 <>
-                  <div className="w-36">
+                  <div className="w-40">
                     <label className="mb-1 block text-xs font-medium text-gray-600">Pump / Vendor</label>
-                    <input type="text" value={pump} onChange={(e) => setPump(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
+                    <select
+                      value={pumpPartyId}
+                      disabled={Boolean(editingLine)}
+                      onChange={(e) => {
+                        const newPump = e.target.value;
+                        setPumpPartyId(newPump);
+                        if (newPump) {
+                          const rememberedRate = loadRememberedRate(newPump);
+                          if (rememberedRate) setRatePerLiter(rememberedRate);
+                        }
+                      }}
+                      className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500 disabled:bg-gray-100"
+                    >
+                      <option value="">Select pump/vendor...</option>
+                      {pumpParties.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.partyName}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="w-20">
+                    <label className="mb-1 block text-xs font-medium text-gray-600">Liters</label>
+                    <input
+                      type="number"
+                      value={liters}
+                      onChange={(e) => {
+                        const newLiters = e.target.value;
+                        setLiters(newLiters);
+                        const rate = Number(ratePerLiter);
+                        const litersNum = Number(newLiters);
+                        if (rate > 0 && litersNum > 0) setAmount(String(round2(rate * litersNum)));
+                      }}
+                      className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
+                    />
                   </div>
                   <div className="w-24">
-                    <label className="mb-1 block text-xs font-medium text-gray-600">Liters</label>
-                    <input type="number" value={liters} onChange={(e) => setLiters(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
+                    <label className="mb-1 block text-xs font-medium text-gray-600">Rate/Liter</label>
+                    <input
+                      type="number"
+                      value={ratePerLiter}
+                      onChange={(e) => {
+                        const newRate = e.target.value;
+                        setRatePerLiter(newRate);
+                        const rate = Number(newRate);
+                        const litersNum = Number(liters);
+                        if (rate > 0 && litersNum > 0) setAmount(String(round2(rate * litersNum)));
+                      }}
+                      className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
+                    />
                   </div>
                 </>
               )}
@@ -1347,20 +1454,27 @@ function DraftsPanel({
         <div className="divide-y">
           {drafts.map((d) => (
             <div key={d.id} className="flex flex-wrap items-center gap-2 px-5 py-2.5 text-sm">
-              <span className="min-w-[160px] flex-1 font-medium text-gray-900">{itemLabel(d)}</span>
-              {d.isDieselLike && (
+              <span className="min-w-[160px] flex-1 font-medium text-gray-900">
+                {itemLabel(d)}
+                {d.isDiesel && d.pumpPartyName && <span className="ml-1 text-xs text-gray-500">({d.pumpPartyName})</span>}
+              </span>
+              {d.isDiesel && (
                 <>
-                  <input
-                    value={d.pump}
-                    onChange={(e) => onUpdate(d.id, { pump: e.target.value })}
-                    placeholder="Pump"
-                    className="w-28 rounded-md border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-blue-500"
-                  />
                   <input
                     value={d.liters}
                     onChange={(e) => onUpdate(d.id, { liters: e.target.value })}
                     placeholder="Liters"
                     className="w-20 rounded-md border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-blue-500"
+                  />
+                  <input
+                    value={d.ratePerLiter}
+                    onChange={(e) => {
+                      const rate = Number(e.target.value);
+                      const litersNum = Number(d.liters);
+                      onUpdate(d.id, { ratePerLiter: e.target.value, ...(rate > 0 && litersNum > 0 ? { amount: String(round2(rate * litersNum)) } : {}) });
+                    }}
+                    placeholder="Rate/Liter"
+                    className="w-24 rounded-md border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-blue-500"
                   />
                 </>
               )}
@@ -1579,9 +1693,15 @@ function PasteListBox({
         payload.lineType = "EXPENSE_CASH";
         payload.expenseAccountId = row.expenseAccountId;
         payload.description = buildDieselDescription(row.pump || "", row.liters || "", "");
-        // Paste-list Diesel defaults to Driver Cash - edit the row
-        // afterward (inline Edit on the Diesel box) if it was
-        // actually paid via Office/Udhaar.
+        payload.isDiesel = true;
+        if (row.liters) payload.liters = Number(row.liters);
+        // Paste-list Diesel never resolves a pumpPartyId (the grammar
+        // only captures a free-text pump name, no Party matching) -
+        // isDiesel alone is enough for the Diesel box/total to pick it
+        // up; pumpPartyId stays null, same as any other informational-
+        // only Diesel line with no linked pump Party. Defaults to
+        // Driver Cash - edit the row afterward (inline Edit on the
+        // Diesel box) if it was actually paid via Office/Udhaar.
       } else {
         if (!row.expenseAccountId) {
           failed++;
@@ -1802,8 +1922,9 @@ type ProfitReport = {
   totalBiltyRent: number;
   totalCarrierRent: number;
   totalBookingIncome: number;
-  expenses: { lineId: string; lineType: string; description: string; amount: number }[];
+  expenses: { lineId: string; lineType: string; description: string; amount: number; isDiesel: boolean }[];
   totalCarrierExpense: number;
+  totalDiesel: number;
   ownCarrierProfit: number;
 };
 
@@ -1888,13 +2009,20 @@ function ProfitReportDrawer({ carrierId, tripId, onClose }: { carrierId: string;
               <div className="space-y-1">
                 {report.expenses.map((e) => (
                   <div key={e.lineId} className="flex justify-between">
-                    <span className="text-gray-600">{e.description}</span>
+                    <span className="text-gray-600">
+                      {e.description}
+                      {e.isDiesel && <span className="ml-1 text-xs text-orange-600">(Diesel)</span>}
+                    </span>
                     <span className="font-medium">Rs. {formatMoney(e.amount)}</span>
                   </div>
                 ))}
               </div>
             )}
-            <div className="mt-2 flex justify-between border-t pt-2 font-semibold">
+            <div className="mt-2 flex justify-between text-xs text-orange-700">
+              <span>of which Diesel</span>
+              <span>Rs. {formatMoney(report.totalDiesel)}</span>
+            </div>
+            <div className="mt-1 flex justify-between border-t pt-2 font-semibold">
               <span>Total Carrier Expense</span>
               <span>Rs. {formatMoney(report.totalCarrierExpense)}</span>
             </div>

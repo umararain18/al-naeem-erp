@@ -71,7 +71,9 @@ export interface CarrierTripLineTemplate {
   employeeId: string | null;
   employeeName: string | null;
   description: string | null;
-  isDieselLike: boolean;
+  isDiesel: boolean;
+  pumpPartyId: string | null;
+  pumpPartyName: string | null;
 }
 
 /**
@@ -80,15 +82,11 @@ export interface CarrierTripLineTemplate {
  * EXPENSE_OFFICE/EXPENSE_CREDIT/DRIVER_SALARY only - COLLECTION/
  * CASH_FROM_OFFICE/DEPOSIT_TO_OFFICE are one-off cash movements, never
  * a recurring pattern worth re-offering), as pure templates: every
- * field EXCEPT amount/liters, which the UI leaves blank for the user
- * to fill. A pure read - this never creates anything; the resulting
- * draft rows this feeds are UI-only state (localStorage) until each
- * is actually saved through the normal lines POST/PATCH endpoints, so
- * they can never create a JournalEntry by themselves. isDieselLike is
- * the CURRENT description-prefix heuristic (see this module's own
- * CARRIER_TRIP_LINE_TYPES doc comments) - once CarrierTripLine gets a
- * real isDiesel column this switches to reading that instead, with no
- * change to this function's callers.
+ * field EXCEPT amount/liters/ratePerLiter, which the UI leaves blank
+ * for the user to fill. A pure read - this never creates anything;
+ * the resulting draft rows this feeds are UI-only state (localStorage)
+ * until each is actually saved through the normal lines POST/PATCH
+ * endpoints, so they can never create a JournalEntry by themselves.
  */
 export async function getPreviousTripExpenseTemplates(
   tx: Tx,
@@ -110,6 +108,7 @@ export async function getPreviousTripExpenseTemplates(
       vendorParty: { select: { partyName: true } },
       officeAccount: { select: { accountName: true } },
       employee: { select: { name: true } },
+      pumpParty: { select: { partyName: true } },
     },
   });
 
@@ -124,7 +123,9 @@ export async function getPreviousTripExpenseTemplates(
     employeeId: l.employeeId,
     employeeName: l.employee?.name || null,
     description: l.description,
-    isDieselLike: (l.description || "").trim().toLowerCase().startsWith("diesel"),
+    isDiesel: l.isDiesel,
+    pumpPartyId: l.pumpPartyId,
+    pumpPartyName: l.pumpParty?.partyName || null,
   }));
 
   return { previousTripId: previousTrip.id, previousTripNo: previousTrip.tripNo, templates };
@@ -396,7 +397,27 @@ export interface PostSimpleInput {
   createdById: string;
 }
 
-export interface PostExpenseInput extends PostSimpleInput {
+/** Meaningful only when isDiesel is true - see CarrierTripLine.isDiesel's
+ * own schema doc comment for why these are independent of the
+ * existing vendorPartyId/description fields. */
+export interface DieselFields {
+  isDiesel?: boolean;
+  liters?: number | null;
+  ratePerLiter?: number | null;
+  pumpPartyId?: string | null;
+}
+
+function dieselLineData(input: DieselFields): Pick<Prisma.CarrierTripLineUncheckedCreateInput, "isDiesel" | "liters" | "ratePerLiter" | "pumpPartyId"> {
+  if (!input.isDiesel) return {};
+  return {
+    isDiesel: true,
+    liters: input.liters ?? null,
+    ratePerLiter: input.ratePerLiter ?? null,
+    pumpPartyId: input.pumpPartyId || null,
+  };
+}
+
+export interface PostExpenseInput extends PostSimpleInput, DieselFields {
   expenseAccountId: string;
 }
 
@@ -583,7 +604,7 @@ export async function postExpenseCashLine(tx: Tx, input: PostExpenseInput) {
         { accountId: driverCashId, debit: 0, credit: input.amount },
       ],
     },
-    { lineType: "EXPENSE_CASH", date: input.date, description, amount: input.amount, expenseAccountId: input.expenseAccountId }
+    { lineType: "EXPENSE_CASH", date: input.date, description, amount: input.amount, expenseAccountId: input.expenseAccountId, ...dieselLineData(input) }
   );
 }
 
@@ -623,7 +644,7 @@ export async function postExpenseOfficeLine(tx: Tx, input: PostExpenseInput & { 
         { accountId: input.officeAccountId, debit: 0, credit: input.amount },
       ],
     },
-    { lineType: "EXPENSE_OFFICE", date: input.date, description, amount: input.amount, expenseAccountId: input.expenseAccountId, officeAccountId: input.officeAccountId }
+    { lineType: "EXPENSE_OFFICE", date: input.date, description, amount: input.amount, expenseAccountId: input.expenseAccountId, officeAccountId: input.officeAccountId, ...dieselLineData(input) }
   );
 }
 
@@ -667,6 +688,7 @@ export async function postExpenseCreditLine(tx: Tx, input: PostExpenseCreditInpu
       amount: input.amount,
       expenseAccountId: input.expenseAccountId,
       vendorPartyId: input.vendorPartyId,
+      ...dieselLineData(input),
     }
   );
 }
@@ -746,6 +768,16 @@ export type TripLineType = (typeof TRIP_LINE_TYPES)[number];
  * (or an existing line's own saved fields, re-shaped the same way) -
  * only the fields relevant to `lineType` are read from it.
  */
+function dieselFieldsFromRawInput(rawInput: Record<string, unknown>): DieselFields {
+  if (!rawInput.isDiesel) return {};
+  return {
+    isDiesel: true,
+    liters: rawInput.liters != null ? Number(rawInput.liters) : null,
+    ratePerLiter: rawInput.ratePerLiter != null ? Number(rawInput.ratePerLiter) : null,
+    pumpPartyId: (rawInput.pumpPartyId as string) || null,
+  };
+}
+
 export async function postTripLineByType(
   tx: Tx,
   lineType: TripLineType,
@@ -773,15 +805,15 @@ export async function postTripLineByType(
       return postDepositToOfficeLine(tx, { ...base, officeAccountId: rawInput.officeAccountId as string });
     case "EXPENSE_CASH":
       if (!rawInput.expenseAccountId) throw new CarrierTripError("MISSING_ACCOUNT", "Expense account is required.");
-      return postExpenseCashLine(tx, { ...base, expenseAccountId: rawInput.expenseAccountId as string });
+      return postExpenseCashLine(tx, { ...base, expenseAccountId: rawInput.expenseAccountId as string, ...dieselFieldsFromRawInput(rawInput) });
     case "EXPENSE_OFFICE":
       if (!rawInput.expenseAccountId) throw new CarrierTripError("MISSING_ACCOUNT", "Expense account is required.");
       if (!rawInput.officeAccountId) throw new CarrierTripError("MISSING_ACCOUNT", "Office account is required.");
-      return postExpenseOfficeLine(tx, { ...base, expenseAccountId: rawInput.expenseAccountId as string, officeAccountId: rawInput.officeAccountId as string });
+      return postExpenseOfficeLine(tx, { ...base, expenseAccountId: rawInput.expenseAccountId as string, officeAccountId: rawInput.officeAccountId as string, ...dieselFieldsFromRawInput(rawInput) });
     case "EXPENSE_CREDIT":
       if (!rawInput.expenseAccountId) throw new CarrierTripError("MISSING_ACCOUNT", "Expense account is required.");
       if (!rawInput.vendorPartyId) throw new CarrierTripError("MISSING_VENDOR", "Vendor party is required for a credit expense.");
-      return postExpenseCreditLine(tx, { ...base, expenseAccountId: rawInput.expenseAccountId as string, vendorPartyId: rawInput.vendorPartyId as string });
+      return postExpenseCreditLine(tx, { ...base, expenseAccountId: rawInput.expenseAccountId as string, vendorPartyId: rawInput.vendorPartyId as string, ...dieselFieldsFromRawInput(rawInput) });
     case "DRIVER_SALARY":
       if (!rawInput.employeeId) throw new CarrierTripError("MISSING_EMPLOYEE", "Employee is required for a salary line.");
       return postDriverSalaryLine(tx, { ...base, employeeId: rawInput.employeeId as string });
@@ -1139,6 +1171,15 @@ export interface TripCashBookRow {
   officeAccountId: string | null;
   vendorPartyId: string | null;
   employeeId: string | null;
+  // Diesel structured fields (CarrierTripLine.isDiesel's own schema
+  // doc comment) - isDiesel is the real flag the Diesel box/total and
+  // the Profit Report filter by, never a "Diesel - ..." description
+  // prefix.
+  isDiesel: boolean;
+  liters: number | null;
+  ratePerLiter: number | null;
+  pumpPartyId: string | null;
+  pumpPartyName: string | null;
 }
 
 /** EXPENSE_CREDIT/EXPENSE_OFFICE never move Driver Cash (neither is a
@@ -1176,6 +1217,7 @@ export async function getTripCashBook(tx: Tx, tripId: string): Promise<{ opening
   const lines = await tx.carrierTripLine.findMany({
     where: { tripId, isDeleted: false },
     orderBy: [{ date: "asc" }, { createdAt: "asc" }],
+    include: { pumpParty: { select: { partyName: true } } },
   });
 
   const openingBalance = await getTripOpeningBalance(tx, tripId, driverCashAccountId);
@@ -1199,6 +1241,11 @@ export async function getTripCashBook(tx: Tx, tripId: string): Promise<{ opening
       officeAccountId: l.officeAccountId,
       vendorPartyId: l.vendorPartyId,
       employeeId: l.employeeId,
+      isDiesel: l.isDiesel,
+      liters: l.liters != null ? Number(l.liters) : null,
+      ratePerLiter: l.ratePerLiter != null ? Number(l.ratePerLiter) : null,
+      pumpPartyId: l.pumpPartyId,
+      pumpPartyName: l.pumpParty?.partyName || null,
     };
   });
 
@@ -1222,8 +1269,11 @@ export interface TripProfitReport {
    * it was paid through) + every other EXPENSE_CASH/EXPENSE_OFFICE/
    * EXPENSE_CREDIT + DRIVER_SALARY line - every real cost of running
    * the Trip, regardless of payment source. */
-  expenses: { lineId: string; lineType: string; description: string; amount: number }[];
+  expenses: { lineId: string; lineType: string; description: string; amount: number; isDiesel: boolean }[];
   totalCarrierExpense: number;
+  /** The isDiesel subset of totalCarrierExpense - see CarrierTripLine.
+   * isDiesel's own schema doc comment. Never description-text based. */
+  totalDiesel: number;
   /** Carrier Rent - Carrier Expense (NOT the same as totalBookingIncome
    * - that is ANC's own booking income, unrelated to this carrier's
    * own profit on the trip it ran). */
@@ -1282,12 +1332,13 @@ export async function getTripProfitReport(tx: Tx, tripId: string): Promise<TripP
     }
   }
 
-  const expenses = lines.map((l) => ({ lineId: l.id, lineType: l.lineType, description: l.description || l.lineType, amount: round2(Number(l.amount)) }));
+  const expenses = lines.map((l) => ({ lineId: l.id, lineType: l.lineType, description: l.description || l.lineType, amount: round2(Number(l.amount)), isDiesel: l.isDiesel }));
 
   const totalBiltyRent = round2(challanIncome.reduce((s, c) => s + c.biltyRent, 0));
   const totalCarrierRent = round2(challanIncome.reduce((s, c) => s + c.carrierRent, 0));
   const totalBookingIncome = round2(challanIncome.reduce((s, c) => s + c.bookingIncome, 0));
   const totalCarrierExpense = round2(expenses.reduce((s, e) => s + e.amount, 0));
+  const totalDiesel = round2(expenses.filter((e) => e.isDiesel).reduce((s, e) => s + e.amount, 0));
 
   return {
     previousBalance,
@@ -1298,6 +1349,7 @@ export async function getTripProfitReport(tx: Tx, tripId: string): Promise<TripP
     totalBookingIncome,
     expenses,
     totalCarrierExpense,
+    totalDiesel,
     ownCarrierProfit: round2(totalCarrierRent - totalCarrierExpense),
   };
 }
