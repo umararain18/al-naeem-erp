@@ -1205,8 +1205,12 @@ export interface TripCashBookRow {
 /** EXPENSE_CREDIT/EXPENSE_OFFICE never move Driver Cash (neither is a
  * cash event for THIS account - Udhaar to a Vendor, or a direct office
  * account payment) - shown in the Out column for visibility, same as
- * the approved UI sketch, but excluded from the running balance. */
-function cashDelta(lineType: string, amount: number): number {
+ * the approved UI sketch, but excluded from the running balance.
+ * Exported so lib/carrier-trip-summary.ts's own computeTripSummaryBar
+ * (the Trip page's summary bar) can be tested directly against this,
+ * the real source of truth, rather than a second reimplementation
+ * that could silently drift from it. */
+export function cashDelta(lineType: string, amount: number): number {
   if (lineType === "COLLECTION" || lineType === "CASH_FROM_OFFICE") return amount;
   if (lineType === "EXPENSE_CASH" || lineType === "DRIVER_SALARY" || lineType === "DEPOSIT_TO_OFFICE") return -amount;
   return 0; // EXPENSE_CREDIT / EXPENSE_OFFICE

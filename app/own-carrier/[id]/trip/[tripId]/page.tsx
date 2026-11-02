@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import { formatBusinessDate } from "@/lib/date-range";
+import { computeTripSummaryBar } from "@/lib/carrier-trip-summary";
 
 function formatMoney(value: number) {
   return new Intl.NumberFormat("en-PK", { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(Math.abs(value));
@@ -450,22 +451,28 @@ export default function CarrierTripDetailPage() {
   // identified by the real isDiesel column (CarrierTripLine.isDiesel's
   // own schema doc comment) rather than by description text, since
   // Diesel can be posted as EXPENSE_CASH/EXPENSE_OFFICE/EXPENSE_CREDIT
-  // depending on payment source. "Total OUT (driver cash)" and
-  // "Diesel total" are deliberately two independent, non-summing
-  // subtotals (a driver-cash-paid Diesel line counts in Diesel total,
-  // NOT in Total OUT (driver cash) - it is still correctly reflected
-  // in Remaining With Driver via the authoritative closingBalance).
+  // depending on payment source.
+  //
+  // INVARIANT (also covered by lib/carrier-trip-summary.test.ts):
+  // Previous Balance + Total IN - Total OUT (Driver Cash) must
+  // always equal Remaining With Driver - the same
+  // identity cashDelta()/getTripOpeningBalance() already enforce
+  // server-side. That means Total OUT (Driver Cash) MUST include a
+  // Diesel line that was actually paid from Driver Cash (EXPENSE_CASH
+  // + isDiesel) - excluding it (as a previous version of this file
+  // did) silently broke the displayed arithmetic even though the real
+  // closingBalance was always correct. "of which Diesel" is shown as
+  // a breakdown UNDER the Total OUT stat so the Diesel-specific total
+  // (all payment sources - driver cash, office, Udhaar) can still be
+  // seen on its own via the separate "Diesel Total" stat, without
+  // double-subtracting it.
   // ------------------------------------------------------------
   const rows = cashBook?.rows || [];
   const inRows = useMemo(() => rows.filter((r) => r.in > 0), [rows]);
   const dieselRows = useMemo(() => rows.filter((r) => r.out > 0 && r.isDiesel), [rows]);
   const outRows = useMemo(() => rows.filter((r) => r.out > 0 && !r.isDiesel), [rows]);
-  const totalIn = useMemo(() => round2(inRows.reduce((s, r) => s + r.in, 0)), [inRows]);
-  const totalOutDriverCash = useMemo(
-    () => round2(outRows.filter((r) => r.lineType === "EXPENSE_CASH" || r.lineType === "DRIVER_SALARY" || r.lineType === "DEPOSIT_TO_OFFICE").reduce((s, r) => s + r.out, 0)),
-    [outRows]
-  );
-  const dieselTotal = useMemo(() => round2(dieselRows.reduce((s, r) => s + r.out, 0)), [dieselRows]);
+  const summaryBar = useMemo(() => computeTripSummaryBar(rows), [rows]);
+  const { totalIn, totalOutDriverCash, dieselByDriverCash, dieselTotal } = summaryBar;
 
   if (loading) {
     return <div className="min-h-screen bg-gray-50 p-6 text-sm text-gray-500">Loading...</div>;
@@ -607,7 +614,12 @@ export default function CarrierTripDetailPage() {
         <div className="mb-6 grid grid-cols-2 gap-3 rounded-xl border bg-white p-4 shadow-sm sm:grid-cols-5">
           <SummaryStat label="Previous Balance" value={formatSignedMoney(cashBook?.openingBalance || 0)} negative={(cashBook?.openingBalance || 0) < 0} />
           <SummaryStat label="Total IN" value={`Rs. ${formatMoney(totalIn)}`} className="text-green-700" />
-          <SummaryStat label="Total OUT (Driver Cash)" value={`Rs. ${formatMoney(totalOutDriverCash)}`} className="text-red-700" />
+          <SummaryStat
+            label="Total OUT (Driver Cash)"
+            value={`Rs. ${formatMoney(totalOutDriverCash)}`}
+            className="text-red-700"
+            subLabel={dieselByDriverCash > 0 ? `incl. Diesel ${formatMoney(dieselByDriverCash)}` : undefined}
+          />
           <SummaryStat label="Diesel Total" value={`Rs. ${formatMoney(dieselTotal)}`} className="text-orange-700" />
           <SummaryStat label="Remaining With Driver" value={formatSignedMoney(cashBook?.closingBalance || 0)} negative={(cashBook?.closingBalance || 0) < 0} bold />
         </div>
@@ -713,11 +725,26 @@ function paidFromLabel(lineType: string): string {
 }
 
 
-function SummaryStat({ label, value, className, negative, bold }: { label: string; value: string; className?: string; negative?: boolean; bold?: boolean }) {
+function SummaryStat({
+  label,
+  value,
+  className,
+  negative,
+  bold,
+  subLabel,
+}: {
+  label: string;
+  value: string;
+  className?: string;
+  negative?: boolean;
+  bold?: boolean;
+  subLabel?: string;
+}) {
   return (
     <div>
       <p className="text-xs text-gray-500">{label}</p>
       <p className={`${bold ? "text-lg" : "text-base"} font-semibold ${negative ? "text-red-700" : className || "text-gray-900"}`}>{value}</p>
+      {subLabel && <p className="text-[11px] text-gray-500">{subLabel}</p>}
     </div>
   );
 }
