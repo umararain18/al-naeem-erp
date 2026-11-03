@@ -851,6 +851,7 @@ export async function PATCH(
           challanId: id,
           challanNo: existingChallan.challanNo,
           challanLoadingDate: effectiveLoadingDate,
+          documentDate: effectiveLoadingDate,
           biltyId: "",
           biltyNo: "",
           incomeOrExpenseAccountId: carrierRentExpenseAccountId!,

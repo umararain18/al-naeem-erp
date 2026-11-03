@@ -374,12 +374,19 @@ interface ApplyCorrectionParams {
   challanId: string;
   challanNo: string;
   // Settlement posting date = Challan date - used ONLY for the
-  // already-settled branch's SETTLEMENT_CORRECTION entry below; the
-  // not-yet-settled branch's CHALLAN_DISPATCH_CORRECTION/
-  // BILTY_BOOKING_CORRECTION keeps today's date (it is correcting a
-  // booking/dispatch entry, not a settlement one, regardless of
-  // whether this Challan happens to have a loadingDate at all).
+  // already-settled branch's SETTLEMENT_CORRECTION entry below.
   challanLoadingDate: Date;
+  // The ORIGINAL document's own date - used ONLY for the not-yet-
+  // settled branch's CHALLAN_DISPATCH_CORRECTION/BILTY_BOOKING_
+  // CORRECTION entry below, so a correction always posts on the date
+  // of the booking/dispatch it is correcting, never on today's date
+  // (the date the edit happened to be made). The caller passes the
+  // Bilty's own date for COLLECTION/COMMISSION, the Challan's own
+  // loadingDate for CARRIER_RENT - whichever is the CURRENT (possibly
+  // just-edited) date of the document actually being corrected, per
+  // the "if the document's own date is edited, new corrections use
+  // the new date" rule.
+  documentDate: Date;
   biltyId: string;
   biltyNo: string;
   /** Booking Income account (COLLECTION) or the relevant Expense account (CARRIER_RENT / COMMISSION). */
@@ -416,6 +423,7 @@ export async function applySettlementCorrection(params: ApplyCorrectionParams): 
     challanId,
     challanNo,
     challanLoadingDate,
+    documentDate,
     biltyId,
     biltyNo,
     incomeOrExpenseAccountId,
@@ -447,7 +455,7 @@ export async function applySettlementCorrection(params: ApplyCorrectionParams): 
 
     await tx.journalEntry.create({
       data: {
-        entryDate: new Date(),
+        entryDate: documentDate,
         referenceType:
           component === "CARRIER_RENT" ? "CHALLAN_DISPATCH_CORRECTION" : "BILTY_BOOKING_CORRECTION",
         referenceId: sourceId,
