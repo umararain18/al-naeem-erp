@@ -105,14 +105,29 @@ async function main() {
   const needsUnsettle: { challanNo: string }[] = [];
   const needsManualReview: { challanNo: string; blockers: string[] }[] = [];
   const noTargetCarrier: { challanNo: string }[] = [];
+  const keptActiveSettlementPayments: { challanNo: string; count: number }[] = [];
 
   let totalCarrierRentBefore = 0;
   let totalBookingIncomeBefore = 0;
+  let totalAncPartyBalanceBefore = 0;
 
+  console.log(`\nPer-Challan detail:\n`);
   for (const m of matches) {
     const impact = await computeConversionImpact(prisma, m.challanId);
     totalCarrierRentBefore += impact.totalCarrierRentToReverse;
     totalBookingIncomeBefore += impact.totalBookingIncomeToReverse;
+    totalAncPartyBalanceBefore += impact.ancPartyNetBalanceBefore ?? 0;
+
+    console.log(`--- ${m.challanNo} -> ${m.targetCarrierNumber ?? "(no matching Own Carrier)"} ---`);
+    console.log(`  Current Carrier Rent: Rs. ${impact.challanCarrierRentField.toLocaleString()} (signed net to reverse: Rs. ${impact.totalCarrierRentToReverse.toLocaleString()})`);
+    console.log(`  Current Booking Income: Rs. ${impact.totalBookingIncomeToReverse.toLocaleString()}`);
+    if (impact.ancPartyNetBalanceBefore !== null) {
+      console.log(`  Al Naeem Cargo party balance - before: Rs. ${impact.ancPartyNetBalanceBefore.toLocaleString()}, after: Rs. ${(impact.ancPartyNetBalanceAfter ?? 0).toLocaleString()}`);
+    }
+    if (impact.activeSettlementPaymentCount > 0) {
+      keptActiveSettlementPayments.push({ challanNo: m.challanNo, count: impact.activeSettlementPaymentCount });
+      console.log(`  Active Daily Posting payment rows: ${impact.activeSettlementPaymentCount} (kept - real receipts, unaffected by this conversion)`);
+    }
 
     if (!m.targetOwnCarrierId) {
       noTargetCarrier.push({ challanNo: m.challanNo });
@@ -129,10 +144,14 @@ async function main() {
     eligible.push(m);
   }
 
-  console.log(`Matched ${matches.length} legacy Challan(s). Eligible now: ${eligible.length}.`);
-  console.log(`\nBEFORE:`);
-  console.log(`  Total Carrier Rent expense/payable currently posted for these Challans: Rs. ${totalCarrierRentBefore.toLocaleString()}`);
-  console.log(`  Total Bilty rent currently recognized as Booking Income for these Challans: Rs. ${totalBookingIncomeBefore.toLocaleString()}`);
+  console.log(`\nMatched ${matches.length} legacy Challan(s). Eligible now: ${eligible.length}.`);
+  console.log(`\nBEFORE (across all matched Challans):`);
+  console.log(`  Total Carrier Rent expense/payable currently posted: Rs. ${totalCarrierRentBefore.toLocaleString()}`);
+  console.log(`  Total Bilty rent currently recognized as Booking Income: Rs. ${totalBookingIncomeBefore.toLocaleString()}`);
+  console.log(`  Total Al Naeem Cargo party balance from these Challans: Rs. ${totalAncPartyBalanceBefore.toLocaleString()}`);
+  if (keptActiveSettlementPayments.length > 0) {
+    console.log(`  Active Daily Posting payment rows kept (unaffected): ${keptActiveSettlementPayments.map((c) => `${c.challanNo} (${c.count})`).join(", ")}`);
+  }
 
   if (noTargetCarrier.length > 0) {
     console.log(`\nNo matching active Own Carrier found (carrierNumber not registered yet) - skipped: ${noTargetCarrier.map((c) => c.challanNo).join(", ")}`);
@@ -188,6 +207,7 @@ async function main() {
   console.log(`  Converted: ${convertedCount}/${eligible.length}`);
   console.log(`  Total Carrier Rent expense/payable reversed: Rs. ${totalCarrierRentReversed.toLocaleString()}`);
   console.log(`  Total Booking Income reversed back to Unearned Revenue: Rs. ${totalBookingIncomeReversed.toLocaleString()}`);
+  console.log(`  Al Naeem Cargo party balance for each converted Challan: Rs. 0`);
 
   await prisma.$disconnect();
 }

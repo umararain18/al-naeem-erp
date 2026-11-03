@@ -84,17 +84,19 @@ async function main() {
     console.log(`--- Challan ${c.challanNo} (${c.id}) ---`);
     console.log(`  Date: ${c.loadingDate.toISOString().slice(0, 10)} | Status: ${impact.status} | Settled: ${impact.isSettled}`);
     console.log(`  Transporter: ${c.transporterParty?.partyName ?? "-"} | carrierNumber field: ${c.carrierNumber ?? "-"}`);
-    console.log(`  Bilty rent (Booking Income to reverse): Rs. ${impact.totalBookingIncomeToReverse.toLocaleString()}`);
-    for (const b of impact.bilties) {
-      console.log(`    - Bilty ${b.biltyNo}: total Rs. ${b.total.toLocaleString()}, currently in Booking Income Rs. ${b.currentBookingIncomeNet.toLocaleString()}${b.needsManualReview ? " [MISMATCH]" : ""}`);
-    }
-    console.log(`  Carrier Rent to reverse: Rs. ${impact.totalCarrierRentToReverse.toLocaleString()}`);
+    console.log(`  Current Carrier Rent (Challan.carrierRent field): Rs. ${impact.challanCarrierRentField.toLocaleString()}`);
+    console.log(`  Carrier Rent to reverse (signed net of every live entry below): Rs. ${impact.totalCarrierRentToReverse.toLocaleString()}`);
     for (const e of impact.carrierRentEntries) {
-      console.log(`    - ${e.referenceType} (${e.journalEntryId}): Rs. ${e.amount.toLocaleString()} dated ${e.entryDate.toISOString().slice(0, 10)}`);
+      console.log(`    - ${e.referenceType} (${e.journalEntryId}): ${e.amount >= 0 ? "+" : ""}Rs. ${e.amount.toLocaleString()} dated ${e.entryDate.toISOString().slice(0, 10)}`);
     }
-    console.log(`  Settlement entries present: ${impact.settlementEntriesPresent} | Active Daily Posting payment rows: ${impact.activeSettlementPaymentCount}`);
-    if (impact.ancPartyNetBalance !== null) {
-      console.log(`  ${c.transporterParty?.partyName ?? "Party"} net balance impact from this Challan's settlement: Rs. ${impact.ancPartyNetBalance.toLocaleString()}`);
+    console.log(`  Current Booking Income (total to reverse): Rs. ${impact.totalBookingIncomeToReverse.toLocaleString()}`);
+    for (const b of impact.bilties) {
+      console.log(`    - Bilty ${b.biltyNo}: total Rs. ${b.total.toLocaleString()}, currently in Booking Income Rs. ${b.currentBookingIncomeNet.toLocaleString()}${b.needsManualReview ? " [NEEDS MANUAL REVIEW]" : ""} (from ${b.sourceEntries.length} source entry/entries)`);
+    }
+    console.log(`  Settlement entries present: ${impact.settlementEntriesPresent}`);
+    console.log(`  Active Daily Posting payment rows: ${impact.activeSettlementPaymentCount}${impact.activeSettlementPaymentCount > 0 ? " (kept - real receipts, unaffected by this conversion)" : ""}`);
+    if (impact.ancPartyNetBalanceBefore !== null) {
+      console.log(`  ${c.transporterParty?.partyName ?? "Party"} balance from this Challan - before: Rs. ${impact.ancPartyNetBalanceBefore.toLocaleString()}, after conversion: Rs. ${(impact.ancPartyNetBalanceAfter ?? 0).toLocaleString()}`);
     }
     if (impact.blockers.length > 0) {
       console.log(`  BLOCKED: ${impact.blockers.join(" | ")}`);
