@@ -1,4 +1,5 @@
 import type { Prisma, PrismaClient } from "@prisma/client";
+import { formatBusinessDate } from "@/lib/date-range";
 
 // ============================================================
 // SHOWROOM PHONCH / DELIVERY - accounting + validation
@@ -372,8 +373,19 @@ export async function assertPhonchEditNotBelowSettled(
   if (!transporterAccountId) return;
   const state = await getPhonchPaymentState(tx, phonchId, transporterAccountId, currentTotalAmount);
   if (round2(newTotalAmount) < state.receivedAmount - EPS) {
+    const latest = await tx.journalLine.findFirst({
+      where: {
+        accountId: transporterAccountId,
+        sourceType: "PHONCH",
+        sourceId: phonchId,
+        journalEntry: { referenceType: "DAILY_POSTING", isDeleted: false },
+      },
+      orderBy: { journalEntry: { entryDate: "desc" } },
+      select: { journalEntry: { select: { entryDate: true } } },
+    });
+    const dateText = latest ? ` (Daily Posting ${formatBusinessDate(latest.journalEntry.entryDate)})` : "";
     throw new PhonchValidationError(
-      `Amount cannot be less than the amount already received: ${formatRs(state.receivedAmount)}.`
+      `Is Phonch ki ${formatRs(state.receivedAmount)} payment pehle ho chuki hai${dateText} — receivable is se kam nahi ho sakta.`
     );
   }
 }

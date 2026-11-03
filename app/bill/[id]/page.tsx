@@ -293,6 +293,7 @@ export default function BillDetailPage({ params }: { params: Promise<{ id: strin
                       sourceType: i.sourceLink.sourceType,
                       privatePhonchVehicleId: i.sourceLink.privatePhonchVehicleId,
                       phonchVehicleId: i.sourceLink.phonchVehicleId,
+                      phonchNo: sourcePhonchRef(i)?.phonchNo || null,
                     }
                   : null,
               })),

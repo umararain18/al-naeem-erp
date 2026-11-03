@@ -1,4 +1,6 @@
 import type { Prisma, PrismaClient } from "@prisma/client";
+import { formatBusinessDate, toBusinessDateInputValue } from "@/lib/date-range";
+import { getPrivatePhonchCarrierRentExpenseAccountId, getPrivatePhonchDeliveryIncomeAccountId } from "@/lib/gross-accounts";
 
 // ============================================================
 // PRIVATE PHONCH - accounting + validation
@@ -588,6 +590,30 @@ export async function getPrivatePhonchAlreadySettledAmount(
   return Math.max(0, round2(debit - credit));
 }
 
+// Most recent Daily Posting entry date that touched this
+// (phonchId, accountId) pair - surfaced in the "cannot reduce below
+// already settled" error below so the user knows exactly which
+// payment is blocking the edit (business date, never a timestamp -
+// see formatBusinessDate's own doc comment).
+async function getPrivatePhonchLatestDailyPostingDate(tx: Tx, phonchId: string, accountId: string): Promise<Date | null> {
+  const latest = await tx.journalLine.findFirst({
+    where: {
+      accountId,
+      sourceType: "PRIVATE_PHONCH",
+      sourceId: phonchId,
+      journalEntry: { referenceType: "DAILY_POSTING", isDeleted: false },
+    },
+    orderBy: { journalEntry: { entryDate: "desc" } },
+    select: { journalEntry: { select: { entryDate: true } } },
+  });
+  return latest?.journalEntry.entryDate ?? null;
+}
+
+function formatAlreadySettledMessage(amount: number, date: Date | null, fieldLabel: string): string {
+  const dateText = date ? ` (Daily Posting ${formatBusinessDate(date)})` : "";
+  return `Is Private Phonch ki ${formatRs(amount)} payment pehle ho chuki hai${dateText} — ${fieldLabel} is se kam nahi ho sakta.`;
+}
+
 /**
  * Validates a Private Phonch EDIT's new financial amounts against
  * what has already been settled via Daily Posting, independently per
@@ -614,16 +640,14 @@ export async function assertPrivatePhonchEditNotBelowSettled(
   if (transporterAccountId) {
     const carrierAlreadyPaid = await getPrivatePhonchAlreadySettledAmount(tx, phonchId, transporterAccountId, "CARRIER_PAYABLE");
     if (round2(resolved.totalCarrierPayable) < carrierAlreadyPaid - EPS) {
-      throw new PrivatePhonchValidationError(
-        `Cannot reduce Carrier Payable below the amount already paid. ${formatRs(carrierAlreadyPaid)} has already been paid.`
-      );
+      const date = await getPrivatePhonchLatestDailyPostingDate(tx, phonchId, transporterAccountId);
+      throw new PrivatePhonchValidationError(formatAlreadySettledMessage(carrierAlreadyPaid, date, "Carrier Payable"));
     }
 
     const recoveryAlreadyReceived = await getPrivatePhonchAlreadySettledAmount(tx, phonchId, transporterAccountId, "DELIVERY_RECOVERY");
     if (round2(resolved.totalTransporterDeliveryRecovery) < recoveryAlreadyReceived - EPS) {
-      throw new PrivatePhonchValidationError(
-        `Cannot reduce Delivery Recovery below the amount already received. ${formatRs(recoveryAlreadyReceived)} has already been received.`
-      );
+      const date = await getPrivatePhonchLatestDailyPostingDate(tx, phonchId, transporterAccountId);
+      throw new PrivatePhonchValidationError(formatAlreadySettledMessage(recoveryAlreadyReceived, date, "Delivery Recovery"));
     }
   }
 
@@ -684,25 +708,29 @@ export async function assertPrivatePhonchEditNotBelowSettled(
     if (round2(newPayableAmount) < alreadyPaid - EPS) {
       // Fully reassigned away (no vehicle attributes anything to this
       // account anymore) reads as a party-change rejection in plain
-      // language; still reduced-but-present reads as the existing,
-      // more generic amount-reduction message - same underlying rule
-      // either way, just the clearer wording for the reassignment case
-      // this task specifically asked for.
-      throw new PrivatePhonchValidationError(
-        newPayableAmount <= EPS
-          ? `${partyName} ko is phonch ki payment ho chuki hai - pehle wo payment Daily Posting se hatayein, phir agent badlein.`
-          : `Cannot reduce Clearing Agent Payable below the amount already paid. ${formatRs(alreadyPaid)} has already been paid.`
-      );
+      // language; still reduced-but-present reads as the generic
+      // amount-reduction message (with the Daily Posting date) - same
+      // underlying rule either way, just the clearer wording for the
+      // reassignment case this task specifically asked for.
+      if (newPayableAmount <= EPS) {
+        throw new PrivatePhonchValidationError(
+          `${partyName} ko is phonch ki payment ho chuki hai - pehle wo payment Daily Posting se hatayein, phir agent badlein.`
+        );
+      }
+      const date = await getPrivatePhonchLatestDailyPostingDate(tx, phonchId, accountId);
+      throw new PrivatePhonchValidationError(formatAlreadySettledMessage(alreadyPaid, date, "CA Payable"));
     }
 
     const alreadyRecovered = await getPrivatePhonchAlreadySettledAmount(tx, phonchId, accountId, "DELIVERY_RECOVERY");
     const newRecoveryAmount = newCaRecoveryByAccountId.get(accountId) || 0;
     if (round2(newRecoveryAmount) < alreadyRecovered - EPS) {
-      throw new PrivatePhonchValidationError(
-        newRecoveryAmount <= EPS
-          ? `${partyName} ko is phonch ki payment ho chuki hai - pehle wo payment Daily Posting se hatayein, phir agent badlein.`
-          : `Cannot reduce Delivery Recovery below the amount already received. ${formatRs(alreadyRecovered)} has already been received.`
-      );
+      if (newRecoveryAmount <= EPS) {
+        throw new PrivatePhonchValidationError(
+          `${partyName} ko is phonch ki payment ho chuki hai - pehle wo payment Daily Posting se hatayein, phir agent badlein.`
+        );
+      }
+      const date = await getPrivatePhonchLatestDailyPostingDate(tx, phonchId, accountId);
+      throw new PrivatePhonchValidationError(formatAlreadySettledMessage(alreadyRecovered, date, "Delivery Recovery"));
     }
   }
 }
@@ -851,4 +879,224 @@ export async function assertPrivatePhonchPaymentNotExceeded(
       `This payment of ${round2(amount)} would exceed this account's remaining payable (${state.remainingDue}) on this Private Phonch. Payable = ${state.totalPayable}, already paid = ${state.paidAmount}.`
     );
   }
+}
+
+// ------------------------------------------------------------
+// BILL BOOK CONFLICT CHECK - a vehicle row that has already been
+// billed (see schema's BillSourceLink, onDelete: Restrict) can never
+// have its Total Rent/Delivery Charges edited here directly UNLESS
+// the linked Bill's own line has ALREADY been updated to the exact
+// same new values (i.e. the Bill was edited first - see
+// app/bill/[id]/route.ts's own sync, or a plain manual Bill edit).
+// Comparing against the Bill's CURRENT live value (never the Private
+// Phonch's own stale pre-edit value) is what lets a legitimate
+// Bill-first edit through while still rejecting a Private-Phonch-only
+// change that would silently desync the two documents.
+// ------------------------------------------------------------
+
+export function assertBilledVehicleAmountMatchesBill(params: {
+  lineNo: number;
+  newTotalRent: number;
+  newDeliveryCharges: number;
+  billNo: string;
+  billLineNo: number;
+  billRent: number;
+  billDelivery: number;
+}): void {
+  const rentMatches = Math.abs(params.billRent - params.newTotalRent) <= EPS;
+  const deliveryMatches = Math.abs(params.billDelivery - params.newDeliveryCharges) <= EPS;
+  if (rentMatches && deliveryMatches) return;
+  throw new PrivatePhonchValidationError(
+    `Vehicle line ${params.lineNo}: Bill ${params.billNo} line ${params.billLineNo} still shows Rent ${formatRs(params.billRent)} / Delivery ${formatRs(
+      params.billDelivery
+    )}. Edit the Bill first to Rent ${formatRs(params.newTotalRent)} / Delivery ${formatRs(params.newDeliveryCharges)}, then retry.`
+  );
+}
+
+// ------------------------------------------------------------
+// BILL BOOK SYNC - a Bill line sourced from a Private Phonch vehicle
+// can, with the user's confirmation (see app/bill/[id]/route.ts's
+// PATCH handler), push its own edited Rent/Delivery straight onto
+// that vehicle in THE SAME transaction as the Bill's own update,
+// instead of making the user separately open and re-save the Private
+// Phonch. Reuses the exact same validation/posting formulas as the
+// Private Phonch PATCH route's own "no party identity changed" path
+// (resolve -> assertPrivatePhonchEditNotBelowSettled -> replace-on-
+// edit the JournalEntry) - a Bill sync never touches Transporter/
+// Clearing Agent identity, only this one vehicle's own Total Rent/
+// Delivery Charges, so that branch alone is always the correct one
+// here. Posted dated the Private Phonch's OWN date (never the Bill's,
+// never today) - same "correction uses the original document's own
+// date" principle already applied everywhere else in this ERP.
+// ------------------------------------------------------------
+
+export async function syncPrivatePhonchVehicleAmountsFromBill(
+  tx: Tx,
+  params: {
+    phonchVehicleId: string;
+    newTotalRent: number;
+    newDeliveryCharges: number;
+    userId: string;
+  }
+): Promise<{ phonchId: string; phonchNo: string; lineNo: number }> {
+  const phonch = await tx.privatePhonch.findFirst({
+    where: { vehicles: { some: { id: params.phonchVehicleId } } },
+    include: {
+      vehicles: true,
+      transporterParty: { select: { partyName: true, isActive: true, account: { select: { id: true, isActive: true } } } },
+    },
+  });
+  if (!phonch) {
+    throw new PrivatePhonchValidationError("Linked Private Phonch vehicle was not found");
+  }
+  if (phonch.isDeleted) {
+    throw new PrivatePhonchValidationError(`Private Phonch ${phonch.phonchNo} is in the Bin - restore it first.`);
+  }
+  const targetVehicle = phonch.vehicles.find((v) => v.id === params.phonchVehicleId)!;
+
+  if (!phonch.transporterParty.isActive || !phonch.transporterParty.account || !phonch.transporterParty.account.isActive) {
+    throw new PrivatePhonchValidationError("This Private Phonch's Transporter does not have an active account");
+  }
+  const transporterAccountId = phonch.transporterParty.account.id;
+
+  const caPartyIds = [...new Set(phonch.vehicles.map((v) => v.clearingAgentPartyId).filter((pid): pid is string => !!pid))];
+  const caParties = caPartyIds.length
+    ? await tx.party.findMany({
+        where: { id: { in: caPartyIds } },
+        select: { id: true, partyName: true, isActive: true, account: { select: { id: true, isActive: true } } },
+      })
+    : [];
+  for (const ca of caParties) {
+    if (!ca.isActive || !ca.account || !ca.account.isActive) {
+      throw new PrivatePhonchValidationError(`Clearing Agent "${ca.partyName}" does not have an active account`);
+    }
+  }
+  const caById = new Map(caParties.map((ca) => [ca.id, ca]));
+  const caAccountIdByPartyId = new Map(caParties.filter((ca) => ca.account).map((ca) => [ca.id, ca.account!.id]));
+
+  const vehiclesInput: PrivatePhonchVehicleInput[] = phonch.vehicles.map((v) => ({
+    biltyNo: v.biltyNo || undefined,
+    challanNo: v.challanNo || undefined,
+    chassisNumber: v.chassisNumber || undefined,
+    engineNumber: v.engineNumber || undefined,
+    vehicleName: v.vehicleName || undefined,
+    clearingAgentPartyId: v.clearingAgentPartyId || undefined,
+    totalRent: v.id === params.phonchVehicleId ? params.newTotalRent : Number(v.totalRent),
+    deliveryCharges: v.id === params.phonchVehicleId ? params.newDeliveryCharges : Number(v.deliveryCharges),
+    carrierPayable: Number(v.carrierPayable),
+    deliveryRecoveryParty: (v.deliveryRecoveryParty as PrivatePhonchDeliveryRecoveryParty | null) || undefined,
+    note: v.note || undefined,
+  }));
+
+  const resolved = resolvePrivatePhonchInput({
+    phonchNo: phonch.phonchNo,
+    date: toBusinessDateInputValue(phonch.date),
+    transporterPartyId: phonch.transporterPartyId,
+    vehicles: vehiclesInput,
+  });
+
+  await assertPrivatePhonchEditNotBelowSettled(tx, phonch.id, transporterAccountId, resolved, caAccountIdByPartyId);
+
+  await tx.privatePhonchVehicle.update({
+    where: { id: params.phonchVehicleId },
+    data: { totalRent: params.newTotalRent, deliveryCharges: params.newDeliveryCharges },
+  });
+
+  const carrierRentExpenseId = await getPrivatePhonchCarrierRentExpenseAccountId(tx);
+  const transporterDescription = buildPrivatePhonchTransporterDescription({ phonchNo: resolved.phonchNo }, resolved.vehicles, resolved.totalCarrierPayable);
+
+  const caPayableByPartyId = new Map<string, number>();
+  for (const v of resolved.vehicles) {
+    if (!v.clearingAgentPartyId || v.caPayable <= 0) continue;
+    caPayableByPartyId.set(v.clearingAgentPartyId, round2((caPayableByPartyId.get(v.clearingAgentPartyId) || 0) + v.caPayable));
+  }
+
+  await tx.journalEntry.updateMany({
+    where: { referenceType: "PRIVATE_PHONCH", referenceId: phonch.id, isDeleted: false },
+    data: { isDeleted: true, deletedAt: new Date(), deletedById: params.userId },
+  });
+
+  const lines: { accountId: string; debit: number; credit: number; description: string; sourceType: string; sourceId: string; sourceNumber: string }[] = [];
+
+  if (resolved.totalRent > 0) {
+    lines.push({
+      accountId: carrierRentExpenseId,
+      debit: resolved.totalRent,
+      credit: 0,
+      description: transporterDescription,
+      sourceType: "PRIVATE_PHONCH",
+      sourceId: phonch.id,
+      sourceNumber: resolved.phonchNo,
+    });
+  }
+  if (resolved.totalCarrierPayable > 0) {
+    lines.push({
+      accountId: transporterAccountId,
+      debit: 0,
+      credit: resolved.totalCarrierPayable,
+      description: transporterDescription,
+      sourceType: "PRIVATE_PHONCH",
+      sourceId: phonch.id,
+      sourceNumber: resolved.phonchNo,
+    });
+  }
+  if (resolved.totalTransporterDeliveryRecovery > 0) {
+    lines.push({
+      accountId: transporterAccountId,
+      debit: resolved.totalTransporterDeliveryRecovery,
+      credit: 0,
+      description: `Private Phonch ${resolved.phonchNo} - Transporter Delivery Recovery`,
+      sourceType: "PRIVATE_PHONCH",
+      sourceId: phonch.id,
+      sourceNumber: resolved.phonchNo,
+    });
+  }
+  for (const [caPartyId, amount] of resolved.caDeliveryRecoveryByPartyId) {
+    if (amount <= 0) continue;
+    const ca = caById.get(caPartyId)!;
+    lines.push({
+      accountId: ca.account!.id,
+      debit: amount,
+      credit: 0,
+      description: `Private Phonch ${resolved.phonchNo} - Clearing Agent Delivery Recovery (${ca.partyName})`,
+      sourceType: "PRIVATE_PHONCH",
+      sourceId: phonch.id,
+      sourceNumber: resolved.phonchNo,
+    });
+  }
+  for (const [caPartyId, amount] of caPayableByPartyId) {
+    const ca = caById.get(caPartyId)!;
+    const description = buildPrivatePhonchClearingAgentDescription(
+      { phonchNo: resolved.phonchNo },
+      resolved.vehicles.filter((v) => v.clearingAgentPartyId === caPartyId),
+      ca.partyName,
+      amount
+    );
+    lines.push({ accountId: ca.account!.id, debit: 0, credit: amount, description, sourceType: "PRIVATE_PHONCH", sourceId: phonch.id, sourceNumber: resolved.phonchNo });
+  }
+  if (resolved.totalDeliveryCharges > 0) {
+    const deliveryIncomeId = await getPrivatePhonchDeliveryIncomeAccountId(tx);
+    lines.push({
+      accountId: deliveryIncomeId,
+      debit: 0,
+      credit: resolved.totalDeliveryCharges,
+      description: `Private Phonch ${resolved.phonchNo} - Delivery Charges`,
+      sourceType: "PRIVATE_PHONCH",
+      sourceId: phonch.id,
+      sourceNumber: resolved.phonchNo,
+    });
+  }
+
+  await tx.journalEntry.create({
+    data: {
+      entryDate: resolved.date,
+      referenceType: "PRIVATE_PHONCH",
+      referenceId: phonch.id,
+      description: transporterDescription,
+      createdById: params.userId,
+      lines: { create: lines },
+    },
+  });
+
+  return { phonchId: phonch.id, phonchNo: phonch.phonchNo, lineNo: targetVehicle.lineNo };
 }

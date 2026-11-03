@@ -11,6 +11,7 @@ import {
   getPrivatePhonchDeliveryRecoveryState,
   getPrivatePhonchAlreadySettledAmount,
   assertPrivatePhonchEditNotBelowSettled,
+  assertBilledVehicleAmountMatchesBill,
   derivePrivatePhonchOverallStatus,
   PrivatePhonchValidationError,
   type PrivatePhonchInput,
@@ -481,7 +482,16 @@ export async function PATCH(
           // ----------------------------------------------------------
           const existingVehicleRows = await tx.privatePhonchVehicle.findMany({
             where: { phonchId: id },
-            select: { id: true, lineNo: true, totalRent: true, deliveryCharges: true, billSourceLinks: { select: { id: true } } },
+            select: {
+              id: true,
+              lineNo: true,
+              totalRent: true,
+              deliveryCharges: true,
+              billSourceLinks: {
+                where: { bill: { isDeleted: false } },
+                select: { billItem: { select: { rent: true, delivery: true, lineNo: true } }, bill: { select: { billNo: true } } },
+              },
+            },
           });
           const billedLineNos = new Set(existingVehicleRows.filter((v) => v.billSourceLinks.length > 0).map((v) => v.lineNo));
           for (const lineNo of billedLineNos) {
@@ -495,22 +505,33 @@ export async function PATCH(
             // source vehicle ONLY at the moment the Bill is created -
             // from then on they are independently stored, raw inputs
             // (see BillItem's own schema doc comment) that never
-            // re-sync with this vehicle. Changing Total Rent/Delivery
-            // Charges here after billing would silently leave the Bill
-            // showing stale figures with no way to tell - confirmed
-            // live (edited a billed vehicle's rent 6000 -> 8500, the
-            // linked Bill item stayed at 6000). Reject instead; Carrier
-            // Payable and Clearing Agent are Private-Phonch-only
-            // concepts BillItem has no field for at all, so they are
-            // never blocked here.
+            // re-sync with this vehicle on their own. Changing Total
+            // Rent/Delivery Charges here after billing is allowed ONLY
+            // when the linked Bill's own line has ALREADY been edited
+            // to the exact same new values (Bill-first workflow, or
+            // the Bill's own "sync" - see app/api/bill/[id]/route.ts) -
+            // comparing against the Bill's CURRENT live value (never
+            // this vehicle's own stale pre-edit value), so a stale
+            // desync between the two documents is always caught, named
+            // exactly (which Bill/line/values), while a legitimate
+            // Bill-first edit goes through. Carrier Payable and
+            // Clearing Agent are Private-Phonch-only concepts BillItem
+            // has no field for at all, so they are never blocked here.
             const existingRow = existingVehicleRows.find((ev) => ev.lineNo === lineNo)!;
-            if (
+            const rentOrDeliveryChanged =
               Math.abs(Number(existingRow.totalRent) - newVehicle.totalRent) > 0.009 ||
-              Math.abs(Number(existingRow.deliveryCharges) - newVehicle.deliveryCharges) > 0.009
-            ) {
-              throw new PrivatePhonchValidationError(
-                "Is gaadi ka Bill ban chuka hai - pehle Bill edit karein."
-              );
+              Math.abs(Number(existingRow.deliveryCharges) - newVehicle.deliveryCharges) > 0.009;
+            if (rentOrDeliveryChanged) {
+              const link = existingRow.billSourceLinks[0];
+              assertBilledVehicleAmountMatchesBill({
+                lineNo,
+                newTotalRent: newVehicle.totalRent,
+                newDeliveryCharges: newVehicle.deliveryCharges,
+                billNo: link.bill.billNo,
+                billLineNo: link.billItem.lineNo,
+                billRent: Number(link.billItem.rent),
+                billDelivery: Number(link.billItem.delivery),
+              });
             }
           }
 

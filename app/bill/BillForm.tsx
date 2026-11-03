@@ -106,7 +106,14 @@ type VehicleRow = {
   rent: string;
   delivery: string;
   otherExpense: string;
-  source: { sourceType: SourceType; privatePhonchVehicleId?: string; phonchVehicleId?: string } | null;
+  source: { sourceType: SourceType; privatePhonchVehicleId?: string; phonchVehicleId?: string; phonchNo?: string } | null;
+  // Set only for a row loaded from an existing Bill (edit mode) -
+  // the Rent/Delivery it had BEFORE this edit, used purely to detect
+  // whether a sourced line's amount actually changed (to offer the
+  // Private Phonch sync prompt on submit). Undefined for a brand-new
+  // row, which therefore never triggers that prompt.
+  originalRent?: number;
+  originalDelivery?: number;
 };
 
 function emptyVehicleRow(key: number): VehicleRow {
@@ -147,6 +154,11 @@ export type BillFormInitialItem = {
     sourceType: SourceType;
     privatePhonchVehicleId: string | null;
     phonchVehicleId: string | null;
+    // Only ever populated for PRIVATE_PHONCH - used purely to name the
+    // document in the "also update linked Private Phonch?" sync
+    // prompt on submit (see handleSubmit below). Never sent back to
+    // the server.
+    phonchNo?: string | null;
   } | null;
 };
 
@@ -209,8 +221,11 @@ export default function BillForm({
               sourceType: item.sourceLink.sourceType,
               privatePhonchVehicleId: item.sourceLink.privatePhonchVehicleId || undefined,
               phonchVehicleId: item.sourceLink.phonchVehicleId || undefined,
+              phonchNo: item.sourceLink.phonchNo || undefined,
             }
           : null,
+        originalRent: Number(item.rent) || 0,
+        originalDelivery: Number(item.delivery) || 0,
       }))
     : [emptyVehicleRow(0)];
 
@@ -395,6 +410,35 @@ export default function BillForm({
       return;
     }
 
+    // A sourced Private Phonch line whose Rent/Delivery actually
+    // changed from what the Bill originally had - offer to push that
+    // same new value onto the linked Private Phonch vehicle in one
+    // transaction, rather than silently leaving the two documents out
+    // of sync (the Private Phonch edit screen would otherwise reject
+    // the same change until the Bill is edited first - see
+    // app/api/private-phonch/[id]/route.ts's own Bill-conflict check).
+    const syncCandidates = vehicles.filter((v) => {
+      if (v.source?.sourceType !== "PRIVATE_PHONCH" || !v.source.privatePhonchVehicleId) return false;
+      if (v.originalRent === undefined || v.originalDelivery === undefined) return false;
+      const newRent = Number(v.rent) || 0;
+      const newDelivery = Number(v.delivery) || 0;
+      return Math.abs(newRent - v.originalRent) > 0.009 || Math.abs(newDelivery - v.originalDelivery) > 0.009;
+    });
+
+    let syncPrivatePhonchVehicles: { privatePhonchVehicleId: string; totalRent: number; deliveryCharges: number }[] | undefined;
+    if (syncCandidates.length > 0) {
+      const summary = syncCandidates
+        .map((v) => `${v.source!.phonchNo || "its Private Phonch"} (Rent ${v.originalRent} → ${Number(v.rent) || 0}, Delivery ${v.originalDelivery} → ${Number(v.delivery) || 0})`)
+        .join("\n");
+      if (window.confirm(`Also update the linked Private Phonch?\n\n${summary}`)) {
+        syncPrivatePhonchVehicles = syncCandidates.map((v) => ({
+          privatePhonchVehicleId: v.source!.privatePhonchVehicleId!,
+          totalRent: Number(v.rent) || 0,
+          deliveryCharges: Number(v.delivery) || 0,
+        }));
+      }
+    }
+
     setSaving(true);
     try {
       const payload = {
@@ -416,6 +460,7 @@ export default function BillForm({
           otherExpense: Number(v.otherExpense) || 0,
           source: v.source || undefined,
         })),
+        ...(syncPrivatePhonchVehicles ? { syncPrivatePhonchVehicles } : {}),
       };
 
       const response = await fetch(mode === "create" ? "/api/bill" : `/api/bill/${billId}`, {

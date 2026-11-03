@@ -13,6 +13,7 @@ import {
   type BillInput,
 } from "@/lib/bill-accounting";
 import { getBillIncomeAccountId, getBillWalkInReceivableAccountId } from "@/lib/gross-accounts";
+import { syncPrivatePhonchVehicleAmountsFromBill, PrivatePhonchValidationError } from "@/lib/private-phonch-accounting";
 import { auditUpdate, auditDelete, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 
 export async function GET(
@@ -119,7 +120,19 @@ export async function PATCH(
     }
 
     const body = await request.json();
-    const data = body as BillInput & { clientPartyId?: string };
+    const data = body as BillInput & {
+      clientPartyId?: string;
+      // User-confirmed cross-document sync (see this file's module doc
+      // comment below the PATCH handler, and
+      // lib/private-phonch-accounting.ts's syncPrivatePhonchVehicleAmountsFromBill) -
+      // pushes this Bill's own edited Rent/Delivery for a
+      // Private-Phonch-sourced line straight onto that vehicle, in the
+      // SAME transaction as this Bill's own update, so the two
+      // documents never go out of sync. Never inferred automatically -
+      // only ever present when the user explicitly confirmed it in
+      // the Bill edit form.
+      syncPrivatePhonchVehicles?: { privatePhonchVehicleId: string; totalRent: number; deliveryCharges: number }[];
+    };
 
     let resolved;
     try {
@@ -284,6 +297,26 @@ export async function PATCH(
             });
           }
 
+          // ------------------------------------------------------------
+          // PRIVATE PHONCH SYNC - user-confirmed only (see this file's
+          // module doc comment above). Runs in THIS SAME transaction so
+          // the Bill and its linked Private Phonch vehicle can never
+          // end up saved out of sync with each other. Dated the
+          // Private Phonch's own date (handled inside
+          // syncPrivatePhonchVehicleAmountsFromBill itself), never this
+          // Bill's date.
+          // ------------------------------------------------------------
+          if (data.syncPrivatePhonchVehicles?.length) {
+            for (const sync of data.syncPrivatePhonchVehicles) {
+              await syncPrivatePhonchVehicleAmountsFromBill(tx, {
+                phonchVehicleId: sync.privatePhonchVehicleId,
+                newTotalRent: Number(sync.totalRent) || 0,
+                newDeliveryCharges: Number(sync.deliveryCharges) || 0,
+                userId: currentUser.userId,
+              });
+            }
+          }
+
           // Replace-on-edit: soft-delete the old JournalEntry, post a
           // fresh one with the new totals - never mutate history in
           // place, mirroring every other module's own edit behavior.
@@ -352,6 +385,9 @@ export async function PATCH(
       return NextResponse.json({ success: true, message: "Bill updated successfully." });
     } catch (error) {
       if (error instanceof BillValidationError) {
+        return NextResponse.json({ success: false, message: error.message }, { status: error.status });
+      }
+      if (error instanceof PrivatePhonchValidationError) {
         return NextResponse.json({ success: false, message: error.message }, { status: error.status });
       }
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2034") {
