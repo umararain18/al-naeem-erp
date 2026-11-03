@@ -11,7 +11,6 @@ import {
   getPrivatePhonchDeliveryRecoveryState,
   getPrivatePhonchAlreadySettledAmount,
   assertPrivatePhonchEditNotBelowSettled,
-  assertBilledVehicleAmountMatchesBill,
   derivePrivatePhonchOverallStatus,
   PrivatePhonchValidationError,
   type PrivatePhonchInput,
@@ -485,12 +484,7 @@ export async function PATCH(
             select: {
               id: true,
               lineNo: true,
-              totalRent: true,
-              deliveryCharges: true,
-              billSourceLinks: {
-                where: { bill: { isDeleted: false } },
-                select: { billItem: { select: { rent: true, delivery: true, lineNo: true } }, bill: { select: { billNo: true } } },
-              },
+              billSourceLinks: { select: { id: true } },
             },
           });
           const billedLineNos = new Set(existingVehicleRows.filter((v) => v.billSourceLinks.length > 0).map((v) => v.lineNo));
@@ -503,36 +497,15 @@ export async function PATCH(
             }
             // Bill Book auto-populates BillItem.rent/delivery from the
             // source vehicle ONLY at the moment the Bill is created -
-            // from then on they are independently stored, raw inputs
-            // (see BillItem's own schema doc comment) that never
-            // re-sync with this vehicle on their own. Changing Total
-            // Rent/Delivery Charges here after billing is allowed ONLY
-            // when the linked Bill's own line has ALREADY been edited
-            // to the exact same new values (Bill-first workflow, or
-            // the Bill's own "sync" - see app/api/bill/[id]/route.ts) -
-            // comparing against the Bill's CURRENT live value (never
-            // this vehicle's own stale pre-edit value), so a stale
-            // desync between the two documents is always caught, named
-            // exactly (which Bill/line/values), while a legitimate
-            // Bill-first edit goes through. Carrier Payable and
-            // Clearing Agent are Private-Phonch-only concepts BillItem
-            // has no field for at all, so they are never blocked here.
-            const existingRow = existingVehicleRows.find((ev) => ev.lineNo === lineNo)!;
-            const rentOrDeliveryChanged =
-              Math.abs(Number(existingRow.totalRent) - newVehicle.totalRent) > 0.009 ||
-              Math.abs(Number(existingRow.deliveryCharges) - newVehicle.deliveryCharges) > 0.009;
-            if (rentOrDeliveryChanged) {
-              const link = existingRow.billSourceLinks[0];
-              assertBilledVehicleAmountMatchesBill({
-                lineNo,
-                newTotalRent: newVehicle.totalRent,
-                newDeliveryCharges: newVehicle.deliveryCharges,
-                billNo: link.bill.billNo,
-                billLineNo: link.billItem.lineNo,
-                billRent: Number(link.billItem.rent),
-                billDelivery: Number(link.billItem.delivery),
-              });
-            }
+            // from then on the two documents are fully INDEPENDENT:
+            // Bill Rent is what's charged to the client, Private
+            // Phonch Rent is what's owed to the Transporter/Clearing
+            // Agent, and they can legitimately differ. Editing this
+            // vehicle's Total Rent/Delivery Charges here never checks,
+            // blocks on, or touches the linked Bill in any way - the
+            // only edit protections left are the paid-amount floor
+            // (assertPrivatePhonchEditNotBelowSettled below) and this
+            // loop's own removal guard above.
           }
 
           await tx.privatePhonchVehicle.deleteMany({ where: { phonchId: id, billSourceLinks: { none: {} } } });

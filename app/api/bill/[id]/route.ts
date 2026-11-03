@@ -122,15 +122,17 @@ export async function PATCH(
     const body = await request.json();
     const data = body as BillInput & {
       clientPartyId?: string;
-      // User-confirmed cross-document sync (see this file's module doc
-      // comment below the PATCH handler, and
-      // lib/private-phonch-accounting.ts's syncPrivatePhonchVehicleAmountsFromBill) -
-      // pushes this Bill's own edited Rent/Delivery for a
-      // Private-Phonch-sourced line straight onto that vehicle, in the
-      // SAME transaction as this Bill's own update, so the two
-      // documents never go out of sync. Never inferred automatically -
-      // only ever present when the user explicitly confirmed it in
-      // the Bill edit form.
+      // OPT-IN ONLY cross-document sync (see this file's own comment
+      // below the PATCH handler, and
+      // lib/private-phonch-accounting.ts's syncPrivatePhonchVehicleAmountsFromBill's
+      // own doc comment) - Bill Rent and Private Phonch Rent are
+      // independent documents that can legitimately differ, so a Bill
+      // edit NEVER touches the Private Phonch on its own. Present only
+      // when the user explicitly ticked the "Same amount Private
+      // Phonch mein bhi lagayein" checkbox on the Bill edit form
+      // (unchecked by default) - then pushes this Bill's own edited
+      // Rent/Delivery for a Private-Phonch-sourced line onto that same
+      // vehicle, in the SAME transaction as this Bill's own update.
       syncPrivatePhonchVehicles?: { privatePhonchVehicleId: string; totalRent: number; deliveryCharges: number }[];
     };
 
@@ -298,10 +300,12 @@ export async function PATCH(
           }
 
           // ------------------------------------------------------------
-          // PRIVATE PHONCH SYNC - user-confirmed only (see this file's
-          // module doc comment above). Runs in THIS SAME transaction so
-          // the Bill and its linked Private Phonch vehicle can never
-          // end up saved out of sync with each other. Dated the
+          // PRIVATE PHONCH SYNC - opt-in checkbox only (see this file's
+          // own comment above). Bill Rent and Private Phonch Rent are
+          // otherwise fully independent - this never runs unless the
+          // user explicitly asked for it. Runs in THIS SAME transaction
+          // so the Bill and the Private Phonch vehicle it pushes to can
+          // never end up saved out of sync with each other. Dated the
           // Private Phonch's own date (handled inside
           // syncPrivatePhonchVehicleAmountsFromBill itself), never this
           // Bill's date.

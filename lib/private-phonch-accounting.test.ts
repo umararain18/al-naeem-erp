@@ -1,57 +1,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import {
-  assertBilledVehicleAmountMatchesBill,
-  syncPrivatePhonchVehicleAmountsFromBill,
-  PrivatePhonchValidationError,
-} from "./private-phonch-accounting";
+import { syncPrivatePhonchVehicleAmountsFromBill, PrivatePhonchValidationError } from "./private-phonch-accounting";
 import { parseISODateStart } from "./date-range";
 
 // ------------------------------------------------------------
-// Fix #1 - app/api/private-phonch/[id]/route.ts's Bill-conflict
-// check. Pure function: no DB access, so a plain unit test.
-// ------------------------------------------------------------
-
-test("assertBilledVehicleAmountMatchesBill allows the edit when the Bill line already has the new values (Bill edited first)", () => {
-  assertBilledVehicleAmountMatchesBill({
-    lineNo: 1,
-    newTotalRent: 18000,
-    newDeliveryCharges: 500,
-    billNo: "4404",
-    billLineNo: 1,
-    billRent: 18000,
-    billDelivery: 500,
-  });
-  // no throw = pass
-});
-
-test("assertBilledVehicleAmountMatchesBill blocks with the exact Bill/line/values when they differ", () => {
-  assert.throws(
-    () =>
-      assertBilledVehicleAmountMatchesBill({
-        lineNo: 1,
-        newTotalRent: 18000,
-        newDeliveryCharges: 500,
-        billNo: "4404",
-        billLineNo: 1,
-        billRent: 20000,
-        billDelivery: 500,
-      }),
-    (error: unknown) => {
-      assert.ok(error instanceof PrivatePhonchValidationError);
-      assert.equal(
-        (error as PrivatePhonchValidationError).message,
-        "Vehicle line 1: Bill 4404 line 1 still shows Rent Rs. 20,000 / Delivery Rs. 500. Edit the Bill first to Rent Rs. 18,000 / Delivery Rs. 500, then retry."
-      );
-      return true;
-    }
-  );
-});
-
-// ------------------------------------------------------------
-// Fix #2 - syncPrivatePhonchVehicleAmountsFromBill(), called from
-// app/api/bill/[id]/route.ts's PATCH handler when the user confirms
-// "also update linked Private Phonch?". Exact production scenario:
+// syncPrivatePhonchVehicleAmountsFromBill() - called from
+// app/api/bill/[id]/route.ts's PATCH handler ONLY when the user
+// explicitly ticks the opt-in "Same amount Private Phonch mein bhi
+// lagayein" checkbox (unchecked by default - a Bill edit never
+// touches the Private Phonch on its own; Bill Rent and Private
+// Phonch Rent are independent documents). Exact production scenario:
 // Private Phonch 6996 (18-10-2026, Transporter Haji Cargo, vehicle
 // Suzuki APV chassis 103022), Clearing Agent Mardan Cargo Tarnol
 // already paid Rs. 17,500 via Daily Posting. Rent 20,000 -> 18,000

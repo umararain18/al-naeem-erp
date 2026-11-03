@@ -882,52 +882,28 @@ export async function assertPrivatePhonchPaymentNotExceeded(
 }
 
 // ------------------------------------------------------------
-// BILL BOOK CONFLICT CHECK - a vehicle row that has already been
-// billed (see schema's BillSourceLink, onDelete: Restrict) can never
-// have its Total Rent/Delivery Charges edited here directly UNLESS
-// the linked Bill's own line has ALREADY been updated to the exact
-// same new values (i.e. the Bill was edited first - see
-// app/bill/[id]/route.ts's own sync, or a plain manual Bill edit).
-// Comparing against the Bill's CURRENT live value (never the Private
-// Phonch's own stale pre-edit value) is what lets a legitimate
-// Bill-first edit through while still rejecting a Private-Phonch-only
-// change that would silently desync the two documents.
-// ------------------------------------------------------------
-
-export function assertBilledVehicleAmountMatchesBill(params: {
-  lineNo: number;
-  newTotalRent: number;
-  newDeliveryCharges: number;
-  billNo: string;
-  billLineNo: number;
-  billRent: number;
-  billDelivery: number;
-}): void {
-  const rentMatches = Math.abs(params.billRent - params.newTotalRent) <= EPS;
-  const deliveryMatches = Math.abs(params.billDelivery - params.newDeliveryCharges) <= EPS;
-  if (rentMatches && deliveryMatches) return;
-  throw new PrivatePhonchValidationError(
-    `Vehicle line ${params.lineNo}: Bill ${params.billNo} line ${params.billLineNo} still shows Rent ${formatRs(params.billRent)} / Delivery ${formatRs(
-      params.billDelivery
-    )}. Edit the Bill first to Rent ${formatRs(params.newTotalRent)} / Delivery ${formatRs(params.newDeliveryCharges)}, then retry.`
-  );
-}
-
-// ------------------------------------------------------------
-// BILL BOOK SYNC - a Bill line sourced from a Private Phonch vehicle
-// can, with the user's confirmation (see app/bill/[id]/route.ts's
-// PATCH handler), push its own edited Rent/Delivery straight onto
-// that vehicle in THE SAME transaction as the Bill's own update,
-// instead of making the user separately open and re-save the Private
-// Phonch. Reuses the exact same validation/posting formulas as the
-// Private Phonch PATCH route's own "no party identity changed" path
-// (resolve -> assertPrivatePhonchEditNotBelowSettled -> replace-on-
-// edit the JournalEntry) - a Bill sync never touches Transporter/
-// Clearing Agent identity, only this one vehicle's own Total Rent/
-// Delivery Charges, so that branch alone is always the correct one
-// here. Posted dated the Private Phonch's OWN date (never the Bill's,
-// never today) - same "correction uses the original document's own
-// date" principle already applied everywhere else in this ERP.
+// BILL BOOK SYNC - OPT-IN ONLY. Bill Rent (charged to the client) and
+// Private Phonch Rent (owed to the Transporter/Clearing Agent) are
+// independent documents that can legitimately differ - a Bill edit
+// never touches the Private Phonch on its own. This is called ONLY
+// when the user explicitly ticks the "Same amount Private Phonch mein
+// bhi lagayein" checkbox on the Bill edit form (unchecked by default -
+// see app/bill/BillForm.tsx and app/api/bill/[id]/route.ts's PATCH
+// handler), to push that SAME new Rent/Delivery onto the linked
+// vehicle in THE SAME transaction as the Bill's own update, instead of
+// making the user separately open and re-save the Private Phonch.
+// Reuses the exact same validation/posting formulas as the Private
+// Phonch PATCH route's own "no party identity changed" path (resolve
+// -> assertPrivatePhonchEditNotBelowSettled -> replace-on-edit the
+// JournalEntry) - a Bill sync never touches Transporter/Clearing Agent
+// identity, only this one vehicle's own Total Rent/Delivery Charges,
+// so that branch alone is always the correct one here. Posted dated
+// the Private Phonch's OWN date (never the Bill's, never today) - same
+// "correction uses the original document's own date" principle already
+// applied everywhere else in this ERP. Posts only to the Private
+// Phonch's own Carrier Rent/Transporter/Clearing Agent/Delivery Income
+// accounts - never to the Bill's own client/income accounts, so the
+// two documents' accounting never cross-posts.
 // ------------------------------------------------------------
 
 export async function syncPrivatePhonchVehicleAmountsFromBill(
