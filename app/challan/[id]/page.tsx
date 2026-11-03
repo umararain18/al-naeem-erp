@@ -614,6 +614,14 @@ export default function ChallanDetailPage({
   // only used to decide whether to show the button at all.
   const [currentUserRole, setCurrentUserRole] = useState<"SUPER_ADMIN" | "MANAGER" | "VIEWER" | null>(null);
 
+  // Convert (legacy) Transporter-dispatched Challan to Own Carrier -
+  // SUPER_ADMIN only, same backend gate as Unsettle. See
+  // lib/challan-own-carrier-conversion.ts for the accounting this
+  // reverses.
+  const [showConvertPicker, setShowConvertPicker] = useState(false);
+  const [ownCarrierOptions, setOwnCarrierOptions] = useState<{ id: string; carrierNumber: string }[]>([]);
+  const [convertCarrierId, setConvertCarrierId] = useState("");
+
   useEffect(() => {
     async function loadCurrentUser() {
       try {
@@ -956,6 +964,56 @@ export default function ChallanDetailPage({
     }
   }
 
+  async function openConvertPicker() {
+    setError("");
+    try {
+      const response = await fetch("/api/own-carrier");
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        setError(data.message || "Unable to load Own Carriers");
+        return;
+      }
+      setOwnCarrierOptions(
+        (data.items || []).filter((c: { isActive: boolean }) => c.isActive)
+      );
+      setConvertCarrierId("");
+      setShowConvertPicker(true);
+    } catch {
+      setError("Unable to connect to the server");
+    }
+  }
+
+  async function convertToOwnCarrier() {
+    if (!challan || !convertCarrierId) return;
+    const carrier = ownCarrierOptions.find((c) => c.id === convertCarrierId);
+    const confirmed = window.confirm(
+      `Convert Challan ${challan.challanNo} from Transporter ${challan.transporterParty?.partyName ?? ""} to Own Carrier ${carrier?.carrierNumber ?? ""}? This reverses its dispatch revenue recognition and Carrier Rent expense/payable via new, dated reversing entries.`
+    );
+    if (!confirmed) return;
+
+    setActionLoading("convertToOwnCarrier");
+    setError("");
+
+    try {
+      const response = await fetch(`/api/challan/${challan.id}/convert-to-own-carrier`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirmation: "CONVERT_TO_OWN_CARRIER", ownCarrierId: convertCarrierId }),
+      });
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        setError(data.message || "Unable to convert challan to own carrier");
+        return;
+      }
+      setShowConvertPicker(false);
+      await loadChallan();
+    } catch {
+      setError("Unable to connect to the server");
+    } finally {
+      setActionLoading(null);
+    }
+  }
+
   async function cancelChallan() {
     if (!challan) return;
     const confirmed = window.confirm(`Cancel challan ${challan.challanNo}?`);
@@ -1175,6 +1233,51 @@ export default function ChallanDetailPage({
                   <p className="mt-1 inline-block rounded-full bg-amber-100 px-2.5 py-0.5 text-xs font-medium text-amber-700">
                     Income pending (Trip slip not closed)
                   </p>
+                )}
+                {!challan.ownCarrier && challan.transporterParty && currentUserRole === "SUPER_ADMIN" && (
+                  <div className="mt-2">
+                    {challan.isSettled ? (
+                      <p className="text-xs text-gray-500">Settled - Unsettle first to convert to Own Carrier.</p>
+                    ) : !showConvertPicker ? (
+                      <button
+                        type="button"
+                        onClick={openConvertPicker}
+                        className="border border-blue-300 text-blue-700 rounded-full px-3 py-1 text-xs font-semibold hover:bg-blue-50"
+                      >
+                        Convert to Own Carrier
+                      </button>
+                    ) : (
+                      <div className="flex items-center gap-2">
+                        <select
+                          value={convertCarrierId}
+                          onChange={(e) => setConvertCarrierId(e.target.value)}
+                          className="rounded-lg border border-gray-300 px-2 py-1 text-xs outline-none focus:border-blue-500"
+                        >
+                          <option value="">Select Own Carrier...</option>
+                          {ownCarrierOptions.map((c) => (
+                            <option key={c.id} value={c.id}>
+                              {c.carrierNumber}
+                            </option>
+                          ))}
+                        </select>
+                        <button
+                          type="button"
+                          onClick={convertToOwnCarrier}
+                          disabled={!convertCarrierId || actionLoading === "convertToOwnCarrier"}
+                          className="border border-blue-300 text-blue-700 rounded-full px-3 py-1 text-xs font-semibold hover:bg-blue-50 disabled:opacity-50"
+                        >
+                          {actionLoading === "convertToOwnCarrier" ? "Converting..." : "Confirm"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setShowConvertPicker(false)}
+                          className="text-xs text-gray-500 hover:underline"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    )}
+                  </div>
                 )}
               </div>
               <div>
