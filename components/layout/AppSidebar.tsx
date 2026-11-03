@@ -28,6 +28,7 @@ import {
   Settings,
   History,
   Car,
+  NotebookPen,
 } from "lucide-react";
 import GlobalSearch from "@/components/layout/GlobalSearch";
 import ThemeToggle from "@/components/theme/ThemeToggle";
@@ -108,6 +109,13 @@ const navigation: { section: string; items: NavItem[] }[] = [
         icon: MapPin,
         permission: "bilty.view",
         match: (pathname) => pathname === "/locations" || pathname.startsWith("/locations/"),
+      },
+      {
+        label: "Notebook",
+        href: "/notebook",
+        icon: NotebookPen,
+        permission: "notebook.view",
+        match: (pathname) => pathname === "/notebook" || pathname.startsWith("/notebook/"),
       },
     ],
   },

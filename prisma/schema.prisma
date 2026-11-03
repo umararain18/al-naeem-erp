@@ -54,6 +54,7 @@ model User {
   unlinkedCarrierTripDocuments CarrierTripDocument[] @relation("CarrierTripDocumentUnlinkedBy")
   createdCarrierTripLines    CarrierTripLine[]     @relation("CarrierTripLineCreatedBy")
   deletedCarrierTripLines    CarrierTripLine[]     @relation("CarrierTripLineDeletedBy")
+  updatedNotebooks           Notebook[]            @relation("NotebookUpdatedBy")
 }
 
 model Party {
@@ -1661,4 +1662,56 @@ model CarrierTripLine {
   @@index([isDeleted])
   @@index([isDiesel])
   @@index([category])
+}
+
+// ============================================================
+// NOTEBOOK - a shared daily whiteboard, NOT an accounting document:
+// no JournalEntry, no Party/Account, no Bin/restore lifecycle. One
+// row per calendar date (lazily created the first time anyone opens
+// that date - see app/api/notebook/[date]/route.ts), visible and
+// editable by every logged-in user with notebook.edit (last write
+// wins; this is a casual daily note, not a financial record, so no
+// Serializable transaction or correction-entry machinery applies).
+// ============================================================
+
+model Notebook {
+  id    String   @id @default(cuid())
+  date  DateTime @unique
+
+  // Freeform - "aaj kiya karna hai", routine notes, anything that
+  // doesn't need its own structured field.
+  notes String? @db.Text
+
+  vehicles NotebookVehicle[]
+
+  updatedById String?
+  updatedBy   User?   @relation("NotebookUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([date])
+}
+
+enum NotebookVehicleStatus {
+  AVAILABLE
+  LOADING
+  DISPATCHED
+}
+
+model NotebookVehicle {
+  id         String   @id @default(cuid())
+  notebookId String
+  notebook   Notebook @relation(fields: [notebookId], references: [id], onDelete: Cascade)
+  lineNo     Int
+
+  // Manual reference text only, like Private Phonch's own biltyNo/
+  // challanNo - never a foreign key into Own Carrier or any other
+  // vehicle record, so a vehicle can be jotted down here even before
+  // (or without ever) being registered anywhere else in the system.
+  vehicleNumber String
+  status        NotebookVehicleStatus @default(AVAILABLE)
+  note          String?
+
+  @@index([notebookId])
 }
