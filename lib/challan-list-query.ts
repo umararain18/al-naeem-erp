@@ -4,6 +4,7 @@ import { computeChallanFinancialsBatch, type ChallanFinancials } from "@/lib/cha
 import { getChallanResponsiblePartiesBatch, type ChallanResponsibleParties } from "@/lib/document-party-resolution";
 import { computeChallanSettlementSummaryBatch, type ChallanSettlementSummary } from "@/lib/challan-settlement-summary";
 import { computeChallanPositionsBatch, resolvePaidUnverifiedEntries, type ChallanPosition } from "@/lib/challan-position";
+import { getUnclaimedGrossBiltyReceivableAmountForCollectionBatch } from "@/lib/gross-accounts";
 
 // ============================================================
 // CHALLAN LIST QUERY - shared "which Challans match, and what's
@@ -177,6 +178,27 @@ export async function computeFilteredChallanPositions(
 
   const settlementSummaryMap = await computeChallanSettlementSummaryBatch(challans.map((c) => c.id));
 
+  // Own Carrier Challans only (a normal Challan's Collection always
+  // fully resolves to a real party at Settlement - see this file's
+  // own module doc comment) - how much of each one's Collection is
+  // still genuinely unassigned, batched across every Bilty on this
+  // page at once (never per-Challan/per-Bilty - see
+  // getUnclaimedGrossBiltyReceivableAmountForCollectionBatch's own
+  // doc comment on why).
+  const ownCarrierSettledChallans = challans.filter((c) => c.ownCarrierId && c.isSettled);
+  const unclaimedCollectionByBiltyId =
+    ownCarrierSettledChallans.length > 0
+      ? await getUnclaimedGrossBiltyReceivableAmountForCollectionBatch(
+          prisma,
+          ownCarrierSettledChallans.flatMap((c) => c.bilties.map((cb) => cb.biltyId))
+        )
+      : new Map<string, number>();
+  const collectionPendingByChallanId = new Map<string, number>();
+  for (const c of ownCarrierSettledChallans) {
+    const total = c.bilties.reduce((s, cb) => s + (unclaimedCollectionByBiltyId.get(cb.biltyId) || 0), 0);
+    if (total > 0.009) collectionPendingByChallanId.set(c.id, Math.round(total * 100) / 100);
+  }
+
   const positionsMap = await computeChallanPositionsBatch(
     challans.map((c) => {
       const summary = settlementSummaryMap[c.id];
@@ -186,6 +208,7 @@ export async function computeFilteredChallanPositions(
         outstandingReceivable: c.outstandingReceivable,
         outstandingPayable: c.outstandingPayable,
         biltyIds: c.bilties.map((cb) => cb.biltyId),
+        collectionPending: collectionPendingByChallanId.get(c.id),
         partyNet: summary?.partyNet || [],
         collectedByParties: summary?.bilties.flatMap((b) => b.toPay.payers) || [],
         paidByParties: summary?.carrierRent.payers || [],

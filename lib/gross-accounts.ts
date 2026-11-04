@@ -251,6 +251,48 @@ export async function getUnclaimedGrossBiltyReceivableAmountForCollection(
   return Math.max(0, Math.min(toPay, net));
 }
 
+// Batched form of the getter above - a small, FIXED number of queries
+// across every Bilty at once instead of 2 per Bilty (one
+// tx.bilty.findUnique, one tx.journalLine.findMany, each called
+// individually by the single-item getter above). Used by
+// lib/challan-list-query.ts / app/api/challan/[id]/route.ts to show
+// each own-carrier Challan's "Receivable (To-Pay pending)" line (see
+// lib/challan-position.ts's own ChallanPositionInput.collectionPending)
+// across a whole list/detail page without reintroducing the exact N+1
+// shape already fixed elsewhere in this codebase for the same reason.
+export async function getUnclaimedGrossBiltyReceivableAmountForCollectionBatch(
+  tx: Tx,
+  biltyIds: string[]
+): Promise<Map<string, number>> {
+  const result = new Map<string, number>();
+  if (biltyIds.length === 0) return result;
+
+  const grossAccountId = await getGrossBiltyReceivableAccountId(tx);
+  const bilties = await tx.bilty.findMany({ where: { id: { in: biltyIds } }, select: { id: true, toPay: true } });
+  const lines = await tx.journalLine.findMany({
+    where: { accountId: grossAccountId, sourceType: "BILTY", sourceId: { in: biltyIds } },
+    select: { sourceId: true, debit: true, credit: true },
+  });
+
+  const netByBiltyId = new Map<string, number>();
+  for (const l of lines) {
+    if (!l.sourceId) continue;
+    netByBiltyId.set(l.sourceId, (netByBiltyId.get(l.sourceId) || 0) + Number(l.debit) - Number(l.credit));
+  }
+
+  for (const b of bilties) {
+    const toPay = Number(b.toPay);
+    if (toPay <= 0) {
+      result.set(b.id, 0);
+      continue;
+    }
+    const net = netByBiltyId.get(b.id) || 0;
+    result.set(b.id, Math.max(0, Math.min(toPay, net)));
+  }
+
+  return result;
+}
+
 // The COMBINED ceiling used by the write-time safety check
 // (assertPaidVerificationNotExceeded in lib/bilty-paid-verification.ts):
 // a Daily Posting receipt credited to Gross Bilty Receivable may

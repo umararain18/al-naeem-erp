@@ -179,6 +179,22 @@ export interface ChallanPositionInput {
   // line, same as every other tier's own dedup. Omit/empty when this
   // Challan has no unverified Paid amount at all.
   paidUnverified?: { accountId: string; partyId: string | null; partyName: string; amount: number }[];
+  // Sum, across this Challan's own Bilties, of whatever Collection/
+  // To-Pay amount is still genuinely sitting in Gross Bilty
+  // Receivable - never reclassified to any real party at all (see
+  // lib/settlement-accounting.ts's CollectionResponsibility
+  // "UNASSIGNED", only ever produced for an Own Carrier Challan with
+  // no Clearing Agent on a Bilty - a normal Challan's Collection
+  // always resolves to a real party at Settlement, so this is always
+  // 0 for one). Caller computes this via
+  // getUnclaimedGrossBiltyReceivableAmountForCollectionBatch()
+  // (lib/gross-accounts.ts) - never a new query here. Becomes its OWN
+  // "Receivable (To-Pay pending)" line with no party attached - same
+  // additive-never-netted treatment as paidUnverified above, and
+  // genuinely distinct from it (this is the Collection/To-Pay slice;
+  // paidUnverified is the separate Paid/advance slice). Omit/0 when
+  // nothing is unassigned.
+  collectionPending?: number;
 }
 
 function clearedPosition(): ChallanPosition {
@@ -271,9 +287,11 @@ export async function computeChallanPositionsBatch(
     // ChallanPositionInput.paidUnverified's own doc comment and this
     // module's header).
     const paidUnverifiedLines = groupPaidUnverified(inp.paidUnverified);
+    const collectionPendingLine = buildCollectionPendingLine(inp.collectionPending);
 
     const base = computeBasePosition(inp, financialsMap[inp.id]);
-    result[inp.id] = mergePaidUnverified(base, paidUnverifiedLines);
+    const withPaidUnverified = mergePaidUnverified(base, paidUnverifiedLines);
+    result[inp.id] = mergeCollectionPending(withPaidUnverified, collectionPendingLine);
   }
 
   return result;
@@ -455,6 +473,37 @@ function mergePaidUnverified(base: ChallanPosition, paidUnverifiedLines: Challan
 
   const bucket: ChallanPositionBucket =
     totalPayable > EPS ? "RECEIVABLE_PAYABLE" : "RECEIVABLE";
+
+  return { bucket, lines, totalReceivable, totalPayable };
+}
+
+/** Builds the single "Receivable (To-Pay pending)" line for an Own
+ * Carrier Challan's genuinely-unassigned Collection amount (see
+ * ChallanPositionInput.collectionPending's own doc comment) - no
+ * party attached (there genuinely isn't one yet), so `parties` is
+ * empty, same as any other tier-resolves-nobody line elsewhere in
+ * this file. Returns null when there is nothing pending (the normal
+ * case for every non-own-carrier Challan). */
+function buildCollectionPendingLine(amount: number | undefined): ChallanPositionLine | null {
+  if (!amount || amount <= EPS) return null;
+  return { direction: "RECEIVABLE", amount: round2(amount), parties: [], note: "To-Pay pending" };
+}
+
+/** Appends the Collection-pending line to `base` - always additive,
+ * never netted against base's own Payable line, exactly mirroring
+ * mergePaidUnverified() above (a different, non-overlapping slice of
+ * this Challan's own Collection amount - see this module's own doc
+ * comment on the two being kept separate). A Challan can therefore
+ * never show CLEARED while a genuine unassigned Collection amount is
+ * still outstanding. */
+function mergeCollectionPending(base: ChallanPosition, line: ChallanPositionLine | null): ChallanPosition {
+  if (!line) return base;
+
+  const lines = [...base.lines, line];
+  const totalReceivable = round2(base.totalReceivable + line.amount);
+  const totalPayable = base.totalPayable;
+
+  const bucket: ChallanPositionBucket = totalPayable > EPS ? "RECEIVABLE_PAYABLE" : "RECEIVABLE";
 
   return { bucket, lines, totalReceivable, totalPayable };
 }

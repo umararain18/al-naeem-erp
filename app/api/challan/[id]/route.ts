@@ -5,6 +5,7 @@ import { hasPermission } from "@/lib/permissions";
 import { Prisma } from "@prisma/client";
 import { computeChallanFinancialsBatch } from "@/lib/challan-financials";
 import { computeChallanPosition, resolvePaidUnverifiedEntries } from "@/lib/challan-position";
+import { getUnclaimedGrossBiltyReceivableAmountForCollectionBatch } from "@/lib/gross-accounts";
 import {
   applySettlementCorrection,
   getSettledPartyAccountIdsBatch,
@@ -236,6 +237,20 @@ export async function GET(
     // instead of a third, independent calculation.
     const settlementSummary = await computeChallanSettlementSummary(challan.id);
 
+    // Own Carrier Challans only - how much of this Challan's own
+    // Collection is still genuinely unassigned (see lib/challan-
+    // position.ts's own ChallanPositionInput.collectionPending doc
+    // comment). 0/omitted for a normal Challan, where this is always 0.
+    let collectionPending: number | undefined;
+    if (challan.ownCarrierId && challan.isSettled) {
+      const unclaimedByBiltyId = await getUnclaimedGrossBiltyReceivableAmountForCollectionBatch(
+        prisma,
+        challan.bilties.map((cb) => cb.biltyId)
+      );
+      const total = challan.bilties.reduce((s, cb) => s + (unclaimedByBiltyId.get(cb.biltyId) || 0), 0);
+      if (total > 0.009) collectionPending = Math.round(total * 100) / 100;
+    }
+
     // ONE financial position for this Challan (lib/challan-
     // position.ts) - the exact same shared calculation the Challan
     // list's table, filter, and summary cards read, built from
@@ -263,6 +278,7 @@ export async function GET(
           : null,
       })),
       paidUnverified: resolvePaidUnverifiedEntries(challan.bilties, settlementSummary),
+      collectionPending,
     });
 
     // Per-component current responsibility (Collection/Commission

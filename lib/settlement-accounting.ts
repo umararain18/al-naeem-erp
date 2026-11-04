@@ -51,7 +51,19 @@ import { Decimal } from "@prisma/client/runtime/library";
 export type CollectionResponsibility =
   | "CLEARING_AGENT"
   | "TRANSPORTER"
-  | "THIRD_PARTY";
+  | "THIRD_PARTY"
+  // Own Carrier Challans only - there is no Transporter to fall back
+  // to, and a Bilty with no Clearing Agent either must still be able
+  // to reach a finalized Settlement (see app/api/challan/[id]/
+  // finalize-settlement/route.ts's own doc comment). The outstanding
+  // Collection amount simply stays in Gross Bilty Receivable,
+  // genuinely unclaimed by any specific party yet - collectible later
+  // by the driver (Trip Wasooli), a Clearing Agent/third party (a
+  // Settlement Payment), or the office (Daily Posting) - see
+  // lib/challan-position.ts's own "Receivable (To-Pay pending)" line.
+  // Never valid for a normal (Transporter-dispatched) Challan, where
+  // every Bilty's Collection must always resolve to a real party.
+  | "UNASSIGNED";
 
 export type CarrierRentResponsibility =
   | "CLEARING_AGENT"
@@ -228,7 +240,7 @@ export function buildSettlementEntries(
     const collectionAmount = getCollectionAmount(bilty);
     const commission = toNumber(bilty.agentCommission);
 
-    if (collectionAmount > 0 && !bilty.collectionPartyAccountId) {
+    if (collectionAmount > 0 && !bilty.collectionPartyAccountId && bilty.collectionResponsibility !== "UNASSIGNED") {
       errors.push({
         field: `bilty:${bilty.biltyNo}.collection`,
         message: `A responsible party account is required for Bilty ${bilty.biltyNo}'s collection.`,
@@ -263,6 +275,16 @@ export function buildSettlementEntries(
   }
 
   let remainingRent = carrierRent;
+  // Tracks whether there is genuinely SOME amount this Challan should
+  // be settling - as opposed to `lines` ending up empty merely
+  // because every nonzero component was deliberately left UNASSIGNED
+  // (Own Carrier, no Clearing Agent - see CollectionResponsibility's
+  // own doc comment). Only the latter must still succeed with zero
+  // posted lines (the Challan still needs isSettled=true /
+  // settlementJournalEntryId to unlock the Settlement Payment engine
+  // for a later CA/third-party collection) - see the `lines.length
+  // === 0` check below, which now distinguishes the two.
+  let totalOriginalAmount = carrierRent;
 
   for (let i = 0; i < input.bilties.length; i++) {
     const bilty = input.bilties[i];
@@ -276,6 +298,7 @@ export function buildSettlementEntries(
     const amount = toNumber(bilty.amount);
     const collectionAmount = getCollectionAmount(bilty);
     const commission = toNumber(bilty.agentCommission);
+    totalOriginalAmount += collectionAmount + commission;
 
     let allocatedRent = 0;
     if (i === input.bilties.length - 1) {
@@ -401,7 +424,18 @@ export function buildSettlementEntries(
     };
   }
 
-  if (lines.length === 0) {
+  // `lines` can legitimately be empty for TWO different reasons -
+  // only one of them is an error:
+  //  - genuinely nothing to settle at all (every component is
+  //    actually 0) - reject, as before.
+  //  - every nonzero component was deliberately left UNASSIGNED (Own
+  //    Carrier, no Clearing Agent - see CollectionResponsibility's
+  //    own doc comment) - allow, posting a zero-line (trivially
+  //    balanced) Settlement entry so this Challan still reaches
+  //    isSettled=true / gets a settlementJournalEntryId, unlocking
+  //    the Settlement Payment engine for a later CA/third-party
+  //    collection, Trip Wasooli, or Daily Posting.
+  if (lines.length === 0 && totalOriginalAmount <= 0.009) {
     errors.push({
       field: "lines",
       message: "No accounting amounts to settle for this challan.",

@@ -3,6 +3,7 @@ import {
   resolveDocumentPartyAccount,
   getChallanEligibleParties,
   getChallanEligiblePartyAccountIds,
+  getBiltyLegitimatePartyAccountIds,
   getPhonchEligiblePartyAccountIds,
   getPrivatePhonchEligibleParties,
   getPrivatePhonchEligiblePartyAccountIds,
@@ -402,12 +403,139 @@ export interface PostCollectionInput {
   amount: number;
   documentType: CarrierTripDocumentType;
   documentId: string;
-  /** Required ONLY when resolveDocumentPartyAccount() cannot resolve
-   * a single unambiguous party (e.g. a Challan with more than one
-   * eligible Receivable party) - validated against that same
-   * document's own eligible-party set, never accepted blindly. */
+  /** CHALLAN only - collect against ONE specific Bilty of the linked
+   * Challan instead of the whole Challan. A Challan can have several
+   * Bilties, each with its own To-Pay party - resolving one party for
+   * the WHOLE Challan (the historical behavior below, still used when
+   * this is omitted) is only ever unambiguous once the Challan is
+   * fully settled into a single net party, which is why Trip Wasooli
+   * against an own-carrier Challan with no settlement yet always
+   * failed with "select the party explicitly" despite there being no
+   * party selector - see postCollectionLine's own doc comment. The
+   * caller posts ONE request per Bilty when splitting a collection
+   * across several (never a combined multi-bilty request) - each
+   * becomes its own CarrierTripLine/JournalEntry, tagged
+   * sourceType:"BILTY"/sourceId:biltyId. */
+  biltyId?: string;
+  /** Required ONLY when resolution cannot resolve a single unambiguous
+   * party (e.g. a Challan with more than one eligible Receivable
+   * party, or a Bilty with several distinct Settlement payers already
+   * recorded) - validated against that same document's own eligible-
+   * party set, never accepted blindly. */
   counterAccountId?: string | null;
   createdById: string;
+}
+
+export interface BiltyCollectionState {
+  biltyId: string;
+  biltyNo: string;
+  toPay: number;
+  // null only when genuinely ambiguous (several distinct, disagreeing
+  // Settlement payers already recorded for this Bilty) - the caller
+  // must then require a manually-selected Counter Account, exactly
+  // like the existing Challan-level flow already does for its own
+  // ambiguous case.
+  accountId: string | null;
+  partyName: string | null;
+  // Remaining amount currently collectible against `accountId` right
+  // now (0 when accountId is null) - the EXACT SAME ceiling
+  // postCollectionLine() itself enforces at write time
+  // (assertBiltyCollectionNotExceeded below), read fresh here purely
+  // for display/prefill in the Trip Wasooli Bilty picker.
+  outstanding: number;
+  // toPay - outstanding - informational only ("already received"),
+  // never used to gate anything.
+  received: number;
+}
+
+/**
+ * Current Collection state for ONE Bilty - who it is currently
+ * resolved to (Gross Bilty Receivable's own "unallocated" pseudo-
+ * party when nothing has claimed it yet, a real Settlement payer, or
+ * null if genuinely ambiguous) and how much of its own To-Pay is
+ * still collectible against that resolution right now. Used by the
+ * Trip Wasooli Bilty picker (getChallanBiltyCollectionBreakdown
+ * below) and, for the write-time ceiling, by postCollectionLine
+ * itself - the SAME read, never two independently-maintained copies.
+ */
+export async function getBiltyCollectionState(tx: Tx, biltyId: string): Promise<BiltyCollectionState> {
+  const bilty = await tx.bilty.findUnique({ where: { id: biltyId }, select: { biltyNo: true, toPay: true, isDeleted: true } });
+  if (!bilty || bilty.isDeleted) {
+    throw new CarrierTripError("DOCUMENT_NOT_FOUND", "Bilty not found.");
+  }
+  const toPay = round2(Number(bilty.toPay));
+  const resolved = await resolveDocumentPartyAccount("BILTY", biltyId, "DEBIT");
+
+  if (!resolved) {
+    return { biltyId, biltyNo: bilty.biltyNo, toPay, accountId: null, partyName: null, outstanding: 0, received: toPay };
+  }
+
+  const outstanding = await getBiltyCollectionOutstanding(tx, biltyId, resolved.accountId, toPay);
+  return { biltyId, biltyNo: bilty.biltyNo, toPay, accountId: resolved.accountId, partyName: resolved.partyName, outstanding, received: round2(toPay - outstanding) };
+}
+
+/** Every Bilty of a linked Challan, in display order - the Trip
+ * Wasooli UI's own "pick one Bilty or split across Bilties" picker.
+ * Small, bounded N per call (one Challan's own Bilties) - never used
+ * for a list page, so no batching concern the way
+ * lib/challan-list-query.ts's own callers have. */
+export async function getChallanBiltyCollectionBreakdown(tx: Tx, challanId: string): Promise<BiltyCollectionState[]> {
+  const challan = await tx.challan.findUnique({
+    where: { id: challanId },
+    select: { isDeleted: true, bilties: { select: { biltyId: true }, orderBy: { addedAt: "asc" } } },
+  });
+  if (!challan || challan.isDeleted) {
+    throw new CarrierTripError("DOCUMENT_NOT_FOUND", "Challan not found.");
+  }
+  const results: BiltyCollectionState[] = [];
+  for (const cb of challan.bilties) {
+    results.push(await getBiltyCollectionState(tx, cb.biltyId));
+  }
+  return results;
+}
+
+/** The ledger-true remaining amount for ONE Bilty's Collection against
+ * ONE specific account, right now - debit minus credit across every
+ * JournalLine ever tagged sourceType:"BILTY"/sourceId:biltyId on that
+ * account, across every referenceType (the original Settlement
+ * reclassification's own debit establishing a party's liability, any
+ * correction/reassignment, and any later Daily-Posting/Trip-Wasooli
+ * receipt crediting it back down) - capped at [0, toPay]. Works
+ * identically whether `accountId` is a real Party's account or Gross
+ * Bilty Receivable itself (the "nobody has claimed this yet" state),
+ * since both are just sub-ledgers tagged the exact same way - see
+ * lib/gross-accounts.ts's own getGrossBiltyReceivableNetBalance for
+ * the identical pattern on the Gross side specifically. This is the
+ * ONE ceiling both the Trip Wasooli picker's display (getBiltyCollectionState
+ * above) and its write-time guard (assertBiltyCollectionNotExceeded
+ * below) read - never two independently-maintained figures. */
+async function getBiltyCollectionOutstanding(tx: Tx, biltyId: string, accountId: string, toPay: number): Promise<number> {
+  const lines = await tx.journalLine.findMany({
+    where: { accountId, sourceType: "BILTY", sourceId: biltyId },
+    select: { debit: true, credit: true },
+  });
+  const net = lines.reduce((s, l) => s + Number(l.debit) - Number(l.credit), 0);
+  return Math.max(0, Math.min(round2(toPay), round2(net)));
+}
+
+/** Rejects a Trip Wasooli Collection receipt that would exceed what
+ * is genuinely still outstanding against the resolved account for
+ * this Bilty - see getBiltyCollectionOutstanding's own doc comment.
+ * Must be called with the SAME `tx` the write itself uses, so it is
+ * re-checked against live, in-transaction state (mirrors every other
+ * assert*NotExceeded in this codebase). */
+async function assertBiltyCollectionNotExceeded(tx: Tx, biltyId: string, accountId: string, amount: number): Promise<void> {
+  const bilty = await tx.bilty.findUnique({ where: { id: biltyId }, select: { toPay: true, biltyNo: true } });
+  const toPay = round2(Number(bilty?.toPay || 0));
+  const remaining = await getBiltyCollectionOutstanding(tx, biltyId, accountId, toPay);
+  if (round2(amount) > remaining + 0.009) {
+    throw new CarrierTripError(
+      "OVER_COLLECTION",
+      `This receipt of Rs. ${round2(amount).toLocaleString()} would exceed the remaining outstanding amount (Rs. ${remaining.toLocaleString()}) for ${
+        bilty ? `Bilty ${bilty.biltyNo}` : "this Bilty"
+      }'s Collection.`
+    );
+  }
 }
 
 export interface PostSimpleInput {
@@ -515,6 +643,69 @@ export async function postCollectionLine(tx: Tx, input: PostCollectionInput) {
   }
 
   const { label } = await assertDocumentExists(tx, input.documentType, input.documentId);
+
+  // ------------------------------------------------------------
+  // CHALLAN + biltyId - see PostCollectionInput.biltyId's own doc
+  // comment for why this exists as a dedicated branch: the LINK is
+  // validated at the Challan level (just above, unchanged), but
+  // resolution/posting happens entirely at the BILTY level - the real
+  // economic unit for To-Pay - instead of trying to resolve ONE party
+  // for every Bilty on the Challan combined.
+  // ------------------------------------------------------------
+  if (input.documentType === "CHALLAN" && input.biltyId) {
+    const challanBilty = await tx.challanBilty.findFirst({
+      where: { challanId: input.documentId, biltyId: input.biltyId },
+      select: { bilty: { select: { biltyNo: true, isDeleted: true } } },
+    });
+    if (!challanBilty || challanBilty.bilty.isDeleted) {
+      throw new CarrierTripError("DOCUMENT_NOT_FOUND", "This Bilty does not belong to the linked Challan.");
+    }
+    const biltyLabel = `Bilty ${challanBilty.bilty.biltyNo}`;
+
+    let biltyCounterAccountId = input.counterAccountId || null;
+    if (!biltyCounterAccountId) {
+      const resolved = await resolveDocumentPartyAccount("BILTY", input.biltyId, "DEBIT");
+      biltyCounterAccountId = resolved?.accountId || null;
+    } else {
+      const eligible = await getBiltyLegitimatePartyAccountIds(input.biltyId, "DEBIT");
+      if (!eligible.has(biltyCounterAccountId)) {
+        throw new CarrierTripError("INVALID_COUNTER_ACCOUNT", `Selected account is not a valid Receivable party for ${biltyLabel}.`);
+      }
+    }
+    if (!biltyCounterAccountId) {
+      throw new CarrierTripError(
+        "PARTY_REQUIRED",
+        `Could not automatically determine who ${biltyLabel}'s collection belongs to - select the party explicitly.`
+      );
+    }
+
+    await assertBiltyCollectionNotExceeded(tx, input.biltyId, biltyCounterAccountId, input.amount);
+
+    const driverCashId = trip.carrier.driverCashAccount!.id;
+    const description = input.description?.trim() || `Collected against ${label} - ${biltyLabel}`;
+
+    return createTripLineEntry(
+      tx,
+      trip,
+      {
+        date: input.date,
+        createdById: input.createdById,
+        description,
+        lines: [
+          { accountId: driverCashId, debit: input.amount, credit: 0, sourceType: "BILTY", sourceId: input.biltyId },
+          { accountId: biltyCounterAccountId, debit: 0, credit: input.amount, sourceType: "BILTY", sourceId: input.biltyId },
+        ],
+      },
+      {
+        lineType: "COLLECTION",
+        date: input.date,
+        description,
+        amount: input.amount,
+        documentType: input.documentType,
+        documentId: input.documentId,
+      }
+    );
+  }
 
   // DEBIT = the main account (Driver Cash) receives money - same
   // direction convention Daily Posting already uses.
@@ -814,6 +1005,7 @@ export async function postTripLineByType(
         ...base,
         documentType,
         documentId: rawInput.documentId as string,
+        biltyId: (rawInput.biltyId as string) || undefined,
         counterAccountId: (rawInput.counterAccountId as string) || null,
       });
     }

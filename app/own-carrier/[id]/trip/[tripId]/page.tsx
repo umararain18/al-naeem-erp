@@ -60,6 +60,21 @@ type DocumentLink = {
   outstanding: number | null;
 };
 
+// GET /api/challan/[id]/bilty-collection-state - one row per Bilty on
+// a linked Challan, for the Collection (Wasooli) "pick one Bilty or
+// split across Bilties" picker. `accountId: null` means genuinely
+// ambiguous - the row needs a manually-picked party before it can be
+// submitted (see QuickEntryForm's own biltyPartyChoice state).
+type BiltyCollectionRow = {
+  biltyId: string;
+  biltyNo: string;
+  toPay: number;
+  accountId: string | null;
+  partyName: string | null;
+  outstanding: number;
+  received: number;
+};
+
 type CashBookRow = {
   id: string;
   date: string;
@@ -949,6 +964,43 @@ function QuickEntryRow({
   const itemRef = useRef<HTMLSelectElement>(null);
   const amountRef = useRef<HTMLInputElement>(null);
 
+  // Per-Bilty Collection breakdown (Trip Wasooli against a linked
+  // CHALLAN) - see app/api/challan/[id]/bilty-collection-state/route.ts.
+  // null = not a Challan selection (or not yet loaded) - the plain
+  // single Amount field above is used in that case, unchanged.
+  const [biltyBreakdown, setBiltyBreakdown] = useState<BiltyCollectionRow[] | null>(null);
+  const [loadingBiltyBreakdown, setLoadingBiltyBreakdown] = useState(false);
+  const [biltyAmounts, setBiltyAmounts] = useState<Record<string, string>>({});
+  // Only populated for a Bilty row whose own resolution is genuinely
+  // ambiguous (accountId: null) - the user must pick a party there
+  // before that row can be submitted, exactly like the existing
+  // whole-document flow's own manual Counter Account fallback.
+  const [biltyPartyChoice, setBiltyPartyChoice] = useState<Record<string, string>>({});
+
+  async function loadBiltyBreakdown(challanId: string) {
+    setLoadingBiltyBreakdown(true);
+    setBiltyBreakdown(null);
+    setBiltyAmounts({});
+    setBiltyPartyChoice({});
+    try {
+      const res = await fetch(`/api/challan/${challanId}/bilty-collection-state`, { cache: "no-store" });
+      const data = await res.json();
+      if (res.ok && data.success && Array.isArray(data.bilties) && data.bilties.length > 0) {
+        setBiltyBreakdown(data.bilties);
+        const prefill: Record<string, string> = {};
+        for (const b of data.bilties as BiltyCollectionRow[]) {
+          if (b.outstanding > 0) prefill[b.biltyId] = String(b.outstanding);
+        }
+        setBiltyAmounts(prefill);
+      }
+    } catch {
+      // Falls back to the plain whole-document Amount field - never
+      // blocks the quick-entry row over a failed preview fetch.
+    } finally {
+      setLoadingBiltyBreakdown(false);
+    }
+  }
+
   useEffect(() => {
     (async () => {
       const [accRes, partyRes] = await Promise.all([fetch("/api/accounts"), fetch("/api/parties")]);
@@ -1060,6 +1112,9 @@ function QuickEntryRow({
     setAmount("");
     setNote("");
     setLiters("");
+    setBiltyBreakdown(null);
+    setBiltyAmounts({});
+    setBiltyPartyChoice({});
     if (!keepType) {
       setItemValue("");
       setPaymentSource("DRIVER_CASH");
@@ -1085,6 +1140,9 @@ function QuickEntryRow({
     setNote("");
     setLiters("");
     setItemValue("");
+    setBiltyBreakdown(null);
+    setBiltyAmounts({});
+    setBiltyPartyChoice({});
     setOfficeAccountId("");
 
     // Paid From default per category (item 8): Diesel -> Udhaar (the
@@ -1127,10 +1185,75 @@ function QuickEntryRow({
           : "EXPENSE_CREDIT";
 
   const dateOutOfRange = date && (date < toYMD(tripDateFrom) || (tripDateTo ? date > toYMD(tripDateTo) : false));
+  const showBiltyBreakdown = quickType.kind === "COLLECTION" && Boolean(biltyBreakdown && biltyBreakdown.length > 0);
+  const biltyBreakdownTotal = round2(
+    Object.entries(biltyAmounts).reduce((s, [, v]) => s + (Number(v) || 0), 0)
+  );
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError("");
+
+    // Per-Bilty Collection split - one POST per Bilty with a nonzero
+    // amount (see PostCollectionInput.biltyId's own doc comment for
+    // why this is never a single combined request), never mixed with
+    // the plain whole-document path below.
+    if (showBiltyBreakdown && biltyBreakdown) {
+      const link = documents.find((d) => d.id === itemValue);
+      if (!link) {
+        setError("Select a document.");
+        return;
+      }
+      const rows = biltyBreakdown
+        .map((b) => ({ b, amt: Number(biltyAmounts[b.biltyId]) || 0 }))
+        .filter((r) => r.amt > 0);
+      if (rows.length === 0) {
+        setError("Enter an amount for at least one Bilty.");
+        return;
+      }
+      for (const { b, amt } of rows) {
+        if (amt > b.outstanding + 0.009) {
+          setError(`Bilty ${b.biltyNo}: amount (Rs. ${formatMoney(amt)}) exceeds its outstanding (Rs. ${formatMoney(b.outstanding)}).`);
+          return;
+        }
+        if (!b.accountId && !biltyPartyChoice[b.biltyId]) {
+          setError(`Bilty ${b.biltyNo}: select who this collection belongs to.`);
+          return;
+        }
+      }
+
+      try {
+        setSaving(true);
+        for (const { b, amt } of rows) {
+          const payload: Record<string, unknown> = {
+            lineType: "COLLECTION",
+            date,
+            amount: amt,
+            description: note.trim() || undefined,
+            documentType: link.documentType,
+            documentId: link.documentId,
+            biltyId: b.biltyId,
+            counterAccountId: b.accountId || biltyPartyChoice[b.biltyId] || undefined,
+          };
+          const res = await fetch(`/api/own-carrier/${carrierId}/trips/${tripId}/lines`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          const data = await res.json();
+          if (!res.ok || !data.success) throw new Error(data.message || `Unable to save Bilty ${b.biltyNo}'s collection.`);
+        }
+        onDateUsed(date);
+        resetForFreshRow(true);
+        onSaved();
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Unable to save one or more Bilty collections.");
+      } finally {
+        setSaving(false);
+      }
+      return;
+    }
+
     const amt = parseAmountExpression(amount);
     if (!amt || amt <= 0) {
       setError('Amount must be greater than zero (e.g. 20000, "20k", "1.5L", or "500+700+300").');
@@ -1269,6 +1392,11 @@ function QuickEntryRow({
                       onClick={() => {
                         setItemValue(d.id);
                         if (d.outstanding != null) setAmount(String(d.outstanding));
+                        if (d.documentType === "CHALLAN") {
+                          void loadBiltyBreakdown(d.documentId);
+                        } else {
+                          setBiltyBreakdown(null);
+                        }
                         focusFirstField();
                       }}
                       className={`rounded-full border px-3 py-1.5 text-xs font-medium ${
@@ -1369,16 +1497,18 @@ function QuickEntryRow({
             </>
           )}
 
-          <div className="w-32">
-            <label className="mb-1 block text-xs font-medium text-gray-600">Amount</label>
-            <input
-              ref={amountRef}
-              type="number"
-              value={amount}
-              onChange={(e) => setAmount(e.target.value)}
-              className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
-            />
-          </div>
+          {!showBiltyBreakdown && (
+            <div className="w-32">
+              <label className="mb-1 block text-xs font-medium text-gray-600">Amount</label>
+              <input
+                ref={amountRef}
+                type="number"
+                value={amount}
+                onChange={(e) => setAmount(e.target.value)}
+                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
+              />
+            </div>
+          )}
 
           {quickType.kind === "EXPENSE" && (
             <>
@@ -1441,6 +1571,53 @@ function QuickEntryRow({
             {saving ? "Saving..." : editingLine ? "Save Edit" : "Save (Enter)"}
           </button>
         </div>
+
+        {quickType.kind === "COLLECTION" && loadingBiltyBreakdown && (
+          <p className="mt-3 text-xs text-gray-400">Loading Bilties...</p>
+        )}
+
+        {showBiltyBreakdown && biltyBreakdown && (
+          <div className="mt-3 rounded-lg border border-gray-200 bg-gray-50 p-3">
+            <p className="mb-2 text-xs font-medium text-gray-600">
+              Pick one Bilty or split across Bilties - amount defaults to each Bilty&apos;s own outstanding, editable.
+            </p>
+            <div className="space-y-1.5">
+              {biltyBreakdown.map((b) => (
+                <div key={b.biltyId} className="flex flex-wrap items-center gap-2 rounded-md bg-white px-2 py-1.5 text-xs">
+                  <span className="w-24 font-medium text-gray-700">Bilty {b.biltyNo}</span>
+                  {b.accountId ? (
+                    <span className="min-w-[120px] flex-1 text-gray-500">{b.partyName}</span>
+                  ) : (
+                    <select
+                      value={biltyPartyChoice[b.biltyId] || ""}
+                      onChange={(e) => setBiltyPartyChoice((prev) => ({ ...prev, [b.biltyId]: e.target.value }))}
+                      className="min-w-[140px] flex-1 rounded border border-amber-300 bg-amber-50 px-2 py-1 text-xs"
+                    >
+                      <option value="">Select party...</option>
+                      {parties
+                        .filter((p) => p.account)
+                        .map((p) => (
+                          <option key={p.id} value={p.account!.id}>
+                            {p.partyName}
+                          </option>
+                        ))}
+                    </select>
+                  )}
+                  <span className="text-gray-400">outstanding Rs. {formatMoney(b.outstanding)}</span>
+                  {b.received > 0 && <span className="text-gray-400">(received Rs. {formatMoney(b.received)})</span>}
+                  <input
+                    type="number"
+                    value={biltyAmounts[b.biltyId] || ""}
+                    onChange={(e) => setBiltyAmounts((prev) => ({ ...prev, [b.biltyId]: e.target.value }))}
+                    placeholder="0"
+                    className="w-28 rounded border border-gray-300 px-2 py-1 text-xs"
+                  />
+                </div>
+              ))}
+            </div>
+            <p className="mt-2 text-xs font-medium text-gray-600">Total: Rs. {formatMoney(biltyBreakdownTotal)}</p>
+          </div>
+        )}
       </form>
     </div>
   );

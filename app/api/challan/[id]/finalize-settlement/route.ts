@@ -155,6 +155,7 @@ export async function POST(
       where: { id },
       include: {
         transporterParty: { select: { id: true, account: { select: { id: true, isActive: true } } } },
+        ownCarrier: { select: { id: true } },
         bilties: {
           include: {
             bilty: {
@@ -302,6 +303,20 @@ export async function POST(
         } else if (transporterAccountId) {
           collectionResponsibility = "TRANSPORTER";
           collectionPartyAccountId = transporterAccountId;
+        } else if (challan.ownCarrierId) {
+          // Own Carrier Challan, no Clearing Agent on this Bilty - there
+          // is no Transporter to fall back to either (see
+          // Challan.ownCarrierId's own schema doc comment), and that
+          // must never block this Challan from reaching a finalized
+          // Settlement at all (the only way to then unlock the multi-
+          // payer Settlement Payment engine for a later CA/third-party
+          // collection, or to let Trip Wasooli/Daily Posting collect
+          // directly). The amount simply stays in Gross Bilty
+          // Receivable, genuinely unclaimed - see
+          // lib/settlement-accounting.ts's CollectionResponsibility
+          // "UNASSIGNED" and lib/challan-position.ts's own "Receivable
+          // (To-Pay pending)" line.
+          collectionResponsibility = "UNASSIGNED";
         } else {
           collectionResponsibility = "TRANSPORTER";
           resolutionErrors.push(
