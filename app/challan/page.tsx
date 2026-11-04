@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { formatBusinessDate } from "@/lib/date-range";
@@ -198,6 +198,9 @@ const positionChipStyles: Record<"RECEIVABLE" | "PAYABLE", string> = {
   PAYABLE: "bg-red-100 text-red-700",
 };
 
+// Filtering itself now happens server-side (app/api/challan/route.ts,
+// via lib/challan-list-query.ts) - this type is kept only for the
+// filter <select>'s own value/state typing below.
 type FinancialFilter =
   | "ALL"
   | "BEFORE_SETTLEMENT"
@@ -206,27 +209,6 @@ type FinancialFilter =
   | "PAYABLE"
   | "RECEIVABLE_PAYABLE"
   | "CLEARED";
-
-function matchesFinancialFilter(challan: Challan, filter: FinancialFilter): boolean {
-  if (filter === "ALL") return true;
-
-  switch (filter) {
-    case "BEFORE_SETTLEMENT":
-      return !challan.isSettled;
-    case "AFTER_SETTLEMENT":
-      return challan.isSettled;
-    case "RECEIVABLE":
-      return safePosition(challan).bucket === "RECEIVABLE";
-    case "PAYABLE":
-      return safePosition(challan).bucket === "PAYABLE";
-    case "RECEIVABLE_PAYABLE":
-      return safePosition(challan).bucket === "RECEIVABLE_PAYABLE";
-    case "CLEARED":
-      return safePosition(challan).bucket === "CLEARED";
-    default:
-      return true;
-  }
-}
 
 // Vehicle names only (never registration numbers), one per linked
 // Bilty, comma-separated - never deduplicated and never collapsed
@@ -411,13 +393,27 @@ export default function ChallanPage() {
   const returnToSuffix = useReturnToSuffix();
   const [challans, setChallans] = useState<Challan[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
 
+  // Server-side pagination (P2-3-style, mirroring app/bilty/page.tsx's
+  // own) - 50 Challans per page, "Load More" appends rather than
+  // replacing. `pagination.total`/`totalPages` always describe the
+  // FULL filtered set on the server, never just what's loaded so far.
+  const [pagination, setPagination] = useState({ page: 1, pageSize: 50, total: 0, totalPages: 1 });
+  // Server-computed Receivable/Payable/Net totals across the FULL
+  // filtered set (never just the loaded pages) - see
+  // app/api/challan/summary/route.ts. Fetched in parallel with the
+  // list itself, never derived from `challans` client-side (that
+  // would only reflect whichever pages happen to be loaded).
+  const [summary, setSummary] = useState({ totalReceivable: 0, totalPayable: 0, net: 0 });
+
   const savedChallanFilters = useMemo(() => getSavedListFilters<ChallanListFilters>(CHALLAN_LIST_KEY), []);
 
   const [search, setSearch] = useState(() => savedChallanFilters?.search ?? "");
+  const [debouncedSearch, setDebouncedSearch] = useState(() => savedChallanFilters?.search ?? "");
   // A drill-down link (e.g. Dashboard's Challan status counts) may
   // deep-link straight to a filter via ?status=... / ?financial=...
   // Seeded from the URL on first mount, then kept in sync via the
@@ -489,106 +485,80 @@ export default function ChallanPage() {
     }
   }
 
-  const filteredChallans = useMemo(() => {
-    const filtered = challans.filter((challan) => {
-      if (statusFilter !== "ALL" && challan.status !== statusFilter) {
-        return false;
-      }
+  // All real filtering (status/financial/search/date range) now
+  // happens server-side (app/api/challan/route.ts, via lib/challan-
+  // list-query.ts) - `challans` already IS the filtered, paginated
+  // result. Kept as a plain alias (rather than renaming every render-
+  // section reference below) so the table/filter JSX is unchanged.
+  const filteredChallans = challans;
 
-      if (!matchesFinancialFilter(challan, financialFilter)) {
-        return false;
-      }
+  // Builds the query string shared by the list fetch and the summary
+  // fetch - same filters, so the two can never silently diverge.
+  function buildFilterQuery(): URLSearchParams {
+    const query = new URLSearchParams();
+    if (statusFilter !== "ALL") query.set("status", statusFilter);
+    if (financialFilter !== "ALL") query.set("financial", financialFilter);
+    if (debouncedSearch) query.set("search", debouncedSearch);
+    if (dateFrom) query.set("dateFrom", dateFrom);
+    if (dateTo) query.set("dateTo", dateTo);
+    return query;
+  }
 
-      if (dateFrom) {
-        const from = new Date(`${dateFrom}T00:00:00`);
-        const challanDate = new Date(challan.loadingDate);
-        if (challanDate < from) return false;
-      }
-
-      if (dateTo) {
-        const to = new Date(`${dateTo}T00:00:00`);
-        const challanDate = new Date(challan.loadingDate);
-        if (challanDate >= to) return false;
-      }
-
-      if (!search.trim()) return true;
-
-      const searchLower = search.toLowerCase();
-      return (
-        challan.challanNo.toLowerCase().includes(searchLower) ||
-        challan.driverName?.toLowerCase().includes(searchLower) ||
-        challan.driverPhone?.toLowerCase().includes(searchLower) ||
-        challan.carrierNumber?.toLowerCase().includes(searchLower) ||
-        challan.transporterParty?.partyName.toLowerCase().includes(searchLower) ||
-        clearingAgentSummary(challan).toLowerCase().includes(searchLower) ||
-        vehicleSummary(challan).toLowerCase().includes(searchLower) ||
-        challan.bilties.some(
-          (cb) =>
-            cb.bilty.biltyNo.toLowerCase().includes(searchLower) ||
-            cb.bilty.clearingAgentParty?.partyName.toLowerCase().includes(searchLower) ||
-            [cb.bilty.vehicleType, cb.bilty.vehicleModel, cb.bilty.registrationNumber]
-              .filter(Boolean)
-              .join(" / ")
-              .toLowerCase()
-              .includes(searchLower)
-        )
-      );
-    });
-
-    return [...filtered].sort(compareChallanNewestFirst);
-  }, [challans, search, statusFilter, financialFilter, dateFrom, dateTo]);
-
-  // Sums challan.position's own totalReceivable/totalPayable (lib/
-  // challan-position.ts) - the EXACT same per-Challan figures the
-  // RECEIVABLE/PAYABLE filter options and the table's Position chips
-  // read, so these cards can never show a different total than what
-  // the filter/table agree on.
-  const summary = useMemo(() => {
-    let totalReceivable = 0;
-    let totalPayable = 0;
-
-    for (const challan of filteredChallans) {
-      const position = safePosition(challan);
-      totalReceivable += position.totalReceivable;
-      totalPayable += position.totalPayable;
-    }
-
-    const net = totalReceivable - totalPayable;
-
-    return { totalReceivable, totalPayable, net };
-  }, [filteredChallans]);
-
-  async function loadChallans() {
+  // page=1 replaces `challans`; any later page (Load More) appends.
+  // no-store: unlike every other list fetch here (next-number,
+  // cancel, deliver, etc.) this one's URL is IDENTICAL across visits
+  // whenever no filter is active - exactly the case a bare Bin ->
+  // Restore -> back-to-list round trip hits. Without no-store, the
+  // browser's own HTTP cache can legitimately serve the pre-restore
+  // response for that unchanged URL instead of refetching, since the
+  // server sends no explicit Cache-Control header either way.
+  async function loadChallans(page: number) {
     try {
       setError("");
-      // Real server-side filtering (Dashboard's "Active/Delivered/
-      // Settled Challan" drill-down cards) - status/financial are sent
-      // to GET /api/challan and applied there, never trusted to the
-      // client-only filteredChallans re-check below (which stays, as a
-      // harmless no-op once the server already filtered, and still
-      // does the actual work for date range/free-text search).
-      const query = new URLSearchParams();
-      if (statusFilter !== "ALL") query.set("status", statusFilter);
-      if (financialFilter !== "ALL") query.set("financial", financialFilter);
-      // no-store: unlike every other list fetch here (next-number,
-      // cancel, deliver, etc.) this one's URL is IDENTICAL across
-      // visits whenever no filter is active (plain "/api/challan") -
-      // exactly the case a bare Bin -> Restore -> back-to-list round
-      // trip hits. Without no-store, the browser's own HTTP cache can
-      // legitimately serve the pre-restore response for that
-      // unchanged URL instead of refetching, since the server sends
-      // no explicit Cache-Control header either way.
-      const response = await fetch(`/api/challan${query.toString() ? `?${query.toString()}` : ""}`, { cache: "no-store" });
+      const query = buildFilterQuery();
+      query.set("page", String(page));
+      query.set("pageSize", String(pagination.pageSize));
+      const response = await fetch(`/api/challan?${query.toString()}`, { cache: "no-store" });
       const data = await response.json();
       if (!response.ok || !data.success) {
         setError(data.message || "Unable to load challans");
         return;
       }
-      setChallans(data.items || []);
+      // Re-sorted after every merge (cheap - at most a few hundred
+      // rows) as a safety net on top of the server's own definitive
+      // order, purely to guard "Load More" append against two pages
+      // ever rendering out of order relative to each other.
+      setChallans((prev) => (page === 1 ? data.items || [] : [...prev, ...(data.items || [])]).sort(compareChallanNewestFirst));
+      if (data.pagination) setPagination(data.pagination);
     } catch {
       setError("Unable to connect to the server");
     } finally {
       setLoading(false);
+      setLoadingMore(false);
+    }
+  }
+
+  async function loadMore() {
+    if (loadingMore || pagination.page >= pagination.totalPages) return;
+    setLoadingMore(true);
+    await loadChallans(pagination.page + 1);
+  }
+
+  // Receivable/Payable/Net across the FULL filtered set (lib/challan-
+  // list-query.ts's own computeFilteredChallanPositions - the EXACT
+  // same per-Challan positions the RECEIVABLE/PAYABLE filter options
+  // and the table's Position chips read), fetched from its own
+  // lightweight endpoint in PARALLEL with the list itself - never
+  // derived from `challans`, which may only hold the first page.
+  async function loadSummary() {
+    try {
+      const response = await fetch(`/api/challan/summary?${buildFilterQuery().toString()}`, { cache: "no-store" });
+      const data = await response.json();
+      if (response.ok && data.success && data.summary) setSummary(data.summary);
+    } catch {
+      // silent - the summary cards are a secondary display; a failed
+      // refresh leaves the previous totals showing rather than erroring
+      // out the whole page.
     }
   }
 
@@ -665,10 +635,29 @@ export default function ChallanPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Debounce free-text search before it reaches the server (same
+  // pattern as app/bilty/page.tsx's own P2-3 pagination). Skipped on
+  // the very first run (mount) - search may have just been restored
+  // from a saved list view (see useListScrollRestore), and this
+  // effect's own 300ms delay would otherwise show a brief flash of
+  // "unfiltered" before the restored search takes effect.
+  const isFirstSearchRun = useRef(true);
   useEffect(() => {
-    void loadChallans();
+    if (isFirstSearchRun.current) {
+      isFirstSearchRun.current = false;
+      setDebouncedSearch(search.trim());
+      return;
+    }
+    const timeout = setTimeout(() => setDebouncedSearch(search.trim()), 300);
+    return () => clearTimeout(timeout);
+  }, [search]);
+
+  useEffect(() => {
+    setLoading(true);
+    void loadChallans(1);
+    void loadSummary();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [statusFilter, financialFilter]);
+  }, [statusFilter, financialFilter, debouncedSearch, dateFrom, dateTo]);
 
   // Persist filters/search whenever any of them change, so a Back
   // navigation to this list (see useListScrollRestore) restores the
@@ -738,7 +727,7 @@ export default function ChallanPage() {
       setMessage("Challan created successfully.");
       resetForm();
       setShowForm(false);
-      await loadChallans();
+      await Promise.all([loadChallans(1), loadSummary()]);
     } catch {
       setError("Unable to connect to the server");
     } finally {
@@ -1267,6 +1256,19 @@ export default function ChallanPage() {
                   );
                 })}
               </div>
+
+              {pagination.page < pagination.totalPages && (
+                <div className="flex justify-center border-t p-4">
+                  <button
+                    type="button"
+                    onClick={() => void loadMore()}
+                    disabled={loadingMore}
+                    className="rounded-lg border px-5 py-2 text-sm font-medium hover:bg-gray-50 disabled:opacity-50"
+                  >
+                    {loadingMore ? "Loading..." : `Load More (${filteredChallans.length} of ${pagination.total})`}
+                  </button>
+                </div>
+              )}
             </>
           )}
         </div>

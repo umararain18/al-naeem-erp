@@ -131,6 +131,21 @@ export function challanGlobalSearchOr(query: string): Prisma.ChallanWhereInput[]
   ];
 }
 
+/** Everything challanGlobalSearchOr() covers, PLUS the per-Bilty
+ * Clearing Agent/vehicle fields app/challan/page.tsx's own (now
+ * server-side) list search also matches, so moving that search to
+ * the DB query (lib/challan-list-query.ts) changes nothing a user
+ * could previously find. */
+export function challanListSearchOr(query: string): Prisma.ChallanWhereInput[] {
+  return [
+    ...challanGlobalSearchOr(query),
+    { bilties: { some: { bilty: { clearingAgentParty: { partyName: { contains: query, mode: "insensitive" } } } } } },
+    { bilties: { some: { bilty: { vehicleType: { contains: query, mode: "insensitive" } } } } },
+    { bilties: { some: { bilty: { vehicleModel: { contains: query, mode: "insensitive" } } } } },
+    { bilties: { some: { bilty: { registrationNumber: { contains: query, mode: "insensitive" } } } } },
+  ];
+}
+
 // ------------------------------------------------------------
 // BILL
 // ------------------------------------------------------------

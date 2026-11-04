@@ -4,15 +4,13 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
-import { computeChallanFinancialsBatch } from "@/lib/challan-financials";
 import { getGrossCarrierRentPayableAccountId } from "@/lib/gross-accounts";
-import { getChallanResponsiblePartiesBatch } from "@/lib/document-party-resolution";
-import { computeChallanSettlementSummaryBatch } from "@/lib/challan-settlement-summary";
-import { computeChallanPositionsBatch, resolvePaidUnverifiedEntries, type ChallanPosition } from "@/lib/challan-position";
 import { SettlementPaymentError } from "@/lib/settlement-payments";
 import { recognizeBiltyBookingIncome, BiltyRevenueRecognitionError } from "@/lib/bilty-revenue-recognition";
 import { autoLinkOwnCarrierChallan } from "@/lib/carrier-trip";
 import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
+import { challanListSearchOr } from "@/lib/search-helpers";
+import { computeFilteredChallanPositions, FINANCIAL_FILTER_VALUES, type FinancialFilterValue } from "@/lib/challan-list-query";
 
 // Re-check status codes for the in-transaction Bilty-availability
 // re-validation below (POST) - kept separate from the pre-transaction
@@ -85,68 +83,33 @@ const createChallanSchema = z.object({
 
 const CHALLAN_STATUS_VALUES = ["IN_TRANSIT", "DELIVERED", "CANCELLED"] as const;
 
-// Newest-Challan-first list ordering. challanNo is a plain String
-// column (real data: "4028", "4029", ... - no fixed-width guarantee,
-// so a lexicographic sort/orderBy would wrongly rank "10000" behind
-// "9999" once the sequence crosses a digit boundary) - Prisma has no
-// numeric-cast `orderBy`, so this compares the trailing digit run of
-// each challanNo as a BigInt (safe for any length) instead. Falls
-// back to a plain string compare only when a challanNo has no digits
-// at all, so a genuinely non-numeric value still sorts deterministically
-// instead of crashing. createdAt (desc) is the secondary tiebreak for a
-// genuine tie (e.g. two Challans sharing a challanNo pattern) - never
-// loadingDate (a user-editable, often-backdated business field) and
-// never vehicle/updatedAt/DB default order.
-function extractChallanSeq(challanNo: string): bigint | null {
-  const match = challanNo.match(/(\d+)(?!.*\d)/);
-  if (!match) return null;
-  try {
-    return BigInt(match[1]);
-  } catch {
-    return null;
-  }
-}
-
-function compareChallanNoDesc(a: string, b: string): number {
-  const seqA = extractChallanSeq(a);
-  const seqB = extractChallanSeq(b);
-  if (seqA !== null && seqB !== null && seqA !== seqB) {
-    return seqA > seqB ? -1 : 1;
-  }
-  return b.localeCompare(a);
-}
-
-// "financial" filter values - driven ENTIRELY by challan.position
-// (lib/challan-position.ts), the SAME one shared calculation the
-// list's summary cards and the Challan Detail page also read. There
-// is no more separate, independently-derived "compact status" here -
-// that used to read challan.settlementSummary.partyNet while the
-// summary cards summed challan.financials.remainingReceivable/
-// remainingPayable, two different calculations that could (and did)
-// disagree. "DUE" no longer exists as a bucket: computeChallanPositionsBatch
-// always resolves a settled Challan with a real remaining amount into
-// RECEIVABLE/PAYABLE/RECEIVABLE_PAYABLE, never an unclassified
-// leftover.
-type FinancialFilterValue = "BEFORE_SETTLEMENT" | "AFTER_SETTLEMENT" | "RECEIVABLE" | "PAYABLE" | "RECEIVABLE_PAYABLE" | "CLEARED";
-const FINANCIAL_FILTER_VALUES: FinancialFilterValue[] = ["BEFORE_SETTLEMENT", "AFTER_SETTLEMENT", "RECEIVABLE", "PAYABLE", "RECEIVABLE_PAYABLE", "CLEARED"];
-
-function matchesFinancialFilter(item: { isSettled: boolean; position?: ChallanPosition }, filter: FinancialFilterValue): boolean {
-  switch (filter) {
-    case "BEFORE_SETTLEMENT":
-      return !item.isSettled;
-    case "AFTER_SETTLEMENT":
-      return item.isSettled;
-    case "RECEIVABLE":
-      return item.position?.bucket === "RECEIVABLE";
-    case "PAYABLE":
-      return item.position?.bucket === "PAYABLE";
-    case "RECEIVABLE_PAYABLE":
-      return item.position?.bucket === "RECEIVABLE_PAYABLE";
-    case "CLEARED":
-      return item.position?.bucket === "CLEARED";
-    default:
-      return true;
-  }
+// ------------------------------------------------------------
+// PHASE TIMING - diagnostic only, always on (negligible overhead:
+// Date.now() + one console.log per request). Added to measure where
+// GET /api/challan's time actually goes before/after the pagination +
+// N+1 fixes in this same change - see docs/PERFORMANCE_CHALLAN_LIST.md
+// for the before/after numbers this produced. Kept in place rather
+// than removed after the fix, so a future regression shows up in
+// plain server logs (grep "[challan-list-timing]") without needing to
+// re-instrument.
+// ------------------------------------------------------------
+function createPhaseTimer() {
+  const phases: { name: string; ms: number }[] = [];
+  let last = Date.now();
+  return {
+    mark(name: string) {
+      const now = Date.now();
+      phases.push({ name, ms: now - last });
+      last = now;
+    },
+    report(label: string, extra?: Record<string, number>) {
+      const total = phases.reduce((s, p) => s + p.ms, 0);
+      const extraStr = extra ? " " + Object.entries(extra).map(([k, v]) => `${k}=${v}`).join(" ") : "";
+      console.log(
+        `[challan-list-timing] ${label} total=${total}ms${extraStr} ` + phases.map((p) => `${p.name}=${p.ms}ms`).join(" ")
+      );
+    },
+  };
 }
 
 export async function GET(request: NextRequest) {
@@ -167,165 +130,112 @@ export async function GET(request: NextRequest) {
       );
     }
 
+    const timer = createPhaseTimer();
+
     const { searchParams } = new URL(request.url);
     const statusParam = searchParams.get("status");
     const status: (typeof CHALLAN_STATUS_VALUES)[number] | null =
       statusParam && (CHALLAN_STATUS_VALUES as readonly string[]).includes(statusParam) ? (statusParam as (typeof CHALLAN_STATUS_VALUES)[number]) : null;
     const financialParam = searchParams.get("financial");
     const financial = financialParam && FINANCIAL_FILTER_VALUES.includes(financialParam as FinancialFilterValue) ? (financialParam as FinancialFilterValue) : null;
+    const search = searchParams.get("search")?.trim() || "";
+    const dateFrom = searchParams.get("dateFrom") || "";
+    const dateTo = searchParams.get("dateTo") || "";
 
-    const challans = await prisma.challan.findMany({
-      where: { isDeleted: false, ...(status ? { status } : {}) },
-      include: {
-        transporterParty: {
-          select: {
-            id: true,
-            partyName: true,
-          },
-        },
-        ownCarrier: {
-          select: {
-            id: true,
-            carrierNumber: true,
-          },
-        },
-        bilties: {
+    // Same page/pageSize validation shape as app/api/bilty/route.ts's
+    // own P2-3 pagination - a syntactically valid but astronomically
+    // large `page` must never reach a `skip` calculation (overflows
+    // there and throws).
+    const rawPage = searchParams.get("page");
+    const parsedPage = rawPage ? parseInt(rawPage, 10) : 1;
+    if (rawPage && !Number.isNaN(parsedPage) && !Number.isSafeInteger(parsedPage)) {
+      return NextResponse.json({ success: false, message: "Invalid page number" }, { status: 400 });
+    }
+    const page = Math.max(1, parsedPage || 1);
+    const pageSize = Math.min(100, Math.max(1, parseInt(searchParams.get("pageSize") || "50", 10) || 50));
+
+    const where: Prisma.ChallanWhereInput = {
+      isDeleted: false,
+      ...(status ? { status } : {}),
+      ...(search ? { OR: challanListSearchOr(search) } : {}),
+      ...(dateFrom || dateTo
+        ? {
+            loadingDate: {
+              // Mirrors the exact semantics the list page's own
+              // (now-removed) client-side date filter used - dateFrom
+              // inclusive, dateTo EXCLUSIVE of that calendar date -
+              // never changed here, only moved server-side.
+              ...(dateFrom ? { gte: new Date(`${dateFrom}T00:00:00`) } : {}),
+              ...(dateTo ? { lt: new Date(`${dateTo}T00:00:00`) } : {}),
+            },
+          }
+        : {}),
+    };
+
+    // LIGHTWEIGHT pass across every Challan matching the plain-column
+    // filters above - computes financial position for all of them
+    // (now cheap - see lib/challan-settlement-summary.ts's own doc
+    // comment on the N+1 fix this relies on), applies the "financial"
+    // filter (a COMPUTED value, never a column, so it can't live in
+    // `where` itself), and returns the definitive ordered id list this
+    // page is sliced from - never a second, independently-filtered
+    // id list that could disagree with it.
+    const filtered = await computeFilteredChallanPositions(where, financial);
+    timer.mark("filteredPositions");
+
+    const total = filtered.orderedIds.length;
+    const pageIds = filtered.orderedIds.slice((page - 1) * pageSize, page * pageSize);
+
+    // PAGE-SCOPED HEAVY FETCH - the full bilty/location/clearing-
+    // agent/agent-party display shape, fetched ONLY for this page's
+    // ids (never for every Challan matching the filters, which would
+    // put list-page cost back on the whole table as it grows).
+    const pageChallans = pageIds.length > 0
+      ? await prisma.challan.findMany({
+          where: { id: { in: pageIds } },
           include: {
-            bilty: {
+            transporterParty: { select: { id: true, partyName: true } },
+            ownCarrier: { select: { id: true, carrierNumber: true } },
+            bilties: {
               include: {
-                fromLocation: { select: { id: true, name: true } },
-                toLocation: { select: { id: true, name: true } },
-                consignorParty: { select: { id: true, partyName: true, account: { select: { id: true } } } },
-                consigneeParty: { select: { id: true, partyName: true, account: { select: { id: true } } } },
-                clearingAgentParty: { select: { id: true, partyName: true } },
-                agentParty: { select: { id: true, partyName: true } },
+                bilty: {
+                  include: {
+                    fromLocation: { select: { id: true, name: true } },
+                    toLocation: { select: { id: true, name: true } },
+                    consignorParty: { select: { id: true, partyName: true, account: { select: { id: true } } } },
+                    consigneeParty: { select: { id: true, partyName: true, account: { select: { id: true } } } },
+                    clearingAgentParty: { select: { id: true, partyName: true } },
+                    agentParty: { select: { id: true, partyName: true } },
+                  },
+                },
               },
+              orderBy: { addedAt: "asc" },
             },
           },
-          orderBy: { addedAt: "asc" },
-        },
-      },
-      orderBy: { createdAt: "desc" },
-    });
+        })
+      : [];
+    timer.mark("pageHeavyFetch");
 
-    // Definitive display order: Challan number sequence, numeric-aware,
-    // descending - see compareChallanNoDesc() above. The Prisma
-    // `orderBy` above is only a reasonable DB-level starting order;
-    // this in-memory sort is what actually determines the final
-    // order (this list has no pagination - it always returns every
-    // non-deleted Challan - so a stable, full in-memory sort is safe
-    // and correct here, never partial/page-dependent).
-    challans.sort((a, b) => compareChallanNoDesc(a.challanNo, b.challanNo) || b.createdAt.getTime() - a.createdAt.getTime());
-
-    // "Income pending (Trip slip not closed)" - own-carrier Challans
-    // only (see Challan.ownCarrierId's own schema doc comment). Net
-    // count (recognized - reversed) per Challan, batched in two
-    // groupBy queries rather than one call per Challan - same
-    // idempotency semantics as lib/carrier-trip.ts's own
-    // getChallanCloseRecognitionNet, just batched for a list.
-    const ownCarrierChallanIds = challans.filter((c) => c.ownCarrierId).map((c) => c.id);
-    const incomePendingSet = new Set<string>();
-    if (ownCarrierChallanIds.length > 0) {
-      const [recognized, reversed] = await Promise.all([
-        prisma.journalEntry.groupBy({
-          by: ["referenceId"],
-          where: { referenceType: "CARRIER_TRIP_CLOSE", referenceId: { in: ownCarrierChallanIds }, isDeleted: false },
-          _count: { _all: true },
-        }),
-        prisma.journalEntry.groupBy({
-          by: ["referenceId"],
-          where: { referenceType: "CARRIER_TRIP_CLOSE_REVERSAL", referenceId: { in: ownCarrierChallanIds }, isDeleted: false },
-          _count: { _all: true },
-        }),
-      ]);
-      const recognizedMap = new Map(recognized.map((r) => [r.referenceId as string, r._count._all]));
-      const reversedMap = new Map(reversed.map((r) => [r.referenceId as string, r._count._all]));
-      for (const id of ownCarrierChallanIds) {
-        const net = (recognizedMap.get(id) || 0) - (reversedMap.get(id) || 0);
-        if (net <= 0) incomePendingSet.add(id);
-      }
-    }
-
-    const financialsMap = await computeChallanFinancialsBatch(
-      challans.map((c) => ({
-        id: c.id,
-        outstandingReceivable: c.outstandingReceivable,
-        outstandingPayable: c.outstandingPayable,
-        biltyIds: c.bilties.map((cb) => cb.biltyId),
-      }))
-    );
-
-    // Purely informational "who" behind the receivable/payable
-    // totals above - does not affect the amounts themselves.
-    const responsiblePartiesMap = await getChallanResponsiblePartiesBatch(
-      challans.filter((c) => c.isSettled).map((c) => c.id)
-    );
-
-    // Dimensionally-separated settlement summary (same authoritative
-    // source Final Settlement and the Challan Detail page use) -
-    // needed here both for the list's own "Bilty Rent" column total
-    // (biltyRentTotal() in app/challan/page.tsx) AND, below, to feed
-    // `position`'s own party resolution (its partyNet and live
-    // "Collected by"/"Paid by" payers - tiers 1-2, see lib/challan-
-    // position.ts's own doc comment) - never a separate calculation.
-    const settlementSummaryMap = await computeChallanSettlementSummaryBatch(challans.map((c) => c.id));
-
-    // ONE financial position per Challan (lib/challan-position.ts) -
-    // the single shared calculation the list's table, filter, and
-    // summary cards, AND the Challan Detail page, all read. Built
-    // from financialsMap's own amounts (above) and
-    // settlementSummaryMap's own partyNet/live payers (party names,
-    // tiers 1-2) plus document role fields (tier 3) - never a
-    // fourth, independent calculation.
-    const positionsMap = await computeChallanPositionsBatch(
-      challans.map((c) => {
-        const summary = settlementSummaryMap[c.id];
-        return {
-          id: c.id,
-          isSettled: c.isSettled,
-          outstandingReceivable: c.outstandingReceivable,
-          outstandingPayable: c.outstandingPayable,
-          biltyIds: c.bilties.map((cb) => cb.biltyId),
-          partyNet: summary?.partyNet || [],
-          collectedByParties: summary?.bilties.flatMap((b) => b.toPay.payers) || [],
-          paidByParties: summary?.carrierRent.payers || [],
-          transporterParty: c.transporterParty
-            ? { partyId: c.transporterParty.id, partyName: c.transporterParty.partyName }
-            : null,
-          biltyParties: c.bilties.map((cb) => ({
-            consignor: cb.bilty.consignorParty
-              ? { partyId: cb.bilty.consignorParty.id, partyName: cb.bilty.consignorParty.partyName }
-              : null,
-            consignee: cb.bilty.consigneeParty
-              ? { partyId: cb.bilty.consigneeParty.id, partyName: cb.bilty.consigneeParty.partyName }
-              : null,
-          })),
-          paidUnverified: resolvePaidUnverifiedEntries(c.bilties, summary),
-        };
-      })
-    );
-
-    const itemsBeforeFinancialFilter = challans.map((c) => ({
-      ...c,
-      financials: financialsMap[c.id],
-      responsibleParties: responsiblePartiesMap[c.id],
-      settlementSummary: settlementSummaryMap[c.id],
-      position: positionsMap[c.id],
-      incomePending: incomePendingSet.has(c.id),
-    }));
-
-    // "financial" (RECEIVABLE/PAYABLE/RECEIVABLE_PAYABLE/CLEARED/...)
-    // is a computed value, not a raw column - filtered here, server-
-    // side, AFTER the batch computation above, rather than in the
-    // Prisma `where` clause. Real server-side filtering either way -
-    // the dashboard's "Settled Challan" etc. drill-down cards never
-    // rely on the client to filter an unfiltered fetch.
-    const items = financial ? itemsBeforeFinancialFilter.filter((item) => matchesFinancialFilter(item, financial)) : itemsBeforeFinancialFilter;
+    const pageChallanById = new Map(pageChallans.map((c) => [c.id, c]));
+    const items = pageIds
+      .map((id) => pageChallanById.get(id))
+      .filter((c): c is NonNullable<typeof c> => !!c)
+      .map((c) => ({
+        ...c,
+        financials: filtered.financialsMap[c.id],
+        responsibleParties: filtered.responsiblePartiesMap[c.id],
+        settlementSummary: filtered.settlementSummaryMap[c.id],
+        position: filtered.positionsMap[c.id],
+        incomePending: filtered.incomePendingSet.has(c.id),
+      }));
+    timer.mark("assemble");
+    timer.report("GET /api/challan", { total, pageSize, itemCount: items.length });
 
     return NextResponse.json(
       {
         success: true,
         items,
+        pagination: { page, pageSize, total, totalPages: Math.max(1, Math.ceil(total / pageSize)) },
         // Challan Bin now also resets every linked Bilty's status and
         // reverses Booking Income (see the DELETE handler in
         // app/api/challan/[id]/route.ts) - SUPER_ADMIN only, matching

@@ -210,6 +210,171 @@ export async function getBiltyPaidVerification(
   };
 }
 
+// ------------------------------------------------------------
+// BATCH - byte-for-byte the SAME computation as getBiltyPaidVerification()
+// above, for every Bilty in `biltyIds`, but issuing a small constant
+// number of queries total instead of ~6 PER Bilty (2x bilty lookup -
+// one here, one duplicated inside resolveBiltyPaidResponsibleParty -
+// plus 3 separate JournalLine scans, one of them behind a per-call
+// getGrossBiltyReceivableAccountId() lookup). Confirmed the dominant
+// cost of GET /api/challan at production-like volume (800 Bilties):
+// ~4.2s of a ~4.4s request, almost entirely this one function called
+// once per Bilty via Promise.all in computeChallanSettlementSummaryBatch.
+// Never used for a single-Bilty, in-transaction write-path check
+// (assertPaidVerificationNotExceeded below still calls the single-item
+// function, which also supports `excludeJournalEntryId` - meaningless
+// in a read-only list context, so this batch form has no such param).
+// ------------------------------------------------------------
+
+export async function getBiltyPaidVerificationBatch(
+  tx: Tx,
+  biltyIds: string[]
+): Promise<Map<string, BiltyPaidVerificationState>> {
+  const result = new Map<string, BiltyPaidVerificationState>();
+  if (biltyIds.length === 0) return result;
+
+  // Replaces BOTH the single `tx.bilty.findUnique` in
+  // getBiltyPaidVerification() AND the duplicate one inside
+  // resolveBiltyPaidResponsibleParty() - one query, every field
+  // either of those two ever needed.
+  const bilties = await tx.bilty.findMany({
+    where: { id: { in: biltyIds } },
+    select: {
+      id: true,
+      advance: true,
+      paidResponsibleParty: { select: { partyName: true, account: { select: { id: true, isActive: true } } } },
+      consignorParty: { select: { partyName: true, account: { select: { id: true, isActive: true } } } },
+      consigneeParty: { select: { partyName: true, account: { select: { id: true, isActive: true } } } },
+    },
+  });
+
+  // Pure in-memory port of resolveBiltyPaidResponsibleParty()'s own
+  // logic (lib/document-party-resolution.ts) - identical rules, just
+  // fed from the single bulk fetch above instead of its own query.
+  function resolveResponsible(b: (typeof bilties)[number]): { accountId: string; partyName: string } | null {
+    if (Number(b.advance) <= 0) return null;
+    if (b.paidResponsibleParty?.account?.id && b.paidResponsibleParty.account.isActive) {
+      return { accountId: b.paidResponsibleParty.account.id, partyName: b.paidResponsibleParty.partyName };
+    }
+    const consignorValid = b.consignorParty?.account?.id && b.consignorParty.account.isActive;
+    const consigneeValid = b.consigneeParty?.account?.id && b.consigneeParty.account.isActive;
+    if (consignorValid && !consigneeValid) return { accountId: b.consignorParty!.account!.id, partyName: b.consignorParty!.partyName };
+    if (consigneeValid && !consignorValid) return { accountId: b.consigneeParty!.account!.id, partyName: b.consigneeParty!.partyName };
+    return null;
+  }
+
+  const paidAmountByBiltyId = new Map<string, number>();
+  const responsibleByBiltyId = new Map<string, { accountId: string; partyName: string } | null>();
+  for (const b of bilties) {
+    paidAmountByBiltyId.set(b.id, round2(Number(b.advance)));
+    responsibleByBiltyId.set(b.id, resolveResponsible(b));
+  }
+
+  // paidTaggedLines, for every Bilty at once - same two referenceType
+  // shapes as the single-item query's own OR, just fetched together
+  // and re-separated in-memory. The first shape's `referenceId: biltyId`
+  // (always the SAME id as that line's own sourceId - see this
+  // module's header comment) is checked explicitly per-line below,
+  // never left to an independent `referenceId: { in: biltyIds }`
+  // filter, which could not by itself guarantee a line's sourceId and
+  // its OWN journalEntry's referenceId are the SAME Bilty rather than
+  // two different ones that both happen to be in this batch.
+  const paidTaggedLines = await tx.journalLine.findMany({
+    where: {
+      sourceType: "BILTY",
+      sourceId: { in: biltyIds },
+      account: { category: "PARTY" },
+      journalEntry: {
+        isDeleted: false,
+        referenceType: { in: ["SETTLEMENT_PAYMENT", "SETTLEMENT_PAYMENT_CORRECTION", "SETTLEMENT_PAYMENT_REVERSAL", "PAID_RESPONSIBILITY_REASSIGNMENT"] },
+      },
+    },
+    select: { accountId: true, sourceId: true, journalEntry: { select: { referenceType: true, referenceId: true } } },
+  });
+
+  const relevantAccountIdsByBiltyId = new Map<string, Set<string>>();
+  for (const line of paidTaggedLines) {
+    if (!line.sourceId) continue;
+    const isReassignment = line.journalEntry.referenceType === "PAID_RESPONSIBILITY_REASSIGNMENT";
+    if (!isReassignment && line.journalEntry.referenceId !== line.sourceId) continue;
+    const set = relevantAccountIdsByBiltyId.get(line.sourceId) || new Set<string>();
+    set.add(line.accountId);
+    relevantAccountIdsByBiltyId.set(line.sourceId, set);
+  }
+  for (const [biltyId, responsible] of responsibleByBiltyId) {
+    if (!responsible) continue;
+    const set = relevantAccountIdsByBiltyId.get(biltyId) || new Set<string>();
+    set.add(responsible.accountId);
+    relevantAccountIdsByBiltyId.set(biltyId, set);
+  }
+
+  // DAILY_POSTING verification lines against any relevant account,
+  // for every Bilty at once - fetched WITHOUT an accountId filter
+  // (each Bilty's own relevant set differs), filtered against the
+  // right Bilty's own set in-memory instead; exactly equivalent to N
+  // separate `accountId: { in: relevantAccountIds } ` queries.
+  const verificationLines =
+    relevantAccountIdsByBiltyId.size > 0
+      ? await tx.journalLine.findMany({
+          where: {
+            sourceType: "BILTY",
+            sourceId: { in: [...relevantAccountIdsByBiltyId.keys()] },
+            journalEntry: { referenceType: "DAILY_POSTING", isDeleted: false },
+          },
+          select: { accountId: true, sourceId: true, debit: true, credit: true },
+        })
+      : [];
+  const partyVerifiedByBiltyId = new Map<string, number>();
+  for (const line of verificationLines) {
+    if (!line.sourceId) continue;
+    const relevant = relevantAccountIdsByBiltyId.get(line.sourceId);
+    if (!relevant || !relevant.has(line.accountId)) continue;
+    partyVerifiedByBiltyId.set(line.sourceId, (partyVerifiedByBiltyId.get(line.sourceId) || 0) + Number(line.credit) - Number(line.debit));
+  }
+
+  // Gross Bilty Receivable receipts - ONE account-id lookup (not one
+  // per Bilty) plus ONE query across every Bilty, instead of N+N.
+  const grossAccountId = await getGrossBiltyReceivableAccountId(tx);
+  const grossLines = await tx.journalLine.findMany({
+    where: {
+      accountId: grossAccountId,
+      sourceType: "BILTY",
+      sourceId: { in: biltyIds },
+      journalEntry: { referenceType: "DAILY_POSTING", isDeleted: false },
+    },
+    select: { sourceId: true, debit: true, credit: true },
+  });
+  const grossNetByBiltyId = new Map<string, number>();
+  for (const line of grossLines) {
+    if (!line.sourceId) continue;
+    grossNetByBiltyId.set(line.sourceId, (grossNetByBiltyId.get(line.sourceId) || 0) + Number(line.credit) - Number(line.debit));
+  }
+
+  for (const biltyId of biltyIds) {
+    const paidAmount = paidAmountByBiltyId.get(biltyId) ?? 0;
+    const responsible = responsibleByBiltyId.get(biltyId) ?? null;
+
+    const partyVerifiedAmount = round2(Math.max(0, partyVerifiedByBiltyId.get(biltyId) || 0));
+    const grossVerifiedAmount = round2(Math.min(paidAmount, Math.max(0, grossNetByBiltyId.get(biltyId) || 0)));
+    const verifiedReceivedAmount = round2(partyVerifiedAmount + grossVerifiedAmount);
+
+    const isInconsistent = verifiedReceivedAmount > paidAmount + EPS;
+    const unverifiedAmount = isInconsistent ? 0 : Math.max(0, round2(paidAmount - verifiedReceivedAmount));
+
+    result.set(biltyId, {
+      biltyId,
+      paidAmount,
+      responsiblePartyAccountId: responsible?.accountId || null,
+      responsiblePartyName: responsible?.partyName || null,
+      verifiedReceivedAmount,
+      unverifiedAmount,
+      isInconsistent,
+    });
+  }
+
+  return result;
+}
+
 /**
  * Validates that a NEW Daily Posting receipt of `amount` credited to
  * `counterAccountId` for this Bilty would not verify more than the

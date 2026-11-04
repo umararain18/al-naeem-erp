@@ -1,8 +1,9 @@
 import { prisma } from "@/lib/prisma";
-import { getBiltyPaidVerification } from "@/lib/bilty-paid-verification";
+import { getBiltyPaidVerificationBatch } from "@/lib/bilty-paid-verification";
 import {
-  getSettledPartyAccountIdsBatch,
+  getSettledPartyAccountIdsForChallansBatch,
   SETTLEMENT_NET_REFERENCE_TYPES,
+  type SettledPartyLookupRequest,
 } from "@/lib/settlement-correction";
 
 // ============================================================
@@ -222,47 +223,38 @@ export async function computeChallanSettlementSummaryBatch(
   ]);
 
   // ------------------------------------------------------------
-  // 4. Paid verification - reused exactly as-is, per Bilty,
-  //    concurrently (the same pattern the Challan Detail GET already
-  //    uses for paidVerification.perBilty).
+  // 4. Paid verification - ONE batched call across every Bilty on
+  //    this page (see lib/bilty-paid-verification.ts's own doc
+  //    comment on getBiltyPaidVerificationBatch - this used to be a
+  //    per-Bilty Promise.all, each call issuing ~6 of its own
+  //    queries; confirmed the dominant cost of GET /api/challan at
+  //    production-like volume).
   // ------------------------------------------------------------
-  const paidVerificationByBiltyId = new Map<string, Awaited<ReturnType<typeof getBiltyPaidVerification>>>();
-  await Promise.all(
-    allBiltyIds.map(async (biltyId) => {
-      const state = await getBiltyPaidVerification(prisma, biltyId);
-      paidVerificationByBiltyId.set(biltyId, state);
-    })
-  );
+  const paidVerificationByBiltyId = await getBiltyPaidVerificationBatch(prisma, allBiltyIds);
 
   // ------------------------------------------------------------
-  // 5. Assemble, falling back to the OLD single-payer mechanism only
-  //    for a component with ZERO live rows on an already-settled
-  //    Challan - never for an unsettled one (nothing to fall back
-  //    to), never fabricated.
+  // 5a. The OLD single-payer mechanism's default party for EACH
+  //    Bilty's Collection, and for each Challan's Carrier Rent -
+  //    gathered as plain REQUESTS first (pure, no DB access), then
+  //    resolved for every Challan in ONE query via
+  //    getSettledPartyAccountIdsForChallansBatch() below - this used
+  //    to call getSettledPartyAccountIdsBatch() once per SETTLED
+  //    Challan in a loop (confirmed N+1 at volume). Requested
+  //    UNCONDITIONALLY (not just when no live rows exist for that
+  //    component), because a party's residual OLD-mechanism
+  //    attribution (e.g. syncCollectionFloorForNewEngineRows()'s
+  //    toPay-floor stand-in) can remain non-zero even once the new
+  //    multi-payer engine already has its own rows for that same
+  //    component - see PartyNetEntry's own doc comment above for why
+  //    this must be considered for an authoritative party net, not
+  //    just for the historical-fallback ComponentSummary path.
   // ------------------------------------------------------------
-  // Raw candidate account IDs per Challan, gathered while building
-  // bilties/carrierRent below - resolved into actual net figures in
-  // ONE pass per Challan afterward (step 6), then given names in one
-  // final batched query across every Challan (step 7).
-  const candidateAccountIdsByChallan = new Map<string, Set<string>>();
+  type OldPartyLookupRequest = { key: string; component: "COLLECTION" | "CARRIER_RENT"; incomeOrExpenseAccountId: string; biltyId: string | null };
+  const oldPartyLookupRequestsByChallan = new Map<string, OldPartyLookupRequest[]>();
+  const challanRequestsForBatch = new Map<string, { settlementJournalEntryId: string; requests: SettledPartyLookupRequest[] }>();
 
   for (const challan of challans) {
-    const candidates = new Set<string>();
-    candidateAccountIdsByChallan.set(challan.id, candidates);
-
-    const bilties: BiltySettlementSummary[] = [];
-
-    // The OLD single-payer mechanism's default party for EACH Bilty's
-    // Collection, and for this Challan's Carrier Rent - resolved
-    // UNCONDITIONALLY (not just when no live rows exist for that
-    // component), because a party's residual OLD-mechanism
-    // attribution (e.g. syncCollectionFloorForNewEngineRows()'s
-    // toPay-floor stand-in) can remain non-zero even once the new multi-payer
-    // engine already has its own rows for that same component - see
-    // PartyNetEntry's own doc comment above for why this must be
-    // considered for an authoritative party net, not just for the
-    // historical-fallback ComponentSummary path.
-    const oldPartyLookupRequests: { key: string; component: "COLLECTION" | "CARRIER_RENT"; incomeOrExpenseAccountId: string; biltyId: string | null }[] = [];
+    const oldPartyLookupRequests: OldPartyLookupRequest[] = [];
     if (challan.isSettled && challan.settlementJournalEntryId) {
       if (bookingIncomeAccount) {
         for (const cb of challan.bilties) {
@@ -284,15 +276,45 @@ export async function computeChallanSettlementSummaryBatch(
         });
       }
     }
-    const oldPartyResults =
-      oldPartyLookupRequests.length > 0
-        ? await getSettledPartyAccountIdsBatch(
-            prisma,
-            challan.id,
-            challan.settlementJournalEntryId as string,
-            oldPartyLookupRequests.map((r) => ({ component: r.component, incomeOrExpenseAccountId: r.incomeOrExpenseAccountId, biltyId: r.biltyId }))
-          )
-        : [];
+    oldPartyLookupRequestsByChallan.set(challan.id, oldPartyLookupRequests);
+    if (oldPartyLookupRequests.length > 0) {
+      challanRequestsForBatch.set(challan.id, {
+        settlementJournalEntryId: challan.settlementJournalEntryId as string,
+        requests: oldPartyLookupRequests.map((r) => ({ component: r.component, incomeOrExpenseAccountId: r.incomeOrExpenseAccountId, biltyId: r.biltyId })),
+      });
+    }
+  }
+
+  const oldPartyResultsByChallan =
+    challanRequestsForBatch.size > 0 ? await getSettledPartyAccountIdsForChallansBatch(prisma, challanRequestsForBatch) : new Map<string, (string | null)[]>();
+
+  // ------------------------------------------------------------
+  // 5b. Assemble, falling back to the OLD single-payer mechanism only
+  //    for a component with ZERO live rows on an already-settled
+  //    Challan - never for an unsettled one (nothing to fall back
+  //    to), never fabricated. Purely in-memory from here on - every
+  //    DB call this loop used to make is now one of the already-
+  //    batched lookups above/below.
+  // ------------------------------------------------------------
+  // Raw candidate account IDs per Challan, gathered while building
+  // bilties/carrierRent below - resolved into actual net figures in
+  // ONE pass per Challan afterward (step 6), then given names in one
+  // final batched query across every Challan (step 7).
+  const candidateAccountIdsByChallan = new Map<string, Set<string>>();
+  // CARRIER_RENT's own OLD-mechanism residual party account id, per
+  // Challan with remaining > 0 - names resolved once, in step 7,
+  // alongside every other partyNet account name (never a per-Challan
+  // account.findUnique()).
+  const carrierRentOldPartyAccountIdByChallan = new Map<string, string>();
+
+  for (const challan of challans) {
+    const candidates = new Set<string>();
+    candidateAccountIdsByChallan.set(challan.id, candidates);
+
+    const bilties: BiltySettlementSummary[] = [];
+
+    const oldPartyLookupRequests = oldPartyLookupRequestsByChallan.get(challan.id) || [];
+    const oldPartyResults = oldPartyResultsByChallan.get(challan.id) || [];
     const oldCollectionPartyByBiltyId = new Map<string, string | null>();
     let oldCarrierRentPartyAccountId: string | null = null;
     oldPartyLookupRequests.forEach((r, i) => {
@@ -368,14 +390,10 @@ export async function computeChallanSettlementSummaryBatch(
     }
 
     if (carrierRentSummary.remaining > 0 && carrierRentOldPartyAccountId) {
-      const account = await prisma.account.findUnique({
-        where: { id: carrierRentOldPartyAccountId },
-        select: { accountName: true, party: { select: { partyName: true } } },
-      });
-      const residualPartyName = account?.party?.partyName || account?.accountName || null;
-      if (residualPartyName) {
-        carrierRentSummary.residualPartyName = residualPartyName;
-      }
+      // Name resolved later, in ONE batched query (step 7) across
+      // every Challan's own residual account - never a per-Challan
+      // account.findUnique() here.
+      carrierRentOldPartyAccountIdByChallan.set(challan.id, carrierRentOldPartyAccountId);
     }
 
     result[challan.id] = { challanId: challan.id, bilties, carrierRent: carrierRentSummary, partyNet: [] };
@@ -479,70 +497,120 @@ export async function computeChallanSettlementSummaryBatch(
   //    "this party's total net across every Collection + Carrier
   //    Rent JournalLine on this Challan" figure, computed the SAME
   //    way getPartyNetFromSettlement() does (same referenceType set,
-  //    same referenceId scope), batched across every candidate
-  //    account gathered above in ONE query per Challan - EXCLUDING
-  //    any JournalEntry that belongs to a PAID SettlementPayment's
-  //    own lifecycle (create/correction/reversal), since PAID is
-  //    informational/context only per the approved business rule and
-  //    must never be silently netted into a party's position. The
-  //    settlement-side computation below is UNCHANGED from before
-  //    Daily Posting was incorporated - only the final merge step
-  //    (after this loop's own per-Challan work) adds in step 5.5's
-  //    already-batched Daily Posting contribution.
+  //    same referenceId scope) - EXCLUDING any JournalEntry that
+  //    belongs to a PAID SettlementPayment's own lifecycle (create/
+  //    correction/reversal), since PAID is informational/context only
+  //    per the approved business rule and must never be silently
+  //    netted into a party's position. Every query below is now
+  //    batched ONCE across every Challan on this page (previously one
+  //    PAID-rows query, one correction-lines query, and one lines
+  //    query PER Challan - confirmed N+1 at volume) - only the final
+  //    per-Challan merge/filter step stays a loop, and it is now pure
+  //    in-memory work, no DB access.
   // ------------------------------------------------------------
+
+  // A party may have Daily Posting activity against a Challan with no
+  // settlement-side candidate lookup ever having found them
+  // (defensive - in practice this account is virtually always already
+  // a candidate) - union them in so they are never missed, same as
+  // before, just done as its own pass ahead of the global queries
+  // below instead of inside the per-Challan loop.
   for (const challan of challans) {
     const candidates = candidateAccountIdsByChallan.get(challan.id) || new Set<string>();
-    // A party may have Daily Posting activity against this Challan
-    // with no settlement-side candidate lookup ever having found them
-    // (defensive - in practice this account is virtually always
-    // already a candidate) - union them in so they are never missed.
     for (const key of dailyPostingNetByChallanAccount.keys()) {
       if (key.startsWith(`${challan.id}:`)) candidates.add(key.slice(challan.id.length + 1));
     }
+    candidateAccountIdsByChallan.set(challan.id, candidates);
+  }
+
+  // PAID rows (and their own correction/reversal entries) for every
+  // Bilty on this page at once, grouped back to each Bilty's owning
+  // Challan via biltyIdToChallanId (built above, in step 5.5) - same
+  // exclusion-set shape as before, just assembled from one global
+  // fetch instead of one query pair per Challan.
+  const allPaidRowsForNetExclusion =
+    allBiltyIds.length > 0
+      ? await prisma.settlementPayment.findMany({
+          where: { component: "PAID", biltyId: { in: allBiltyIds } },
+          select: { id: true, journalEntryId: true, biltyId: true },
+        })
+      : [];
+  const excludedJournalEntryIdsByChallan = new Map<string, Set<string>>();
+  const paidRowIdToChallanId = new Map<string, string>();
+  for (const row of allPaidRowsForNetExclusion) {
+    if (!row.biltyId) continue;
+    const owningChallanId = biltyIdToChallanId.get(row.biltyId);
+    if (!owningChallanId) continue;
+    paidRowIdToChallanId.set(row.id, owningChallanId);
+    const set = excludedJournalEntryIdsByChallan.get(owningChallanId) || new Set<string>();
+    set.add(row.journalEntryId);
+    excludedJournalEntryIdsByChallan.set(owningChallanId, set);
+  }
+  const allPaidRowIds = allPaidRowsForNetExclusion.map((r) => r.id);
+  const allPaidCorrectionLines =
+    allPaidRowIds.length > 0
+      ? await prisma.journalLine.findMany({
+          where: { sourceType: "SETTLEMENT_PAYMENT", sourceId: { in: allPaidRowIds } },
+          select: { journalEntryId: true, sourceId: true },
+        })
+      : [];
+  for (const l of allPaidCorrectionLines) {
+    const owningChallanId = l.sourceId ? paidRowIdToChallanId.get(l.sourceId) : undefined;
+    if (!owningChallanId) continue;
+    const set = excludedJournalEntryIdsByChallan.get(owningChallanId) || new Set<string>();
+    set.add(l.journalEntryId);
+    excludedJournalEntryIdsByChallan.set(owningChallanId, set);
+  }
+
+  // The settlement-side PARTY NET lines themselves, across every
+  // Challan's own candidate accounts at once - `referenceId` is
+  // either a Challan id directly or one of its Bilty ids (both
+  // resolved back to the owning Challan via the same Sets/map used
+  // throughout this function), and `accountId` is re-checked against
+  // THIS Challan's own candidate set below (never another Challan's -
+  // the global fetch below only narrows which ROWS are even possible
+  // candidates anywhere on this page).
+  const challanIdSet = new Set(challanIds);
+  const allCandidateAccountIds = [...new Set([...candidateAccountIdsByChallan.values()].flatMap((s) => [...s]))];
+  const allReferenceIds = [...challanIds, ...allBiltyIds];
+  const allPartyNetLines =
+    allCandidateAccountIds.length > 0 && allReferenceIds.length > 0
+      ? await prisma.journalLine.findMany({
+          where: {
+            accountId: { in: allCandidateAccountIds },
+            journalEntry: {
+              isDeleted: false,
+              referenceType: { in: SETTLEMENT_NET_REFERENCE_TYPES },
+              referenceId: { in: allReferenceIds },
+            },
+          },
+          select: { accountId: true, debit: true, credit: true, journalEntryId: true, journalEntry: { select: { referenceId: true } } },
+        })
+      : [];
+  const partyNetLinesByChallan = new Map<string, { accountId: string; debit: number; credit: number; journalEntryId: string }[]>();
+  for (const l of allPartyNetLines) {
+    const refId = l.journalEntry.referenceId;
+    if (!refId) continue;
+    const owningChallanId = challanIdSet.has(refId) ? refId : biltyIdToChallanId.get(refId);
+    if (!owningChallanId) continue;
+    const list = partyNetLinesByChallan.get(owningChallanId) || [];
+    list.push({ accountId: l.accountId, debit: Number(l.debit), credit: Number(l.credit), journalEntryId: l.journalEntryId });
+    partyNetLinesByChallan.set(owningChallanId, list);
+  }
+
+  for (const challan of challans) {
+    const candidates = candidateAccountIdsByChallan.get(challan.id) || new Set<string>();
     const candidateList = [...candidates];
     if (candidateList.length === 0) continue;
 
-    const biltyIds = challan.bilties.filter((cb) => !cb.bilty.isDeleted).map((cb) => cb.bilty.id);
-    const referenceIds = [challan.id, ...biltyIds];
-
-    // PAID rows for this Challan's Bilties, and their own correction/
-    // reversal entries (tagged sourceType:"SETTLEMENT_PAYMENT",
-    // sourceId:<row id> - the same convention updateSettlementPaymentAmount()/
-    // deleteSettlementPayment() already use for EVERY component, which
-    // is what makes this a reliable, precise exclusion rather than a
-    // description-text guess).
-    const paidRows = biltyIds.length > 0
-      ? await prisma.settlementPayment.findMany({
-          where: { component: "PAID", biltyId: { in: biltyIds } },
-          select: { id: true, journalEntryId: true },
-        })
-      : [];
-    const excludedJournalEntryIds = new Set(paidRows.map((r) => r.journalEntryId));
-    if (paidRows.length > 0) {
-      const paidCorrectionLines = await prisma.journalLine.findMany({
-        where: { sourceType: "SETTLEMENT_PAYMENT", sourceId: { in: paidRows.map((r) => r.id) } },
-        select: { journalEntryId: true },
-      });
-      for (const l of paidCorrectionLines) excludedJournalEntryIds.add(l.journalEntryId);
-    }
-
-    const lines = await prisma.journalLine.findMany({
-      where: {
-        accountId: { in: candidateList },
-        journalEntry: {
-          isDeleted: false,
-          referenceType: { in: SETTLEMENT_NET_REFERENCE_TYPES },
-          referenceId: { in: referenceIds },
-        },
-      },
-      select: { accountId: true, debit: true, credit: true, journalEntryId: true },
-    });
+    const excludedJournalEntryIds = excludedJournalEntryIdsByChallan.get(challan.id) || new Set<string>();
+    const lines = (partyNetLinesByChallan.get(challan.id) || []).filter((l) => candidates.has(l.accountId));
 
     const netByAccountId = new Map<string, number>();
     for (const l of lines) {
       if (excludedJournalEntryIds.has(l.journalEntryId)) continue;
       const current = netByAccountId.get(l.accountId) || 0;
-      netByAccountId.set(l.accountId, round2(current + Number(l.debit) - Number(l.credit)));
+      netByAccountId.set(l.accountId, round2(current + l.debit - l.credit));
     }
 
     // Merge in step 5.5's already-batched Daily Posting contribution -
@@ -565,12 +633,17 @@ export async function computeChallanSettlementSummaryBatch(
   }
 
   // ------------------------------------------------------------
-  // 7. Party names for every partyNet entry across every Challan, in
-  //    ONE final query (accounts already covered by payerAccountById
-  //    are looked up again here too - a small, bounded overlap, not
-  //    worth a second map/merge for the sizes involved).
+  // 7. Party names for every partyNet entry across every Challan, AND
+  //    every Carrier Rent residualPartyName (previously one
+  //    account.findUnique() per Challan - step 5b above now only
+  //    records the account id, resolved here instead), in ONE final
+  //    query (accounts already covered by payerAccountById are looked
+  //    up again here too - a small, bounded overlap, not worth a
+  //    second map/merge for the sizes involved).
   // ------------------------------------------------------------
-  const allPartyNetAccountIds = [...new Set(Object.values(result).flatMap((r) => r.partyNet.map((p) => p.accountId)))];
+  const allPartyNetAccountIds = [
+    ...new Set([...Object.values(result).flatMap((r) => r.partyNet.map((p) => p.accountId)), ...carrierRentOldPartyAccountIdByChallan.values()]),
+  ];
   if (allPartyNetAccountIds.length > 0) {
     const accounts = await prisma.account.findMany({
       where: { id: { in: allPartyNetAccountIds } },
@@ -582,6 +655,13 @@ export async function computeChallanSettlementSummaryBatch(
         const account = accountById.get(entry.accountId);
         entry.partyId = account?.party?.id || null;
         entry.partyName = account?.party?.partyName || account?.accountName || "Party";
+      }
+    }
+    for (const [challanId, accountId] of carrierRentOldPartyAccountIdByChallan) {
+      const account = accountById.get(accountId);
+      const residualPartyName = account?.party?.partyName || account?.accountName || null;
+      if (residualPartyName) {
+        result[challanId].carrierRent.residualPartyName = residualPartyName;
       }
     }
   }

@@ -292,6 +292,83 @@ export async function getSettledPartyAccountIdsBatch(
   return requests.map((r) => resolvePartyFromLines(lines, r.component, r.incomeOrExpenseAccountId, r.biltyId));
 }
 
+/**
+ * Same resolution as getSettledPartyAccountIdsBatch() above, but
+ * across MANY Challans in one query instead of one
+ * fetchSettledLines() call per Challan - used by
+ * lib/challan-settlement-summary.ts's own batch function for a whole
+ * list page, where calling the per-Challan version in a loop was a
+ * confirmed N+1 (one query per settled Challan). Returns, per
+ * Challan, exactly what getSettledPartyAccountIdsBatch() would have
+ * for that Challan's own requests - this only changes how many times
+ * the database is queried, never the resolution rules or their
+ * result.
+ *
+ * A line's owner Challan is resolved explicitly per-line (never by
+ * independently IN-filtering both `id` and `referenceId` against the
+ * full challan/entry-id sets, which could not by itself guarantee a
+ * SETTLEMENT_CORRECTION line's own referenceId and the settlement
+ * entry id it was fetched alongside belong to the SAME Challan rather
+ * than two different ones in this batch): a line belongs to whichever
+ * Challan's own settlementJournalEntryId equals this line's
+ * journalEntry.id, or, for a SETTLEMENT_CORRECTION line, whichever
+ * Challan its journalEntry.referenceId names directly.
+ */
+export async function getSettledPartyAccountIdsForChallansBatch(
+  tx: Tx,
+  challanRequests: Map<string, { settlementJournalEntryId: string; requests: SettledPartyLookupRequest[] }>
+): Promise<Map<string, (string | null)[]>> {
+  const result = new Map<string, (string | null)[]>();
+  const challanIds = [...challanRequests.keys()];
+  if (challanIds.length === 0) return result;
+
+  const settlementEntryIdToChallanId = new Map<string, string>();
+  for (const challanId of challanIds) {
+    settlementEntryIdToChallanId.set(challanRequests.get(challanId)!.settlementJournalEntryId, challanId);
+  }
+
+  const lines = await tx.journalLine.findMany({
+    where: {
+      journalEntry: {
+        isDeleted: false,
+        OR: [
+          { id: { in: [...settlementEntryIdToChallanId.keys()] } },
+          { referenceType: "SETTLEMENT_CORRECTION", referenceId: { in: challanIds } },
+        ],
+      },
+    },
+    select: { ...SETTLED_LINE_SELECT, journalEntry: { select: { id: true, referenceType: true, referenceId: true } } },
+    orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+  });
+
+  const linesByChallanId = new Map<string, SettledLine[]>();
+  for (const line of lines) {
+    const ownerChallanId =
+      line.journalEntry.referenceType === "SETTLEMENT_CORRECTION"
+        ? line.journalEntry.referenceId
+        : settlementEntryIdToChallanId.get(line.journalEntry.id) || null;
+    if (!ownerChallanId) continue;
+    const list = linesByChallanId.get(ownerChallanId) || [];
+    list.push(line);
+    linesByChallanId.set(ownerChallanId, list);
+  }
+
+  for (const challanId of challanIds) {
+    const { requests } = challanRequests.get(challanId)!;
+    if (requests.length === 0) {
+      result.set(challanId, []);
+      continue;
+    }
+    const challanLines = linesByChallanId.get(challanId) || [];
+    result.set(
+      challanId,
+      requests.map((r) => resolvePartyFromLines(challanLines, r.component, r.incomeOrExpenseAccountId, r.biltyId))
+    );
+  }
+
+  return result;
+}
+
 // Every referenceType that can ever carry a PARTY-account
 // reclassification line for a Challan's settlement position - the
 // OLD single-payer mechanism's own two ("SETTLEMENT",

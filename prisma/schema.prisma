@@ -357,6 +357,14 @@ model JournalEntry {
   @@index([entryDate])
   @@index([referenceType])
   @@index([referenceId])
+  // Composite, additive - almost every reader in this codebase
+  // filters by BOTH columns together (e.g. referenceType:
+  // "SETTLEMENT", referenceId: { in: challanIds }), which the two
+  // single-column indexes above can each only partly serve on their
+  // own. Never removes the single-column indexes - a few readers
+  // (e.g. the Bin's own referenceId-only lookups) still filter by
+  // just one of the two.
+  @@index([referenceType, referenceId])
   @@index([createdById])
   @@index([isDeleted])
   @@index([reversesEntryId])
@@ -382,6 +390,14 @@ model JournalLine {
   @@index([accountId])
   @@index([sourceType])
   @@index([sourceId])
+  // Composite, additive - almost every reader in this codebase
+  // filters by BOTH columns together (e.g. sourceType: "BILTY",
+  // sourceId: { in: biltyIds }), confirmed the single biggest
+  // production cost of GET /api/challan at volume before this
+  // change's N+1 fixes (lib/bilty-paid-verification.ts /
+  // lib/challan-settlement-summary.ts). Never removes the single-
+  // column indexes above.
+  @@index([sourceType, sourceId])
   @@index([sourceNumber])
 }
 
