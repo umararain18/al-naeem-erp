@@ -116,7 +116,7 @@ function categoryLabel(category: string | null | undefined): string {
   }
 }
 
-// Keyed by the REAL posted CarrierTripLineType - used for the Reverse
+// Keyed by the REAL posted CarrierTripLineType - used for the Delete
 // confirm text. The quick-entry row's own Type buttons (QUICK_TYPES
 // below) are a separate, UI-only taxonomy layered on top of these.
 const LINE_TYPE_LABELS: Record<string, string> = {
@@ -427,8 +427,8 @@ export default function CarrierTripDetailPage() {
     refresh();
   }
 
-  async function handleReverseLine(row: CashBookRow) {
-    const reason = window.prompt(`Reverse this ${LINE_TYPE_LABELS[row.lineType] || row.lineType} line (Rs. ${formatMoney(row.in || row.out)})?\n\nOptional reason:`);
+  async function handleDeleteLine(row: CashBookRow) {
+    const reason = window.prompt(`Delete this ${LINE_TYPE_LABELS[row.lineType] || row.lineType} line (Rs. ${formatMoney(row.in || row.out)})? This moves it to the Bin.\n\nOptional reason:`);
     if (reason === null) return;
     const res = await fetch(`/api/own-carrier/${carrierId}/trips/${tripId}/lines/${row.id}`, {
       method: "DELETE",
@@ -437,7 +437,7 @@ export default function CarrierTripDetailPage() {
     });
     const data = await res.json();
     if (!res.ok || !data.success) {
-      alert(data.message || "Unable to reverse line.");
+      alert(data.message || "Unable to delete line.");
       return;
     }
     if (editingLine?.id === row.id) setEditingLine(null);
@@ -659,7 +659,7 @@ export default function CarrierTripDetailPage() {
             amountClassName="text-green-700"
             canAct={canAct}
             onEdit={setEditingLine}
-            onReverse={handleReverseLine}
+            onDelete={handleDeleteLine}
           />
           <CashList
             title="OUT"
@@ -668,7 +668,7 @@ export default function CarrierTripDetailPage() {
             amountClassName="text-red-700"
             canAct={canAct}
             onEdit={setEditingLine}
-            onReverse={handleReverseLine}
+            onDelete={handleDeleteLine}
           />
         </div>
 
@@ -707,8 +707,8 @@ export default function CarrierTripDetailPage() {
                               <button type="button" onClick={() => setEditingLine(row)} className="rounded-md border px-2 py-1 text-xs hover:bg-gray-50">
                                 Edit
                               </button>
-                              <button type="button" onClick={() => handleReverseLine(row)} className="rounded-md border border-red-200 px-2 py-1 text-xs text-red-600 hover:bg-red-50">
-                                Reverse
+                              <button type="button" onClick={() => handleDeleteLine(row)} className="rounded-md border border-red-200 px-2 py-1 text-xs text-red-600 hover:bg-red-50">
+                                Delete
                               </button>
                             </div>
                           </td>
@@ -795,7 +795,7 @@ function CashList({
   amountClassName,
   canAct,
   onEdit,
-  onReverse,
+  onDelete,
 }: {
   title: string;
   rows: CashBookRow[];
@@ -803,7 +803,7 @@ function CashList({
   amountClassName: string;
   canAct: boolean;
   onEdit: (row: CashBookRow) => void;
-  onReverse: (row: CashBookRow) => void;
+  onDelete: (row: CashBookRow) => void;
 }) {
   return (
     <div className="overflow-hidden rounded-xl border bg-white shadow-sm">
@@ -832,8 +832,8 @@ function CashList({
                     <button type="button" onClick={() => onEdit(row)} className="rounded-md border px-2 py-1 text-xs hover:bg-gray-50">
                       Edit
                     </button>
-                    <button type="button" onClick={() => onReverse(row)} className="rounded-md border border-red-200 px-2 py-1 text-xs text-red-600 hover:bg-red-50">
-                      Reverse
+                    <button type="button" onClick={() => onDelete(row)} className="rounded-md border border-red-200 px-2 py-1 text-xs text-red-600 hover:bg-red-50">
+                      Delete
                     </button>
                   </div>
                 )}

@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useReturnToSuffix, withReturnTo } from "@/components/useListScrollRestore";
 
-type ItemType = "BILTY" | "CHALLAN" | "PAYSLIP" | "JOURNAL_ENTRY" | "DAILY_POSTING";
+type ItemType = "BILTY" | "CHALLAN" | "PAYSLIP" | "JOURNAL_ENTRY" | "DAILY_POSTING" | "CARRIER_TRIP_LINE";
 
 type BinItem = {
   type: ItemType;
@@ -18,6 +18,8 @@ type BinItem = {
     canRestore: boolean;
     canPermanentlyDelete: boolean;
   };
+  carrierId?: string;
+  tripId?: string;
 };
 
 type Capabilities = {
@@ -28,6 +30,7 @@ type Capabilities = {
   canRestorePayslip: boolean;
   canRestoreJournalEntry: boolean;
   canPermanentlyDeleteJournalEntry: boolean;
+  canRestoreCarrierTripLine: boolean;
 };
 
 function formatDate(value: string) {
@@ -51,6 +54,7 @@ export default function BinPage() {
     canRestorePayslip: false,
     canRestoreJournalEntry: false,
     canPermanentlyDeleteJournalEntry: false,
+    canRestoreCarrierTripLine: false,
   });
   const [typeFilter, setTypeFilter] = useState("ALL");
   const [search, setSearch] = useState("");
@@ -93,6 +97,7 @@ export default function BinPage() {
         canRestorePayslip: false,
         canRestoreJournalEntry: false,
         canPermanentlyDeleteJournalEntry: false,
+        canRestoreCarrierTripLine: false,
       });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to load Bin");
@@ -128,6 +133,12 @@ export default function BinPage() {
         // sync - the generic accounting-transactions route below has
         // no awareness of the Payslip side.
         restoreUrl = `/api/payslips/${item.id}/restore`;
+      } else if (item.type === "CARRIER_TRIP_LINE") {
+        // Nested under its own carrier/trip, same shape as the lines
+        // API itself - keeps CarrierTripLine.isDeleted and its own
+        // JournalEntry.isDeleted in sync (see lib/carrier-trip.ts's
+        // restoreCarrierTripLine).
+        restoreUrl = `/api/own-carrier/${item.carrierId}/trips/${item.tripId}/lines/${item.id}/restore`;
       } else {
         restoreUrl = `/api/accounting-transactions/${item.id}/restore`;
       }
@@ -189,6 +200,8 @@ export default function BinPage() {
         return "Daily Posting";
       case "JOURNAL_ENTRY":
         return "Journal Entry";
+      case "CARRIER_TRIP_LINE":
+        return "Trip Line";
     }
   };
 
@@ -196,15 +209,16 @@ export default function BinPage() {
     if (item.type === "BILTY") return capabilities.canRestoreBilty;
     if (item.type === "CHALLAN") return capabilities.canRestoreChallan;
     if (item.type === "PAYSLIP") return capabilities.canRestorePayslip;
+    if (item.type === "CARRIER_TRIP_LINE") return capabilities.canRestoreCarrierTripLine;
     return capabilities.canRestoreJournalEntry;
   };
 
   const canPermanentlyDelete = (item: BinItem) => {
     if (item.type === "BILTY") return capabilities.canPermanentlyDeleteBilty;
     if (item.type === "CHALLAN") return capabilities.canPermanentlyDeleteChallan;
-    // No payslip-permanent-delete capability exists - see the API
-    // route's own comment.
-    if (item.type === "PAYSLIP") return false;
+    // No payslip/trip-line-permanent-delete capability exists - see
+    // the API route's own comment.
+    if (item.type === "PAYSLIP" || item.type === "CARRIER_TRIP_LINE") return false;
     return capabilities.canPermanentlyDeleteJournalEntry;
   };
 
@@ -242,6 +256,7 @@ export default function BinPage() {
             <option value="PAYSLIP">Payslip</option>
             <option value="DAILY_POSTING">Daily Posting</option>
             <option value="JOURNAL_ENTRY">Journal Entries</option>
+            <option value="CARRIER_TRIP_LINE">Trip Lines</option>
           </select>
           <input
             value={search}

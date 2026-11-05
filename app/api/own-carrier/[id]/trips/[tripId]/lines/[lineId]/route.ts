@@ -2,19 +2,15 @@ import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
-import { reverseCarrierTripLine, editCarrierTripLine, CarrierTripError } from "@/lib/carrier-trip";
-import { auditDelete, auditUpdate, actorFromUser, requestContext } from "@/lib/audit-log";
+import { deleteCarrierTripLine, editCarrierTripLine, CarrierTripError } from "@/lib/carrier-trip";
+import { auditDelete, auditUpdate, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 
-// PATCH - "edits" a line from the UI's point of view, but is NEVER a
-// mutation of the existing row under the hood: it reverses the
-// existing line and posts a brand new one with the edited values
-// (lib/carrier-trip.ts's editCarrierTripLine), in ONE transaction -
-// same append-only discipline as every other correction in this
-// schema. The lineType itself cannot change this way (see that
-// function's own doc comment) - the request body still carries every
-// type-specific field (documentId, category, etc.) the SAME way POST
-// .../lines does, since they are simply re-applied to the
-// freshly-posted line.
+// PATCH - edits a line truly IN PLACE (lib/carrier-trip.ts's
+// editCarrierTripLine): the SAME JournalEntry/JournalLine rows are
+// updated, never a reversal + a brand new entry. The lineType itself
+// cannot change this way (see that function's own doc comment) - the
+// request body still carries every type-specific field (documentId,
+// category, etc.) the SAME way POST .../lines does.
 export async function PATCH(
   request: NextRequest,
   { params }: { params: Promise<{ id: string; tripId: string; lineId: string }> }
@@ -48,26 +44,29 @@ export async function PATCH(
     let newLine;
     try {
       newLine = await prisma.$transaction(async (tx) => {
-        return editCarrierTripLine(tx, {
+        const updated = await editCarrierTripLine(tx, {
           lineId,
-          deletedById: currentUser.userId,
-          reason: body.reason || "edited",
+          editedById: currentUser.userId,
           date,
           description,
           amount,
           rawInput: body,
         });
-      });
 
-      await prisma.$transaction(async (tx) => {
+        const changedFields = diffFields(line, updated, ["date", "description", "amount", "category", "officeAccountId", "vendorPartyId", "employeeId", "isDiesel", "liters", "ratePerLiter", "pumpPartyId"]);
         await auditUpdate(tx, {
           actor: actorFromUser(currentUser),
           module: "CARRIER_TRIP_LINE",
           entityType: "CarrierTripLine",
-          entityId: newLine!.id,
-          description: `Edited ${line.lineType} line (Rs. ${Number(line.amount).toLocaleString()} -> Rs. ${amount.toLocaleString()}) on Trip - replaces ${lineId}`,
+          entityId: updated.id,
+          description: `Edited ${line.lineType} line on Trip (in place)${body.reason ? `: ${body.reason}` : ""}`,
+          oldValues: Object.fromEntries(Object.entries(changedFields).map(([k, v]) => [k, v.old])),
+          newValues: Object.fromEntries(Object.entries(changedFields).map(([k, v]) => [k, v.new])),
+          changedFields,
           ...requestContext(request),
         });
+
+        return updated;
       });
     } catch (error) {
       if (error instanceof CarrierTripError) {
@@ -83,10 +82,10 @@ export async function PATCH(
   }
 }
 
-// DELETE - never a real delete. Posts a compensating JournalEntry
-// (reversesEntryId) and flips CarrierTripLine.isDeleted - same Bin/
-// reversal discipline as every other accounting-relevant row in this
-// codebase (see lib/carrier-trip.ts's reverseCarrierTripLine).
+// DELETE - soft-deletes into the SAME accounting Bin every other
+// document-level write in this codebase uses (lib/carrier-trip.ts's
+// deleteCarrierTripLine) - excluded from ledger/balances/P&L, visible
+// and restorable from the central Bin.
 export async function DELETE(
   request: NextRequest,
   { params }: { params: Promise<{ id: string; tripId: string; lineId: string }> }
@@ -110,14 +109,14 @@ export async function DELETE(
 
     try {
       await prisma.$transaction(async (tx) => {
-        await reverseCarrierTripLine(tx, { lineId, deletedById: currentUser.userId, reason: body?.reason });
+        await deleteCarrierTripLine(tx, { lineId, deletedById: currentUser.userId, reason: body?.reason });
 
         await auditDelete(tx, {
           actor: actorFromUser(currentUser),
           module: "CARRIER_TRIP_LINE",
           entityType: "CarrierTripLine",
           entityId: lineId,
-          description: `Reversed ${line.lineType} line (Rs. ${Number(line.amount).toLocaleString()}) on Trip${body?.reason ? `: ${body.reason}` : ""}`,
+          description: `Deleted ${line.lineType} line (Rs. ${Number(line.amount).toLocaleString()}) on Trip - moved to Bin${body?.reason ? `: ${body.reason}` : ""}`,
           ...requestContext(request),
         });
       });
@@ -128,9 +127,9 @@ export async function DELETE(
       throw error;
     }
 
-    return NextResponse.json({ success: true, message: "Line reversed successfully." });
+    return NextResponse.json({ success: true, message: "Line deleted successfully." });
   } catch (error) {
-    console.error("Reverse carrier trip line error:", error);
-    return NextResponse.json({ success: false, message: "Unable to reverse line" }, { status: 500 });
+    console.error("Delete carrier trip line error:", error);
+    return NextResponse.json({ success: false, message: "Unable to delete line" }, { status: 500 });
   }
 }

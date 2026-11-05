@@ -17,7 +17,7 @@ function endOfDay(value: string) {
 }
 
 type BinItem = {
-  type: "BILTY" | "CHALLAN" | "PAYSLIP" | "JOURNAL_ENTRY" | "DAILY_POSTING";
+  type: "BILTY" | "CHALLAN" | "PAYSLIP" | "JOURNAL_ENTRY" | "DAILY_POSTING" | "CARRIER_TRIP_LINE";
   id: string;
   reference: string;
   title: string;
@@ -32,6 +32,12 @@ type BinItem = {
     canRestore: boolean;
     canPermanentlyDelete: boolean;
   };
+  // CARRIER_TRIP_LINE only - its own restore endpoint is nested under
+  // its carrier/trip (same shape as the lines API itself), unlike
+  // every other bin item type's own flat restore endpoint, so the
+  // frontend needs these two extra ids to build that URL.
+  carrierId?: string;
+  tripId?: string;
 };
 
 export async function GET(request: NextRequest) {
@@ -98,6 +104,15 @@ export async function GET(request: NextRequest) {
     // exists (app/api/payslips/[id]/route.ts's DELETE only ever soft-
     // deletes, mirroring Employee's own bin-only design).
     const payslipCanRestore = hasPermission(currentUser, "accountingTransactions.restore");
+    // Own-Carrier Trip line deletes - a dedicated bin item, NOT
+    // surfaced via the generic Journal Entries bucket below (same
+    // reasoning as Payslip above). Restore goes through
+    // POST .../trips/[tripId]/lines/[lineId]/restore, the only place
+    // that keeps CarrierTripLine.isDeleted and its own JournalEntry.
+    // isDeleted in sync - see lib/carrier-trip.ts's
+    // restoreCarrierTripLine.
+    const carrierTripLineCanRestore = hasPermission(currentUser, "ownCarrier.restore");
+    const carrierTripLineCanPermanentlyDelete = false; // no permanent-delete path exists for Trip lines - Bin only.
 
     const items: BinItem[] = [];
 
@@ -236,13 +251,65 @@ export async function GET(request: NextRequest) {
       }
     }
 
+    // Own-Carrier Trip lines - see carrierTripLineCanRestore's own
+    // comment above for why this is a dedicated bucket. Excludes
+    // legacy pre-this-feature reversal pairs that scripts/cleanup-
+    // carrier-trip-line-reversal-pairs.ts has since retired (they have
+    // a CARRIER_TRIP_LINE_REVERSAL entry pointing at them) - those are
+    // permanently retired history, never meant to resurface as an
+    // actionable Bin item (see restoreCarrierTripLine's own doc
+    // comment for why restoring just one side would be unsafe).
+    if (type === "ALL" || type === "CARRIER_TRIP_LINE") {
+      const lineWhere: Prisma.CarrierTripLineWhereInput = {
+        isDeleted: true,
+        journalEntry: { reversedBy: { none: {} } },
+        ...(Object.keys(deletedAt).length > 0 ? { deletedAt } : {}),
+      };
+
+      if (search) {
+        lineWhere.OR = [
+          { description: { contains: search, mode: "insensitive" } },
+          { trip: { tripNo: { contains: search, mode: "insensitive" } } },
+          { trip: { carrier: { carrierNumber: { contains: search, mode: "insensitive" } } } },
+        ];
+      }
+
+      const tripLines = await prisma.carrierTripLine.findMany({
+        where: lineWhere,
+        include: {
+          trip: { select: { id: true, tripNo: true, carrierId: true, carrier: { select: { carrierNumber: true } } } },
+          deletedBy: { select: { id: true, fullName: true, username: true } },
+        },
+        orderBy: [{ deletedAt: "desc" }, { date: "desc" }],
+      });
+
+      for (const line of tripLines) {
+        items.push({
+          type: "CARRIER_TRIP_LINE",
+          id: line.id,
+          reference: `Trip ${line.trip.tripNo}`,
+          title: `${line.trip.carrier.carrierNumber} / ${line.lineType} - Rs. ${Number(line.amount).toLocaleString()}${line.description ? ` (${line.description})` : ""}`,
+          deletedAt: line.deletedAt ? new Date(line.deletedAt).toISOString() : "",
+          deletedBy: line.deletedBy,
+          moduleUrl: `/own-carrier/${line.trip.carrierId}/trip/${line.trip.id}`,
+          capabilities: {
+            canRestore: carrierTripLineCanRestore,
+            canPermanentlyDelete: carrierTripLineCanPermanentlyDelete,
+          },
+          carrierId: line.trip.carrierId,
+          tripId: line.trip.id,
+        });
+      }
+    }
+
     // Journal Entries
     if (type === "ALL" || type === "JOURNAL_ENTRY" || type === "DAILY_POSTING") {
       const journalWhere: Prisma.JournalEntryWhereInput = {
         isDeleted: true,
-        // Surfaced through the dedicated Payslip bin item above instead
-        // (see comment there for why this exclusion is required).
-        referenceType: { not: "PAYROLL_SALARY" },
+        // Surfaced through the dedicated Payslip/Carrier-Trip-Line bin
+        // items above instead (see their own comments for why these
+        // exclusions are required).
+        referenceType: { notIn: ["PAYROLL_SALARY", "CARRIER_TRIP_LINE", "CARRIER_TRIP_LINE_REVERSAL"] },
         ...(Object.keys(deletedAt).length > 0 ? { deletedAt } : {}),
       };
 
@@ -303,6 +370,7 @@ export async function GET(request: NextRequest) {
         canRestorePayslip: payslipCanRestore,
         canRestoreJournalEntry: journalCanRestore,
         canPermanentlyDeleteJournalEntry: journalCanPermanentlyDelete,
+        canRestoreCarrierTripLine: carrierTripLineCanRestore,
       },
     });
   } catch (error) {

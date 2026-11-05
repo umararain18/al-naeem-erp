@@ -1126,103 +1126,354 @@ export async function postTripLineByType(
   }
 }
 
+function dieselFieldsForEdit(rawInput: Record<string, unknown>): Pick<Prisma.CarrierTripLineUncheckedUpdateInput, "isDiesel" | "liters" | "ratePerLiter" | "pumpPartyId"> {
+  if (!rawInput.isDiesel) return { isDiesel: false, liters: null, ratePerLiter: null, pumpPartyId: null };
+  return {
+    isDiesel: true,
+    liters: rawInput.liters != null ? Number(rawInput.liters) : null,
+    ratePerLiter: rawInput.ratePerLiter != null ? Number(rawInput.ratePerLiter) : null,
+    pumpPartyId: (rawInput.pumpPartyId as string) || null,
+  };
+}
+
+type JournalLineRow = { id: string; accountId: string; debit: Prisma.Decimal | number; credit: Prisma.Decimal | number; description: string | null; sourceType: string | null; sourceId: string | null; sourceNumber: string | null };
+
+/** Picks the OTHER line of a 2-line entry - every Trip line is
+ * exactly a Dr/Cr pair, so once one side is identified by its known
+ * account id, the remaining line is unambiguous regardless of
+ * creation order. */
+function otherLine(lines: JournalLineRow[], excludeId: string): JournalLineRow {
+  const found = lines.find((l) => l.id !== excludeId);
+  if (!found) throw new CarrierTripError("CORRUPT_ENTRY", "This line's own JournalEntry does not have exactly two lines - data inconsistency, contact support.");
+  return found;
+}
+
+function findLineByAccount(lines: JournalLineRow[], accountId: string): JournalLineRow | undefined {
+  return lines.find((l) => l.accountId === accountId);
+}
+
 /**
- * Edits a line "in place" from the UI's point of view - under the
- * hood this is NEVER a mutation of the existing row: it reverses the
- * existing line (reverseCarrierTripLine - same reversesEntryId
- * mechanism as every other correction in this schema) and posts a
- * brand new one via postTripLineByType, in ONE transaction, so there
- * is never a moment with neither line live. The lineType itself is
- * NOT editable this way (the new line must be the SAME type as the
- * one being replaced) - switching types is a delete-and-recreate the
- * UI does explicitly, never an implicit side effect of an edit.
+ * Edits a Trip line truly IN PLACE: the SAME JournalEntry/JournalLine
+ * rows are updated (amount, account, description, date, diesel
+ * fields) - never a reversal + a brand-new entry. The lineType itself
+ * is NOT editable this way (switching types is a delete-and-recreate
+ * the UI does explicitly, never an implicit side effect of an edit),
+ * and for COLLECTION, the linked document (documentType/documentId/
+ * biltyId) is likewise fixed - only its resolved counterAccountId,
+ * amount, description and date can change. Blocked once the owning
+ * Trip is CLOSED (reopen it first) - same guard as every other write
+ * here. Returns the updated CarrierTripLine row; callers that need an
+ * Audit Log diff build it themselves from the row they already have
+ * before calling this (see diffFields in lib/audit-log.ts) - this
+ * function performs no audit writes of its own, consistent with every
+ * other mutator in this module.
  */
 export async function editCarrierTripLine(
   tx: Tx,
   input: {
     lineId: string;
-    deletedById: string;
-    reason?: string;
+    editedById: string;
     date: Date;
     description: string | null;
     amount: number;
     rawInput: Record<string, unknown>;
   }
 ) {
-  const existing = await tx.carrierTripLine.findUnique({ where: { id: input.lineId }, select: { tripId: true, lineType: true, isDeleted: true } });
+  const existing = await tx.carrierTripLine.findUnique({
+    where: { id: input.lineId },
+    include: {
+      journalEntry: { include: { lines: true } },
+      trip: { include: { carrier: { include: { driverCashAccount: true } } } },
+    },
+  });
   if (!existing || existing.isDeleted) {
-    throw new CarrierTripError("LINE_NOT_FOUND", "This line was not found or is already reversed.");
+    throw new CarrierTripError("LINE_NOT_FOUND", "This line was not found or has been deleted.");
+  }
+  if (existing.journalEntry.isDeleted) {
+    throw new CarrierTripError("LINE_NOT_FOUND", "This line was not found or has been deleted.");
+  }
+  if (existing.trip.status !== "OPEN") {
+    throw new CarrierTripError("TRIP_CLOSED", "This Trip is closed - reopen it before editing a line.");
+  }
+  if (input.amount <= 0) {
+    throw new CarrierTripError("INVALID_AMOUNT", "Amount must be greater than zero.");
+  }
+  await assertLineDateValid(tx, existing.tripId, input.date, input.rawInput);
+
+  const driverCashId = existing.trip.carrier.driverCashAccount?.id;
+  if (!driverCashId) {
+    throw new CarrierTripError("NO_DRIVER_CASH_ACCOUNT", "This carrier has no Driver Cash account - data inconsistency, contact support.");
+  }
+  const entryLines = existing.journalEntry.lines;
+  const amount = input.amount;
+
+  type LineUpdate = { id: string; accountId: string; debit: number; credit: number; sourceType?: string | null; sourceId?: string | null; sourceNumber?: string | null };
+  let description: string;
+  let carrierTripLineData: Record<string, unknown> = {};
+  let lineUpdates: LineUpdate[];
+
+  switch (existing.lineType as TripLineType) {
+    case "EXPENSE_CASH": {
+      if (!input.rawInput.category) throw new CarrierTripError("MISSING_CATEGORY", "Expense category is required.");
+      const category = assertValidExpenseCategory(input.rawInput.category as string);
+      const tripInProgressAccountId = await getOrCreateTripInProgressAccountId(tx, existing.trip.carrierId);
+      const tipLine = findLineByAccount(entryLines, tripInProgressAccountId) || entryLines[0];
+      const cashLine = otherLine(entryLines, tipLine.id);
+      description = input.description?.trim() || categoryLabel(category);
+      carrierTripLineData = { category, ...dieselFieldsForEdit(input.rawInput) };
+      lineUpdates = [
+        { id: tipLine.id, accountId: tripInProgressAccountId, debit: amount, credit: 0 },
+        { id: cashLine.id, accountId: driverCashId, debit: 0, credit: amount },
+      ];
+      break;
+    }
+    case "EXPENSE_OFFICE": {
+      if (!input.rawInput.category) throw new CarrierTripError("MISSING_CATEGORY", "Expense category is required.");
+      if (!input.rawInput.officeAccountId) throw new CarrierTripError("MISSING_ACCOUNT", "Office account is required.");
+      const category = assertValidExpenseCategory(input.rawInput.category as string);
+      const officeAccountId = input.rawInput.officeAccountId as string;
+      const officeAccount = await tx.account.findUnique({ where: { id: officeAccountId } });
+      if (!officeAccount || !officeAccount.isActive) {
+        throw new CarrierTripError("INVALID_ACCOUNT", "Selected office account was not found or is inactive.");
+      }
+      const tripInProgressAccountId = await getOrCreateTripInProgressAccountId(tx, existing.trip.carrierId);
+      const tipLine = findLineByAccount(entryLines, tripInProgressAccountId) || entryLines[0];
+      const officeLine = otherLine(entryLines, tipLine.id);
+      description = input.description?.trim() || `${categoryLabel(category)} (Office Account - ${officeAccount.accountName})`;
+      carrierTripLineData = { category, officeAccountId, ...dieselFieldsForEdit(input.rawInput) };
+      lineUpdates = [
+        { id: tipLine.id, accountId: tripInProgressAccountId, debit: amount, credit: 0 },
+        { id: officeLine.id, accountId: officeAccountId, debit: 0, credit: amount },
+      ];
+      break;
+    }
+    case "EXPENSE_CREDIT": {
+      if (!input.rawInput.category) throw new CarrierTripError("MISSING_CATEGORY", "Expense category is required.");
+      if (!input.rawInput.vendorPartyId) throw new CarrierTripError("MISSING_VENDOR", "Vendor party is required for a credit expense.");
+      const category = assertValidExpenseCategory(input.rawInput.category as string);
+      const vendorPartyId = input.rawInput.vendorPartyId as string;
+      const vendorParty = await tx.party.findUnique({ where: { id: vendorPartyId }, include: { account: true } });
+      if (!vendorParty || !vendorParty.isActive || !vendorParty.account) {
+        throw new CarrierTripError("INVALID_VENDOR", "Selected vendor party was not found or is inactive.");
+      }
+      const tripInProgressAccountId = await getOrCreateTripInProgressAccountId(tx, existing.trip.carrierId);
+      const tipLine = findLineByAccount(entryLines, tripInProgressAccountId) || entryLines[0];
+      const vendorLine = otherLine(entryLines, tipLine.id);
+      description = input.description?.trim() || `${categoryLabel(category)} (Udhaar - ${vendorParty.partyName})`;
+      carrierTripLineData = { category, vendorPartyId, ...dieselFieldsForEdit(input.rawInput) };
+      lineUpdates = [
+        { id: tipLine.id, accountId: tripInProgressAccountId, debit: amount, credit: 0 },
+        { id: vendorLine.id, accountId: vendorParty.account.id, debit: 0, credit: amount },
+      ];
+      break;
+    }
+    case "DRIVER_SALARY": {
+      if (!input.rawInput.employeeId) throw new CarrierTripError("MISSING_EMPLOYEE", "Employee is required for a salary line.");
+      const employeeId = input.rawInput.employeeId as string;
+      const employee = await tx.employee.findUnique({ where: { id: employeeId } });
+      if (!employee || employee.isDeleted) {
+        throw new CarrierTripError("INVALID_EMPLOYEE", "Selected employee was not found.");
+      }
+      const tripInProgressAccountId = await getOrCreateTripInProgressAccountId(tx, existing.trip.carrierId);
+      const tipLine = findLineByAccount(entryLines, tripInProgressAccountId) || entryLines[0];
+      const cashLine = otherLine(entryLines, tipLine.id);
+      description = input.description?.trim() || `Salary paid to ${employee.name}`;
+      carrierTripLineData = { employeeId, category: "SALARY" };
+      lineUpdates = [
+        { id: tipLine.id, accountId: tripInProgressAccountId, debit: amount, credit: 0 },
+        { id: cashLine.id, accountId: driverCashId, debit: 0, credit: amount },
+      ];
+      break;
+    }
+    case "CASH_FROM_OFFICE":
+    case "DEPOSIT_TO_OFFICE": {
+      if (!input.rawInput.officeAccountId) throw new CarrierTripError("MISSING_ACCOUNT", "Office account is required.");
+      const officeAccountId = input.rawInput.officeAccountId as string;
+      const officeAccount = await tx.account.findUnique({ where: { id: officeAccountId } });
+      if (!officeAccount || !officeAccount.isActive) {
+        throw new CarrierTripError("INVALID_ACCOUNT", "Selected office account was not found or is inactive.");
+      }
+      const cashLine = findLineByAccount(entryLines, driverCashId) || entryLines[0];
+      const officeLine = otherLine(entryLines, cashLine.id);
+      carrierTripLineData = { officeAccountId };
+      if (existing.lineType === "CASH_FROM_OFFICE") {
+        description = input.description?.trim() || "Cash from office";
+        lineUpdates = [
+          { id: cashLine.id, accountId: driverCashId, debit: amount, credit: 0 },
+          { id: officeLine.id, accountId: officeAccountId, debit: 0, credit: amount },
+        ];
+      } else {
+        description = input.description?.trim() || `Deposit to ${officeAccount.accountName}`;
+        lineUpdates = [
+          { id: officeLine.id, accountId: officeAccountId, debit: amount, credit: 0 },
+          { id: cashLine.id, accountId: driverCashId, debit: 0, credit: amount },
+        ];
+      }
+      break;
+    }
+    case "COLLECTION": {
+      if (existing.documentType !== (input.rawInput.documentType as string | undefined || existing.documentType) || existing.documentId !== (input.rawInput.documentId as string | undefined || existing.documentId)) {
+        throw new CarrierTripError("DOCUMENT_NOT_EDITABLE", "A Collection line's linked document cannot be changed by editing - delete and re-create it against the new document instead.");
+      }
+      const cashLine = findLineByAccount(entryLines, driverCashId) || entryLines[0];
+      const partyLine = otherLine(entryLines, cashLine.id);
+      // The per-Bilty branch (see postCollectionLine) never stores its
+      // own biltyId on CarrierTripLine - it is only ever recoverable
+      // from the party line's own sourceType:"BILTY"/sourceId tag.
+      const biltyId = partyLine.sourceType === "BILTY" ? partyLine.sourceId : null;
+      const counterAccountId = (input.rawInput.counterAccountId as string) || partyLine.accountId;
+      if (counterAccountId !== partyLine.accountId) {
+        // Explicitly reassigned to a different party/account - re-check
+        // eligibility the exact same way creation does.
+        const eligible =
+          existing.documentType === "CHALLAN" && biltyId
+            ? await getBiltyLegitimatePartyAccountIds(biltyId, "DEBIT")
+            : existing.documentType === "CHALLAN"
+              ? await getChallanEligiblePartyAccountIds(existing.documentId!, "DEBIT")
+              : existing.documentType === "PRIVATE_PHONCH"
+                ? await getPrivatePhonchEligiblePartyAccountIds(existing.documentId!, "DEBIT")
+                : await getPhonchEligiblePartyAccountIds(existing.documentId!);
+        if (!eligible.has(counterAccountId)) {
+          throw new CarrierTripError("INVALID_COUNTER_ACCOUNT", "Selected account is not a valid Receivable party for this document.");
+        }
+      }
+      // Re-validate the over-collection ceiling only for the INCREASE
+      // over this line's own current amount - every assert*NotExceeded
+      // check below is ledger-true over ALL live lines, which already
+      // includes this line's own current contribution; a reduction (or
+      // an unchanged amount) can never newly exceed anything.
+      const currentAmount = round2(Number(existing.amount));
+      const increase = round2(amount - currentAmount);
+      if (increase > 0.009) {
+        if (existing.documentType === "CHALLAN" && biltyId) {
+          const bilty = await tx.bilty.findUnique({ where: { id: biltyId }, select: { toPay: true } });
+          const toPay = round2(Number(bilty?.toPay || 0));
+          const outstandingExcludingThis = round2((await getUnclaimedGrossBiltyReceivableAmountForCollection(tx, biltyId)) + currentAmount);
+          if (round2(amount) > outstandingExcludingThis + 0.009) {
+            throw new CarrierTripError("OVER_COLLECTION", `This receipt of Rs. ${round2(amount).toLocaleString()} would exceed the remaining outstanding amount (Rs. ${Math.max(0, Math.min(toPay, outstandingExcludingThis)).toLocaleString()}).`);
+          }
+        } else if (existing.documentType === "PHONCH") {
+          await assertPhonchReceiptNotExceeded(tx, existing.documentId!, counterAccountId, increase, "DEBIT");
+        } else if (existing.documentType === "PRIVATE_PHONCH") {
+          await assertPrivatePhonchPaymentNotExceeded(tx, existing.documentId!, counterAccountId, increase, "DEBIT");
+        }
+      }
+      description = input.description?.trim() || partyLine.description || existing.description || "Collection";
+      lineUpdates = [
+        { id: cashLine.id, accountId: driverCashId, debit: amount, credit: 0, sourceType: cashLine.sourceType, sourceId: cashLine.sourceId, sourceNumber: cashLine.sourceNumber },
+        { id: partyLine.id, accountId: counterAccountId, debit: 0, credit: amount, sourceType: partyLine.sourceType, sourceId: partyLine.sourceId, sourceNumber: partyLine.sourceNumber },
+      ];
+      break;
+    }
+    default:
+      throw new CarrierTripError("INVALID_LINE_TYPE", "Invalid line type.");
   }
 
-  await reverseCarrierTripLine(tx, { lineId: input.lineId, deletedById: input.deletedById, reason: input.reason || "edited" });
+  await tx.journalEntry.update({
+    where: { id: existing.journalEntryId },
+    data: { entryDate: input.date, description },
+  });
+  for (const lineUpdate of lineUpdates) {
+    await tx.journalLine.update({
+      where: { id: lineUpdate.id },
+      data: {
+        accountId: lineUpdate.accountId,
+        debit: lineUpdate.debit,
+        credit: lineUpdate.credit,
+        description,
+        ...(lineUpdate.sourceType !== undefined ? { sourceType: lineUpdate.sourceType } : {}),
+        ...(lineUpdate.sourceId !== undefined ? { sourceId: lineUpdate.sourceId } : {}),
+        ...(lineUpdate.sourceNumber !== undefined ? { sourceNumber: lineUpdate.sourceNumber } : {}),
+      },
+    });
+  }
 
-  return postTripLineByType(
-    tx,
-    existing.lineType as TripLineType,
-    { tripId: existing.tripId, date: input.date, description: input.description, amount: input.amount, createdById: input.deletedById },
-    input.rawInput
-  );
+  return tx.carrierTripLine.update({
+    where: { id: input.lineId },
+    data: { date: input.date, description, amount, ...carrierTripLineData },
+  });
 }
 
 /**
- * Reverses one CarrierTripLine - NEVER edits/deletes its JournalEntry;
- * posts a NEW entry with reversesEntryId pointing at it (same
- * mechanism lib/challan-lifecycle.ts's Unsettle already uses) and
- * flips CarrierTripLine.isDeleted. Blocked once the owning Trip is
- * CLOSED (reopen it first), same as every other write here.
+ * Deletes a Trip line into the SAME accounting Bin every other
+ * document-level write in this codebase uses - soft-deletes this
+ * line's own JournalEntry (isDeleted/deletedAt/deletedById), which
+ * excludes it from every ledger/balance/P&L query (they all filter
+ * `journalEntry.isDeleted: false`), plus the CarrierTripLine row
+ * itself in parallel (kept in sync the same way Payslip keeps its own
+ * isDeleted in step with its PAYROLL_SALARY JournalEntry - see
+ * app/api/bin/route.ts's own comment on that precedent). Replaces the
+ * old append-only "post an opposite-signed compensating entry, keep
+ * the original live forever" design (reverseCarrierTripLine) - that
+ * design is what produced the historical CARRIER_TRIP_LINE_REVERSAL
+ * pairs scripts/cleanup-carrier-trip-line-reversal-pairs.ts now cleans
+ * up. Restore is restoreCarrierTripLine below. Blocked once the
+ * owning Trip is CLOSED (reopen it first).
  */
-export async function reverseCarrierTripLine(tx: Tx, input: { lineId: string; deletedById: string; reason?: string }) {
+export async function deleteCarrierTripLine(tx: Tx, input: { lineId: string; deletedById: string; reason?: string }) {
   const line = await tx.carrierTripLine.findUnique({
     where: { id: input.lineId },
-    include: { journalEntry: { include: { lines: true } }, trip: true },
+    include: { journalEntry: true, trip: true },
   });
   if (!line || line.isDeleted) {
-    throw new CarrierTripError("LINE_NOT_FOUND", "This line was not found or is already reversed.");
+    throw new CarrierTripError("LINE_NOT_FOUND", "This line was not found or is already deleted.");
   }
   if (line.trip.status !== "OPEN") {
-    throw new CarrierTripError("TRIP_CLOSED", "This Trip is closed - reopen it before reversing a line.");
+    throw new CarrierTripError("TRIP_CLOSED", "This Trip is closed - reopen it before deleting a line.");
   }
 
-  const existingReversal = await tx.journalEntry.findFirst({ where: { reversesEntryId: line.journalEntryId, isDeleted: false } });
-  if (existingReversal) {
-    throw new CarrierTripError("ALREADY_REVERSED", "This line has already been reversed.");
-  }
-
-  const description = `Reversed - ${line.description || line.lineType} (${input.reason?.trim() || "removed"})`;
-
-  await tx.journalEntry.create({
-    data: {
-      // The ORIGINAL line's own date, never "today" - a reversal is a
-      // correction of an entry that happened on ITS OWN date, not a
-      // new event happening today. Dating it today would misstate
-      // Driver Cash's balance on every day between the original date
-      // and today (see getTripOpeningBalance's own date-scoped
-      // reasoning above - a reversal dated wrong is exactly the kind
-      // of "later activity leaking into an earlier Previous Balance"
-      // this fix is closing the other half of).
-      entryDate: line.journalEntry.entryDate,
-      referenceType: "CARRIER_TRIP_LINE_REVERSAL",
-      referenceId: line.tripId,
-      reversesEntryId: line.journalEntryId,
-      description,
-      createdById: input.deletedById,
-      lines: {
-        create: line.journalEntry.lines.map((l) => ({
-          accountId: l.accountId,
-          debit: Number(l.credit),
-          credit: Number(l.debit),
-          description,
-          sourceType: l.sourceType,
-          sourceId: l.sourceId,
-          sourceNumber: l.sourceNumber,
-        })),
-      },
-    },
+  const deletedAt = new Date();
+  await tx.journalEntry.update({
+    where: { id: line.journalEntryId },
+    data: { isDeleted: true, deletedAt, deletedById: input.deletedById },
   });
 
   return tx.carrierTripLine.update({
     where: { id: input.lineId },
-    data: { isDeleted: true, deletedAt: new Date(), deletedById: input.deletedById },
+    data: { isDeleted: true, deletedAt, deletedById: input.deletedById },
+  });
+}
+
+/** Restores a Bin'd Trip line - flips BOTH CarrierTripLine.isDeleted
+ * and its JournalEntry.isDeleted back, in step (never the generic
+ * /api/accounting-transactions/[id]/restore route, which only knows
+ * about the JournalEntry side - same reasoning as Payslip's own
+ * dedicated restore route). Blocked once the owning Trip is CLOSED
+ * (reopen it first) - restoring a line onto a closed Trip would stage
+ * a change Close's own totals never accounted for. Also refuses a
+ * line whose own JournalEntry has a live-or-Bin'd
+ * CARRIER_TRIP_LINE_REVERSAL pointing at it - that shape only ever
+ * comes from a PRE-this-feature legacy edit/delete
+ * (scripts/cleanup-carrier-trip-line-reversal-pairs.ts's own target),
+ * never from deleteCarrierTripLine (which creates no reversal at
+ * all), so restoring just this one side would resurrect the original
+ * entry WITHOUT the reversal that was keeping it net zero - an
+ * imbalance. Such a pair is permanently retired; it is never meant to
+ * be restored through this path. */
+export async function restoreCarrierTripLine(tx: Tx, input: { lineId: string; restoredById: string }) {
+  const line = await tx.carrierTripLine.findUnique({
+    where: { id: input.lineId },
+    include: { trip: true },
+  });
+  if (!line || !line.isDeleted) {
+    throw new CarrierTripError("LINE_NOT_FOUND", "This line was not found or is not in the Bin.");
+  }
+  if (line.trip.status !== "OPEN") {
+    throw new CarrierTripError("TRIP_CLOSED", "This Trip is closed - reopen it before restoring a line.");
+  }
+  const reversalExists = await tx.journalEntry.findFirst({ where: { reversesEntryId: line.journalEntryId }, select: { id: true } });
+  if (reversalExists) {
+    throw new CarrierTripError("LEGACY_REVERSAL_PAIR", "This line was retired by the historical reversal-pair cleanup, not deleted directly - it cannot be restored through this path.");
+  }
+
+  await tx.journalEntry.update({
+    where: { id: line.journalEntryId },
+    data: { isDeleted: false, deletedAt: null, deletedById: null },
+  });
+
+  return tx.carrierTripLine.update({
+    where: { id: input.lineId },
+    data: { isDeleted: false, deletedAt: null, deletedById: null },
   });
 }
 
@@ -1267,9 +1518,8 @@ export async function reverseCarrierTripLine(tx: Tx, input: { lineId: string; de
 // Reopen reverses whichever of the two is currently live, each dated
 // the SAME entryDate it was posted at (the Trip's own dateTo - never
 // "today"; a reversal is a correction of something that happened on
-// its own date, not a new event happening today - same principle
-// already applied to Trip line reversals, see reverseCarrierTripLine's
-// own doc comment) - never a per-Challan loop any more.
+// its own date, not a new event happening today) - never a
+// per-Challan loop any more.
 // ============================================================
 
 export const CARRIER_TRIP_CLOSE_REFERENCE_TYPE = "CARRIER_TRIP_CLOSE";
