@@ -1955,6 +1955,25 @@ function classifyBalance(value: number): "RECEIVABLE" | "PAYABLE" | "SETTLED" {
   return "SETTLED";
 }
 
+// LIABILITY/EQUITY/INCOME are credit-normal - a credit balance there
+// is the favorable/expected direction (e.g. Income showing a profit),
+// a DEBIT balance is abnormal (e.g. an Income account showing a net
+// LOSS - CBM-191's own Carrier Profit going debit). ASSET/EXPENSE/
+// PARTY stay debit-normal (a Receivable, like an Asset, is favorable
+// on debit) - unchanged from classifyBalance()'s own original
+// convention. Reusing the existing RECEIVABLE/PAYABLE token names
+// (rather than introducing a parallel set) keeps every existing
+// consumer of FinalLedgerRow.balanceType - the page's own green/red
+// running-balance color and the Excel/PDF export's own sign flip for
+// "PAYABLE" - correct for every account type with no further changes;
+// only getPartyLedgerData() (genuinely always debit=Receivable/
+// credit=Payable, regardless of the party's own account type) must
+// keep calling classifyBalance() directly, never this wrapper.
+const CREDIT_NORMAL_ACCOUNT_TYPES = new Set(["LIABILITY", "EQUITY", "INCOME"]);
+function classifyBalanceForAccountType(value: number, accountType: string): "RECEIVABLE" | "PAYABLE" | "SETTLED" {
+  return classifyBalance(CREDIT_NORMAL_ACCOUNT_TYPES.has(accountType) ? -value : value);
+}
+
 /**
  * The document a row groups under for Short View, per MoneyType's own
  * natural anchor (CARRIER_RENT -> Challan; BILTY_RENT_COLLECTION/
@@ -2105,7 +2124,7 @@ export async function getAccountLedgerData(
   const shortView = !!options.shortView;
   const hideReversedEntries = !!options.hideReversedEntries || shortView;
 
-  const account = await prisma.account.findUnique({ where: { id: accountId }, select: { id: true, accountName: true } });
+  const account = await prisma.account.findUnique({ where: { id: accountId }, select: { id: true, accountName: true, accountType: true } });
   if (!account) {
     throw new PartyLedgerLookupError("NO_ACCOUNT", "Account not found.");
   }
@@ -2272,7 +2291,7 @@ export async function getAccountLedgerData(
       debit: row.debit,
       credit: row.credit,
       balance: Math.abs(displayRunningBalance),
-      balanceType: classifyBalance(displayRunningBalance),
+      balanceType: classifyBalanceForAccountType(displayRunningBalance, account.accountType),
       isGrouped: row.isGrouped,
       isRemoved: row.isRemoved,
       isReversedPairMember: row.isReversedPairMember,
@@ -2326,7 +2345,7 @@ export async function getAccountLedgerData(
       debit: openingBalanceFromEntry > 0 ? openingBalanceFromEntry : 0,
       credit: openingBalanceFromEntry < 0 ? Math.abs(openingBalanceFromEntry) : 0,
       balance: Math.abs(openingBalanceFromEntry),
-      balanceType: classifyBalance(openingBalanceFromEntry),
+      balanceType: classifyBalanceForAccountType(openingBalanceFromEntry, account.accountType),
       isGrouped: false,
       isRemoved: false,
       isReversedPairMember: false,
@@ -2351,7 +2370,7 @@ export async function getAccountLedgerData(
       periodDebit,
       periodCredit,
       closingBalance,
-      balanceType: classifyBalance(closingBalance),
+      balanceType: classifyBalanceForAccountType(closingBalance, account.accountType),
     },
     ledger: orderedLedger,
   };

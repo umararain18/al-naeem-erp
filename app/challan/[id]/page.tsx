@@ -1337,8 +1337,30 @@ export default function ChallanDetailPage({
                 <p className="font-medium">{challan.carrierNumber || "—"}</p>
               </div>
               <div>
-                <p className="text-gray-500">Carrier Rent</p>
-                <p className="font-medium">Rs. {Number(challan.carrierRent || 0).toLocaleString()}</p>
+                {challan.ownCarrier ? (
+                  // Challan.carrierRent is always 0 for an own-carrier
+                  // dispatch (the real figure lives on the linking
+                  // Trip's own CarrierTripDocument.carrierRentAmount -
+                  // see Challan.ownCarrierId's own schema doc comment,
+                  // and FinancialSummaryCards' own identical fix above)
+                  // - show that instead of a misleading "Carrier Rent
+                  // Rs. 0".
+                  <>
+                    <p className="text-gray-500">Carrier (trip)</p>
+                    {challan.tripCarrierRent ? (
+                      <p className="font-medium">
+                        Rs. {challan.tripCarrierRent.amount.toLocaleString()} — Trip {challan.tripCarrierRent.tripNo}
+                      </p>
+                    ) : (
+                      <p className="font-medium text-amber-600">Not linked to a Trip</p>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <p className="text-gray-500">Carrier Rent</p>
+                    <p className="font-medium">Rs. {Number(challan.carrierRent || 0).toLocaleString()}</p>
+                  </>
+                )}
               </div>
               {challan.remarks && (
                 <div>

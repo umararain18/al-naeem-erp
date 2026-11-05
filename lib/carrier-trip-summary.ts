@@ -22,7 +22,19 @@
 // cashDelta() exactly (the real, server-side source of truth for
 // which lineTypes move Driver Cash) - EXPENSE_OFFICE/EXPENSE_CREDIT
 // never touch Driver Cash regardless of isDiesel, so they're
-// excluded here the same way.
+// excluded here the same way. An EXTERNAL row (source: "EXTERNAL" -
+// Daily Posting/Direct Entry) is a REAL Driver Cash movement
+// regardless of its own lineType label ("DAILY_POSTING" is a display
+// label, not one of CarrierTripLine's own lineTypes) - getTripCashBook
+// (lib/carrier-trip.ts) only ever queries it scoped to the Driver Cash
+// account in the first place, so it is counted by `source` alone,
+// never lineType. Omitting these from the totals (while still
+// showing them in the IN/OUT lists - the Trip 52 bug: an OUT list
+// showing "Daily Posting - Office Cash 145,000" against a Total OUT
+// of 25,000) is what broke the displayed Previous + IN - OUT =
+// Remaining arithmetic below, even though the real closingBalance
+// (lib/carrier-trip.ts's own cashDelta()-based sum, which already
+// included every external line) was always correct.
 // ============================================================
 
 export interface TripSummaryBarRow {
@@ -30,6 +42,7 @@ export interface TripSummaryBarRow {
   out: number;
   isDiesel: boolean;
   lineType: string;
+  source: "TRIP_LINE" | "EXTERNAL";
 }
 
 export interface TripSummaryBar {
@@ -58,7 +71,7 @@ export function computeTripSummaryBar(rows: TripSummaryBarRow[]): TripSummaryBar
     if (r.in > 0) totalIn += r.in;
     if (r.out > 0) {
       if (r.isDiesel) dieselTotal += r.out;
-      if (DRIVER_CASH_OUT_LINE_TYPES.has(r.lineType)) {
+      if (r.source === "EXTERNAL" || DRIVER_CASH_OUT_LINE_TYPES.has(r.lineType)) {
         totalOutDriverCash += r.out;
         if (r.isDiesel) dieselByDriverCash += r.out;
       }

@@ -1645,9 +1645,19 @@ async function reverseLiveCloseEntry(
  * header comment for the exact shape. A no-op (posts nothing) if no
  * link contributes anything.
  */
+/** "Trip 51 (Karachi - Dera Ismail Khan - Abdul Hakeem)" when the
+ * Trip's own `route` (user-typed, the cities entered on the Trip) is
+ * set, else plain "Trip 51" - shared by both Close entries' own
+ * descriptions below so Reopen's own "reversing: ..." text (which
+ * just echoes the live entry's own description back) picks it up
+ * automatically, with no separate fix needed there. */
+function tripLabel(tripNo: string, route: string | null): string {
+  return route ? `Trip ${tripNo} (${route})` : `Trip ${tripNo}`;
+}
+
 async function recognizeCarrierTripIncome(
   tx: Tx,
-  input: { tripId: string; tripNo: string; carrierId: string; entryDate: Date; createdById: string }
+  input: { tripId: string; tripNo: string; route: string | null; carrierId: string; entryDate: Date; createdById: string }
 ): Promise<boolean> {
   const links = await tx.carrierTripDocument.findMany({
     where: { tripId: input.tripId, documentType: "CHALLAN", unlinkedAt: null },
@@ -1690,7 +1700,7 @@ async function recognizeCarrierTripIncome(
   ]);
 
   const challanNos = contributions.map((c) => c.challanNo).join(", ");
-  const description = `Trip ${input.tripNo} – Challan ${challanNos} – Carrier Rent`;
+  const description = `${tripLabel(input.tripNo, input.route)} – Challan ${challanNos} – Carrier Rent`;
 
   const lines: { accountId: string; debit: number; credit: number; sourceType: string; sourceId: string; sourceNumber: string }[] = [];
   let carrierRentTotal = 0;
@@ -1736,7 +1746,7 @@ async function recognizeCarrierTripIncome(
  */
 async function recognizeCarrierTripExpenseClearing(
   tx: Tx,
-  input: { tripId: string; tripNo: string; carrierId: string; entryDate: Date; createdById: string }
+  input: { tripId: string; tripNo: string; route: string | null; carrierId: string; entryDate: Date; createdById: string }
 ): Promise<boolean> {
   const expenseLines = await tx.carrierTripLine.findMany({
     where: { tripId: input.tripId, isDeleted: false, lineType: { in: ["EXPENSE_CASH", "EXPENSE_OFFICE", "EXPENSE_CREDIT", "DRIVER_SALARY"] } },
@@ -1759,8 +1769,8 @@ async function recognizeCarrierTripExpenseClearing(
   ]);
 
   const description = challanNos
-    ? `Trip ${input.tripNo} – Challan ${challanNos} – Expenses`
-    : `Trip ${input.tripNo} – Expenses`;
+    ? `${tripLabel(input.tripNo, input.route)} – Challan ${challanNos} – Expenses`
+    : `${tripLabel(input.tripNo, input.route)} – Expenses`;
 
   await tx.journalEntry.create({
     data: {
@@ -1803,8 +1813,8 @@ export async function closeCarrierTrip(tx: Tx, input: { tripId: string; updatedB
     data: { status: "CLOSED", dateTo, updatedById: input.updatedById },
   });
 
-  await recognizeCarrierTripIncome(tx, { tripId: input.tripId, tripNo: trip.tripNo, carrierId: trip.carrierId, entryDate: dateTo, createdById: input.updatedById });
-  await recognizeCarrierTripExpenseClearing(tx, { tripId: input.tripId, tripNo: trip.tripNo, carrierId: trip.carrierId, entryDate: dateTo, createdById: input.updatedById });
+  await recognizeCarrierTripIncome(tx, { tripId: input.tripId, tripNo: trip.tripNo, route: trip.route, carrierId: trip.carrierId, entryDate: dateTo, createdById: input.updatedById });
+  await recognizeCarrierTripExpenseClearing(tx, { tripId: input.tripId, tripNo: trip.tripNo, route: trip.route, carrierId: trip.carrierId, entryDate: dateTo, createdById: input.updatedById });
 
   return updated;
 }

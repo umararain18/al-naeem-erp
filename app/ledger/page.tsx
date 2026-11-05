@@ -13,6 +13,12 @@ import {
 } from "@/components/LedgerDetailsPicker";
 import { getSavedListFilters, saveListFilters, useListScrollRestore, LIST_HIGHLIGHT_CLASS } from "@/components/useListScrollRestore";
 
+// LIABILITY/EQUITY/INCOME are credit-normal - mirrors lib/ledger-
+// description.ts's own CREDIT_NORMAL_ACCOUNT_TYPES exactly (that
+// file's own classifyBalanceForAccountType is the server-side
+// equivalent of this page's own isFavorable checks below).
+const CREDIT_NORMAL_ACCOUNT_TYPES = new Set(["LIABILITY", "EQUITY", "INCOME"]);
+
 const GENERAL_LEDGER_LIST_KEY = "general-ledger-list";
 interface GeneralLedgerListFilters {
   accountId: string;
@@ -392,6 +398,15 @@ export default function LedgerPage() {
                     {accountSummary.map((a) => {
                       const balance = a.balance || 0;
                       const isDebit = balance > 0;
+                      // LIABILITY/EQUITY/INCOME are credit-normal - a
+                      // credit balance there is favorable (e.g. Income
+                      // showing a profit), a debit balance is abnormal
+                      // (e.g. Carrier Profit going debit = a loss) and
+                      // must show red, not green like a normal debit
+                      // Asset/Expense balance - see lib/ledger-
+                      // description.ts's classifyBalanceForAccountType
+                      // for the server-side equivalent of this same fix.
+                      const isFavorable = CREDIT_NORMAL_ACCOUNT_TYPES.has(a.accountType) ? !isDebit : isDebit;
                       return (
                         <tr key={a.id} className="hover:bg-gray-50">
                           <td className="px-4 py-3">
@@ -408,7 +423,7 @@ export default function LedgerPage() {
                             <button
                               type="button"
                               onClick={() => selectAccount(a.id)}
-                              className={`hover:underline ${isDebit ? "text-green-600" : "text-red-600"}`}
+                              className={`hover:underline ${isFavorable ? "text-green-600" : "text-red-600"}`}
                             >
                               {formatCurrency(Math.abs(balance))} {isDebit ? "Dr" : "Cr"}
                             </button>
