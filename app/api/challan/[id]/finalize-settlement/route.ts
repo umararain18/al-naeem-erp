@@ -15,8 +15,9 @@ import {
   getGrossBiltyReceivableAccountId,
   getGrossCarrierRentPayableAccountId,
   getGrossCommissionPayableAccountId,
+  getUnclaimedGrossBiltyReceivableAmountForCollectionBatch,
 } from "@/lib/gross-accounts";
-import { createSettlementPayment, reconcileCollectionAttributionAtSettlement, SettlementPaymentError } from "@/lib/settlement-payments";
+import { createSettlementPayment, SettlementPaymentError } from "@/lib/settlement-payments";
 import { auditSettlement, auditUpdate, actorFromUser, requestContext } from "@/lib/audit-log";
 
 // ============================================================
@@ -54,6 +55,10 @@ import { auditSettlement, auditUpdate, actorFromUser, requestContext } from "@/l
 // SettlementPayment row but no settlement. See lib/settlement-
 // payments.ts's own SERIALIZABLE + P2034 handling, reused unchanged.
 // ============================================================
+
+function round2(value: number): number {
+  return Math.round((value + Number.EPSILON) * 100) / 100;
+}
 
 const allocationSchema = z.object({
   component: z.enum(["COLLECTION", "CARRIER_RENT"]),
@@ -286,6 +291,26 @@ export async function POST(
       carrierRentResponsibility = "ANC";
     }
 
+    // Ledger-true unclaimed Collection per Bilty - the EXACT same
+    // function Trip Wasooli's own over-collection guard
+    // (assertBiltyCollectionNotExceeded in lib/carrier-trip.ts) and
+    // the SettlementPayment engine's own ceiling checks already read.
+    // Using `bilty.toPay` directly here (the OLD bug) ignored any
+    // amount a driver already collected via Trip Wasooli, or the
+    // office already collected via Daily Posting, BEFORE this
+    // Settlement - reclassifying the Bilty's FULL To-Pay to the
+    // Collection-responsible party even though part (or all) of it
+    // was already claimed elsewhere, crediting Gross Bilty Receivable
+    // a second time and fabricating a Receivable from a party that
+    // never actually held that money (production Challan 6435 / Bilty
+    // 453: driver collected the full 14,000 via Trip 52 Wasooli, then
+    // this route ALSO reclassified the full 14,000 to the Clearing
+    // Agent, Dr Zaheer Maluk 14,000 / Cr Gross - a false Receivable).
+    const unclaimedByBiltyId = await getUnclaimedGrossBiltyReceivableAmountForCollectionBatch(
+      prisma,
+      challan.bilties.map((cb) => cb.bilty.id)
+    );
+
     const resolutionErrors: string[] = [];
     const biltiesInput: BiltySettlementInput[] = challan.bilties.map((cb) => {
       const bilty = cb.bilty;
@@ -297,11 +322,17 @@ export async function POST(
       // Collection-responsible party. A fully-Paid Bilty (toPay = 0)
       // needs no Collection party at all. See
       // lib/settlement-accounting.ts's BiltySettlementInput.collectionAmount.
-      // Reduced by whatever this SAME request's own COLLECTION
+      // Starts from the ledger-true UNCLAIMED amount (never the static
+      // bilty.toPay field - see this function's own comment above),
+      // reduced by whatever this SAME request's own COLLECTION
       // allocation(s) for this Bilty already cover - see the Area 2
-      // comment above.
+      // comment above. A Bilty already fully claimed via Trip Wasooli/
+      // Daily Posting correctly resolves to 0 here - "nothing to
+      // settle" for its own Collection component (buildSettlementEntries
+      // only posts a Collection line when collectionAmount > 0).
       const sameRequestCovered = sameRequestCollectionCoveredByBiltyId.get(bilty.id) || 0;
-      const collectionAmount = Math.max(0, Number(bilty.toPay) - sameRequestCovered);
+      const unclaimed = unclaimedByBiltyId.get(bilty.id) || 0;
+      const collectionAmount = Math.max(0, round2(unclaimed - sameRequestCovered));
       // See the outstandingCommissionByBiltyId comment above - never
       // bilty.agentCommission directly.
       const commissionAmount = Math.max(0, outstandingCommissionByBiltyId.get(bilty.id) || 0);
@@ -687,21 +718,23 @@ export async function POST(
             },
           });
 
-          // Reconcile each Bilty's freshly-established OLD single-payer
-          // Collection default down to its CURRENT toPay, in the SAME
-          // transaction, before any staged allocation runs - closes the
-          // lifecycle gap where a Bilty's advance/Paid amount was
-          // already raised BEFORE this Challan was ever settled (so
-          // the PAID row's own sync correctly no-opped for lack of a
-          // settled Challan at that time, and buildSettlementEntries()
-          // above has no notion of toPay - only the Bilty's full
-          // total). Idempotent and a no-op for a genuinely To-Pay
-          // Bilty (see reconcileCollectionAttributionAtSettlement()'s
-          // own doc comment) - safe to call unconditionally for every
-          // Bilty on every finalize-settlement.
-          for (const cb of challan.bilties) {
-            await reconcileCollectionAttributionAtSettlement(tx, id, cb.biltyId, currentUser.userId);
-          }
+          // reconcileCollectionAttributionAtSettlement() USED to run here,
+          // reconciling the freshly-established OLD single-payer
+          // Collection default down to Bilty.toPay - a workaround for
+          // buildSettlementEntries() previously establishing that
+          // default from the Bilty's full `total`, blind to toPay. Now
+          // that `collectionAmount` above is itself the ledger-true
+          // unclaimed figure (Paid-claim-aware AND Trip-Wasooli/Daily-
+          // Posting-aware - see that computation's own comment), the
+          // freshly-established default is ALREADY correct from the
+          // moment it posts, so that reconciliation step is redundant -
+          // worse, its own floor (bilty.toPay, blind to Trip Wasooli)
+          // would have tried to "restore" an amount a driver already
+          // collected directly back onto the Collection-responsible
+          // party, undoing the fix above (removed; see git history for
+          // reconcileCollectionAttributionAtSettlement() if this
+          // Paid-before-first-settlement gap needs revisiting through
+          // a ledger-true floor instead of a blind one).
 
           // Same transaction, same tx - if ANY allocation is invalid
           // (over-allocation, bad account, etc.) this throws and the

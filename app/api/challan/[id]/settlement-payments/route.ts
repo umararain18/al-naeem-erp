@@ -7,8 +7,13 @@ import {
   createSettlementPayment,
   getComponentPaymentState,
 } from "@/lib/settlement-payments";
+import { getUnclaimedGrossBiltyReceivableAmountForCollection } from "@/lib/gross-accounts";
 import { prisma } from "@/lib/prisma";
 import { auditSettlementPayment, actorFromUser, requestContext } from "@/lib/audit-log";
+
+function round2(value: number): number {
+  return Math.round((value + Number.EPSILON) * 100) / 100;
+}
 
 // NOTE: createSettlementPayment() (lib/settlement-payments.ts) manages
 // its OWN internal transaction and is an accounting helper this task
@@ -66,14 +71,39 @@ export async function GET(
 
     const state = await getComponentPaymentState(component, { challanId, biltyId });
 
+    // Own-Carrier Challans only: Collection's own "Received" must
+    // also reflect whatever a driver already collected via Trip
+    // Wasooli (or the office via Daily Posting) - amounts that never
+    // go through a SettlementPayment row at all, so
+    // getComponentPaymentState's own row-sum (correct for every other
+    // component/case) under-reports them. The ledger-true unclaimed
+    // figure is the SAME one Trip Wasooli's own over-collection guard
+    // reads (getUnclaimedGrossBiltyReceivableAmountForCollection in
+    // lib/carrier-trip.ts) - "Received" = componentTotal - unclaimed,
+    // which already nets in every SettlementPayment row too (they
+    // post against the same Gross account). Never applied to a normal
+    // Challan - see app/api/challan/[id]/route.ts's own toPayLedger
+    // comment for why that would misreport a Collection a real party
+    // has not actually handed to the office yet.
+    let totalPaid = state.totalPaid;
+    let remainingDue = state.remainingDue;
+    if (component === "COLLECTION" && biltyId) {
+      const challanForOwnCarrierCheck = await prisma.challan.findUnique({ where: { id: challanId }, select: { ownCarrierId: true } });
+      if (challanForOwnCarrierCheck?.ownCarrierId) {
+        const unclaimed = await getUnclaimedGrossBiltyReceivableAmountForCollection(prisma, biltyId);
+        totalPaid = round2(state.componentTotal - unclaimed);
+        remainingDue = Math.max(0, round2(state.componentTotal - totalPaid));
+      }
+    }
+
     return NextResponse.json({
       success: true,
       component,
       challanId,
       biltyId: biltyId || null,
       componentTotal: state.componentTotal,
-      totalPaid: state.totalPaid,
-      remainingDue: state.remainingDue,
+      totalPaid,
+      remainingDue,
       distinctPayerAccountIds: state.distinctPayerAccountIds,
       // Settlement History display: newest -> oldest, like every
       // other normal ERP list screen. getComponentPaymentState()

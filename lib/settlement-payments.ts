@@ -233,7 +233,18 @@ async function resolveComponentContext(
   if (!challan || challan.isDeleted) {
     throw new SettlementPaymentError("CHALLAN_NOT_FOUND", "Challan not found.");
   }
-  if (!challan.isSettled || !challan.settlementJournalEntryId) {
+  // settlementJournalEntryId is correctly null for a Challan settled
+  // via the "nothing to settle" path (every component already fully
+  // claimed before Settlement - e.g. a Bilty's full To-Pay already
+  // collected via Trip Wasooli, see app/api/challan/[id]/finalize-
+  // settlement/route.ts's own fix) - isSettled alone is the real
+  // gate. The functions below that read context.settlementJournalEntryId
+  // (findSettledPartyAccountId / getComponentNetAmount, via
+  // fetchSettledLines in lib/settlement-correction.ts) tolerate null
+  // safely - an `id: null` filter simply matches no JournalEntry,
+  // correctly reporting "no old-mechanism attribution exists" rather
+  // than throwing.
+  if (!challan.isSettled) {
     throw new SettlementPaymentError(
       "CHALLAN_NOT_SETTLED",
       "This Challan has not been through Final Settlement yet - settlement payment rows can only be recorded against an already-settled Challan."
@@ -578,83 +589,6 @@ export async function previewCollectionFloorForBilty(
   };
 }
 
-/**
- * Closes a distinct lifecycle gap from syncCollectionFloorForBilty()
- * above: a Bilty's advance/PAID amount can already be raised BEFORE
- * its Challan is ever settled for the first time - at that moment
- * syncCollectionFloorForBilty() (called from the PAID row's own
- * create/update) correctly no-ops, since there is no settled Challan
- * yet to reconcile against. Nothing else ever revisits it afterward:
- * buildSettlementEntries() (lib/settlement-accounting.ts) establishes
- * the OLD single-payer Collection default using the Bilty's full
- * `total` - the ledger has no notion of `toPay` at that point - so a
- * Bilty that was already fully (or partially) Paid before its first
- * settlement is left with a stale over-attribution that nothing ever
- * releases.
- *
- * Must be called from WITHIN the SAME transaction that just created
- * the settlement JournalEntry (finalize-settlement), immediately
- * after, for every Bilty on the Challan - reconciling the freshly-
- * established default down to that Bilty's CURRENT `toPay` (the
- * authoritative "how much Collection is actually outstanding" figure
- * the rest of the multi-payer engine already uses everywhere else).
- *
- * This is a DIFFERENT floor concept from syncCollectionFloorForNewEngineRows()
- * above (which reconciles the default against ONGOING new-engine
- * COLLECTION rows, keyed off their live total) - here the floor is
- * simply the Bilty's own toPay, independent of any new-engine
- * COLLECTION activity:
- *   - Genuinely To-Pay (toPay === total): floor === the default
- *     itself - a no-op, nothing was ever wrongly attributed.
- *   - Partially Paid (0 < toPay < total): only the amount ABOVE
- *     toPay is released - the still-outstanding toPay stays exactly
- *     where the OLD mechanism put it.
- *   - Fully Paid (toPay === 0): the entire default is released.
- *
- * Fully idempotent (delegates to ensureOldAttributionWithinFloor()'s
- * own live-net recomputation, which no-ops once the old attribution
- * already sits at or below the requested floor) - safe to call on
- * every Bilty on every finalize-settlement, including Bilties that
- * were never affected by this gap at all.
- */
-export async function reconcileCollectionAttributionAtSettlement(
-  tx: Tx,
-  challanId: string,
-  biltyId: string,
-  createdById: string | null
-): Promise<void> {
-  const bilty = await tx.bilty.findUnique({
-    where: { id: biltyId },
-    select: { id: true, biltyNo: true, advance: true, toPay: true, isDeleted: true },
-  });
-  if (!bilty || bilty.isDeleted) return;
-
-  const challan = await tx.challan.findUnique({
-    where: { id: challanId },
-    select: { id: true, challanNo: true, loadingDate: true, settlementJournalEntryId: true },
-  });
-  if (!challan || !challan.settlementJournalEntryId) return;
-
-  const grossAccountId = await getGrossBiltyReceivableAccountId(tx);
-  const floor = Math.max(0, round2(Number(bilty.toPay)));
-
-  const collectionContext: ComponentContext = {
-    challanId: challan.id,
-    challanNo: challan.challanNo,
-    challanLoadingDate: challan.loadingDate,
-    settlementJournalEntryId: challan.settlementJournalEntryId,
-    biltyId: bilty.id,
-    biltyNo: bilty.biltyNo,
-    biltyAdvance: round2(Number(bilty.advance)),
-    // Not used by ensureOldAttributionWithinFloor() - see
-    // syncCollectionFloorForBilty()'s identical comment above.
-    componentTotal: 0,
-    grossAccountId,
-    documentLabel: `Bilty ${bilty.biltyNo} To-Pay`,
-  };
-
-  await ensureOldAttributionWithinFloor(tx, "COLLECTION", collectionContext, createdById, floor);
-}
 
 /**
  * Keeps the OLD (single-payer) Carrier Rent mechanism's ledger

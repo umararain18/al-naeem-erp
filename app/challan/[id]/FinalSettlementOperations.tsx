@@ -34,6 +34,10 @@ function formatCurrency(value: number) {
   return `Rs. ${Math.round(value).toLocaleString()}`;
 }
 
+function round2(value: number): number {
+  return Math.round((value + Number.EPSILON) * 100) / 100;
+}
+
 type PartyOption = {
   partyId: string;
   partyName: string;
@@ -605,6 +609,7 @@ function DraftSettlementSection({
   component,
   biltyId,
   componentTotal,
+  baselineReceived = 0,
   dueLabel,
   paidLabel,
   remainingLabel,
@@ -619,6 +624,12 @@ function DraftSettlementSection({
   component: "COLLECTION" | "CARRIER_RENT";
   biltyId?: string;
   componentTotal: number;
+  // COLLECTION only (always 0 for CARRIER_RENT) - already received
+  // OUTSIDE this screen (Trip Wasooli, Daily Posting), before any
+  // staged allocation is even added - see BiltySettlementBlock's own
+  // alreadyCollectedViaLedger comment for why this must count as
+  // "Received" too, not just this screen's own staged rows.
+  baselineReceived?: number;
   dueLabel: string;
   paidLabel: string;
   remainingLabel: string;
@@ -639,8 +650,8 @@ function DraftSettlementSection({
   const ownRows = stagedAllocations.filter(
     (a) => a.component === component && (component === "CARRIER_RENT" || a.biltyId === biltyId)
   );
-  const totalPaid = ownRows.reduce((s, r) => s + r.amount, 0);
-  const remainingDue = Math.max(0, Math.round((componentTotal - totalPaid) * 100) / 100);
+  const totalPaid = round2(baselineReceived + ownRows.reduce((s, r) => s + r.amount, 0));
+  const remainingDue = Math.max(0, round2(componentTotal - totalPaid));
 
   const displayRows: DisplayRow[] = ownRows.map((r) => ({ id: r.id, payerAccountId: r.payerAccountId, amount: r.amount, isDraft: true }));
 
@@ -698,6 +709,7 @@ function BiltySettlementBlock({
   isSettled,
   bilty,
   paidVerification,
+  ledgerUnclaimed,
   parties,
   canManage,
   stagedAllocations,
@@ -717,6 +729,13 @@ function BiltySettlementBlock({
         isInconsistent: boolean;
       }
     | undefined;
+  // Own-Carrier Bilties only (undefined for a normal Challan) - the
+  // ledger-true remaining Collection, straight from
+  // challan.toPayLedger.perBilty (see that field's own doc comment in
+  // page.tsx). Lets the DRAFT "To-Pay Receiving" box show a Trip
+  // Wasooli/Daily Posting collection as "Received" before Finalize
+  // Settlement ever runs, instead of 0.
+  ledgerUnclaimed: number | undefined;
   parties: PartyOption[];
   canManage: boolean;
   stagedAllocations: StagedAllocation[];
@@ -745,6 +764,11 @@ function BiltySettlementBlock({
   })();
 
   const toPay = Number(bilty.toPay || 0);
+  // Already collected outside this screen entirely (Trip Wasooli,
+  // Daily Posting) - see ledgerUnclaimed's own doc comment above.
+  // Falls back to 0 (today's unchanged behavior) for a normal Challan,
+  // where ledgerUnclaimed is never provided.
+  const alreadyCollectedViaLedger = ledgerUnclaimed != null ? Math.max(0, Math.round((toPay - ledgerUnclaimed) * 100) / 100) : 0;
 
   return (
     <div className="rounded-xl border p-4 md:p-5 mb-4">
@@ -837,6 +861,7 @@ function BiltySettlementBlock({
               component="COLLECTION"
               biltyId={bilty.id}
               componentTotal={toPay}
+              baselineReceived={alreadyCollectedViaLedger}
               dueLabel="To-Pay Due"
               paidLabel="Received"
               remainingLabel="Remaining"
@@ -1045,6 +1070,7 @@ export default function FinalSettlementOperations({
               isSettled={isSettled}
               bilty={bilty}
               paidVerification={paidVerification?.perBilty[bilty.id]}
+              ledgerUnclaimed={challan.toPayLedger?.perBilty[bilty.id]?.remaining}
               parties={parties}
               canManage={canManage}
               stagedAllocations={stagedAllocations}

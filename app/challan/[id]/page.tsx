@@ -155,7 +155,7 @@ export type Challan = {
   // app/api/challan/[id]/route.ts's own doc comment on why this is
   // kept separate from the normal-Challan SettlementPayment-based
   // toPayReceived/Remaining below. Null for a normal Challan.
-  toPayLedger?: { due: number; remaining: number; received: number } | null;
+  toPayLedger?: { due: number; remaining: number; received: number; perBilty: Record<string, { due: number; remaining: number; received: number }> } | null;
 };
 
 export type SettlementPayerBreakdown = {

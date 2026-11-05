@@ -274,7 +274,7 @@ export async function GET(
     // a normal Challan's card keeps reading its own existing
     // SettlementPayment-based "Received" figure, unchanged.
     let collectionPending: number | undefined;
-    let toPayLedger: { due: number; remaining: number; received: number } | null = null;
+    let toPayLedger: { due: number; remaining: number; received: number; perBilty: Record<string, { due: number; remaining: number; received: number }> } | null = null;
     if (challan.ownCarrierId) {
       const unclaimedByBiltyId = await getUnclaimedGrossBiltyReceivableAmountForCollectionBatch(
         prisma,
@@ -284,7 +284,18 @@ export async function GET(
       if (challan.isSettled && total > 0.009) collectionPending = total;
 
       const due = round2(challan.bilties.reduce((s, cb) => s + Number(cb.bilty.toPay), 0));
-      toPayLedger = { due, remaining: total, received: round2(due - total) };
+      // Per-Bilty breakdown - the Final Settlement screen's own
+      // per-Bilty "To-Pay Receiving" box needs this (not just the
+      // Challan-level aggregate above) so it can show a Trip
+      // Wasooli/Daily Posting collection as "Received" instead of 0,
+      // the exact gap production Bilty 453 exposed.
+      const perBilty: Record<string, { due: number; remaining: number; received: number }> = {};
+      for (const cb of challan.bilties) {
+        const biltyDue = round2(Number(cb.bilty.toPay));
+        const biltyRemaining = round2(unclaimedByBiltyId.get(cb.biltyId) || 0);
+        perBilty[cb.biltyId] = { due: biltyDue, remaining: biltyRemaining, received: round2(biltyDue - biltyRemaining) };
+      }
+      toPayLedger = { due, remaining: total, received: round2(due - total), perBilty };
     }
 
     // ONE financial position for this Challan (lib/challan-
