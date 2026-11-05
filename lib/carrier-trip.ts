@@ -1588,10 +1588,23 @@ export function cashDelta(lineType: string, amount: number): number {
  * posted to this account (any source: an earlier Trip's own lines,
  * Daily Posting, a direct Journal Entry, the account's own opening-
  * balance entry) whose JournalEntry.entryDate is strictly before
- * `dateFrom`. This is the account's own "opening balance" (there is
+ * `dateFrom` - EXCEPT this SAME Trip's own lines (and their own
+ * reversals). This is the account's own "opening balance" (there is
  * no separate Account.openingBalance column - an opening balance is
  * itself just an early JournalLine, already included here) plus
  * every earlier line, nothing more and nothing less.
+ *
+ * The THIS-trip exclusion matters because a line can legitimately be
+ * dated before its own Trip's dateFrom (a backdated entry, or a Trip
+ * whose own start date was edited forward after lines already
+ * existed) - getTripCashBook's own `lines` query is NOT date-filtered
+ * (it shows every one of THIS Trip's own lines regardless of date),
+ * so such a line is already counted once, there, as this Trip's own
+ * IN/OUT. Counting it a SECOND time here, folded into Previous
+ * Balance, would double-count it. Every OTHER Trip's own lines dated
+ * before `dateFrom` are correctly still included - this exclusion is
+ * scoped to `tripId` alone, never to the CARRIER_TRIP_LINE
+ * referenceType in general.
  *
  * Previously this instead computed the account's CURRENT (as-of-now)
  * balance minus this Trip's own net cash effect, which silently
@@ -1603,9 +1616,16 @@ export function cashDelta(lineType: string, amount: number): number {
  * computed wrong. Shared by getTripCashBook (its own "Opening
  * Balance" row) and getTripProfitReport (its own "Previous Balance"
  * stat). */
-async function getTripOpeningBalance(tx: Tx, dateFrom: Date, driverCashAccountId: string): Promise<number> {
+async function getTripOpeningBalance(tx: Tx, tripId: string, dateFrom: Date, driverCashAccountId: string): Promise<number> {
   const result = await tx.journalLine.aggregate({
-    where: { accountId: driverCashAccountId, journalEntry: { isDeleted: false, entryDate: { lt: dateFrom } } },
+    where: {
+      accountId: driverCashAccountId,
+      journalEntry: {
+        isDeleted: false,
+        entryDate: { lt: dateFrom },
+        NOT: { referenceType: { in: TRIP_LINE_REFERENCE_TYPES }, referenceId: tripId },
+      },
+    },
     _sum: { debit: true, credit: true },
   });
   const debit = Number(result._sum.debit || 0);
@@ -1633,7 +1653,7 @@ export async function getTripCashBook(tx: Tx, tripId: string): Promise<{ opening
     include: { pumpParty: { select: { partyName: true } } },
   });
 
-  const openingBalance = await getTripOpeningBalance(tx, trip.dateFrom, driverCashAccountId);
+  const openingBalance = await getTripOpeningBalance(tx, tripId, trip.dateFrom, driverCashAccountId);
 
   // Driver Cash activity from any OTHER source (Daily Posting, a
   // direct Journal Entry, etc.) dated within THIS Trip's own date
@@ -1781,7 +1801,7 @@ export interface TripProfitReport {
 export async function getTripProfitReport(tx: Tx, tripId: string): Promise<TripProfitReport> {
   const trip = await getTripOrThrow(tx, tripId);
   const driverCashAccountId = trip.carrier.driverCashAccount?.id;
-  const previousBalance = driverCashAccountId ? await getTripOpeningBalance(tx, trip.dateFrom, driverCashAccountId) : 0;
+  const previousBalance = driverCashAccountId ? await getTripOpeningBalance(tx, tripId, trip.dateFrom, driverCashAccountId) : 0;
 
   const [documents, lines] = await Promise.all([
     tx.carrierTripDocument.findMany({ where: { tripId, unlinkedAt: null } }),
