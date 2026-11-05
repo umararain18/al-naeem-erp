@@ -3,7 +3,7 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
-import { getTripCashBook, closeCarrierTrip, reopenCarrierTrip, getDocumentOutstandingAmount, CarrierTripError } from "@/lib/carrier-trip";
+import { getTripCashBook, closeCarrierTrip, reopenCarrierTrip, getDocumentOutstandingAmount, validateTripDateRangeChange, CarrierTripError } from "@/lib/carrier-trip";
 import { auditUpdate, auditDelete, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 
 async function loadDocumentLabels(
@@ -142,6 +142,25 @@ export async function PATCH(
     }
 
     const body = await request.json();
+
+    // A CLOSED Trip's own details (No./route/notes/dates) are
+    // blocked from editing while closed - reopening is always
+    // available to anyone who can reach this route at all (reopening
+    // requires the exact same ownCarrier.edit permission already
+    // checked above), so this is never a dead end, just a required
+    // first step. The status transition itself (body.status, handled
+    // further below) is the one exception - that IS how reopening
+    // happens - but no OTHER field may change in the same request
+    // while still closed, so a reopen is always a deliberate,
+    // separate step before any data edit, never an implicit side effect.
+    const isEditingDetails = ["tripNo", "route", "notes", "dateFrom", "dateTo"].some((k) => body[k] !== undefined);
+    if (existing.status === "CLOSED" && isEditingDetails) {
+      return NextResponse.json(
+        { success: false, message: "This Trip is closed - reopen it first (pehle reopen karein) before editing its details." },
+        { status: 400 }
+      );
+    }
+
     const updateData: Prisma.CarrierTripUncheckedUpdateInput = { updatedById: currentUser.userId };
 
     if (body.tripNo !== undefined) {
@@ -180,6 +199,34 @@ export async function PATCH(
         updateData.dateTo = dateTo;
       }
     }
+
+    // Validate the resulting range whenever either bound is actually
+    // changing - never on a request that leaves both untouched.
+    // Blocked (dateFrom after dateTo) is always rejected; warnings
+    // (existing lines/documents or another Trip's own range) are
+    // rejected UNLESS the caller already confirmed - same
+    // "confirmDuplicate" pattern as app/api/daily-posting/route.ts.
+    if (updateData.dateFrom !== undefined || updateData.dateTo !== undefined) {
+      const newDateFrom = (updateData.dateFrom as Date | undefined) ?? existing.dateFrom;
+      const newDateTo = updateData.dateTo !== undefined ? (updateData.dateTo as Date | null) : existing.dateTo;
+
+      const { blocked, warnings } = await validateTripDateRangeChange(prisma, {
+        tripId,
+        carrierId: id,
+        newDateFrom,
+        newDateTo,
+      });
+      if (blocked) {
+        return NextResponse.json({ success: false, message: blocked }, { status: 400 });
+      }
+      if (warnings.length > 0 && !body.confirmDateRangeWarning) {
+        return NextResponse.json(
+          { success: false, code: "DATE_RANGE_WARNING", message: warnings.join(" "), warnings },
+          { status: 409 }
+        );
+      }
+    }
+
     // STATUS (Close/Reopen) is handled separately via the dedicated
     // closeCarrierTrip/reopenCarrierTrip orchestration below - NOT a
     // plain column write - since Close recognizes (and Reopen

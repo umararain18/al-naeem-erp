@@ -211,10 +211,11 @@ export default function OwnCarrierDetailPage() {
               <p className="text-base font-semibold text-gray-900">Rs. {formatMoney(carrierSummary.challanReceivable)}</p>
             </div>
             <div>
-              <p className="text-xs text-gray-500">Carrier Profit (all trips)</p>
+              <p className="text-xs text-gray-500">Expenses posted (open trips)</p>
               <p className={`text-base font-semibold ${carrierSummary.carrierProfit >= 0 ? "text-green-700" : "text-red-700"}`}>
                 {formatSignedMoney(carrierSummary.carrierProfit)}
               </p>
+              <p className="text-[11px] text-gray-400">income posts on Trip close</p>
             </div>
           </div>
         )}

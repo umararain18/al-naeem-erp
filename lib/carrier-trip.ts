@@ -1018,12 +1018,64 @@ function dieselFieldsFromRawInput(rawInput: Record<string, unknown>): DieselFiel
   };
 }
 
+function toYMD(date: Date): string {
+  return date.toISOString().slice(0, 10);
+}
+
+/** null when `date` is within [dateFrom, dateTo] (dateTo open-ended
+ * if null, i.e. an OPEN trip never warns on its own upper bound) -
+ * otherwise a human message naming which bound it misses. Exported
+ * so the Trip-edit flow (PATCH .../trips/[tripId]) can run the exact
+ * same check in the opposite direction (existing lines/documents
+ * against a NEW proposed range) without a second implementation. */
+export function tripDateRangeWarning(trip: { tripNo: string; dateFrom: Date; dateTo: Date | null }, date: Date): string | null {
+  if (date.getTime() < trip.dateFrom.getTime()) {
+    return `This date (${toYMD(date)}) is before Trip ${trip.tripNo}'s own start date (${toYMD(trip.dateFrom)}).`;
+  }
+  if (trip.dateTo && date.getTime() > trip.dateTo.getTime()) {
+    return `This date (${toYMD(date)}) is after Trip ${trip.tripNo}'s own end date (${toYMD(trip.dateTo)}).`;
+  }
+  return null;
+}
+
+/** HARD block (never overridable) on a future-dated line - compared
+ * at day resolution against today, so "today" itself always passes. */
+function assertLineDateNotFuture(date: Date): void {
+  const todayEnd = new Date();
+  todayEnd.setHours(23, 59, 59, 999);
+  if (date.getTime() > todayEnd.getTime()) {
+    throw new CarrierTripError("FUTURE_DATE", `This line's date (${toYMD(date)}) is in the future - it cannot be later than today.`);
+  }
+}
+
+/**
+ * Shared date validation for every Trip line write (create via
+ * postTripLineByType, and edit via editCarrierTripLine - which calls
+ * back into postTripLineByType for its replacement line, so this one
+ * call site covers both). Future-dated is always rejected outright;
+ * outside the Trip's own [dateFrom, dateTo] range is a WARNING only -
+ * rejected UNLESS the caller already confirmed it (rawInput.
+ * confirmOutsideRange), mirroring the existing "confirmDuplicate"
+ * pattern in app/api/daily-posting/route.ts.
+ */
+async function assertLineDateValid(tx: Tx, tripId: string, date: Date, rawInput: Record<string, unknown>): Promise<void> {
+  assertLineDateNotFuture(date);
+  const trip = await tx.carrierTrip.findUnique({ where: { id: tripId }, select: { tripNo: true, dateFrom: true, dateTo: true } });
+  if (!trip) return; // getTripOrThrow (called right after, by every post*Line function) reports the real "not found" error.
+  const warning = tripDateRangeWarning(trip, date);
+  if (warning && !rawInput.confirmOutsideRange) {
+    throw new CarrierTripError("OUTSIDE_TRIP_RANGE", `${warning} Continue anyway?`);
+  }
+}
+
 export async function postTripLineByType(
   tx: Tx,
   lineType: TripLineType,
   base: { tripId: string; date: Date; description: string | null; amount: number; createdById: string },
   rawInput: Record<string, unknown>
 ) {
+  await assertLineDateValid(tx, base.tripId, base.date, rawInput);
+
   switch (lineType) {
     case "COLLECTION": {
       const documentType = rawInput.documentType as CarrierTripDocumentType;
@@ -1129,7 +1181,15 @@ export async function reverseCarrierTripLine(tx: Tx, input: { lineId: string; de
 
   await tx.journalEntry.create({
     data: {
-      entryDate: new Date(),
+      // The ORIGINAL line's own date, never "today" - a reversal is a
+      // correction of an entry that happened on ITS OWN date, not a
+      // new event happening today. Dating it today would misstate
+      // Driver Cash's balance on every day between the original date
+      // and today (see getTripOpeningBalance's own date-scoped
+      // reasoning above - a reversal dated wrong is exactly the kind
+      // of "later activity leaking into an earlier Previous Balance"
+      // this fix is closing the other half of).
+      entryDate: line.journalEntry.entryDate,
       referenceType: "CARRIER_TRIP_LINE_REVERSAL",
       referenceId: line.tripId,
       reversesEntryId: line.journalEntryId,
@@ -1387,6 +1447,85 @@ export async function reopenCarrierTrip(tx: Tx, input: { tripId: string; updated
   });
 }
 
+/**
+ * Validates a proposed Trip.dateFrom/dateTo change - called from
+ * PATCH /api/own-carrier/[id]/trips/[tripId] BEFORE the actual
+ * update, never from inside it, since this never touches any
+ * JournalEntry (editing a Trip's own dates is purely a record edit -
+ * see this function's own callers for why Previous Balance then
+ * simply recalculates on its next read, from getTripOpeningBalance
+ * reading the Trip's own, now-updated, dateFrom).
+ *
+ * `blocked` (always rejected, no override) covers:
+ *  - dateFrom after dateTo.
+ * `warnings` (rejected UNLESS the caller already confirmed) covers:
+ *  - an existing line, or a linked document's own date (Challan.
+ *    loadingDate / Phonch.date / PrivatePhonch.date), that would fall
+ *    outside the NEW range.
+ *  - the new range overlapping another (non-deleted) Trip of the
+ *    SAME carrier - an open-ended Trip (dateTo null) is treated as
+ *    ongoing through "today" for this comparison, mirroring
+ *    getTripCashBook's own "ongoing through today" treatment of an
+ *    open Trip's own missing end date.
+ */
+export async function validateTripDateRangeChange(
+  tx: Tx,
+  input: { tripId: string; carrierId: string; newDateFrom: Date; newDateTo: Date | null }
+): Promise<{ blocked: string | null; warnings: string[] }> {
+  const { tripId, carrierId, newDateFrom, newDateTo } = input;
+
+  if (newDateTo && newDateFrom.getTime() > newDateTo.getTime()) {
+    return { blocked: "Start date cannot be after end date.", warnings: [] };
+  }
+
+  const warnings: string[] = [];
+  const rangeEnd = newDateTo ?? new Date();
+
+  const lines = await tx.carrierTripLine.findMany({
+    where: { tripId, isDeleted: false },
+    select: { date: true, description: true, lineType: true },
+  });
+  const linesOutside = lines.filter((l) => l.date.getTime() < newDateFrom.getTime() || l.date.getTime() > rangeEnd.getTime());
+  if (linesOutside.length > 0) {
+    warnings.push(
+      `${linesOutside.length} existing line(s) (e.g. ${linesOutside[0].description || linesOutside[0].lineType} on ${toYMD(linesOutside[0].date)}) would fall outside the new date range.`
+    );
+  }
+
+  const docs = await tx.carrierTripDocument.findMany({ where: { tripId, unlinkedAt: null } });
+  for (const doc of docs) {
+    let docDate: Date | null = null;
+    let label = `${doc.documentType} ${doc.documentId}`;
+    if (doc.documentType === "CHALLAN") {
+      const d = await tx.challan.findUnique({ where: { id: doc.documentId }, select: { challanNo: true, loadingDate: true } });
+      if (d) { docDate = d.loadingDate; label = `Challan ${d.challanNo}`; }
+    } else if (doc.documentType === "PHONCH") {
+      const d = await tx.phonch.findUnique({ where: { id: doc.documentId }, select: { phonchNo: true, date: true } });
+      if (d) { docDate = d.date; label = `Phonch ${d.phonchNo}`; }
+    } else if (doc.documentType === "PRIVATE_PHONCH") {
+      const d = await tx.privatePhonch.findUnique({ where: { id: doc.documentId }, select: { phonchNo: true, date: true } });
+      if (d) { docDate = d.date; label = `Private Phonch ${d.phonchNo}`; }
+    }
+    if (docDate && (docDate.getTime() < newDateFrom.getTime() || docDate.getTime() > rangeEnd.getTime())) {
+      warnings.push(`Linked ${label} is dated ${toYMD(docDate)}, outside the new date range.`);
+    }
+  }
+
+  const otherTrips = await tx.carrierTrip.findMany({
+    where: { carrierId, isDeleted: false, id: { not: tripId } },
+    select: { tripNo: true, dateFrom: true, dateTo: true },
+  });
+  for (const other of otherTrips) {
+    const otherEnd = other.dateTo ?? new Date();
+    const overlaps = newDateFrom.getTime() <= otherEnd.getTime() && other.dateFrom.getTime() <= rangeEnd.getTime();
+    if (overlaps) {
+      warnings.push(`The new range overlaps Trip ${other.tripNo} (${toYMD(other.dateFrom)} - ${other.dateTo ? toYMD(other.dateTo) : "ongoing"}).`);
+    }
+  }
+
+  return { blocked: null, warnings };
+}
+
 // ============================================================
 // READ - Trip Cash Book + Trip Profit Report. Pure reads, nothing
 // here is ever stored - always derived live from CarrierTripLine +
@@ -1421,6 +1560,13 @@ export interface TripCashBookRow {
   ratePerLiter: number | null;
   pumpPartyId: string | null;
   pumpPartyName: string | null;
+  // "TRIP_LINE" for a real CarrierTripLine (editable/reversible via
+  // this Trip's own line endpoints) vs "EXTERNAL" for a Driver Cash
+  // JournalLine from any OTHER source (Daily Posting, a direct
+  // Journal Entry, etc.) dated within this Trip's own date range -
+  // shown for visibility/reconciliation only, never editable or
+  // reversible from this page. See getTripCashBook's own doc comment.
+  source: "TRIP_LINE" | "EXTERNAL";
 }
 
 /** EXPENSE_CREDIT/EXPENSE_OFFICE never move Driver Cash (neither is a
@@ -1437,21 +1583,43 @@ export function cashDelta(lineType: string, amount: number): number {
   return 0; // EXPENSE_CREDIT / EXPENSE_OFFICE
 }
 
-/** Driver Cash's own CURRENT ledger balance (one continuous account
- * across every Trip) minus THIS Trip's own total cash effect - never
- * a separately stored snapshot. Shared by getTripCashBook (its own
- * "Opening Balance" row) and getTripProfitReport (its own "Previous
- * Balance", carried from whatever the last closed Trip left behind -
- * the SAME number, since Driver Cash never resets between Trips). */
-async function getTripOpeningBalance(tx: Tx, tripId: string, driverCashAccountId: string): Promise<number> {
-  const lines = await tx.carrierTripLine.findMany({
-    where: { tripId, isDeleted: false },
-    select: { lineType: true, amount: true },
+/** Driver Cash's own ledger-true balance AS OF the moment just before
+ * `dateFrom` - the sum (debit - credit) of EVERY JournalLine ever
+ * posted to this account (any source: an earlier Trip's own lines,
+ * Daily Posting, a direct Journal Entry, the account's own opening-
+ * balance entry) whose JournalEntry.entryDate is strictly before
+ * `dateFrom`. This is the account's own "opening balance" (there is
+ * no separate Account.openingBalance column - an opening balance is
+ * itself just an early JournalLine, already included here) plus
+ * every earlier line, nothing more and nothing less.
+ *
+ * Previously this instead computed the account's CURRENT (as-of-now)
+ * balance minus this Trip's own net cash effect, which silently
+ * pulled in anything dated AFTER this Trip - later Trips' own lines,
+ * later corrections/reversals, later Daily Posting receipts - into a
+ * "Previous Balance" that should only ever reflect what came before.
+ * Driver Cash never resets between Trips, so a strictly date-scoped
+ * balance is what "Previous Balance" has always meant; it was simply
+ * computed wrong. Shared by getTripCashBook (its own "Opening
+ * Balance" row) and getTripProfitReport (its own "Previous Balance"
+ * stat). */
+async function getTripOpeningBalance(tx: Tx, dateFrom: Date, driverCashAccountId: string): Promise<number> {
+  const result = await tx.journalLine.aggregate({
+    where: { accountId: driverCashAccountId, journalEntry: { isDeleted: false, entryDate: { lt: dateFrom } } },
+    _sum: { debit: true, credit: true },
   });
-  const currentBalance = await getDriverCashBalance(tx, driverCashAccountId);
-  const thisTripNetCashEffect = round2(lines.reduce((s, l) => s + cashDelta(l.lineType, Number(l.amount)), 0));
-  return round2(currentBalance - thisTripNetCashEffect);
+  const debit = Number(result._sum.debit || 0);
+  const credit = Number(result._sum.credit || 0);
+  return round2(debit - credit);
 }
+
+// referenceTypes this module itself ever posts to Driver Cash under -
+// excluded from the "external" scan below so another source's lines
+// are never confused with this Trip's own (already shown via `lines`
+// above) or another Trip's own (deliberately never borrowed into
+// THIS Trip's cash book - each Trip only ever shows its own lines
+// plus genuinely external activity in its own date range).
+const TRIP_LINE_REFERENCE_TYPES = ["CARRIER_TRIP_LINE", "CARRIER_TRIP_LINE_REVERSAL"];
 
 export async function getTripCashBook(tx: Tx, tripId: string): Promise<{ openingBalance: number; rows: TripCashBookRow[]; closingBalance: number }> {
   const trip = await getTripOrThrow(tx, tripId);
@@ -1465,33 +1633,103 @@ export async function getTripCashBook(tx: Tx, tripId: string): Promise<{ opening
     include: { pumpParty: { select: { partyName: true } } },
   });
 
-  const openingBalance = await getTripOpeningBalance(tx, tripId, driverCashAccountId);
+  const openingBalance = await getTripOpeningBalance(tx, trip.dateFrom, driverCashAccountId);
+
+  // Driver Cash activity from any OTHER source (Daily Posting, a
+  // direct Journal Entry, etc.) dated within THIS Trip's own date
+  // range - shown for visibility/reconciliation (e.g. a driver
+  // "Peshki" receipt posted directly via Daily Posting instead of
+  // Trip Wasooli) even though it was never a CarrierTripLine. An
+  // OPEN trip (no dateTo yet) scans through today - the same
+  // "ongoing through today" assumption closeCarrierTrip() itself
+  // makes when auto-filling dateTo.
+  const rangeEnd = trip.dateTo ?? new Date();
+  const externalLines = await tx.journalLine.findMany({
+    where: {
+      accountId: driverCashAccountId,
+      journalEntry: {
+        isDeleted: false,
+        referenceType: { notIn: TRIP_LINE_REFERENCE_TYPES },
+        entryDate: { gte: trip.dateFrom, lte: rangeEnd },
+      },
+    },
+    include: { journalEntry: { select: { entryDate: true, description: true, referenceType: true } } },
+    orderBy: { journalEntry: { entryDate: "asc" } },
+  });
+
+  type MergedRow = { date: Date; createdAt: Date; delta: number; build: (balance: number) => TripCashBookRow };
+
+  const merged: MergedRow[] = [
+    ...lines.map((l) => ({
+      date: l.date,
+      createdAt: l.createdAt,
+      // The REAL cash effect - 0 for EXPENSE_CREDIT/EXPENSE_OFFICE
+      // even though their `out` is still shown for visibility (see
+      // cashDelta's own doc comment) - never derived from the
+      // displayed in/out below, which would wrongly pull those two
+      // line types into the running balance.
+      delta: cashDelta(l.lineType, Number(l.amount)),
+      build: (balance: number): TripCashBookRow => {
+        const amount = Number(l.amount);
+        return {
+          id: l.id,
+          date: l.date.toISOString(),
+          lineType: l.lineType,
+          description: l.description || l.lineType,
+          in: cashDelta(l.lineType, amount) > 0 ? amount : l.lineType === "COLLECTION" || l.lineType === "CASH_FROM_OFFICE" ? amount : 0,
+          out: cashDelta(l.lineType, amount) < 0 || l.lineType === "EXPENSE_CREDIT" || l.lineType === "EXPENSE_OFFICE" ? amount : 0,
+          balance,
+          documentType: l.documentType,
+          documentId: l.documentId,
+          category: l.category,
+          officeAccountId: l.officeAccountId,
+          vendorPartyId: l.vendorPartyId,
+          employeeId: l.employeeId,
+          isDiesel: l.isDiesel,
+          liters: l.liters != null ? Number(l.liters) : null,
+          ratePerLiter: l.ratePerLiter != null ? Number(l.ratePerLiter) : null,
+          pumpPartyId: l.pumpPartyId,
+          pumpPartyName: l.pumpParty?.partyName || null,
+          source: "TRIP_LINE",
+        };
+      },
+    })),
+    ...externalLines.map((jl) => {
+      const net = round2(Number(jl.debit) - Number(jl.credit));
+      const entryDate = jl.journalEntry.entryDate;
+      return {
+        date: entryDate,
+        createdAt: entryDate,
+        delta: net,
+        build: (balance: number): TripCashBookRow => ({
+          id: jl.id,
+          date: entryDate.toISOString(),
+          lineType: "DAILY_POSTING",
+          description: jl.journalEntry.description || jl.description || "Daily Posting",
+          in: net > 0 ? net : 0,
+          out: net < 0 ? -net : 0,
+          balance,
+          documentType: jl.sourceType || null,
+          documentId: jl.sourceId || null,
+          category: null,
+          officeAccountId: null,
+          vendorPartyId: null,
+          employeeId: null,
+          isDiesel: false,
+          liters: null,
+          ratePerLiter: null,
+          pumpPartyId: null,
+          pumpPartyName: null,
+          source: "EXTERNAL",
+        }),
+      };
+    }),
+  ].sort((a, b) => a.date.getTime() - b.date.getTime() || a.createdAt.getTime() - b.createdAt.getTime());
 
   let balance = openingBalance;
-  const rows: TripCashBookRow[] = lines.map((l) => {
-    const amount = Number(l.amount);
-    const delta = cashDelta(l.lineType, amount);
-    balance = round2(balance + delta);
-    return {
-      id: l.id,
-      date: l.date.toISOString(),
-      lineType: l.lineType,
-      description: l.description || l.lineType,
-      in: delta > 0 ? amount : l.lineType === "COLLECTION" || l.lineType === "CASH_FROM_OFFICE" ? amount : 0,
-      out: delta < 0 || l.lineType === "EXPENSE_CREDIT" || l.lineType === "EXPENSE_OFFICE" ? amount : 0,
-      balance,
-      documentType: l.documentType,
-      documentId: l.documentId,
-      category: l.category,
-      officeAccountId: l.officeAccountId,
-      vendorPartyId: l.vendorPartyId,
-      employeeId: l.employeeId,
-      isDiesel: l.isDiesel,
-      liters: l.liters != null ? Number(l.liters) : null,
-      ratePerLiter: l.ratePerLiter != null ? Number(l.ratePerLiter) : null,
-      pumpPartyId: l.pumpPartyId,
-      pumpPartyName: l.pumpParty?.partyName || null,
-    };
+  const rows: TripCashBookRow[] = merged.map((m) => {
+    balance = round2(balance + m.delta);
+    return m.build(balance);
   });
 
   return { openingBalance, rows, closingBalance: balance };
@@ -1543,7 +1781,7 @@ export interface TripProfitReport {
 export async function getTripProfitReport(tx: Tx, tripId: string): Promise<TripProfitReport> {
   const trip = await getTripOrThrow(tx, tripId);
   const driverCashAccountId = trip.carrier.driverCashAccount?.id;
-  const previousBalance = driverCashAccountId ? await getTripOpeningBalance(tx, tripId, driverCashAccountId) : 0;
+  const previousBalance = driverCashAccountId ? await getTripOpeningBalance(tx, trip.dateFrom, driverCashAccountId) : 0;
 
   const [documents, lines] = await Promise.all([
     tx.carrierTripDocument.findMany({ where: { tripId, unlinkedAt: null } }),

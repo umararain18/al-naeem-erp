@@ -94,6 +94,7 @@ type CashBookRow = {
   ratePerLiter: number | null;
   pumpPartyId: string | null;
   pumpPartyName: string | null;
+  source: "TRIP_LINE" | "EXTERNAL";
 };
 
 type CashBook = { openingBalance: number; rows: CashBookRow[]; closingBalance: number };
@@ -266,6 +267,7 @@ export default function CarrierTripDetailPage() {
   const [refreshToken, setRefreshToken] = useState(0);
   const [linkDocsOpen, setLinkDocsOpen] = useState(false);
   const [reportOpen, setReportOpen] = useState(false);
+  const [editTripOpen, setEditTripOpen] = useState(false);
   const [editingLine, setEditingLine] = useState<CashBookRow | null>(null);
   const [lastDate, setLastDate] = useState<string | null>(null);
   const [drafts, setDrafts] = useState<DraftRow[]>([]);
@@ -515,6 +517,11 @@ export default function CarrierTripDetailPage() {
           </div>
           <div className="flex items-center gap-3">
             <span className={`inline-block rounded-full px-3 py-1 text-xs font-medium ${trip.status === "OPEN" ? "bg-blue-100 text-blue-700" : "bg-gray-100 text-gray-600"}`}>{trip.status}</span>
+            {capabilities.canEdit && trip.status === "OPEN" && (
+              <button type="button" onClick={() => setEditTripOpen(true)} className="rounded-lg border px-4 py-2 text-sm hover:bg-gray-50">
+                Edit
+              </button>
+            )}
             {capabilities.canEdit && (
               <button type="button" onClick={toggleStatus} className="rounded-lg border px-4 py-2 text-sm hover:bg-gray-50">
                 {trip.status === "OPEN" ? "Close Trip" : "Reopen Trip"}
@@ -525,6 +532,10 @@ export default function CarrierTripDetailPage() {
             </button>
           </div>
         </div>
+
+        {trip.status === "CLOSED" && capabilities.canEdit && (
+          <p className="mb-4 -mt-4 text-xs text-gray-500">Reopen this Trip to edit its No./route/notes/dates.</p>
+        )}
 
         {/* DOCUMENTS */}
         <div className="mb-6 rounded-xl border bg-white shadow-sm">
@@ -725,6 +736,19 @@ export default function CarrierTripDetailPage() {
       )}
 
       {reportOpen && <ProfitReportDrawer carrierId={carrierId} tripId={tripId} onClose={() => setReportOpen(false)} />}
+
+      {editTripOpen && (
+        <EditTripDrawer
+          carrierId={carrierId}
+          tripId={tripId}
+          trip={trip}
+          onClose={() => setEditTripOpen(false)}
+          onSaved={() => {
+            setEditTripOpen(false);
+            refresh();
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -793,12 +817,17 @@ function CashList({
           {rows.map((row) => (
             <div key={row.id} className="flex items-center justify-between gap-2 px-5 py-2.5 text-sm">
               <div className="min-w-0">
-                <p className="truncate text-gray-900">{row.description}</p>
+                <p className="truncate text-gray-900">
+                  {row.description}
+                  {row.source === "EXTERNAL" && (
+                    <span className="ml-2 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-medium text-amber-700">Daily Posting</span>
+                  )}
+                </p>
                 <p className="text-xs text-gray-500">{formatBusinessDate(row.date)}</p>
               </div>
               <div className="flex shrink-0 items-center gap-2">
                 <span className={`font-medium ${amountClassName}`}>Rs. {formatMoney(row[amountKey])}</span>
-                {canAct && (
+                {canAct && row.source === "TRIP_LINE" && (
                   <div className="flex gap-1">
                     <button type="button" onClick={() => onEdit(row)} className="rounded-md border px-2 py-1 text-xs hover:bg-gray-50">
                       Edit
@@ -919,6 +948,23 @@ const CATEGORY_TO_QUICK_KEY: Record<string, QuickTypeKey> = {
 
 function buildDieselDescription(pump: string, liters: string, note: string): string {
   return ["Diesel", pump.trim() || null, liters.trim() ? `${liters.trim()}L` : null, note.trim() || null].filter(Boolean).join(" - ");
+}
+
+// Posts/edits ONE Trip line, transparently handling the server's
+// "date is outside the Trip's own range" WARNING (code
+// OUTSIDE_TRIP_RANGE, lib/carrier-trip.ts's own tripDateRangeWarning) -
+// a future-dated line (code FUTURE_DATE) is a hard block with no such
+// retry. Mirrors the existing "confirmDuplicate" pattern already used
+// elsewhere in this codebase (app/api/daily-posting/route.ts).
+async function postLineWithRangeConfirm(url: string, method: "POST" | "PATCH", payload: Record<string, unknown>) {
+  let res = await fetch(url, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+  let data = await res.json();
+  if (!res.ok && data.code === "OUTSIDE_TRIP_RANGE" && window.confirm(`${data.message}\n\nOK = save anyway, Cancel = go back and fix the date.`)) {
+    res = await fetch(url, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...payload, confirmOutsideRange: true }) });
+    data = await res.json();
+  }
+  if (!res.ok || !data.success) throw new Error(data.message || "Unable to save line.");
+  return data;
 }
 
 function QuickEntryRow({
@@ -1185,6 +1231,7 @@ function QuickEntryRow({
           : "EXPENSE_CREDIT";
 
   const dateOutOfRange = date && (date < toYMD(tripDateFrom) || (tripDateTo ? date > toYMD(tripDateTo) : false));
+  const dateIsFuture = Boolean(date && date > todayYMD());
   const showBiltyBreakdown = quickType.kind === "COLLECTION" && Boolean(biltyBreakdown && biltyBreakdown.length > 0);
   const biltyBreakdownTotal = round2(
     Object.entries(biltyAmounts).reduce((s, [, v]) => s + (Number(v) || 0), 0)
@@ -1193,6 +1240,11 @@ function QuickEntryRow({
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError("");
+
+    if (dateIsFuture) {
+      setError("This line's date is in the future - it cannot be later than today.");
+      return;
+    }
 
     // Per-Bilty Collection split - one POST per Bilty with a nonzero
     // amount (see PostCollectionInput.biltyId's own doc comment for
@@ -1235,13 +1287,7 @@ function QuickEntryRow({
             biltyId: b.biltyId,
             counterAccountId: b.accountId || biltyPartyChoice[b.biltyId] || undefined,
           };
-          const res = await fetch(`/api/own-carrier/${carrierId}/trips/${tripId}/lines`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload),
-          });
-          const data = await res.json();
-          if (!res.ok || !data.success) throw new Error(data.message || `Unable to save Bilty ${b.biltyNo}'s collection.`);
+          await postLineWithRangeConfirm(`/api/own-carrier/${carrierId}/trips/${tripId}/lines`, "POST", payload);
         }
         onDateUsed(date);
         resetForFreshRow(true);
@@ -1316,13 +1362,7 @@ function QuickEntryRow({
       const url = editingLine
         ? `/api/own-carrier/${carrierId}/trips/${tripId}/lines/${editingLine.id}`
         : `/api/own-carrier/${carrierId}/trips/${tripId}/lines`;
-      const res = await fetch(url, {
-        method: editingLine ? "PATCH" : "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const data = await res.json();
-      if (!res.ok || !data.success) throw new Error(data.message || "Unable to save line.");
+      await postLineWithRangeConfirm(url, editingLine ? "PATCH" : "POST", payload);
       onDateUsed(date);
       if (quickType.kind === "EXPENSE" && !editingLine) {
         try {
@@ -1375,7 +1415,11 @@ function QuickEntryRow({
           <div className="w-36">
             <label className="mb-1 block text-xs font-medium text-gray-600">Date</label>
             <input type="date" value={date} onChange={(e) => setDate(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
-            {dateOutOfRange && <p className="mt-1 text-xs text-amber-600">Outside Trip&apos;s date range</p>}
+            {dateIsFuture ? (
+              <p className="mt-1 text-xs text-red-600">Future date not allowed</p>
+            ) : (
+              dateOutOfRange && <p className="mt-1 text-xs text-amber-600">Outside Trip&apos;s date range</p>
+            )}
           </div>
 
           {quickType.kind === "COLLECTION" && (
@@ -2008,6 +2052,122 @@ function PasteListBox({
         </div>
       )}
     </div>
+  );
+}
+
+// ============================================================
+// EDIT TRIP DRAWER - Trip No./route/notes/Start-End date. Only shown
+// while OPEN (the page itself hides the Edit button for a CLOSED
+// Trip) - PATCH /api/own-carrier/[id]/trips/[tripId] still enforces
+// the same block server-side regardless. A date-range warning
+// (code DATE_RANGE_WARNING - existing lines/documents outside the
+// new range, or an overlap with another Trip) is confirmable via
+// window.confirm, mirroring postLineWithRangeConfirm's own pattern
+// above; a hard validation error (e.g. start after end) is not.
+// ============================================================
+function EditTripDrawer({
+  carrierId,
+  tripId,
+  trip,
+  onClose,
+  onSaved,
+}: {
+  carrierId: string;
+  tripId: string;
+  trip: Trip;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const [tripNo, setTripNo] = useState(trip.tripNo);
+  const [route, setRoute] = useState(trip.route || "");
+  const [notes, setNotes] = useState(trip.notes || "");
+  const [dateFrom, setDateFrom] = useState(toYMD(trip.dateFrom));
+  const [dateTo, setDateTo] = useState(trip.dateTo ? toYMD(trip.dateTo) : "");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  async function handleSave() {
+    if (!tripNo.trim()) {
+      setError("Trip No. is required.");
+      return;
+    }
+    if (dateTo && dateFrom > dateTo) {
+      setError("Start date cannot be after end date.");
+      return;
+    }
+    const payload: Record<string, unknown> = {
+      tripNo: tripNo.trim(),
+      route: route.trim() || null,
+      notes: notes.trim() || null,
+      dateFrom,
+      dateTo: dateTo || null,
+    };
+    try {
+      setSaving(true);
+      setError("");
+      let res = await fetch(`/api/own-carrier/${carrierId}/trips/${tripId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      let data = await res.json();
+      if (!res.ok && data.code === "DATE_RANGE_WARNING") {
+        if (!window.confirm(`${data.message}\n\nOK = save anyway, Cancel = go back and fix the dates.`)) {
+          setSaving(false);
+          return;
+        }
+        res = await fetch(`/api/own-carrier/${carrierId}/trips/${tripId}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...payload, confirmDateRangeWarning: true }),
+        });
+        data = await res.json();
+      }
+      if (!res.ok || !data.success) throw new Error(data.message || "Unable to update Trip.");
+      onSaved();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to update Trip.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Drawer open onClose={onClose} title="Edit Trip">
+      <div className="space-y-4">
+        {error && <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>}
+        <div>
+          <label className="mb-1 block text-xs font-medium text-gray-600">Trip No.</label>
+          <input type="text" value={tripNo} onChange={(e) => setTripNo(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
+        </div>
+        <div>
+          <label className="mb-1 block text-xs font-medium text-gray-600">Route</label>
+          <input type="text" value={route} onChange={(e) => setRoute(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
+        </div>
+        <div className="flex gap-3">
+          <div className="flex-1">
+            <label className="mb-1 block text-xs font-medium text-gray-600">Start Date</label>
+            <input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
+          </div>
+          <div className="flex-1">
+            <label className="mb-1 block text-xs font-medium text-gray-600">End Date</label>
+            <input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
+          </div>
+        </div>
+        <div>
+          <label className="mb-1 block text-xs font-medium text-gray-600">Notes</label>
+          <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={3} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
+        </div>
+        <div className="flex justify-end gap-2 pt-2">
+          <button type="button" onClick={onClose} className="rounded-lg border px-4 py-2 text-sm hover:bg-gray-50">
+            Cancel
+          </button>
+          <button type="button" onClick={handleSave} disabled={saving} className="rounded-lg bg-blue-600 px-4 py-2 text-sm text-white hover:bg-blue-700 disabled:opacity-50">
+            {saving ? "Saving..." : "Save"}
+          </button>
+        </div>
+      </div>
+    </Drawer>
   );
 }
 
