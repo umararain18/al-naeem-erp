@@ -11,7 +11,11 @@ import {
 import { assertPhonchReceiptNotExceeded } from "@/lib/phonch-accounting";
 import { assertPrivatePhonchPaymentNotExceeded } from "@/lib/private-phonch-accounting";
 import { getDriverCashBalance, getOrCreateCarrierProfitAccountId } from "@/lib/own-carrier";
-import { getUnearnedRevenueAccountId } from "@/lib/gross-accounts";
+import {
+  getUnearnedRevenueAccountId,
+  getGrossBiltyReceivableAccountId,
+  getUnclaimedGrossBiltyReceivableAmountForCollection,
+} from "@/lib/gross-accounts";
 import { netIncome } from "@/lib/pnl";
 
 // Expense category - set on EXPENSE_CASH/EXPENSE_OFFICE/EXPENSE_CREDIT
@@ -449,14 +453,33 @@ export interface BiltyCollectionState {
 }
 
 /**
- * Current Collection state for ONE Bilty - who it is currently
- * resolved to (Gross Bilty Receivable's own "unallocated" pseudo-
- * party when nothing has claimed it yet, a real Settlement payer, or
- * null if genuinely ambiguous) and how much of its own To-Pay is
- * still collectible against that resolution right now. Used by the
- * Trip Wasooli Bilty picker (getChallanBiltyCollectionBreakdown
- * below) and, for the write-time ceiling, by postCollectionLine
- * itself - the SAME read, never two independently-maintained copies.
+ * Current Collection state for ONE Bilty, for Trip Wasooli's own
+ * driver-collection purpose specifically - deliberately NOT the same
+ * question as "who is this Bilty's Collection currently resolved to"
+ * (resolveDocumentPartyAccount("BILTY", ...), used by Daily Posting
+ * etc.), which resolves the WHOLE Bilty to a single Settlement payer
+ * once ANY payer row exists for it (see getBiltyCollectionState's
+ * prior implementation, kept only in git history) - that collapses a
+ * CA's own partial settlement-payment slice and the Bilty's still-
+ * genuinely-unclaimed remainder into one party, so a driver's own
+ * in-person cash receipt for the UNCLAIMED remainder would wrongly
+ * post as if received FROM the CA, clearing the CA's own liability
+ * instead of reducing the real remainder (the exact bug a Trip
+ * Wasooli/Settlement-Payment ordering test surfaced).
+ *
+ * The driver only ever physically collects cash the consignee pays
+ * directly - never a transfer from a CA/third-party's own
+ * reclassified slice - so the correct, unambiguous target for Trip
+ * Wasooli is always Gross Bilty Receivable's own CURRENT unclaimed
+ * balance for this Bilty (getUnclaimedGrossBiltyReceivableAmountForCollection,
+ * the exact same ledger-true figure driving the Challan position's
+ * "Receivable (To-Pay pending)" line) - never a specific party's
+ * account. Once that balance is fully reclassified away (an old
+ * single-payer CLEARING_AGENT settlement, or new-engine Settlement
+ * Payment rows covering it in full) there is nothing left for the
+ * driver to collect for this Bilty - accountId is null and
+ * outstanding is 0, not an "ambiguous, pick a party" state (there is
+ * no remaining ambiguity to resolve: there is simply nothing left).
  */
 export async function getBiltyCollectionState(tx: Tx, biltyId: string): Promise<BiltyCollectionState> {
   const bilty = await tx.bilty.findUnique({ where: { id: biltyId }, select: { biltyNo: true, toPay: true, isDeleted: true } });
@@ -464,14 +487,14 @@ export async function getBiltyCollectionState(tx: Tx, biltyId: string): Promise<
     throw new CarrierTripError("DOCUMENT_NOT_FOUND", "Bilty not found.");
   }
   const toPay = round2(Number(bilty.toPay));
-  const resolved = await resolveDocumentPartyAccount("BILTY", biltyId, "DEBIT");
+  const outstanding = round2(await getUnclaimedGrossBiltyReceivableAmountForCollection(tx, biltyId));
 
-  if (!resolved) {
+  if (outstanding <= 0.009) {
     return { biltyId, biltyNo: bilty.biltyNo, toPay, accountId: null, partyName: null, outstanding: 0, received: toPay };
   }
 
-  const outstanding = await getBiltyCollectionOutstanding(tx, biltyId, resolved.accountId, toPay);
-  return { biltyId, biltyNo: bilty.biltyNo, toPay, accountId: resolved.accountId, partyName: resolved.partyName, outstanding, received: round2(toPay - outstanding) };
+  const grossAccountId = await getGrossBiltyReceivableAccountId(tx);
+  return { biltyId, biltyNo: bilty.biltyNo, toPay, accountId: grossAccountId, partyName: "Unallocated (To-Pay pending)", outstanding, received: round2(toPay - outstanding) };
 }
 
 /** Every Bilty of a linked Challan, in display order - the Trip
@@ -664,8 +687,14 @@ export async function postCollectionLine(tx: Tx, input: PostCollectionInput) {
 
     let biltyCounterAccountId = input.counterAccountId || null;
     if (!biltyCounterAccountId) {
-      const resolved = await resolveDocumentPartyAccount("BILTY", input.biltyId, "DEBIT");
-      biltyCounterAccountId = resolved?.accountId || null;
+      // Always the Bilty's own CURRENT unclaimed Gross balance - never
+      // the whole-Bilty single-payer resolver - see
+      // getBiltyCollectionState's own doc comment above for why: a
+      // driver's own cash receipt must reduce the genuinely-unclaimed
+      // remainder, never a CA/third-party's own already-reclassified
+      // slice, however that slice was established.
+      const unclaimed = await getUnclaimedGrossBiltyReceivableAmountForCollection(tx, input.biltyId);
+      biltyCounterAccountId = unclaimed > 0.009 ? await getGrossBiltyReceivableAccountId(tx) : null;
     } else {
       const eligible = await getBiltyLegitimatePartyAccountIds(input.biltyId, "DEBIT");
       if (!eligible.has(biltyCounterAccountId)) {
@@ -675,7 +704,7 @@ export async function postCollectionLine(tx: Tx, input: PostCollectionInput) {
     if (!biltyCounterAccountId) {
       throw new CarrierTripError(
         "PARTY_REQUIRED",
-        `Could not automatically determine who ${biltyLabel}'s collection belongs to - select the party explicitly.`
+        `${biltyLabel} has nothing left outstanding to collect - its To-Pay has already been fully assigned to a party or received.`
       );
     }
 

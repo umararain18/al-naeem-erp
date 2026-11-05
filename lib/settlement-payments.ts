@@ -5,6 +5,7 @@ import { prisma } from "@/lib/prisma";
 import {
   getGrossBiltyReceivableAccountId,
   getGrossCarrierRentPayableAccountId,
+  getUnclaimedGrossBiltyReceivableAmountForCollection,
 } from "@/lib/gross-accounts";
 import {
   findSettledPartyAccountId,
@@ -1326,10 +1327,25 @@ export async function createSettlementPayment(
     const existingTotal = round2(existingRows.reduce((s, r) => s + r.amount, 0));
     const requested = round2(amount);
 
-    if (existingTotal + requested > context.componentTotal + EPS) {
+    // COLLECTION's real ceiling is the Bilty's own CURRENT unclaimed
+    // Gross balance, not just componentTotal minus this engine's own
+    // rows - `existingTotal` alone cannot see a Trip Wasooli driver
+    // receipt or a direct Daily Posting receipt, either of which may
+    // already have reduced the SAME Gross balance this payer's row is
+    // about to reclassify out of. Using the ledger-true balance here
+    // (the exact figure lib/carrier-trip.ts's own getBiltyCollectionState
+    // reads for the opposite direction) is what makes "never count the
+    // same Rupee twice" hold across every collection channel, not just
+    // within this engine's own rows.
+    const availableCeiling =
+      component === "COLLECTION"
+        ? round2(await getUnclaimedGrossBiltyReceivableAmountForCollection(tx, context.biltyId as string))
+        : round2(context.componentTotal - existingTotal);
+
+    if (requested > availableCeiling + EPS) {
       throw new SettlementPaymentError(
         "OVER_ALLOCATION",
-        `This payment of ${requested} would exceed ${context.documentLabel}'s remaining amount (${round2(context.componentTotal - existingTotal)}).`
+        `This payment of ${requested} would exceed ${context.documentLabel}'s remaining amount (${availableCeiling}).`
       );
     }
 
@@ -1518,15 +1534,25 @@ export async function updateSettlementPaymentAmount(
     });
     const otherTotal = round2(otherRows.reduce((s, r) => s + Number(r.amount), 0));
     const requested = round2(newAmount);
+    const currentAmount = round2(Number(existing.amount));
 
-    if (otherTotal + requested > context.componentTotal + EPS) {
+    // Same ledger-true ceiling as createSettlementPayment() above -
+    // see its own comment. This row's own current amount is added
+    // back since the live Gross balance already reflects it as
+    // claimed; the check is against the room available for its NEW
+    // total, not its delta.
+    const availableCeiling =
+      component === "COLLECTION"
+        ? round2((await getUnclaimedGrossBiltyReceivableAmountForCollection(tx, context.biltyId as string)) + currentAmount)
+        : round2(context.componentTotal - otherTotal);
+
+    if (requested > availableCeiling + EPS) {
       throw new SettlementPaymentError(
         "OVER_ALLOCATION",
-        `New amount (${requested}) would exceed ${context.documentLabel}'s remaining amount (${round2(context.componentTotal - otherTotal)}).`
+        `New amount (${requested}) would exceed ${context.documentLabel}'s remaining amount (${availableCeiling}).`
       );
     }
 
-    const currentAmount = round2(Number(existing.amount));
     const delta = round2(requested - currentAmount);
 
     if (delta !== 0) {
