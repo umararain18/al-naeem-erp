@@ -22,6 +22,7 @@ type ProfitLossResponse = {
   income: PnLAccount[];
   expenses: PnLAccount[];
   summary: Summary;
+  tripInProgressTotal: number;
   filters: { from: string | null; to: string | null };
 };
 
@@ -244,6 +245,11 @@ export default function ProfitLossPage() {
               {summary.netProfit < 0 ? " Loss" : " Profit"}
             </p>
           </div>
+          {data.tripInProgressTotal > 0 && (
+            <p className="mt-2 text-xs text-gray-500">
+              Memo: {formatCurrency(data.tripInProgressTotal)} of own-carrier Trip expenses are still &quot;Trip in Progress&quot; (open Trips not yet closed) - not yet included above.
+            </p>
+          )}
         </div>
       </div>
     </main>

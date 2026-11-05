@@ -10,7 +10,7 @@ import {
 } from "@/lib/document-party-resolution";
 import { assertPhonchReceiptNotExceeded } from "@/lib/phonch-accounting";
 import { assertPrivatePhonchPaymentNotExceeded } from "@/lib/private-phonch-accounting";
-import { getDriverCashBalance, getOrCreateCarrierProfitAccountId } from "@/lib/own-carrier";
+import { getDriverCashBalance, getOrCreateCarrierProfitAccountId, getOrCreateTripInProgressAccountId } from "@/lib/own-carrier";
 import {
   getUnearnedRevenueAccountId,
   getGrossBiltyReceivableAccountId,
@@ -831,11 +831,14 @@ export async function postCashFromOfficeLine(tx: Tx, input: PostOfficeTransferIn
 }
 
 /** OUT - trip expense paid by the driver from Driver Cash. Dr this
- * carrier's own Carrier Profit account / Cr Driver Cash - every
- * expense/salary line debits the SAME account now (see
- * Account.ownCarrierIncomeId's own schema comment), so `category` is
- * what distinguishes a Diesel purchase from a Toll payment, never an
- * account picker. */
+ * carrier's own "Trip in Progress" clearing account / Cr Driver Cash -
+ * every expense/salary line debits the SAME clearing account now
+ * (never Carrier Profit directly - see this module's own header
+ * comment), so `category` is what distinguishes a Diesel purchase
+ * from a Toll payment, never an account picker. Trip CLOSE moves the
+ * Trip's own total out of Trip in Progress into Carrier Profit in one
+ * entry - never before then, so an open Trip's own expenses never
+ * show in P&L. */
 export async function postExpenseCashLine(tx: Tx, input: PostExpenseInput) {
   const trip = await getTripOrThrow(tx, input.tripId);
   if (trip.status !== "OPEN") throw new CarrierTripError("TRIP_CLOSED", "This Trip is closed.");
@@ -843,7 +846,7 @@ export async function postExpenseCashLine(tx: Tx, input: PostExpenseInput) {
   const category = assertValidExpenseCategory(input.category);
 
   const driverCashId = trip.carrier.driverCashAccount!.id;
-  const carrierProfitAccountId = await getOrCreateCarrierProfitAccountId(tx, trip.carrierId);
+  const tripInProgressAccountId = await getOrCreateTripInProgressAccountId(tx, trip.carrierId);
   const description = input.description?.trim() || categoryLabel(category);
 
   return createTripLineEntry(
@@ -854,7 +857,7 @@ export async function postExpenseCashLine(tx: Tx, input: PostExpenseInput) {
       createdById: input.createdById,
       description,
       lines: [
-        { accountId: carrierProfitAccountId, debit: input.amount, credit: 0 },
+        { accountId: tripInProgressAccountId, debit: input.amount, credit: 0 },
         { accountId: driverCashId, debit: 0, credit: input.amount },
       ],
     },
@@ -863,7 +866,7 @@ export async function postExpenseCashLine(tx: Tx, input: PostExpenseInput) {
 }
 
 /** OUT - trip expense (e.g. Diesel paid via an office account) charged
- * directly to an office Cash/Bank account. Dr Carrier Profit / Cr
+ * directly to an office Cash/Bank account. Dr Trip in Progress / Cr
  * office account. Never touches Driver Cash - same "payment source
  * never moves Driver Cash" rule as EXPENSE_CREDIT. */
 export async function postExpenseOfficeLine(tx: Tx, input: PostExpenseInput & { officeAccountId: string }) {
@@ -877,7 +880,7 @@ export async function postExpenseOfficeLine(tx: Tx, input: PostExpenseInput & { 
     throw new CarrierTripError("INVALID_ACCOUNT", "Selected office account was not found or is inactive.");
   }
 
-  const carrierProfitAccountId = await getOrCreateCarrierProfitAccountId(tx, trip.carrierId);
+  const tripInProgressAccountId = await getOrCreateTripInProgressAccountId(tx, trip.carrierId);
   const description = input.description?.trim() || `${categoryLabel(category)} (Office Account - ${officeAccount.accountName})`;
 
   return createTripLineEntry(
@@ -888,7 +891,7 @@ export async function postExpenseOfficeLine(tx: Tx, input: PostExpenseInput & { 
       createdById: input.createdById,
       description,
       lines: [
-        { accountId: carrierProfitAccountId, debit: input.amount, credit: 0 },
+        { accountId: tripInProgressAccountId, debit: input.amount, credit: 0 },
         { accountId: input.officeAccountId, debit: 0, credit: input.amount },
       ],
     },
@@ -896,7 +899,7 @@ export async function postExpenseOfficeLine(tx: Tx, input: PostExpenseInput & { 
   );
 }
 
-/** OUT - trip expense, Udhaar (credit) to a Vendor Party. Dr Carrier Profit / Cr Vendor. Never touches Driver Cash. */
+/** OUT - trip expense, Udhaar (credit) to a Vendor Party. Dr Trip in Progress / Cr Vendor. Never touches Driver Cash. */
 export async function postExpenseCreditLine(tx: Tx, input: PostExpenseCreditInput) {
   const trip = await getTripOrThrow(tx, input.tripId);
   if (trip.status !== "OPEN") throw new CarrierTripError("TRIP_CLOSED", "This Trip is closed.");
@@ -908,7 +911,7 @@ export async function postExpenseCreditLine(tx: Tx, input: PostExpenseCreditInpu
     throw new CarrierTripError("INVALID_VENDOR", "Selected vendor party was not found or is inactive.");
   }
 
-  const carrierProfitAccountId = await getOrCreateCarrierProfitAccountId(tx, trip.carrierId);
+  const tripInProgressAccountId = await getOrCreateTripInProgressAccountId(tx, trip.carrierId);
   const description = input.description?.trim() || `${categoryLabel(category)} (Udhaar - ${vendorParty.partyName})`;
 
   return createTripLineEntry(
@@ -919,7 +922,7 @@ export async function postExpenseCreditLine(tx: Tx, input: PostExpenseCreditInpu
       createdById: input.createdById,
       description,
       lines: [
-        { accountId: carrierProfitAccountId, debit: input.amount, credit: 0 },
+        { accountId: tripInProgressAccountId, debit: input.amount, credit: 0 },
         { accountId: vendorParty.account.id, debit: 0, credit: input.amount },
       ],
     },
@@ -936,12 +939,13 @@ export async function postExpenseCreditLine(tx: Tx, input: PostExpenseCreditInpu
 }
 
 /** OUT - driver salary is a carrier expense now (never a Payslip/
- * employee-account posting): Dr this carrier's own Carrier Profit
- * account / Cr Driver Cash. No "employee must have a linked account"
- * requirement any more - the Employee row only needs to exist and not
- * be binned, since salary no longer touches that employee's own
- * account at all. category is always "SALARY" - not user-supplied,
- * since DRIVER_SALARY is its own distinct lineType already. */
+ * employee-account posting): Dr this carrier's own "Trip in Progress"
+ * clearing account / Cr Driver Cash. No "employee must have a linked
+ * account" requirement any more - the Employee row only needs to
+ * exist and not be binned, since salary no longer touches that
+ * employee's own account at all. category is always "SALARY" - not
+ * user-supplied, since DRIVER_SALARY is its own distinct lineType
+ * already. */
 export async function postDriverSalaryLine(tx: Tx, input: PostSalaryInput) {
   const trip = await getTripOrThrow(tx, input.tripId);
   if (trip.status !== "OPEN") throw new CarrierTripError("TRIP_CLOSED", "This Trip is closed.");
@@ -953,7 +957,7 @@ export async function postDriverSalaryLine(tx: Tx, input: PostSalaryInput) {
   }
 
   const driverCashId = trip.carrier.driverCashAccount!.id;
-  const carrierProfitAccountId = await getOrCreateCarrierProfitAccountId(tx, trip.carrierId);
+  const tripInProgressAccountId = await getOrCreateTripInProgressAccountId(tx, trip.carrierId);
   const description = input.description?.trim() || `Salary paid to ${employee.name}`;
 
   return createTripLineEntry(
@@ -964,7 +968,7 @@ export async function postDriverSalaryLine(tx: Tx, input: PostSalaryInput) {
       createdById: input.createdById,
       description,
       lines: [
-        { accountId: carrierProfitAccountId, debit: input.amount, credit: 0 },
+        { accountId: tripInProgressAccountId, debit: input.amount, credit: 0 },
         { accountId: driverCashId, debit: 0, credit: input.amount },
       ],
     },
@@ -1223,38 +1227,85 @@ export async function reverseCarrierTripLine(tx: Tx, input: { lineId: string; de
 }
 
 // ============================================================
-// TRIP CLOSE INCOME RECOGNITION - see Challan.ownCarrierId's own
-// schema doc comment for the full rationale. An own-carrier Challan's
-// Bilty rent sits untouched in Unearned Revenue from booking all the
-// way through dispatch; closing the Trip that links it is the ONE
-// moment its income is finally recognized, split between real
-// Booking Income and this carrier's own "Carrier Profit" account by the
-// manually-entered CarrierTripDocument.carrierRentAmount.
+// TRIP CLOSE INCOME RECOGNITION + EXPENSE CLEARING - see
+// Challan.ownCarrierId's own schema doc comment for the income-
+// deferral rationale. An own-carrier Challan's Bilty rent sits
+// untouched in Unearned Revenue from booking all the way through
+// dispatch; a Trip's own expense/diesel/salary lines sit in "Trip in
+// Progress" (never Carrier Profit directly - see postExpenseCashLine's
+// own doc comment) for as long as the Trip stays OPEN. Closing the
+// Trip is the ONE moment both get resolved into Carrier Profit, in
+// EXACTLY TWO JournalEntries (never one per linked Challan, never one
+// per expense line):
 //
-// referenceType "CARRIER_TRIP_CLOSE", referenceId = the CHALLAN's own
-// id (never the Trip's or the link's) - a Challan can only ever have
-// ONE currently-active Trip link at a time (the partial unique index
-// on CarrierTripDocument), so this is always unambiguous, exactly
-// like lib/bilty-revenue-recognition.ts's own per-Bilty scoping -
-// even across an unlink -> relink-to-a-later-Trip cycle (only
-// possible while OPEN; see unlinkDocumentFromTrip), since at most one
-// recognition is ever live for a given Challan at once.
+//   Entry A ("...Carrier Rent"), referenceType CARRIER_TRIP_CLOSE,
+//   referenceId = the TRIP's own id (never a Challan's - a Trip can
+//   close several Challans at once, so this entry's own lines, not
+//   its referenceId, carry each Challan's own sourceType:"CHALLAN"/
+//   sourceId tag): Dr Unearned Revenue / Cr Booking Income, per
+//   contributing Challan (Bilty Rent minus that Challan's own Carrier
+//   Rent), PLUS one combined Cr Carrier Profit line for every
+//   contributing Challan's Carrier Rent summed together. A Challan
+//   with zero Bilty Rent, or already recognized (see
+//   getChallanCloseRecognitionNet), contributes nothing and is left
+//   out of this entry entirely - exactly as recognizeBiltyBookingIncome()'s
+//   own idempotency already works per-Bilty.
+//
+//   Entry B ("...Expenses"), referenceType CARRIER_TRIP_CLOSE_EXPENSE,
+//   referenceId = the TRIP's own id: Dr Carrier Profit / Cr Trip in
+//   Progress, for this Trip's own total EXPENSE_CASH/EXPENSE_OFFICE/
+//   EXPENSE_CREDIT/DRIVER_SALARY amount (read straight off
+//   CarrierTripLine.tripId/lineType/amount - the SAME figure
+//   getTripProfitReport's own totalCarrierExpense already is, not a
+//   second calculation).
+//
+// Either entry is simply never created when it would have nothing to
+// post (no Challan contributes / zero trip expense) - "exactly two"
+// is the common case, not an invariant enforced by fabricating a
+// zero-line entry.
+//
+// Reopen reverses whichever of the two is currently live, each dated
+// the SAME entryDate it was posted at (the Trip's own dateTo - never
+// "today"; a reversal is a correction of something that happened on
+// its own date, not a new event happening today - same principle
+// already applied to Trip line reversals, see reverseCarrierTripLine's
+// own doc comment) - never a per-Challan loop any more.
 // ============================================================
 
 export const CARRIER_TRIP_CLOSE_REFERENCE_TYPE = "CARRIER_TRIP_CLOSE";
 export const CARRIER_TRIP_CLOSE_REVERSAL_REFERENCE_TYPE = "CARRIER_TRIP_CLOSE_REVERSAL";
+export const CARRIER_TRIP_CLOSE_EXPENSE_REFERENCE_TYPE = "CARRIER_TRIP_CLOSE_EXPENSE";
+export const CARRIER_TRIP_CLOSE_EXPENSE_REVERSAL_REFERENCE_TYPE = "CARRIER_TRIP_CLOSE_EXPENSE_REVERSAL";
 
-// Net count idiom - see lib/bilty-revenue-recognition.ts's own
-// getRecognitionNet() for why NET (recognitions - reversals) is
-// required rather than a plain existence check: a Challan can
-// legitimately cycle through recognize (close) -> reverse (reopen) ->
-// recognize (re-close) more than once.
+/** Ledger-true net (debit - credit) on Unearned Revenue for this ONE
+ * Challan's own sourceType:"CHALLAN"/sourceId tag, across every live
+ * CARRIER_TRIP_CLOSE/CARRIER_TRIP_CLOSE_REVERSAL JournalLine - works
+ * identically whether this Challan's own recognition lines live
+ * inside a solo entry or a combined multi-Challan one, since the tag
+ * is per-LINE, never per-entry. Positive = currently recognized
+ * (Entry A's own Dr Unearned Revenue line for this Challan is still
+ * live, uncanceled by a later reversal's Cr); zero = not recognized
+ * (never happened, or happened and was since reversed). Replaces the
+ * old "count recognize entries minus count reversal entries" idiom,
+ * which assumed exactly one entry per Challan and broke once several
+ * Challans' own recognition lines could share a single combined
+ * entry.
+ */
 async function getChallanCloseRecognitionNet(tx: Tx, challanId: string): Promise<number> {
-  const [recognizedCount, reversedCount] = await Promise.all([
-    tx.journalEntry.count({ where: { referenceType: CARRIER_TRIP_CLOSE_REFERENCE_TYPE, referenceId: challanId, isDeleted: false } }),
-    tx.journalEntry.count({ where: { referenceType: CARRIER_TRIP_CLOSE_REVERSAL_REFERENCE_TYPE, referenceId: challanId, isDeleted: false } }),
-  ]);
-  return recognizedCount - reversedCount;
+  const unearnedRevenueAccountId = await getUnearnedRevenueAccountId(tx);
+  const lines = await tx.journalLine.findMany({
+    where: {
+      accountId: unearnedRevenueAccountId,
+      sourceType: "CHALLAN",
+      sourceId: challanId,
+      journalEntry: {
+        referenceType: { in: [CARRIER_TRIP_CLOSE_REFERENCE_TYPE, CARRIER_TRIP_CLOSE_REVERSAL_REFERENCE_TYPE] },
+        isDeleted: false,
+      },
+    },
+    select: { debit: true, credit: true },
+  });
+  return round2(lines.reduce((s, l) => s + Number(l.debit) - Number(l.credit), 0));
 }
 
 /** True if this own-carrier Challan's income is CURRENTLY recognized
@@ -1263,7 +1314,7 @@ async function getChallanCloseRecognitionNet(tx: Tx, challanId: string): Promise
  * and the Challan list to show "Income pending (Trip slip not
  * closed)" before this is true. */
 export async function isCarrierTripChallanIncomeRecognized(tx: Tx, challanId: string): Promise<boolean> {
-  return (await getChallanCloseRecognitionNet(tx, challanId)) > 0;
+  return (await getChallanCloseRecognitionNet(tx, challanId)) > 0.009;
 }
 
 async function getActiveBookingIncomeAccountId(tx: Tx): Promise<string> {
@@ -1274,88 +1325,40 @@ async function getActiveBookingIncomeAccountId(tx: Tx): Promise<string> {
   return account.id;
 }
 
-/**
- * Recognizes ONE linked own-carrier Challan's income at Trip CLOSE:
- * Dr Unearned Revenue (this Challan's total Bilty rent) / Cr Booking
- * Income (Bilty rent - Carrier Rent) / Cr this carrier's own Own
- * Carrier Income account (Carrier Rent). A no-op (returns false) if
- * already recognized (net > 0, see getChallanCloseRecognitionNet), if
- * the Challan is not actually an own-carrier Challan, or if its total
- * Bilty rent is 0 - mirrors recognizeBiltyBookingIncome()'s own
- * idempotency exactly. If Carrier Rent happens to exceed Bilty rent
- * (a loss-making dispatch), Booking Income is debited instead of
- * credited for the shortfall, rather than silently clamping it away.
- */
-export async function recognizeCarrierTripChallanIncome(
-  tx: Tx,
-  input: { tripDocumentId: string; entryDate: Date; tripNo: string; createdById: string }
-): Promise<boolean> {
-  const link = await tx.carrierTripDocument.findUnique({ where: { id: input.tripDocumentId }, include: { trip: true } });
-  if (!link || link.documentType !== "CHALLAN") return false;
-
-  const challan = await tx.challan.findUnique({ where: { id: link.documentId }, select: { id: true, challanNo: true, ownCarrierId: true } });
-  if (!challan || !challan.ownCarrierId || challan.ownCarrierId !== link.trip.carrierId) return false;
-
-  if ((await getChallanCloseRecognitionNet(tx, challan.id)) > 0) return false;
-
-  const bilties = await tx.challanBilty.findMany({ where: { challanId: challan.id }, select: { bilty: { select: { total: true } } } });
-  const biltyRentTotal = round2(bilties.reduce((s, b) => s + Number(b.bilty.total), 0));
-  if (biltyRentTotal <= 0) return false;
-
-  const carrierRentAmount = round2(Math.max(0, Number(link.carrierRentAmount)));
-  const bookingIncomeAmount = round2(biltyRentTotal - carrierRentAmount);
-
-  const [unearnedRevenueAccountId, bookingIncomeAccountId, carrierProfitAccountId] = await Promise.all([
-    getUnearnedRevenueAccountId(tx),
-    getActiveBookingIncomeAccountId(tx),
-    getOrCreateCarrierProfitAccountId(tx, link.trip.carrierId),
-  ]);
-
-  const description = `Trip ${input.tripNo} closed - Challan ${challan.challanNo} income recognized (Bilty Rent ${biltyRentTotal}, Carrier Rent ${carrierRentAmount})`;
-
-  const lines: { accountId: string; debit: number; credit: number; sourceType: string; sourceId: string; sourceNumber: string }[] = [
-    { accountId: unearnedRevenueAccountId, debit: biltyRentTotal, credit: 0, sourceType: "CHALLAN", sourceId: challan.id, sourceNumber: challan.challanNo },
-  ];
-  if (bookingIncomeAmount >= 0) {
-    lines.push({ accountId: bookingIncomeAccountId, debit: 0, credit: bookingIncomeAmount, sourceType: "CHALLAN", sourceId: challan.id, sourceNumber: challan.challanNo });
-  } else {
-    lines.push({ accountId: bookingIncomeAccountId, debit: -bookingIncomeAmount, credit: 0, sourceType: "CHALLAN", sourceId: challan.id, sourceNumber: challan.challanNo });
-  }
-  if (carrierRentAmount > 0) {
-    lines.push({ accountId: carrierProfitAccountId, debit: 0, credit: carrierRentAmount, sourceType: "CHALLAN", sourceId: challan.id, sourceNumber: challan.challanNo });
-  }
-
-  await tx.journalEntry.create({
-    data: {
-      entryDate: input.entryDate,
-      referenceType: CARRIER_TRIP_CLOSE_REFERENCE_TYPE,
-      referenceId: challan.id,
-      description,
-      createdById: input.createdById,
-      lines: { create: lines.map((l) => ({ ...l, description })) },
-    },
+/** The one currently-LIVE (never reversed) JournalEntry of a given
+ * referenceType/referenceId, if any - at most one is ever live at
+ * once for CARRIER_TRIP_CLOSE/CARRIER_TRIP_CLOSE_EXPENSE scoped to a
+ * single Trip (Close/Reopen are mutually exclusive states), but a
+ * Trip that has been through more than one close/reopen cycle can
+ * have several HISTORICAL entries of the same referenceType/
+ * referenceId - this returns only the one without an existing
+ * reversal pointing at it. */
+async function findLiveCloseEntry(tx: Tx, referenceType: string, referenceId: string) {
+  const entries = await tx.journalEntry.findMany({
+    where: { referenceType, referenceId, isDeleted: false },
+    include: { lines: true },
+    orderBy: { createdAt: "asc" },
   });
-
-  return true;
+  if (entries.length === 0) return null;
+  const reversedIds = new Set(
+    (
+      await tx.journalEntry.findMany({
+        where: { reversesEntryId: { in: entries.map((e) => e.id) }, isDeleted: false },
+        select: { reversesEntryId: true },
+      })
+    ).map((e) => e.reversesEntryId)
+  );
+  return entries.find((e) => !reversedIds.has(e.id)) ?? null;
 }
 
-/**
- * The exact reverse of recognizeCarrierTripChallanIncome() - called
- * when a Trip holding a recognized own-carrier Challan is reopened.
- * A no-op (returns false) if nothing is currently recognized for this
- * Challan.
- */
-export async function reverseCarrierTripChallanIncome(
+/** Reverses one live close-side entry found by findLiveCloseEntry,
+ * dated the SAME entryDate as the original (never "today") - a
+ * no-op (returns false) if none is currently live. */
+async function reverseLiveCloseEntry(
   tx: Tx,
-  input: { challanId: string; entryDate: Date; reason: string; createdById: string }
+  input: { referenceType: string; reversalReferenceType: string; tripId: string; entryDate: Date; reason: string; createdById: string }
 ): Promise<boolean> {
-  if ((await getChallanCloseRecognitionNet(tx, input.challanId)) <= 0) return false;
-
-  const entry = await tx.journalEntry.findFirst({
-    where: { referenceType: CARRIER_TRIP_CLOSE_REFERENCE_TYPE, referenceId: input.challanId, isDeleted: false },
-    include: { lines: true },
-    orderBy: { createdAt: "desc" },
-  });
+  const entry = await findLiveCloseEntry(tx, input.referenceType, input.tripId);
   if (!entry) return false;
 
   const description = `Trip reopened - ${input.reason} - reversing: ${entry.description}`;
@@ -1363,8 +1366,8 @@ export async function reverseCarrierTripChallanIncome(
   await tx.journalEntry.create({
     data: {
       entryDate: input.entryDate,
-      referenceType: CARRIER_TRIP_CLOSE_REVERSAL_REFERENCE_TYPE,
-      referenceId: input.challanId,
+      referenceType: input.reversalReferenceType,
+      referenceId: input.tripId,
       reversesEntryId: entry.id,
       description,
       createdById: input.createdById,
@@ -1386,11 +1389,156 @@ export async function reverseCarrierTripChallanIncome(
 }
 
 /**
+ * Builds and posts Entry A ("...Carrier Rent") for every currently
+ * ACTIVE, not-yet-recognized, nonzero-Bilty-Rent CHALLAN link on this
+ * Trip, combined into ONE JournalEntry - see this section's own
+ * header comment for the exact shape. A no-op (posts nothing) if no
+ * link contributes anything.
+ */
+async function recognizeCarrierTripIncome(
+  tx: Tx,
+  input: { tripId: string; tripNo: string; carrierId: string; entryDate: Date; createdById: string }
+): Promise<boolean> {
+  const links = await tx.carrierTripDocument.findMany({
+    where: { tripId: input.tripId, documentType: "CHALLAN", unlinkedAt: null },
+  });
+  if (links.length === 0) return false;
+
+  const challans = await tx.challan.findMany({
+    where: { id: { in: links.map((l) => l.documentId) }, ownCarrierId: input.carrierId },
+    select: { id: true, challanNo: true, bilties: { select: { bilty: { select: { total: true } } } } },
+  });
+  const challanById = new Map(challans.map((c) => [c.id, c]));
+
+  type Contribution = { challanId: string; challanNo: string; biltyRentTotal: number; carrierRentAmount: number; bookingIncomeAmount: number };
+  const contributions: Contribution[] = [];
+
+  for (const link of links) {
+    const challan = challanById.get(link.documentId);
+    if (!challan) continue;
+    if ((await getChallanCloseRecognitionNet(tx, challan.id)) > 0.009) continue;
+
+    const biltyRentTotal = round2(challan.bilties.reduce((s, b) => s + Number(b.bilty.total), 0));
+    if (biltyRentTotal <= 0) continue;
+
+    const carrierRentAmount = round2(Math.max(0, Number(link.carrierRentAmount)));
+    contributions.push({
+      challanId: challan.id,
+      challanNo: challan.challanNo,
+      biltyRentTotal,
+      carrierRentAmount,
+      bookingIncomeAmount: round2(biltyRentTotal - carrierRentAmount),
+    });
+  }
+
+  if (contributions.length === 0) return false;
+
+  const [unearnedRevenueAccountId, bookingIncomeAccountId, carrierProfitAccountId] = await Promise.all([
+    getUnearnedRevenueAccountId(tx),
+    getActiveBookingIncomeAccountId(tx),
+    getOrCreateCarrierProfitAccountId(tx, input.carrierId),
+  ]);
+
+  const challanNos = contributions.map((c) => c.challanNo).join(", ");
+  const description = `Trip ${input.tripNo} – Challan ${challanNos} – Carrier Rent`;
+
+  const lines: { accountId: string; debit: number; credit: number; sourceType: string; sourceId: string; sourceNumber: string }[] = [];
+  let carrierRentTotal = 0;
+
+  for (const c of contributions) {
+    lines.push({ accountId: unearnedRevenueAccountId, debit: c.biltyRentTotal, credit: 0, sourceType: "CHALLAN", sourceId: c.challanId, sourceNumber: c.challanNo });
+    if (c.bookingIncomeAmount >= 0) {
+      lines.push({ accountId: bookingIncomeAccountId, debit: 0, credit: c.bookingIncomeAmount, sourceType: "CHALLAN", sourceId: c.challanId, sourceNumber: c.challanNo });
+    } else {
+      lines.push({ accountId: bookingIncomeAccountId, debit: -c.bookingIncomeAmount, credit: 0, sourceType: "CHALLAN", sourceId: c.challanId, sourceNumber: c.challanNo });
+    }
+    carrierRentTotal = round2(carrierRentTotal + c.carrierRentAmount);
+  }
+
+  if (carrierRentTotal > 0) {
+    // One COMBINED line for every contributing Challan's own Carrier
+    // Rent, summed - never one per Challan (see this section's own
+    // header comment) - tagged to the Trip itself, since it is not
+    // any single Challan's own amount any more.
+    lines.push({ accountId: carrierProfitAccountId, debit: 0, credit: carrierRentTotal, sourceType: "CARRIER_TRIP", sourceId: input.tripId, sourceNumber: input.tripNo });
+  }
+
+  await tx.journalEntry.create({
+    data: {
+      entryDate: input.entryDate,
+      referenceType: CARRIER_TRIP_CLOSE_REFERENCE_TYPE,
+      referenceId: input.tripId,
+      description,
+      createdById: input.createdById,
+      lines: { create: lines.map((l) => ({ ...l, description })) },
+    },
+  });
+
+  return true;
+}
+
+/**
+ * Builds and posts Entry B ("...Expenses") - Dr Carrier Profit / Cr
+ * Trip in Progress for this Trip's own total expense/diesel/salary
+ * amount (CarrierTripLine.tripId-scoped, the same figure
+ * getTripProfitReport's own totalCarrierExpense already is). A no-op
+ * if that total is 0.
+ */
+async function recognizeCarrierTripExpenseClearing(
+  tx: Tx,
+  input: { tripId: string; tripNo: string; carrierId: string; entryDate: Date; createdById: string }
+): Promise<boolean> {
+  const expenseLines = await tx.carrierTripLine.findMany({
+    where: { tripId: input.tripId, isDeleted: false, lineType: { in: ["EXPENSE_CASH", "EXPENSE_OFFICE", "EXPENSE_CREDIT", "DRIVER_SALARY"] } },
+    select: { amount: true },
+  });
+  const expenseTotal = round2(expenseLines.reduce((s, l) => s + Number(l.amount), 0));
+  if (expenseTotal <= 0) return false;
+
+  const links = await tx.carrierTripDocument.findMany({
+    where: { tripId: input.tripId, documentType: "CHALLAN", unlinkedAt: null },
+  });
+  const challans = links.length
+    ? await tx.challan.findMany({ where: { id: { in: links.map((l) => l.documentId) } }, select: { challanNo: true }, orderBy: { challanNo: "asc" } })
+    : [];
+  const challanNos = challans.map((c) => c.challanNo).join(", ");
+
+  const [carrierProfitAccountId, tripInProgressAccountId] = await Promise.all([
+    getOrCreateCarrierProfitAccountId(tx, input.carrierId),
+    getOrCreateTripInProgressAccountId(tx, input.carrierId),
+  ]);
+
+  const description = challanNos
+    ? `Trip ${input.tripNo} – Challan ${challanNos} – Expenses`
+    : `Trip ${input.tripNo} – Expenses`;
+
+  await tx.journalEntry.create({
+    data: {
+      entryDate: input.entryDate,
+      referenceType: CARRIER_TRIP_CLOSE_EXPENSE_REFERENCE_TYPE,
+      referenceId: input.tripId,
+      description,
+      createdById: input.createdById,
+      lines: {
+        create: [
+          { accountId: carrierProfitAccountId, debit: expenseTotal, credit: 0, description, sourceType: "CARRIER_TRIP", sourceId: input.tripId, sourceNumber: input.tripNo },
+          { accountId: tripInProgressAccountId, debit: 0, credit: expenseTotal, description, sourceType: "CARRIER_TRIP", sourceId: input.tripId, sourceNumber: input.tripNo },
+        ],
+      },
+    },
+  });
+
+  return true;
+}
+
+/**
  * Orchestrates Trip CLOSE: sets status CLOSED (auto-filling dateTo
  * with today if the user never set one - Close never blocks on a
- * missing end date), then recognizes income for every currently
- * ACTIVE (unlinkedAt: null) CHALLAN link on this Trip, dated the
- * Trip's own end date.
+ * missing end date), then posts Entry A (Carrier Rent, every
+ * contributing linked Challan combined) and Entry B (Expenses, this
+ * Trip's own total), both dated the Trip's own end date - see this
+ * section's own header comment. Either is simply skipped when it
+ * would have nothing to post.
  */
 export async function closeCarrierTrip(tx: Tx, input: { tripId: string; updatedById: string }) {
   const trip = await getTripOrThrow(tx, input.tripId);
@@ -1405,27 +1553,18 @@ export async function closeCarrierTrip(tx: Tx, input: { tripId: string; updatedB
     data: { status: "CLOSED", dateTo, updatedById: input.updatedById },
   });
 
-  const challanLinks = await tx.carrierTripDocument.findMany({
-    where: { tripId: input.tripId, documentType: "CHALLAN", unlinkedAt: null },
-  });
-
-  for (const link of challanLinks) {
-    await recognizeCarrierTripChallanIncome(tx, {
-      tripDocumentId: link.id,
-      entryDate: dateTo,
-      tripNo: trip.tripNo,
-      createdById: input.updatedById,
-    });
-  }
+  await recognizeCarrierTripIncome(tx, { tripId: input.tripId, tripNo: trip.tripNo, carrierId: trip.carrierId, entryDate: dateTo, createdById: input.updatedById });
+  await recognizeCarrierTripExpenseClearing(tx, { tripId: input.tripId, tripNo: trip.tripNo, carrierId: trip.carrierId, entryDate: dateTo, createdById: input.updatedById });
 
   return updated;
 }
 
 /**
- * Orchestrates Trip REOPEN: reverses income recognition for every
- * currently ACTIVE CHALLAN link on this Trip (safe no-op for any
- * Challan that was never actually recognized - e.g. zero Bilty rent),
- * then sets status back to OPEN.
+ * Orchestrates Trip REOPEN: reverses whichever of Entry A/Entry B is
+ * currently live (safe no-op for either that was never posted - e.g.
+ * zero trip expense), each dated the Trip's own dateTo (never
+ * "today" - see this section's own header comment), then sets status
+ * back to OPEN.
  */
 export async function reopenCarrierTrip(tx: Tx, input: { tripId: string; updatedById: string; reason?: string }) {
   const trip = await getTripOrThrow(tx, input.tripId);
@@ -1433,20 +1572,25 @@ export async function reopenCarrierTrip(tx: Tx, input: { tripId: string; updated
     throw new CarrierTripError("ALREADY_OPEN", "This Trip is already open.");
   }
 
-  const challanLinks = await tx.carrierTripDocument.findMany({
-    where: { tripId: input.tripId, documentType: "CHALLAN", unlinkedAt: null },
-  });
-
   const reason = input.reason?.trim() || `Trip ${trip.tripNo} reopened`;
+  const entryDate = trip.dateTo ?? new Date();
 
-  for (const link of challanLinks) {
-    await reverseCarrierTripChallanIncome(tx, {
-      challanId: link.documentId,
-      entryDate: new Date(),
-      reason,
-      createdById: input.updatedById,
-    });
-  }
+  await reverseLiveCloseEntry(tx, {
+    referenceType: CARRIER_TRIP_CLOSE_REFERENCE_TYPE,
+    reversalReferenceType: CARRIER_TRIP_CLOSE_REVERSAL_REFERENCE_TYPE,
+    tripId: input.tripId,
+    entryDate,
+    reason,
+    createdById: input.updatedById,
+  });
+  await reverseLiveCloseEntry(tx, {
+    referenceType: CARRIER_TRIP_CLOSE_EXPENSE_REFERENCE_TYPE,
+    reversalReferenceType: CARRIER_TRIP_CLOSE_EXPENSE_REVERSAL_REFERENCE_TYPE,
+    tripId: input.tripId,
+    entryDate,
+    reason,
+    createdById: input.updatedById,
+  });
 
   return tx.carrierTrip.update({
     where: { id: input.tripId },
@@ -1948,12 +2092,20 @@ export interface CarrierPageSummary {
    * ALL trips, open and closed alike. The exact same number that
    * shows as this carrier's own line on the P&L report. */
   carrierProfit: number;
+  /** This carrier's own "Trip in Progress" clearing account's own net
+   * ledger balance (debit - credit, the ASSET convention) - every
+   * currently-OPEN Trip's own expense/diesel/salary total, sitting
+   * here until each Trip closes and moves it into Carrier Profit in
+   * one entry (see lib/carrier-trip.ts's own module comment). 0 once
+   * every Trip is closed - this account never carries a balance
+   * across a closed Trip. */
+  tripInProgress: number;
 }
 
 export async function getCarrierPageSummary(tx: Tx, carrierId: string): Promise<CarrierPageSummary> {
   const carrier = await tx.ownCarrier.findUnique({
     where: { id: carrierId },
-    include: { driverCashAccount: true, ownCarrierIncomeAccount: true },
+    include: { driverCashAccount: true, ownCarrierIncomeAccount: true, tripInProgressAccount: true },
   });
   if (!carrier) throw new CarrierTripError("OWN_CARRIER_NOT_FOUND", "Own Carrier not found.");
 
@@ -1966,6 +2118,15 @@ export async function getCarrierPageSummary(tx: Tx, carrierId: string): Promise<
       _sum: { debit: true, credit: true },
     });
     carrierProfit = round2(netIncome({ debit: Number(agg._sum.debit || 0), credit: Number(agg._sum.credit || 0) }));
+  }
+
+  let tripInProgress = 0;
+  if (carrier.tripInProgressAccount) {
+    const agg = await tx.journalLine.aggregate({
+      where: { accountId: carrier.tripInProgressAccount.id, journalEntry: { isDeleted: false } },
+      _sum: { debit: true, credit: true },
+    });
+    tripInProgress = round2(Number(agg._sum.debit || 0) - Number(agg._sum.credit || 0));
   }
 
   const vendorLines = await tx.carrierTripLine.findMany({
@@ -2003,7 +2164,7 @@ export async function getCarrierPageSummary(tx: Tx, carrierId: string): Promise<
     challanReceivable = round2(challanReceivable + (outstanding || 0));
   }
 
-  return { driverCashBalance, vendorsPayable, totalVendorsPayable, challanReceivable, carrierProfit };
+  return { driverCashBalance, vendorsPayable, totalVendorsPayable, challanReceivable, carrierProfit, tripInProgress };
 }
 
 /**

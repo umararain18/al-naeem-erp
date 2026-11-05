@@ -44,17 +44,17 @@ model User {
   deletedBills                  Bill[]              @relation("BillDeletedBy")
   updatedBusinessSettings       BusinessSettings[]  @relation("BusinessSettingsUpdatedBy")
 
-  createdOwnCarriers         OwnCarrier[]          @relation("OwnCarrierCreatedBy")
-  updatedOwnCarriers         OwnCarrier[]          @relation("OwnCarrierUpdatedBy")
-  deletedOwnCarriers         OwnCarrier[]          @relation("OwnCarrierDeletedBy")
-  createdCarrierTrips        CarrierTrip[]         @relation("CarrierTripCreatedBy")
-  updatedCarrierTrips        CarrierTrip[]         @relation("CarrierTripUpdatedBy")
-  deletedCarrierTrips        CarrierTrip[]         @relation("CarrierTripDeletedBy")
-  linkedCarrierTripDocuments CarrierTripDocument[] @relation("CarrierTripDocumentLinkedBy")
+  createdOwnCarriers           OwnCarrier[]          @relation("OwnCarrierCreatedBy")
+  updatedOwnCarriers           OwnCarrier[]          @relation("OwnCarrierUpdatedBy")
+  deletedOwnCarriers           OwnCarrier[]          @relation("OwnCarrierDeletedBy")
+  createdCarrierTrips          CarrierTrip[]         @relation("CarrierTripCreatedBy")
+  updatedCarrierTrips          CarrierTrip[]         @relation("CarrierTripUpdatedBy")
+  deletedCarrierTrips          CarrierTrip[]         @relation("CarrierTripDeletedBy")
+  linkedCarrierTripDocuments   CarrierTripDocument[] @relation("CarrierTripDocumentLinkedBy")
   unlinkedCarrierTripDocuments CarrierTripDocument[] @relation("CarrierTripDocumentUnlinkedBy")
-  createdCarrierTripLines    CarrierTripLine[]     @relation("CarrierTripLineCreatedBy")
-  deletedCarrierTripLines    CarrierTripLine[]     @relation("CarrierTripLineDeletedBy")
-  updatedNotebooks           Notebook[]            @relation("NotebookUpdatedBy")
+  createdCarrierTripLines      CarrierTripLine[]     @relation("CarrierTripLineCreatedBy")
+  deletedCarrierTripLines      CarrierTripLine[]     @relation("CarrierTripLineDeletedBy")
+  updatedNotebooks             Notebook[]            @relation("NotebookUpdatedBy")
 }
 
 model Party {
@@ -87,9 +87,9 @@ model Party {
 
   bills Bill[] @relation("BillClientParty")
 
-  carrierTripVendorLines CarrierTripLine[] @relation("CarrierTripLineVendor")
-  carrierTripPumpLines   CarrierTripLine[] @relation("CarrierTripLinePump")
-  ownCarrierDefaultPumpFor OwnCarrier[]    @relation("OwnCarrierDefaultPump")
+  carrierTripVendorLines   CarrierTripLine[] @relation("CarrierTripLineVendor")
+  carrierTripPumpLines     CarrierTripLine[] @relation("CarrierTripLinePump")
+  ownCarrierDefaultPumpFor OwnCarrier[]      @relation("OwnCarrierDefaultPump")
 }
 
 // ============================================================
@@ -171,24 +171,24 @@ model Payslip {
 }
 
 model Account {
-  id                 String              @id @default(cuid())
-  accountName        String
-  accountCode        String?             @unique
-  accountType        AccountType
-  category           AccountCategory
-  description        String?
-  isSystem           Boolean             @default(false)
-  isActive           Boolean             @default(true)
-  parentId           String?
-  partyId            String?             @unique
-  employeeId         String?             @unique
+  id                          String              @id @default(cuid())
+  accountName                 String
+  accountCode                 String?             @unique
+  accountType                 AccountType
+  category                    AccountCategory
+  description                 String?
+  isSystem                    Boolean             @default(false)
+  isActive                    Boolean             @default(true)
+  parentId                    String?
+  partyId                     String?             @unique
+  employeeId                  String?             @unique
   // 1:1 with OwnCarrier's own dedicated "Driver Cash" account - same
   // nullable-unique-FK precedent as partyId/employeeId above. Named
   // explicitly ("OwnCarrierDriverCashAccount") because Account now has
   // a SECOND, independent 1:1 relation to OwnCarrier below (the Own
   // Carrier Income account) - Prisma requires every relation between
   // the same two models to be named once there is more than one.
-  ownCarrierId       String?             @unique
+  ownCarrierId                String?             @unique
   // 1:1 with OwnCarrier's own dedicated "<carrier> — Own Carrier
   // Income" account (INCOME/CARRIER_INCOME) - created alongside Driver
   // Cash at carrier creation (see lib/own-carrier.ts's
@@ -197,19 +197,31 @@ model Account {
   // (see lib/carrier-trip.ts's recognizeCarrierTripChallanIncome) -
   // never at dispatch, unlike every other income account in this
   // schema.
-  ownCarrierIncomeId String?             @unique
-  createdAt          DateTime            @default(now())
-  updatedAt          DateTime            @updatedAt
-  parent             Account?            @relation("AccountHierarchy", fields: [parentId], references: [id], onDelete: Restrict)
-  children           Account[]           @relation("AccountHierarchy")
-  party              Party?              @relation(fields: [partyId], references: [id])
-  employee           Employee?           @relation(fields: [employeeId], references: [id])
-  ownCarrier         OwnCarrier?         @relation("OwnCarrierDriverCashAccount", fields: [ownCarrierId], references: [id])
-  ownCarrierIncomeFor OwnCarrier?        @relation("OwnCarrierIncomeAccount", fields: [ownCarrierIncomeId], references: [id])
-  ledgerEntries      JournalLine[]
-  settlementPayments SettlementPayment[]
-  carrierTripExpenseLines CarrierTripLine[] @relation("CarrierTripLineExpenseAccount")
-  carrierTripOfficeLines  CarrierTripLine[] @relation("CarrierTripLineOfficeAccount")
+  ownCarrierIncomeId          String?             @unique
+  // 1:1 with OwnCarrier's own dedicated "<carrier> — Trip in
+  // Progress" clearing account (ASSET/OTHER_ASSET) - every trip
+  // expense/diesel/salary line debits THIS account instead of
+  // Carrier Profit directly (see lib/carrier-trip.ts's own module
+  // comment), so an open Trip's own expenses never touch Carrier
+  // Profit (and therefore never show in P&L) until the Trip actually
+  // CLOSES - at which point Trip CLOSE's own "Expenses" entry moves
+  // the Trip's total expense from here into Carrier Profit in one
+  // shot (Dr Carrier Profit / Cr Trip in Progress). Driver Cash/
+  // vendor/office sides of each expense line are unchanged.
+  ownCarrierTripInProgressId  String?             @unique
+  createdAt                   DateTime            @default(now())
+  updatedAt                   DateTime            @updatedAt
+  parent                      Account?            @relation("AccountHierarchy", fields: [parentId], references: [id], onDelete: Restrict)
+  children                    Account[]           @relation("AccountHierarchy")
+  party                       Party?              @relation(fields: [partyId], references: [id])
+  employee                    Employee?           @relation(fields: [employeeId], references: [id])
+  ownCarrier                  OwnCarrier?         @relation("OwnCarrierDriverCashAccount", fields: [ownCarrierId], references: [id])
+  ownCarrierIncomeFor         OwnCarrier?         @relation("OwnCarrierIncomeAccount", fields: [ownCarrierIncomeId], references: [id])
+  ownCarrierTripInProgressFor OwnCarrier?         @relation("OwnCarrierTripInProgressAccount", fields: [ownCarrierTripInProgressId], references: [id])
+  ledgerEntries               JournalLine[]
+  settlementPayments          SettlementPayment[]
+  carrierTripExpenseLines     CarrierTripLine[]   @relation("CarrierTripLineExpenseAccount")
+  carrierTripOfficeLines      CarrierTripLine[]   @relation("CarrierTripLineOfficeAccount")
 
   @@index([accountType])
   @@index([category])
@@ -1433,8 +1445,9 @@ model OwnCarrier {
   defaultPumpParty   Party?  @relation("OwnCarrierDefaultPump", fields: [defaultPumpPartyId], references: [id], onDelete: SetNull)
   defaultPaidFrom    String?
 
-  driverCashAccount    Account? @relation("OwnCarrierDriverCashAccount")
+  driverCashAccount       Account? @relation("OwnCarrierDriverCashAccount")
   ownCarrierIncomeAccount Account? @relation("OwnCarrierIncomeAccount")
+  tripInProgressAccount   Account? @relation("OwnCarrierTripInProgressAccount")
 
   // Bin
   isDeleted   Boolean   @default(false)
@@ -1691,8 +1704,8 @@ model CarrierTripLine {
 // ============================================================
 
 model Notebook {
-  id    String   @id @default(cuid())
-  date  DateTime @unique
+  id   String   @id @default(cuid())
+  date DateTime @unique
 
   // Freeform - "aaj kiya karna hai", routine notes, anything that
   // doesn't need its own structured field.

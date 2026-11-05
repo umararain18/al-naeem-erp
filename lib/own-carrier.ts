@@ -84,14 +84,26 @@ export async function createOwnCarrierWithAccount(
       accountName: `${carrier.carrierNumber} — Carrier Profit`,
       accountType: "INCOME",
       category: "CARRIER_INCOME",
-      description: `Automatic Carrier Profit account for own carrier: ${carrier.carrierNumber} - credited with Carrier Rent at Trip close, debited with every trip expense and driver salary. Its own net balance IS this carrier's profit.`,
+      description: `Automatic Carrier Profit account for own carrier: ${carrier.carrierNumber} - credited with Carrier Rent and debited with every trip expense and driver salary, both ONLY at Trip close (see "Trip in Progress" below for where these sit while a Trip is still open). Its own net balance IS this carrier's profit.`,
       ownCarrierIncomeId: carrier.id,
       isSystem: false,
       isActive: true,
     },
   });
 
-  return { carrier, account, profitAccount };
+  const tripInProgressAccount = await tx.account.create({
+    data: {
+      accountName: `${carrier.carrierNumber} — Trip in Progress`,
+      accountType: "ASSET",
+      category: "OTHER_ASSET",
+      description: `Automatic clearing account for own carrier: ${carrier.carrierNumber} - every OPEN Trip's own expense/diesel/salary lines debit this account instead of Carrier Profit directly, so an open Trip's own expenses never show in P&L. Trip CLOSE moves the Trip's total expense from here into Carrier Profit in one entry (Dr Carrier Profit / Cr Trip in Progress); Reopen reverses it.`,
+      ownCarrierTripInProgressId: carrier.id,
+      isSystem: false,
+      isActive: true,
+    },
+  });
+
+  return { carrier, account, profitAccount, tripInProgressAccount };
 }
 
 /**
@@ -117,6 +129,7 @@ export async function getOwnCarrierOrThrow(tx: Tx, carrierId: string) {
     include: {
       driverCashAccount: true,
       ownCarrierIncomeAccount: true,
+      tripInProgressAccount: true,
       currentDriver: { select: { id: true, name: true } },
     },
   });
@@ -148,6 +161,34 @@ export async function getOrCreateCarrierProfitAccountId(tx: Tx, carrierId: strin
       category: "CARRIER_INCOME",
       description: `Automatic Carrier Profit account for own carrier: ${carrier.carrierNumber} - credited with Carrier Rent at Trip close, debited with every trip expense and driver salary.`,
       ownCarrierIncomeId: carrierId,
+      isSystem: false,
+      isActive: true,
+    },
+    select: { id: true },
+  });
+  return created.id;
+}
+
+/**
+ * Lazy find-or-create for a carrier's own "<carrier> — Trip in
+ * Progress" clearing account - same defensive-fallback precedent as
+ * getOrCreateCarrierProfitAccountId above, for any carrier row that
+ * predates this account existing.
+ */
+export async function getOrCreateTripInProgressAccountId(tx: Tx, carrierId: string): Promise<string> {
+  const existing = await tx.account.findUnique({ where: { ownCarrierTripInProgressId: carrierId }, select: { id: true } });
+  if (existing) return existing.id;
+
+  const carrier = await tx.ownCarrier.findUnique({ where: { id: carrierId }, select: { carrierNumber: true } });
+  if (!carrier) throw new OwnCarrierError("OWN_CARRIER_NOT_FOUND", "Own Carrier not found.");
+
+  const created = await tx.account.create({
+    data: {
+      accountName: `${carrier.carrierNumber} — Trip in Progress`,
+      accountType: "ASSET",
+      category: "OTHER_ASSET",
+      description: `Automatic clearing account for own carrier: ${carrier.carrierNumber} - every OPEN Trip's own expense/diesel/salary lines debit this account instead of Carrier Profit directly, so an open Trip's own expenses never show in P&L.`,
+      ownCarrierTripInProgressId: carrierId,
       isSystem: false,
       isActive: true,
     },

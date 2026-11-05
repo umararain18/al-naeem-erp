@@ -40,6 +40,7 @@ type JournalEntry = {
   totalDebit: number;
   totalCredit: number;
   isBalanced: boolean;
+  tripLink: { carrierId: string; tripId: string; tripNo: string } | null;
 };
 
 export default function AccountingTransactionDetailPage({
@@ -131,6 +132,17 @@ export default function AccountingTransactionDetailPage({
       return { href: withReturnTo(`/private-phonch/${line.sourceId}`, returnToSuffix), label: `Private Phonch ${line.sourceNumber || line.sourceId}` };
     }
 
+    // Own Carrier Trip Close/Expenses lines - resolved via entry.tripLink
+    // (needs the Trip's own carrierId too, which the line's own
+    // sourceId=tripId alone doesn't carry - see this page's own GET
+    // route for where that resolution happens).
+    if (line.sourceType === "CARRIER_TRIP" && entry?.tripLink) {
+      return {
+        href: withReturnTo(`/own-carrier/${entry.tripLink.carrierId}/trip/${entry.tripLink.tripId}`, returnToSuffix),
+        label: `Trip ${line.sourceNumber || entry.tripLink.tripNo}`,
+      };
+    }
+
     return null;
   }
 
@@ -152,6 +164,14 @@ export default function AccountingTransactionDetailPage({
                   className="bg-blue-600 text-white px-4 py-2 rounded-lg text-sm hover:bg-blue-700"
                 >
                   View Challan
+                </Link>
+              )}
+              {entry.tripLink && (
+                <Link
+                  href={withReturnTo(`/own-carrier/${entry.tripLink.carrierId}/trip/${entry.tripLink.tripId}`, returnToSuffix)}
+                  className="bg-blue-600 text-white px-4 py-2 rounded-lg text-sm hover:bg-blue-700"
+                >
+                  View Trip {entry.tripLink.tripNo}
                 </Link>
               )}
               <Link href="/accounting-transactions" className="border rounded-lg px-4 py-2 text-sm hover:bg-gray-50">

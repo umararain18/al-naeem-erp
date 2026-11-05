@@ -107,6 +107,31 @@ export async function GET(request: NextRequest) {
     const totalExpenses = expenseAccounts.reduce((sum, entry) => sum + entry.amount, 0);
     const netProfit = totalIncome - totalExpenses;
 
+    // Memo only - NOT part of Income/Expense above (it is an ASSET
+    // account, correctly excluded from P&L itself). Every own-carrier's
+    // own "Trip in Progress" clearing account's own CURRENT (as-of-now,
+    // never date-filtered the way the P&L lines above are - an open
+    // Trip's own balance is a point-in-time fact, not a period total)
+    // balance, summed - every OPEN Trip's own expense/diesel/salary
+    // total still sitting there, not yet in Carrier Profit (and
+    // therefore not yet in the Expenses above either) because the
+    // Trip it belongs to has not closed yet. Shown so this report is
+    // never read as "own-carrier expenses are understated" when they
+    // are simply deferred until Trip close - see lib/carrier-trip.ts's
+    // own module comment for the full rationale.
+    const tripInProgressAccounts = await prisma.account.findMany({
+      where: { isActive: true, ownCarrierTripInProgressId: { not: null } },
+      select: { id: true },
+    });
+    let tripInProgressTotal = 0;
+    if (tripInProgressAccounts.length > 0) {
+      const tripInProgressAgg = await prisma.journalLine.aggregate({
+        where: { accountId: { in: tripInProgressAccounts.map((a) => a.id) }, journalEntry: { isDeleted: false } },
+        _sum: { debit: true, credit: true },
+      });
+      tripInProgressTotal = Number(tripInProgressAgg._sum.debit || 0) - Number(tripInProgressAgg._sum.credit || 0);
+    }
+
     return NextResponse.json({
       success: true,
       income: incomeAccounts,
@@ -116,6 +141,7 @@ export async function GET(request: NextRequest) {
         totalExpenses,
         netProfit,
       },
+      tripInProgressTotal,
       filters: {
         from: from || null,
         to: to || null,

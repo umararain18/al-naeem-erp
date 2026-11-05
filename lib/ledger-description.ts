@@ -898,6 +898,12 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
   // staying locked inside the pre-composed description string.
   const phonchIds = new Set<string>();
   const billIds = new Set<string>();
+  // Own Carrier Trip Close/Expenses entries (lib/carrier-trip.ts) -
+  // tagged sourceType:"CARRIER_TRIP"/sourceId:<tripId> on every one of
+  // their own lines (never one Challan's id - one entry can combine
+  // several), so clicking them opens that Trip's own Trip Slip
+  // directly instead of the generic transaction detail page.
+  const carrierTripIds = new Set<string>();
 
   for (const bucket of buckets.values()) {
     if (bucket.payment?.biltyId) biltyIds.add(bucket.payment.biltyId);
@@ -912,6 +918,7 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
     if (line.referenceType === "PHONCH" && line.referenceId) phonchIds.add(line.referenceId);
     if (line.sourceType === "BILL" && line.sourceId) billIds.add(line.sourceId);
     if (line.referenceType === "BILL" && line.referenceId) billIds.add(line.referenceId);
+    if (line.sourceType === "CARRIER_TRIP" && line.sourceId) carrierTripIds.add(line.sourceId);
     if ((line.referenceType === "BILTY_BOOKING" || line.referenceType === "BILTY_BOOKING_CORRECTION") && line.referenceId) {
       biltyIds.add(line.referenceId);
     }
@@ -1087,6 +1094,12 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
         })
       : Promise.resolve([]),
   ]);
+
+  const carrierTripRows =
+    carrierTripIds.size > 0
+      ? await prisma.carrierTrip.findMany({ where: { id: { in: [...carrierTripIds] } }, select: { id: true, tripNo: true, carrierId: true } })
+      : [];
+  const carrierTripById = new Map(carrierTripRows.map((t) => [t.id, t]));
 
   const biltyById = new Map<string, BiltyCtx>(biltyRows.map((b) => [b.id, toBiltyCtx(b)]));
   const challanCtxById = new Map<string, ChallanCtx>();
@@ -1559,6 +1572,16 @@ export async function buildUserFacingLedgerRows(accountId: string, lines: RawLed
           : challanDescription(challan, null, amount, direction);
       documentType = "CHALLAN";
       details = challanDetails(challan, null, direction);
+    } else if (line.sourceType === "CARRIER_TRIP" && line.sourceId && carrierTripById.has(line.sourceId)) {
+      // Own Carrier Trip Close ("...Carrier Rent") / Expenses entries
+      // (lib/carrier-trip.ts) - links straight to that Trip's own Trip
+      // Slip rather than the generic transaction detail page.
+      const trip = carrierTripById.get(line.sourceId)!;
+      reference = `Trip ${trip.tripNo}`;
+      referenceHref = `/own-carrier/${trip.carrierId}/trip/${trip.id}`;
+      description = line.lineDescription || line.entryDescription || reference;
+      documentType = "OTHER";
+      details = { paymentType: direction };
     } else if (
       (line.referenceType === "BILTY_BOOKING" || line.referenceType === "BILTY_BOOKING_CORRECTION") &&
       line.referenceId &&

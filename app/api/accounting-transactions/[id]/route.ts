@@ -65,6 +65,28 @@ export async function GET(
     const totalDebit = entry.lines.reduce((sum, line) => sum + Number(line.debit), 0);
     const totalCredit = entry.lines.reduce((sum, line) => sum + Number(line.credit), 0);
 
+    // Own Carrier Trip Close/Reopen entries (both the Carrier Rent and
+    // the Expenses entry, and either's reversal) carry the TRIP's own
+    // id as referenceId (never a single Challan's, since one entry
+    // can combine several - see lib/carrier-trip.ts's own module
+    // comment) - resolved here so the page can link straight to that
+    // Trip's own Trip Slip / Profit Report, which needs both the
+    // Trip's id AND its carrier's id to build the URL.
+    const TRIP_CLOSE_REFERENCE_TYPES = [
+      "CARRIER_TRIP_CLOSE",
+      "CARRIER_TRIP_CLOSE_REVERSAL",
+      "CARRIER_TRIP_CLOSE_EXPENSE",
+      "CARRIER_TRIP_CLOSE_EXPENSE_REVERSAL",
+    ];
+    let tripLink: { carrierId: string; tripId: string; tripNo: string } | null = null;
+    if (entry.referenceType && TRIP_CLOSE_REFERENCE_TYPES.includes(entry.referenceType) && entry.referenceId) {
+      const trip = await prisma.carrierTrip.findUnique({
+        where: { id: entry.referenceId },
+        select: { id: true, tripNo: true, carrierId: true },
+      });
+      if (trip) tripLink = { carrierId: trip.carrierId, tripId: trip.id, tripNo: trip.tripNo };
+    }
+
     return NextResponse.json({
       success: true,
       entry: {
@@ -72,6 +94,7 @@ export async function GET(
         totalDebit,
         totalCredit,
         isBalanced: Math.abs(totalDebit - totalCredit) < 0.01,
+        tripLink,
       },
     });
   } catch (error) {
