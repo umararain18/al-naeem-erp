@@ -431,11 +431,126 @@ export async function POST(
     const nothingLeftForDefault =
       settlementResult.errors.length === 1 && settlementResult.errors[0].field === "lines";
 
-    if (!settlementResult.isValid && !(nothingLeftForDefault && allocations.length > 0)) {
+    // OWN CARRIER, GENUINELY NOTHING TO SETTLE - every Bilty is fully
+    // Paid (or its To-Pay is already fully collected via some
+    // channel - Trip Wasooli, a Settlement Payment, Daily Posting -
+    // see lib/gross-accounts.ts's own ledger-true "unclaimed" figure,
+    // which is what totalOriginalAmount ultimately reflects through
+    // buildSettlementEntries) and Carrier Rent is always 0 for one
+    // (it lives on the linking Trip, never here). This is a genuinely
+    // valid end state, not an error - there is no Gross balance left
+    // anywhere to reclassify, so Finalize Settlement marks the
+    // Challan Settled directly, with NO JournalEntry at all (not even
+    // the zero-line marker other paths use - there is nothing for a
+    // marker to hold a settlementJournalEntryId FOR here, since
+    // nothing downstream - the multi-payer engine, a later correction -
+    // has anything left to allocate against either). Unsettle already
+    // handles a null settlementJournalEntryId correctly as a pure no-op
+    // reversal (lib/challan-lifecycle.ts's reverseChallanSettlementEntries
+    // queries by referenceType/referenceId, never by this id) - "just
+    // clears the flag" falls out for free, no change needed there.
+    //
+    // A NORMAL (non-own-carrier) Challan hitting this same "lines"
+    // error keeps failing exactly as before - its Collection/Carrier
+    // Rent must always resolve to a real party at Settlement, so
+    // genuinely nothing-to-settle should not normally happen there and
+    // stays a surfaced error, never silently accepted.
+    const ownCarrierNothingToSettle = Boolean(challan.ownCarrierId) && nothingLeftForDefault && allocations.length === 0;
+
+    if (!settlementResult.isValid && !(nothingLeftForDefault && allocations.length > 0) && !ownCarrierNothingToSettle) {
       return NextResponse.json(
         { success: false, message: settlementResult.errors.map((e) => e.message).join(", ") },
         { status: 400 }
       );
+    }
+
+    if (ownCarrierNothingToSettle) {
+      try {
+        const updatedChallan = await prisma.$transaction(
+          async (tx) => {
+            const freshChallan = await tx.challan.findUnique({ where: { id }, select: { isSettled: true } });
+            if (!freshChallan || freshChallan.isSettled) {
+              throw new SettlementPaymentError(
+                "ALREADY_SETTLED",
+                "This Challan was settled by another request just now. Please refresh."
+              );
+            }
+
+            const settled = await tx.challan.update({
+              where: { id },
+              data: {
+                isSettled: true,
+                settledAt: new Date(),
+                settledById: currentUser.userId,
+                settlementNotes: data.settlementNotes || undefined,
+                settlementJournalEntryId: null,
+                outstandingReceivable: 0,
+                outstandingPayable: 0,
+                updatedById: currentUser.userId,
+              },
+              include: {
+                transporterParty: { select: { id: true, partyName: true } },
+                bilties: {
+                  include: {
+                    bilty: {
+                      include: {
+                        fromLocation: { select: { id: true, name: true } },
+                        toLocation: { select: { id: true, name: true } },
+                        consignorParty: { select: { id: true, partyName: true } },
+                        consigneeParty: { select: { id: true, partyName: true } },
+                        clearingAgentParty: { select: { id: true, partyName: true } },
+                        agentParty: { select: { id: true, partyName: true } },
+                      },
+                    },
+                  },
+                  orderBy: { addedAt: "asc" },
+                },
+              },
+            });
+
+            await auditSettlement(tx, {
+              actor: actorFromUser(currentUser),
+              module: "SETTLEMENT",
+              entityType: "Challan",
+              entityId: id,
+              documentNo: settled.challanNo,
+              description: `Finalized Settlement for Challan ${settled.challanNo} - nothing to settle (Own Carrier, fully Paid/collected, no Carrier Rent) - no journal entry posted`,
+              newValues: {
+                settlementNotes: data.settlementNotes || null,
+                outstandingReceivable: 0,
+                outstandingPayable: 0,
+                allocations: [],
+              },
+              ...requestContext(request),
+            });
+
+            return settled;
+          },
+          { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
+        );
+
+        return NextResponse.json({
+          success: true,
+          message: "Challan settled successfully (nothing to settle).",
+          challan: updatedChallan,
+          accounting: { entriesCreated: 0, totalDebit: 0, totalCredit: 0, outstandingReceivable: 0, outstandingPayable: 0 },
+          allocationsCreated: [],
+        });
+      } catch (txError) {
+        if (txError instanceof SettlementPaymentError) {
+          return NextResponse.json(
+            { success: false, code: txError.code, message: txError.message },
+            { status: errorStatus(txError.code) }
+          );
+        }
+        if (txError instanceof Prisma.PrismaClientKnownRequestError && txError.code === "P2034") {
+          return NextResponse.json(
+            { success: false, message: "This Challan was modified concurrently. Please retry." },
+            { status: 409 }
+          );
+        }
+        throw txError;
+      }
     }
 
     // Validate allocations reference bilties that actually belong to

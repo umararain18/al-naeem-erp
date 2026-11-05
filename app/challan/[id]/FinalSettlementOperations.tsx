@@ -1011,8 +1011,19 @@ export default function FinalSettlementOperations({
           <p className="font-semibold">{formatCurrency(totals.toPay)}</p>
         </div>
         <div className="bg-gray-50 rounded-lg p-3">
-          <p className="text-xs text-gray-500">Carrier Rent</p>
-          <p className="font-semibold">{formatCurrency(carrierRentAmount)}</p>
+          <p className="text-xs text-gray-500">{challan.ownCarrier ? "Carrier (trip)" : "Carrier Rent"}</p>
+          {challan.ownCarrier ? (
+            challan.tripCarrierRent ? (
+              <>
+                <p className="font-semibold">{formatCurrency(challan.tripCarrierRent.amount)}</p>
+                <p className="text-[11px] text-gray-500">Trip {challan.tripCarrierRent.tripNo}</p>
+              </>
+            ) : (
+              <p className="text-xs text-amber-600">Not linked to a Trip</p>
+            )
+          ) : (
+            <p className="font-semibold">{formatCurrency(carrierRentAmount)}</p>
+          )}
         </div>
         <div className="bg-gray-50 rounded-lg p-3">
           <p className="text-xs text-gray-500">Unverified Paid</p>

@@ -223,6 +223,66 @@ export async function getUnclaimedGrossBiltyReceivableAmount(
   return Math.max(0, Math.min(advance, net));
 }
 
+// Gross Bilty Receivable is shared by BOTH the Paid and the
+// Collection/To-Pay component, and a Daily Posting receipt credited
+// to it carries no tag distinguishing which one it was for (see
+// lib/bilty-paid-verification.ts's own identical comment on its
+// "grossVerifiedAmount"). getUnclaimedGrossBiltyReceivableAmountForCollection
+// below must therefore never treat the STILL-UNRESOLVED Paid slice as
+// if it were available Collection headroom - this computes exactly
+// that Paid-side claim, the minimal mirror of getBiltyPaidVerification's
+// own "grossVerifiedAmount" piece (never the full function - importing
+// lib/bilty-paid-verification.ts here would be circular, since it
+// already imports from this module) scoped to: 0 once a PAID
+// SettlementPayment row exists for this Bilty (the Paid amount has
+// already been reclassified OUT of Gross entirely, to a real party -
+// see lib/settlement-payments.ts's own COLLECTION/PAID direction
+// comment), otherwise the Paid amount minus whatever has already been
+// verified via a Daily Posting credit straight to Gross.
+async function getBiltyPaidClaimOnGrossBatch(
+  tx: Tx,
+  biltyIds: string[],
+  grossAccountId: string
+): Promise<Map<string, number>> {
+  const result = new Map<string, number>();
+  if (biltyIds.length === 0) return result;
+
+  const bilties = await tx.bilty.findMany({ where: { id: { in: biltyIds } }, select: { id: true, advance: true } });
+  const biltiesWithAdvance = bilties.filter((b) => Number(b.advance) > 0);
+  if (biltiesWithAdvance.length === 0) return result;
+
+  const paidRows = await tx.settlementPayment.findMany({
+    where: { component: "PAID", biltyId: { in: biltiesWithAdvance.map((b) => b.id) } },
+    select: { biltyId: true },
+  });
+  const hasPaidRow = new Set(paidRows.map((r) => r.biltyId));
+
+  const stillInGross = biltiesWithAdvance.filter((b) => !hasPaidRow.has(b.id));
+  if (stillInGross.length === 0) return result;
+
+  const dailyPostingLines = await tx.journalLine.findMany({
+    where: {
+      accountId: grossAccountId,
+      sourceType: "BILTY",
+      sourceId: { in: stillInGross.map((b) => b.id) },
+      journalEntry: { referenceType: "DAILY_POSTING", isDeleted: false },
+    },
+    select: { sourceId: true, debit: true, credit: true },
+  });
+  const grossVerifiedByBiltyId = new Map<string, number>();
+  for (const l of dailyPostingLines) {
+    if (!l.sourceId) continue;
+    grossVerifiedByBiltyId.set(l.sourceId, (grossVerifiedByBiltyId.get(l.sourceId) || 0) + Number(l.credit) - Number(l.debit));
+  }
+
+  for (const b of stillInGross) {
+    const grossVerified = Math.max(0, grossVerifiedByBiltyId.get(b.id) || 0);
+    result.set(b.id, Math.max(0, Number(b.advance) - grossVerified));
+  }
+
+  return result;
+}
+
 // The Collection/To-Pay-side counterpart of the getter above - never
 // more than the Bilty's own To-Pay amount. Per the LOCKED rule traced
 // to app/api/bilty/route.ts's own booking entry ("Dr Gross Bilty
@@ -236,6 +296,15 @@ export async function getUnclaimedGrossBiltyReceivableAmount(
 // destination specifically - deliberately never a guess at the
 // Transporter/Clearing Agent merely because they are named on the
 // Challan.
+//
+// Subtracts getBiltyPaidClaimOnGrossBatch's own figure first - a
+// still-unresolved Paid amount sitting in this SAME account must
+// never also be counted as available Collection headroom (the exact
+// bug a mixed Paid/To-Pay own-carrier Bilty, fully collected via Trip
+// Wasooli, surfaced: Gross's own net balance included the unverified
+// Paid slice, which this getter used to report as "Receivable
+// (To-Pay pending)" even though every Rupee of the real To-Pay had
+// already been collected).
 export async function getUnclaimedGrossBiltyReceivableAmountForCollection(
   tx: Tx,
   biltyId: string,
@@ -247,8 +316,10 @@ export async function getUnclaimedGrossBiltyReceivableAmountForCollection(
   const toPay = Number(bilty.toPay);
   if (toPay <= 0) return 0;
 
+  const grossAccountId = await getGrossBiltyReceivableAccountId(tx);
   const net = await getGrossBiltyReceivableNetBalance(tx, biltyId, excludeJournalEntryId);
-  return Math.max(0, Math.min(toPay, net));
+  const paidClaim = (await getBiltyPaidClaimOnGrossBatch(tx, [biltyId], grossAccountId)).get(biltyId) || 0;
+  return Math.max(0, Math.min(toPay, net - paidClaim));
 }
 
 // Batched form of the getter above - a small, FIXED number of queries
@@ -280,6 +351,8 @@ export async function getUnclaimedGrossBiltyReceivableAmountForCollectionBatch(
     netByBiltyId.set(l.sourceId, (netByBiltyId.get(l.sourceId) || 0) + Number(l.debit) - Number(l.credit));
   }
 
+  const paidClaimByBiltyId = await getBiltyPaidClaimOnGrossBatch(tx, biltyIds, grossAccountId);
+
   for (const b of bilties) {
     const toPay = Number(b.toPay);
     if (toPay <= 0) {
@@ -287,7 +360,8 @@ export async function getUnclaimedGrossBiltyReceivableAmountForCollectionBatch(
       continue;
     }
     const net = netByBiltyId.get(b.id) || 0;
-    result.set(b.id, Math.max(0, Math.min(toPay, net)));
+    const paidClaim = paidClaimByBiltyId.get(b.id) || 0;
+    result.set(b.id, Math.max(0, Math.min(toPay, net - paidClaim)));
   }
 
   return result;
