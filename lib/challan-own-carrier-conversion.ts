@@ -122,6 +122,9 @@ export interface ConversionImpact {
   carrierRentEntries: CarrierRentEntryImpact[];
   /** Signed net of every live carrierRentEntries amount - the Challan's CURRENT Carrier Rent, not an unsigned sum of entry magnitudes. */
   totalCarrierRentToReverse: number;
+  /** See this field's own computation comment above - true only for
+   * the pre-Gross-accounting-era direct-to-party dispatch pattern. */
+  hasLegacyDirectPartyEntry: boolean;
   bilties: BiltyRevenueImpact[];
   /** Sum of every Bilty's currentBookingIncomeNet - the CURRENT total Booking Income that would move back to Unearned Revenue. */
   totalBookingIncomeToReverse: number;
@@ -173,7 +176,7 @@ export async function computeConversionImpact(tx: Tx, challanId: string): Promis
   // ---- Carrier Rent: every live dispatch/correction entry, signed ----
   const carrierRentForwardEntries = await tx.journalEntry.findMany({
     where: { referenceType: { in: CHALLAN_DISPATCH_REFERENCE_TYPES }, referenceId: challanId, isDeleted: false },
-    include: { lines: { include: { account: { select: { category: true } } } } },
+    include: { lines: { include: { account: { select: { id: true, category: true } } } } },
     orderBy: { createdAt: "asc" },
   });
   const alreadyReversedIds = new Set(
@@ -206,6 +209,26 @@ export async function computeConversionImpact(tx: Tx, challanId: string): Promis
     };
   });
   const totalCarrierRentToReverse = carrierRentEntries.reduce((s, e) => s + e.amount, 0);
+
+  // True if any live dispatch/correction entry credited the
+  // Transporter Party's own account DIRECTLY rather than the Gross
+  // Carrier Rent Payable suspense account - the pre-Gross-accounting-
+  // era dispatch pattern this module's own header describes. A
+  // Challan with ONLY Gross-routed entries (the current, modern
+  // pattern) is false here - its own carrierRent is already
+  // correctly reversible via the generic Gross-targeted correction in
+  // lib/settlement-correction.ts, and reversing those SAME entries a
+  // SECOND time via this module's own entry-by-entry reversal would
+  // double-count. Used by the Challan edit route (not just this
+  // module's own dedicated conversion action) to decide whether a
+  // Transporter -> Own Carrier transition needs this module's
+  // reversal at all.
+  const transporterAccountIdForLegacyCheck = challan.transporterParty?.account?.id ?? null;
+  const hasLegacyDirectPartyEntry = transporterAccountIdForLegacyCheck
+    ? liveCarrierRentEntries.some((e) =>
+        e.lines.some((l) => l.accountId === transporterAccountIdForLegacyCheck && Number(l.credit) > 0.009)
+      )
+    : false;
 
   // ---- Booking Income: CURRENT net per Bilty, from ANY source ----
   const activeBilties = challan.bilties.filter((b) => !b.bilty.isDeleted).map((b) => b.bilty);
@@ -284,6 +307,7 @@ export async function computeConversionImpact(tx: Tx, challanId: string): Promis
     challanCarrierRentField: Number(challan.carrierRent),
     carrierRentEntries,
     totalCarrierRentToReverse,
+    hasLegacyDirectPartyEntry,
     bilties,
     totalBookingIncomeToReverse,
     settlementEntriesPresent,
@@ -301,11 +325,129 @@ export interface ConvertResult {
 }
 
 /**
- * Performs the actual conversion - reverses every live Carrier Rent
- * dispatch/correction entry individually (dated each entry's own
- * entryDate - already the Challan date, see lib/settlement-
- * correction.ts) and posts ONE net Booking-Income-to-Unearned-Revenue
- * reversal per Bilty (dated the Challan's loadingDate), then clears
+ * Reverses every live Carrier Rent dispatch/correction entry
+ * individually (dated each entry's own entryDate - already the
+ * Challan date, see lib/settlement-correction.ts). Pure write, no
+ * blocker check of its own - the caller (convertChallanToOwnCarrier,
+ * or the Challan edit route's own Transporter -> Own Carrier
+ * transition) must already have confirmed `impact.blockers` is
+ * empty. Does NOT touch ownCarrierId/transporterPartyId/carrierRent,
+ * and does NOT touch Booking Income (see
+ * reverseLegacyBookingIncomeToUnearnedRevenue below, kept as a
+ * SEPARATE function deliberately: the Challan edit route's own
+ * "OWN CARRIER TRANSITION" block already reverses each still-linked
+ * Bilty's MODERN (BILTY_REVENUE_RECOGNITION) Booking Income itself
+ * whenever becomingOwnCarrier - calling both that AND this module's
+ * own all-sources Booking Income reversal for the SAME Bilty would
+ * double-reverse the modern portion. The edit route therefore calls
+ * ONLY this Carrier-Rent-specific function; convertChallanToOwnCarrier
+ * (the dedicated, standalone conversion action, where nothing else
+ * touches Booking Income) calls both this AND that one.
+ */
+export async function reverseLegacyCarrierRentDispatchEntries(
+  tx: Tx,
+  impact: ConversionImpact,
+  createdById: string
+): Promise<number> {
+  for (const entry of impact.carrierRentEntries) {
+    const original = await tx.journalEntry.findUniqueOrThrow({ where: { id: entry.journalEntryId }, include: { lines: true } });
+    const description = `Own Carrier Conversion - ${impact.challanNo} - reversing: ${original.description}`;
+    await tx.journalEntry.create({
+      data: {
+        entryDate: original.entryDate,
+        referenceType: CHALLAN_OWN_CARRIER_CONVERSION_REVERSAL_REFERENCE_TYPE,
+        referenceId: impact.challanId,
+        reversesEntryId: original.id,
+        description,
+        createdById,
+        lines: {
+          create: original.lines.map((l) => ({
+            accountId: l.accountId,
+            debit: Number(l.credit),
+            credit: Number(l.debit),
+            description,
+            sourceType: l.sourceType,
+            sourceId: l.sourceId,
+            sourceNumber: l.sourceNumber,
+          })),
+        },
+      },
+    });
+  }
+  return impact.totalCarrierRentToReverse;
+}
+
+/** Posts ONE net Booking-Income-to-Unearned-Revenue reversal per
+ * Bilty (dated the Challan's loadingDate), from ANY source (legacy
+ * direct booking, modern dispatch recognition, or any correction
+ * since - see ConversionImpact.bilties' own doc comment). See
+ * reverseLegacyCarrierRentDispatchEntries's own doc comment above for
+ * why this is kept separate and who may safely call it. */
+export async function reverseLegacyBookingIncomeToUnearnedRevenue(
+  tx: Tx,
+  impact: ConversionImpact,
+  createdById: string
+): Promise<number> {
+  if (!impact.bilties.some((b) => b.currentBookingIncomeNet > 0.009)) {
+    return 0;
+  }
+
+  const [bookingIncomeAccountId, unearnedRevenueAccountId] = await Promise.all([
+    getActiveBookingIncomeAccountId(tx),
+    getUnearnedRevenueAccountId(tx),
+  ]);
+
+  for (const b of impact.bilties) {
+    if (b.currentBookingIncomeNet <= 0.009) continue;
+    const amount = b.currentBookingIncomeNet;
+    const description = `Own Carrier Conversion - ${impact.challanNo} - Bilty ${b.biltyNo} Booking Income reversed to Unearned Revenue`;
+    // reversesEntryId only when exactly ONE entry contributed this
+    // Bilty's entire net - otherwise the net cannot be attributed to
+    // a single source entry (still exactly correct; just not
+    // individually linked).
+    const reversesEntryId = b.sourceEntries.length === 1 ? b.sourceEntries[0].journalEntryId : undefined;
+
+    await tx.journalEntry.create({
+      data: {
+        entryDate: impact.loadingDate,
+        referenceType: CHALLAN_OWN_CARRIER_CONVERSION_REVERSAL_REFERENCE_TYPE,
+        referenceId: impact.challanId,
+        ...(reversesEntryId ? { reversesEntryId } : {}),
+        description,
+        createdById,
+        lines: {
+          create: [
+            {
+              accountId: bookingIncomeAccountId,
+              debit: amount,
+              credit: 0,
+              description,
+              sourceType: "BILTY",
+              sourceId: b.biltyId,
+              sourceNumber: b.biltyNo,
+            },
+            {
+              accountId: unearnedRevenueAccountId,
+              debit: 0,
+              credit: amount,
+              description,
+              sourceType: "BILTY",
+              sourceId: b.biltyId,
+              sourceNumber: b.biltyNo,
+            },
+          ],
+        },
+      },
+    });
+  }
+
+  return impact.totalBookingIncomeToReverse;
+}
+
+/**
+ * Performs the actual conversion - reverses history via
+ * reverseLegacyCarrierRentDispatchEntries() and
+ * reverseLegacyBookingIncomeToUnearnedRevenue(), then clears
  * transporterPartyId, zeroes carrierRent, and sets ownCarrierId.
  * Throws ChallanConversionError (never writes anything) if
  * computeConversionImpact() reports any blocker.
@@ -326,84 +468,8 @@ export async function convertChallanToOwnCarrier(
     throw new ChallanConversionError("NOT_ELIGIBLE", impact.blockers.join("; "));
   }
 
-  const reason = `Converted Challan ${impact.challanNo} from Transporter ${impact.transporterPartyName ?? ""} to Own Carrier ${carrier.carrierNumber}`;
-
-  for (const entry of impact.carrierRentEntries) {
-    const original = await tx.journalEntry.findUniqueOrThrow({ where: { id: entry.journalEntryId }, include: { lines: true } });
-    const description = `Own Carrier Conversion - ${impact.challanNo} - reversing: ${original.description}`;
-    await tx.journalEntry.create({
-      data: {
-        entryDate: original.entryDate,
-        referenceType: CHALLAN_OWN_CARRIER_CONVERSION_REVERSAL_REFERENCE_TYPE,
-        referenceId: challanId,
-        reversesEntryId: original.id,
-        description,
-        createdById,
-        lines: {
-          create: original.lines.map((l) => ({
-            accountId: l.accountId,
-            debit: Number(l.credit),
-            credit: Number(l.debit),
-            description,
-            sourceType: l.sourceType,
-            sourceId: l.sourceId,
-            sourceNumber: l.sourceNumber,
-          })),
-        },
-      },
-    });
-  }
-
-  if (impact.bilties.some((b) => b.currentBookingIncomeNet > 0.009)) {
-    const [bookingIncomeAccountId, unearnedRevenueAccountId] = await Promise.all([
-      getActiveBookingIncomeAccountId(tx),
-      getUnearnedRevenueAccountId(tx),
-    ]);
-
-    for (const b of impact.bilties) {
-      if (b.currentBookingIncomeNet <= 0.009) continue;
-      const amount = b.currentBookingIncomeNet;
-      const description = `Own Carrier Conversion - ${impact.challanNo} - Bilty ${b.biltyNo} Booking Income reversed to Unearned Revenue`;
-      // reversesEntryId only when exactly ONE entry contributed this
-      // Bilty's entire net - otherwise the net cannot be attributed to
-      // a single source entry (still exactly correct; just not
-      // individually linked).
-      const reversesEntryId = b.sourceEntries.length === 1 ? b.sourceEntries[0].journalEntryId : undefined;
-
-      await tx.journalEntry.create({
-        data: {
-          entryDate: impact.loadingDate,
-          referenceType: CHALLAN_OWN_CARRIER_CONVERSION_REVERSAL_REFERENCE_TYPE,
-          referenceId: challanId,
-          ...(reversesEntryId ? { reversesEntryId } : {}),
-          description,
-          createdById,
-          lines: {
-            create: [
-              {
-                accountId: bookingIncomeAccountId,
-                debit: amount,
-                credit: 0,
-                description,
-                sourceType: "BILTY",
-                sourceId: b.biltyId,
-                sourceNumber: b.biltyNo,
-              },
-              {
-                accountId: unearnedRevenueAccountId,
-                debit: 0,
-                credit: amount,
-                description,
-                sourceType: "BILTY",
-                sourceId: b.biltyId,
-                sourceNumber: b.biltyNo,
-              },
-            ],
-          },
-        },
-      });
-    }
-  }
+  const carrierRentReversed = await reverseLegacyCarrierRentDispatchEntries(tx, impact, createdById);
+  const bookingIncomeReversed = await reverseLegacyBookingIncomeToUnearnedRevenue(tx, impact, createdById);
 
   await tx.challan.update({
     where: { id: challanId },
@@ -415,9 +481,5 @@ export async function convertChallanToOwnCarrier(
     },
   });
 
-  return {
-    impact,
-    carrierRentReversed: impact.totalCarrierRentToReverse,
-    bookingIncomeReversed: impact.totalBookingIncomeToReverse,
-  };
+  return { impact, carrierRentReversed, bookingIncomeReversed };
 }

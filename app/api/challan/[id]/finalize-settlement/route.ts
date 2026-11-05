@@ -250,7 +250,19 @@ export async function POST(
       challan.bilties.find((cb) => cb.bilty.clearingAgentParty?.account?.isActive)?.bilty.clearingAgentParty?.account
         ?.id || null;
 
-    const carrierRentAmount = Number(challan.carrierRent);
+    // Own Carrier Challans NEVER get a Carrier Rent party, full stop -
+    // that figure lives on the linking Trip's own CarrierTripDocument.
+    // carrierRentAmount, never on this Challan's own settlement (see
+    // Challan.ownCarrierId's own schema doc comment). This is a
+    // defensive guard independent of whether Challan.carrierRent is
+    // actually 0 right now (create/edit already force it to 0 - see
+    // app/api/challan/route.ts and app/api/challan/[id]/route.ts) -
+    // a stale nonzero value from any other path (a legacy import, a
+    // data-repair script, a future bug upstream) must never be able
+    // to resolve a Transporter/Clearing-Agent Payable here, which is
+    // exactly what produced "Payable to [Transporter]" on an
+    // own-carrier Challan in production (Challan 6402).
+    const carrierRentAmount = challan.ownCarrierId ? 0 : Number(challan.carrierRent);
     let carrierRentResponsibility: CarrierRentResponsibility;
     let carrierRentPartyAccountId: string | null = null;
     if (carrierRentAmount > 0) {

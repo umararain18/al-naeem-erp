@@ -20,6 +20,7 @@ import { recognizeBiltyBookingIncome, reverseBiltyBookingIncome, BiltyRevenueRec
 import { auditUpdate, auditDelete, auditRestore, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 import { assertSuperAdmin, biltyHasPhonchOrBillReference, ChallanLifecycleError } from "@/lib/challan-lifecycle";
 import { isCarrierTripChallanIncomeRecognized, autoLinkOwnCarrierChallan } from "@/lib/carrier-trip";
+import { computeConversionImpact, reverseLegacyCarrierRentDispatchEntries } from "@/lib/challan-own-carrier-conversion";
 
 function round2(value: number): number {
   return Math.round(value * 100) / 100;
@@ -185,6 +186,8 @@ export async function GET(
         challan,
         incomePending: null,
         linkedToTrip: null,
+        tripCarrierRent: null,
+        toPayLedger: null,
         financials: null,
         responsibleParties: null,
         settlementBreakdown: null,
@@ -204,9 +207,21 @@ export async function GET(
     // autoLinkOwnCarrierChallan() could not auto-link at create/edit
     // time (the carrier had no OPEN Trip then) and nobody has linked
     // manually since. Always false for a regular Challan.
-    const linkedToTrip = challan.ownCarrierId
-      ? Boolean(await prisma.carrierTripDocument.findFirst({ where: { documentType: "CHALLAN", documentId: challan.id, unlinkedAt: null }, select: { id: true } }))
-      : true;
+    const activeTripLink = challan.ownCarrierId
+      ? await prisma.carrierTripDocument.findFirst({
+          where: { documentType: "CHALLAN", documentId: challan.id, unlinkedAt: null },
+          select: { carrierRentAmount: true, trip: { select: { tripNo: true } } },
+        })
+      : null;
+    const linkedToTrip = challan.ownCarrierId ? Boolean(activeTripLink) : true;
+    // Own Carrier Challans only - the real Carrier Rent figure lives
+    // on the linking Trip's own CarrierTripDocument.carrierRentAmount,
+    // never on Challan.carrierRent (always 0 for one - see Challan.
+    // ownCarrierId's own schema doc comment). Null when not linked -
+    // the UI shows "Not linked" rather than a misleading Rs. 0.
+    const tripCarrierRent = activeTripLink
+      ? { amount: Number(activeTripLink.carrierRentAmount), tripNo: activeTripLink.trip.tripNo }
+      : null;
 
     const financials = (
       await computeChallanFinancialsBatch([
@@ -241,14 +256,35 @@ export async function GET(
     // Collection is still genuinely unassigned (see lib/challan-
     // position.ts's own ChallanPositionInput.collectionPending doc
     // comment). 0/omitted for a normal Challan, where this is always 0.
+    //
+    // `toPayLedger` is the SAME underlying ledger-true figure
+    // (getUnclaimedGrossBiltyReceivableAmountForCollectionBatch - the
+    // exact function lib/carrier-trip.ts's own getDocumentOutstandingAmount
+    // now reads for a linked Trip's own "outstanding" display too),
+    // exposed unconditionally (not gated on isSettled - it is a pure
+    // ledger read, always valid) so the Financial Summary's own
+    // To-Pay "Received"/"Remaining" card reads the SAME number a
+    // linked Trip does for this Challan - never two independently-
+    // maintained figures that can disagree (the Challan 6406 vs. Trip
+    // 51 discrepancy this closes). Never computed for a normal
+    // Challan - Collection there always reclassifies fully to a real
+    // party at Settlement (never left unclaimed in Gross), so "0
+    // remaining in Gross" would wrongly read as "fully received"
+    // before the party has actually handed anything to the office;
+    // a normal Challan's card keeps reading its own existing
+    // SettlementPayment-based "Received" figure, unchanged.
     let collectionPending: number | undefined;
-    if (challan.ownCarrierId && challan.isSettled) {
+    let toPayLedger: { due: number; remaining: number; received: number } | null = null;
+    if (challan.ownCarrierId) {
       const unclaimedByBiltyId = await getUnclaimedGrossBiltyReceivableAmountForCollectionBatch(
         prisma,
         challan.bilties.map((cb) => cb.biltyId)
       );
-      const total = challan.bilties.reduce((s, cb) => s + (unclaimedByBiltyId.get(cb.biltyId) || 0), 0);
-      if (total > 0.009) collectionPending = Math.round(total * 100) / 100;
+      const total = round2(challan.bilties.reduce((s, cb) => s + (unclaimedByBiltyId.get(cb.biltyId) || 0), 0));
+      if (challan.isSettled && total > 0.009) collectionPending = total;
+
+      const due = round2(challan.bilties.reduce((s, cb) => s + Number(cb.bilty.toPay), 0));
+      toPayLedger = { due, remaining: total, received: round2(due - total) };
     }
 
     // ONE financial position for this Challan (lib/challan-
@@ -386,6 +422,8 @@ export async function GET(
       challan,
       incomePending,
       linkedToTrip,
+      tripCarrierRent,
+      toPayLedger,
       financials,
       responsibleParties,
       settlementBreakdown,
@@ -650,6 +688,23 @@ export async function PATCH(
     const becomingOwnCarrier = finalOwnCarrierId !== existingChallan.ownCarrierId && Boolean(finalOwnCarrierId);
     const leavingOwnCarrier = Boolean(existingChallan.ownCarrierId) && finalOwnCarrierId !== existingChallan.ownCarrierId;
 
+    // STALE LEGACY DISPATCH CHECK - a Challan whose Transporter was
+    // dispatched before the Gross-accounting system existed credited
+    // that Transporter's own account DIRECTLY for Carrier Rent
+    // (CHALLAN_DISPATCH), never through Gross. The generic Carrier
+    // Rent correction below (carrierRentDelta/applySettlementCorrection)
+    // assumes the ORIGINAL entry used Gross - correct for every
+    // MODERN dispatch, but it silently leaves such a legacy entry's
+    // real party credit live forever, since it never touches Gross at
+    // all (the exact "Payable to [Transporter]" left on an own-carrier
+    // Challan found in production - Challan 6402). Detected and
+    // reversed here via the SAME entry-by-entry mechanism the
+    // dedicated "Convert to Own Carrier" action already uses
+    // (lib/challan-own-carrier-conversion.ts) - the generic correction
+    // is then skipped for THIS transition specifically (see
+    // `useLegacyDispatchReversal` below), so the same entries are
+    // never reversed twice.
+    let conversionImpact: Awaited<ReturnType<typeof computeConversionImpact>> | null = null;
     if (becomingOwnCarrier) {
       const ownCarrier = await prisma.ownCarrier.findUnique({ where: { id: finalOwnCarrierId! }, select: { isDeleted: true } });
       if (!ownCarrier || ownCarrier.isDeleted) {
@@ -658,7 +713,21 @@ export async function PATCH(
           { status: 400 }
         );
       }
+
+      if (existingChallan.transporterPartyId) {
+        conversionImpact = await computeConversionImpact(prisma, id);
+        if (conversionImpact.hasLegacyDirectPartyEntry && conversionImpact.blockers.length > 0) {
+          return NextResponse.json(
+            {
+              success: false,
+              message: `Cannot switch to Own Carrier: this Challan has a legacy Carrier Rent dispatch entry crediting ${conversionImpact.transporterPartyName ?? "the Transporter"} directly that must be reversed first, but: ${conversionImpact.blockers.join("; ")}.`,
+            },
+            { status: 400 }
+          );
+        }
+      }
     }
+    const useLegacyDispatchReversal = Boolean(conversionImpact?.hasLegacyDirectPartyEntry);
 
     if (leavingOwnCarrier && (await isCarrierTripChallanIncomeRecognized(prisma, id))) {
       return NextResponse.json(
@@ -859,7 +928,13 @@ export async function PATCH(
       // against a concurrent settlement-payment row creation.
       await assertComponentTotalNotBelowActiveRows(tx, "CARRIER_RENT", { challanId: id }, newCarrierRent);
 
-      if (carrierRentDelta !== 0) {
+      // Legacy direct-to-party dispatch entries are reversed via their
+      // OWN entry-by-entry mechanism instead (see the "STALE LEGACY
+      // DISPATCH CHECK" above) - the generic Gross-targeted correction
+      // would wrongly assume Gross was used and never touch the real
+      // stale party credit, so it must be skipped here, never run
+      // alongside the dedicated reversal for the SAME transition.
+      if (carrierRentDelta !== 0 && !useLegacyDispatchReversal) {
         await applySettlementCorrection({
           tx,
           component: "CARRIER_RENT",
@@ -877,6 +952,16 @@ export async function PATCH(
           description: `Correction - ${existingChallan.challanNo} - Carrier Rent ${oldCarrierRent} -> ${newCarrierRent}`,
           explicitPartyAccountId: explicitCarrierRentPartyAccountId,
         });
+      }
+
+      if (useLegacyDispatchReversal && conversionImpact) {
+        // Carrier Rent only here - Booking Income is already reversed
+        // below by this SAME transition's own "OWN CARRIER TRANSITION"
+        // block (reverseBiltyBookingIncome, per-Bilty) - see
+        // reverseLegacyCarrierRentDispatchEntries's own doc comment
+        // for why calling this module's own Booking Income reversal
+        // too would double-reverse it.
+        await reverseLegacyCarrierRentDispatchEntries(tx, conversionImpact, currentUser.userId);
       }
 
       if (removeBiltyIds.length > 0) {

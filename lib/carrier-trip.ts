@@ -15,6 +15,7 @@ import {
   getUnearnedRevenueAccountId,
   getGrossBiltyReceivableAccountId,
   getUnclaimedGrossBiltyReceivableAmountForCollection,
+  getUnclaimedGrossBiltyReceivableAmountForCollectionBatch,
 } from "@/lib/gross-accounts";
 import { netIncome } from "@/lib/pnl";
 
@@ -207,19 +208,23 @@ export async function getTripOrThrow(tx: Tx, tripId: string) {
  * convenience for the Cash Book's quick-entry Collection row (never a
  * cap enforced at write time; the existing per-type assert* checks in
  * lib/phonch-accounting.ts / lib/private-phonch-accounting.ts remain
- * the only real validation, unchanged). Deliberately self-contained
- * rather than reusing those modules' own getPhonchPaymentState/
- * getPrivatePhonchPaymentState (which only see Daily Posting receipts,
- * not this Trip's own COLLECTION lines) or
- * getPrivatePhonchEligibleParties (a genuinely multi-party Clearing
- * Agent/Transporter split not worth replicating for a prefill):
- *   - CHALLAN: sum(bilty.toPay) across its Bilties - every COLLECTION
- *     ever posted against this exact document (any Trip, not just
- *     this one, since a document can only ever have one ACTIVE link
- *     at a time but may have been partly collected on an earlier one).
+ * the only real validation, unchanged).
+ *   - CHALLAN: the SAME ledger-true "still genuinely unclaimed in
+ *     Gross" figure getBiltyCollectionState's own Trip Wasooli
+ *     resolution reads (getUnclaimedGrossBiltyReceivableAmountForCollectionBatch,
+ *     summed across every Bilty on the Challan) - NOT "sum(toPay)
+ *     minus this module's own COLLECTION rows", which only ever saw
+ *     Trip Wasooli receipts and stayed wrongly nonzero once a Bilty
+ *     was instead cleared via Daily Posting or a Settlement Payment
+ *     (the exact Challan 6406-shows-Cleared-but-Trip-51-shows-
+ *     Outstanding-46,000 production discrepancy). This is now the
+ *     SAME number app/api/challan/[id]/route.ts's own `toPayLedger`
+ *     exposes for the Challan page's own To-Pay card - one ledger-
+ *     true source for both, never two independently-maintained ones.
  *   - PHONCH: its own total (deliveryCharges + otherExpense + claim,
  *     the same figure the Phonch model's own total already is) minus
- *     every COLLECTION ever posted against it.
+ *     every COLLECTION ever posted against it (unchanged - Phonch has
+ *     no equivalent Gross-suspense Collection concept to read from).
  *   - PRIVATE_PHONCH: not computed (returns null) - its Carrier
  *     Payable/Clearing Agent/Delivery Recovery split is genuinely
  *     multi-party; the quick-entry row leaves Amount blank for it
@@ -232,17 +237,19 @@ export async function getDocumentOutstandingAmount(
   documentType: CarrierTripDocumentType,
   documentId: string
 ): Promise<number | null> {
+  if (documentType === "CHALLAN") {
+    const bilties = await tx.challanBilty.findMany({ where: { challanId: documentId }, select: { biltyId: true } });
+    const biltyIds = bilties.map((b) => b.biltyId);
+    if (biltyIds.length === 0) return 0;
+    const unclaimedByBiltyId = await getUnclaimedGrossBiltyReceivableAmountForCollectionBatch(tx, biltyIds);
+    return round2([...unclaimedByBiltyId.values()].reduce((s, v) => s + v, 0));
+  }
+
   const collectedAgg = await tx.carrierTripLine.aggregate({
     where: { lineType: "COLLECTION", documentType, documentId, isDeleted: false },
     _sum: { amount: true },
   });
   const collected = round2(Number(collectedAgg._sum.amount || 0));
-
-  if (documentType === "CHALLAN") {
-    const bilties = await tx.challanBilty.findMany({ where: { challanId: documentId }, select: { bilty: { select: { toPay: true } } } });
-    const total = round2(bilties.reduce((s, b) => s + Number(b.bilty.toPay), 0));
-    return Math.max(0, round2(total - collected));
-  }
 
   if (documentType === "PHONCH") {
     const phonch = await tx.phonch.findUnique({

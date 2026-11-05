@@ -144,6 +144,18 @@ export type Challan = {
   // doc comment) - true until the linking Trip is CLOSED.
   incomePending?: boolean | null;
   linkedToTrip?: boolean | null;
+  // Own Carrier dispatch only - the real Carrier Rent figure, read
+  // from the linking Trip's own CarrierTripDocument.carrierRentAmount
+  // (Challan.carrierRent is always 0 for one - see Challan.
+  // ownCarrierId's own schema doc comment). Null when not linked.
+  tripCarrierRent?: { amount: number; tripNo: string } | null;
+  // Own Carrier dispatch only - the SAME ledger-true "still genuinely
+  // unclaimed in Gross" figure a linked Trip's own "outstanding"
+  // reads (lib/carrier-trip.ts's getDocumentOutstandingAmount) - see
+  // app/api/challan/[id]/route.ts's own doc comment on why this is
+  // kept separate from the normal-Challan SettlementPayment-based
+  // toPayReceived/Remaining below. Null for a normal Challan.
+  toPayLedger?: { due: number; remaining: number; received: number } | null;
 };
 
 export type SettlementPayerBreakdown = {
@@ -301,18 +313,35 @@ function FinancialSummaryCards({ challan }: { challan: Challan }) {
   const rentTotal = challan.bilties.reduce((sum, cb) => sum + Number(cb.bilty.total || 0), 0);
   const pv = challan.paidVerification?.aggregate;
 
-  const toPayDue = summary.bilties.reduce((s, b) => s + b.toPay.total, 0);
+  // Own Carrier Challans: Collection can genuinely sit unclaimed in
+  // Gross (collectible later by the driver via Trip Wasooli, a CA/
+  // third party, or the office), so the SettlementPayment-only
+  // `toPayPayers` breakdown below (built for a normal Challan, where
+  // Collection always reclassifies fully to a real party at
+  // Settlement) never sees a Trip Wasooli receipt at all. Read the
+  // SAME ledger-true figure a linked Trip's own "outstanding" reads
+  // instead (challan.toPayLedger - see app/api/challan/[id]/route.ts's
+  // own doc comment) - one source for both, never two that can
+  // disagree.
+  const toPayDue = challan.toPayLedger ? challan.toPayLedger.due : summary.bilties.reduce((s, b) => s + b.toPay.total, 0);
   const toPayPayers = mergePayers(summary.bilties.flatMap((b) => b.toPay.payers));
-  const toPayReceived = toPayPayers.length > 0
-    ? summary.bilties.reduce((s, b) => s + b.toPay.paidOrReceived, 0)
-    : Math.min(toPayDue, Number(challan.financials?.received || 0));
-  const toPayRemaining = Math.max(0, Math.round((toPayDue - toPayReceived) * 100) / 100);
+  const toPayReceived = challan.toPayLedger
+    ? challan.toPayLedger.received
+    : toPayPayers.length > 0
+      ? summary.bilties.reduce((s, b) => s + b.toPay.paidOrReceived, 0)
+      : Math.min(toPayDue, Number(challan.financials?.received || 0));
+  const toPayRemaining = challan.toPayLedger ? challan.toPayLedger.remaining : Math.max(0, Math.round((toPayDue - toPayReceived) * 100) / 100);
 
   const cr = summary.carrierRent;
   const crPaidOrReceived = cr.payers.length > 0
     ? cr.paidOrReceived
     : Math.min(cr.total, Number(challan.financials?.paid || 0));
   const crRemaining = Math.max(0, Math.round((cr.total - crPaidOrReceived) * 100) / 100);
+  // Own Carrier dispatch: Challan.carrierRent is always 0 (the real
+  // figure lives on the linking Trip's own CarrierTripDocument -
+  // see Challan.ownCarrierId's own schema doc comment) - show that
+  // instead of a misleading "Carrier Rent Rs. 0".
+  const tripCarrierRent = challan.tripCarrierRent;
 
   return (
     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
@@ -346,16 +375,30 @@ function FinancialSummaryCards({ challan }: { challan: Challan }) {
         <PayersList payers={toPayPayers} label="Collected by" />
       </div>
 
-      <div className="rounded-lg border p-3">
-        <p className="text-xs text-gray-500">Carrier Rent</p>
-        <p className="font-semibold text-lg">Rs. {cr.total.toLocaleString()}</p>
-        <p className="mt-1 text-xs text-gray-600">Paid: Rs. {crPaidOrReceived.toLocaleString()}</p>
-        <p className="text-xs text-gray-600">Remaining: Rs. {crRemaining.toLocaleString()}</p>
-        <PayersList payers={cr.payers} label="Paid by" />
-        {crRemaining > 0.009 && cr.residualPartyName && (
-          <p className="mt-1 text-xs text-gray-500">Payable to: {cr.residualPartyName}</p>
-        )}
-      </div>
+      {challan.ownCarrier ? (
+        <div className="rounded-lg border p-3">
+          <p className="text-xs text-gray-500">Carrier (trip)</p>
+          {tripCarrierRent ? (
+            <>
+              <p className="font-semibold text-lg">Rs. {tripCarrierRent.amount.toLocaleString()}</p>
+              <p className="mt-1 text-xs text-gray-600">Trip {tripCarrierRent.tripNo}</p>
+            </>
+          ) : (
+            <p className="mt-1 text-xs text-amber-600">Not linked to a Trip</p>
+          )}
+        </div>
+      ) : (
+        <div className="rounded-lg border p-3">
+          <p className="text-xs text-gray-500">Carrier Rent</p>
+          <p className="font-semibold text-lg">Rs. {cr.total.toLocaleString()}</p>
+          <p className="mt-1 text-xs text-gray-600">Paid: Rs. {crPaidOrReceived.toLocaleString()}</p>
+          <p className="text-xs text-gray-600">Remaining: Rs. {crRemaining.toLocaleString()}</p>
+          <PayersList payers={cr.payers} label="Paid by" />
+          {crRemaining > 0.009 && cr.residualPartyName && (
+            <p className="mt-1 text-xs text-gray-500">Payable to: {cr.residualPartyName}</p>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -657,6 +700,8 @@ export default function ChallanDetailPage({
         position: data.position,
         incomePending: data.incomePending,
         linkedToTrip: data.linkedToTrip,
+        tripCarrierRent: data.tripCarrierRent,
+        toPayLedger: data.toPayLedger,
       });
       setCanRestore(!!data.capabilities?.canRestore);
       setCanBin(!!data.capabilities?.canBin);
