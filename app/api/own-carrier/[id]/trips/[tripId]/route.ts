@@ -90,7 +90,7 @@ export async function GET(
         trip,
         documents: [],
         cashBook: null,
-        capabilities: { canRestore: hasPermission(currentUser, "ownCarrier.restore"), canEdit: false, canBin: false },
+        capabilities: { canRestore: hasPermission(currentUser, "ownCarrier.restore"), canEdit: false, canBin: false, canCloseReopen: false },
       });
     }
 
@@ -108,6 +108,12 @@ export async function GET(
         canEdit: hasPermission(currentUser, "ownCarrier.edit") && trip.status === "OPEN",
         canBin: hasPermission(currentUser, "ownCarrier.bin"),
         canRestore: false,
+        // Deliberately NOT scoped to trip.status === "OPEN" (unlike
+        // canEdit above) - the Close/Reopen toggle button is the ONE
+        // action that must stay visible on a CLOSED Trip (otherwise
+        // there is no way back to OPEN at all). Every other action
+        // gated by canEdit correctly stays OPEN-only.
+        canCloseReopen: hasPermission(currentUser, "ownCarrier.edit"),
       },
     });
   } catch (error) {

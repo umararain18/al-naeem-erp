@@ -299,7 +299,7 @@ export default function CarrierTripDetailPage() {
   const [trip, setTrip] = useState<Trip | null>(null);
   const [documents, setDocuments] = useState<DocumentLink[]>([]);
   const [cashBook, setCashBook] = useState<CashBook | null>(null);
-  const [capabilities, setCapabilities] = useState({ canEdit: false, canBin: false });
+  const [capabilities, setCapabilities] = useState({ canEdit: false, canBin: false, canCloseReopen: false });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [refreshToken, setRefreshToken] = useState(0);
@@ -456,7 +456,7 @@ export default function CarrierTripDetailPage() {
       setTrip(data.trip);
       setDocuments(data.documents || []);
       setCashBook(data.cashBook);
-      setCapabilities(data.capabilities || { canEdit: false, canBin: false });
+      setCapabilities(data.capabilities || { canEdit: false, canBin: false, canCloseReopen: false });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to load Trip");
     } finally {
@@ -604,7 +604,7 @@ export default function CarrierTripDetailPage() {
                 Edit
               </button>
             )}
-            {capabilities.canEdit && (
+            {capabilities.canCloseReopen && (
               <button type="button" onClick={toggleStatus} className="rounded-lg border px-4 py-2 text-sm hover:bg-gray-50">
                 {trip.status === "OPEN" ? "Close Trip" : "Reopen Trip"}
               </button>
