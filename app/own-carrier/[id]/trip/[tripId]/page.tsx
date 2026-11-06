@@ -51,6 +51,11 @@ type Trip = {
     defaultPumpParty: { id: string; partyName: string } | null;
     currentDriverId: string | null;
     currentDriver: { id: string; name: string } | null;
+    // Raw Prisma Decimal passthrough, numeric string or null - null (or
+    // "0") means this carrier has NOT opted into day-based salary
+    // accrual, so a Salary line here still posts as a plain trip
+    // expense (see isDriverSalaryConfigured in lib/carrier-trip.ts).
+    driverMonthlySalary: string | null;
   };
 };
 
@@ -729,6 +734,7 @@ export default function CarrierTripDetailPage() {
               defaultPaidFrom: trip.carrier.defaultPaidFrom,
               currentDriverId: trip.carrier.currentDriverId,
               currentDriverName: trip.carrier.currentDriver?.name || null,
+              driverMonthlySalary: trip.carrier.driverMonthlySalary,
             }}
           />
         )}
@@ -1148,7 +1154,13 @@ function QuickEntryRow({
   editingLine: CashBookRow | null;
   onCancelEdit: () => void;
   onSaved: () => void;
-  carrierDefaults: { defaultPumpPartyId: string | null; defaultPaidFrom: string | null; currentDriverId: string | null; currentDriverName: string | null };
+  carrierDefaults: {
+    defaultPumpPartyId: string | null;
+    defaultPaidFrom: string | null;
+    currentDriverId: string | null;
+    currentDriverName: string | null;
+    driverMonthlySalary: string | null;
+  };
 }) {
   const [quickTypeKey, setQuickTypeKey] = useState<QuickTypeKey>("WASOOLI");
   const [date, setDate] = useState(lastDate || toYMD(tripDateFrom));
@@ -1707,6 +1719,9 @@ function QuickEntryRow({
                 <p className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-700">{carrierDefaults.currentDriverName}</p>
               ) : (
                 <p className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">No current driver set - set one in Carrier Settings.</p>
+              )}
+              {!(carrierDefaults.driverMonthlySalary && Number(carrierDefaults.driverMonthlySalary) > 0) && (
+                <p className="mt-1 text-[11px] text-gray-500">Set monthly salary in carrier settings to split salary by trip days.</p>
               )}
             </div>
           )}

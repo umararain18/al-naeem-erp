@@ -59,6 +59,7 @@ type CarrierSummary = {
   challanReceivable: number;
   carrierProfit: number;
   tripInProgress: number;
+  driverSalaryPayableNet: number;
 };
 
 type UnlinkedChallan = { id: string; challanNo: string; loadingDate: string };
@@ -249,6 +250,15 @@ export default function OwnCarrierDetailPage() {
               <p className="text-xs text-gray-500">Trip in Progress</p>
               <p className="text-base font-semibold text-gray-900">Rs. {formatMoney(carrierSummary.tripInProgress)}</p>
               <p className="text-[11px] text-gray-400">open trips' own expenses - moves to Carrier Profit on close</p>
+            </div>
+            <div>
+              <p className="text-xs text-gray-500">Driver Salary Payable</p>
+              <p className={`text-base font-semibold ${carrierSummary.driverSalaryPayableNet < 0 ? "text-red-700" : "text-gray-900"}`}>
+                Rs. {formatMoney(Math.abs(carrierSummary.driverSalaryPayableNet))}
+              </p>
+              <p className="text-[11px] text-gray-400">
+                {carrierSummary.driverSalaryPayableNet < 0 ? "payable to driver" : carrierSummary.driverSalaryPayableNet > 0 ? "advance to driver" : "accrued = paid"}
+              </p>
             </div>
           </div>
         )}

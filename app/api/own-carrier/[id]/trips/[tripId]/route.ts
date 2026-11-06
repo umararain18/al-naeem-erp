@@ -85,6 +85,7 @@ export async function GET(
             oilIssueThresholdKm: true,
             oilIssueLitersAboveThreshold: true,
             oilIssueLitersAtOrBelowThreshold: true,
+            driverMonthlySalary: true,
           },
         },
         documents: { where: { unlinkedAt: null }, orderBy: { linkedAt: "asc" } },
@@ -299,12 +300,32 @@ export async function PATCH(
         let updatedTrip = await tx.carrierTrip.findUniqueOrThrow({ where: { id: tripId } });
 
         if (targetStatus === "CLOSED") {
-          updatedTrip = await closeCarrierTrip(tx, {
+          const closed = await closeCarrierTrip(tx, {
             tripId,
             updatedById: currentUser.userId,
             oilIssueLiters: body.oilIssueLiters != null ? Number(body.oilIssueLiters) : undefined,
             confirmInsufficientOilStock: Boolean(body.confirmInsufficientOilStock),
           });
+          const { migratedSalaryLineIds, ...closedTrip } = closed;
+          updatedTrip = closedTrip;
+
+          // Separate audit entry for the legacy-salary-line migration
+          // (see migrateLegacySalaryLinesToPayable's own doc comment) -
+          // kept apart from the general field-diff audit below since
+          // this isn't a change to the Trip's own fields, it's a
+          // reclassification of existing ledger lines.
+          if (migratedSalaryLineIds.length > 0) {
+            await auditUpdate(tx, {
+              actor: actorFromUser(currentUser),
+              module: "CARRIER_TRIP",
+              entityType: "CarrierTrip",
+              entityId: tripId,
+              documentNo: updatedTrip.tripNo,
+              description: `Trip ${updatedTrip.tripNo}: migrated ${migratedSalaryLineIds.length} legacy salary line(s) from Trip in Progress to Driver Salary Payable on Close`,
+              changedFields: { migratedSalaryLineIds: { old: null, new: migratedSalaryLineIds } },
+              ...requestContext(request),
+            });
+          }
         } else if (targetStatus === "OPEN") {
           updatedTrip = await reopenCarrierTrip(tx, { tripId, updatedById: currentUser.userId, reason: body.reason });
         }

@@ -991,18 +991,36 @@ export async function postExpenseCreditLine(tx: Tx, input: PostExpenseCreditInpu
   );
 }
 
-/** OUT - driver salary PAID is NEVER a trip expense any more (see
- * this module's own SALARY ALLOCATION header comment below): Dr this
- * carrier's own "Driver Salary Payable" account (paying down what is
- * owed) / Cr Driver Cash. The real cost is recognized separately, by
- * DAYS, at Trip CLOSE (recognizeCarrierTripSalaryAccrual) and at
- * month-end (allocateIdleSalary) - this function only ever moves cash
- * against the payable, with zero P&L effect of its own. No "employee
- * must have a linked account" requirement - the Employee row only
- * needs to exist and not be binned, since salary never touches that
- * employee's own account at all. category is always "SALARY" - not
- * user-supplied, since DRIVER_SALARY is its own distinct lineType
- * already. */
+/** True once a carrier has a real (> 0) monthly salary configured -
+ * ONLY then does paying salary stop being a trip expense (see
+ * postDriverSalaryLine's own doc comment). A carrier with nothing
+ * configured keeps the ORIGINAL behavior (Dr Trip in Progress / Cr
+ * Driver Cash) so nothing is silently lost for a carrier that never
+ * opts into day-based accrual. */
+function isDriverSalaryConfigured(carrier: { driverMonthlySalary: unknown }): boolean {
+  return carrier.driverMonthlySalary != null && Number(carrier.driverMonthlySalary) > 0;
+}
+
+/** OUT - driver salary paid. TWO shapes, decided by whether this
+ * carrier currently has a monthly salary configured
+ * (isDriverSalaryConfigured):
+ *   - Configured: Dr this carrier's own "Driver Salary Payable"
+ *     account (paying down what is owed) / Cr Driver Cash - never a
+ *     trip expense of its own; the real cost is recognized
+ *     separately, by DAYS, at Trip CLOSE
+ *     (recognizeCarrierTripSalaryAccrual) and at month-end
+ *     (allocateIdleSalary).
+ *   - NOT configured (the ORIGINAL, pre-accrual behavior, kept so a
+ *     carrier that never opts in loses nothing): Dr this carrier's
+ *     own "Trip in Progress" clearing account / Cr Driver Cash - a
+ *     real trip expense, swept into Carrier Profit at Close exactly
+ *     like every other expense line (see
+ *     recognizeCarrierTripExpenseClearing's own doc comment).
+ * No "employee must have a linked account" requirement either way -
+ * the Employee row only needs to exist and not be binned, since
+ * salary never touches that employee's own account at all. category
+ * is always "SALARY" - not user-supplied, since DRIVER_SALARY is its
+ * own distinct lineType already. */
 export async function postDriverSalaryLine(tx: Tx, input: PostSalaryInput) {
   const trip = await getTripOrThrow(tx, input.tripId);
   if (trip.status !== "OPEN") throw new CarrierTripError("TRIP_CLOSED", "This Trip is closed.");
@@ -1014,7 +1032,9 @@ export async function postDriverSalaryLine(tx: Tx, input: PostSalaryInput) {
   }
 
   const driverCashId = trip.carrier.driverCashAccount!.id;
-  const salaryPayableAccountId = await getOrCreateDriverSalaryPayableAccountId(tx, trip.carrierId);
+  const drAccountId = isDriverSalaryConfigured(trip.carrier)
+    ? await getOrCreateDriverSalaryPayableAccountId(tx, trip.carrierId)
+    : await getOrCreateTripInProgressAccountId(tx, trip.carrierId);
   const description = input.description?.trim() || `Salary paid to ${employee.name}`;
 
   return createTripLineEntry(
@@ -1025,7 +1045,7 @@ export async function postDriverSalaryLine(tx: Tx, input: PostSalaryInput) {
       createdById: input.createdById,
       description,
       lines: [
-        { accountId: salaryPayableAccountId, debit: input.amount, credit: 0 },
+        { accountId: drAccountId, debit: input.amount, credit: 0 },
         { accountId: driverCashId, debit: 0, credit: input.amount },
       ],
     },
@@ -1427,19 +1447,23 @@ export async function editCarrierTripLine(
       if (!employee || employee.isDeleted) {
         throw new CarrierTripError("INVALID_EMPLOYEE", "Selected employee was not found.");
       }
-      // Finds the OTHER (non-Driver-Cash) side by account id when it
-      // already is the Payable account; falls back to entryLines[0]
-      // (same precedent as every other case here) for a line posted
-      // BEFORE this change, whose Dr side still points at Trip in
-      // Progress - editing it this way correctly migrates that one
-      // line's own accounting over to the Payable account.
-      const salaryPayableAccountId = await getOrCreateDriverSalaryPayableAccountId(tx, existing.trip.carrierId);
-      const payableLine = findLineByAccount(entryLines, salaryPayableAccountId) || entryLines[0];
-      const cashLine = otherLine(entryLines, payableLine.id);
+      // Same conditional Dr target as postDriverSalaryLine (Payable
+      // when this carrier currently has a monthly salary configured,
+      // Trip in Progress otherwise) - re-derived fresh on every edit,
+      // so editing a line also migrates it if the carrier's own
+      // configuration changed since it was posted. Finds the
+      // existing OTHER (non-Driver-Cash) side by whichever of the two
+      // possible accounts it currently is; falls back to
+      // entryLines[0] (same precedent as every other case here).
+      const drAccountId = isDriverSalaryConfigured(existing.trip.carrier)
+        ? await getOrCreateDriverSalaryPayableAccountId(tx, existing.trip.carrierId)
+        : await getOrCreateTripInProgressAccountId(tx, existing.trip.carrierId);
+      const drLine = findLineByAccount(entryLines, drAccountId) || entryLines[0];
+      const cashLine = otherLine(entryLines, drLine.id);
       description = input.description?.trim() || `Salary paid to ${employee.name}`;
       carrierTripLineData = { employeeId, category: "SALARY" };
       lineUpdates = [
-        { id: payableLine.id, accountId: salaryPayableAccountId, debit: amount, credit: 0 },
+        { id: drLine.id, accountId: drAccountId, debit: amount, credit: 0 },
         { id: cashLine.id, accountId: driverCashId, debit: 0, credit: amount },
       ];
       break;
@@ -1966,6 +1990,46 @@ export function computeTripMonthDaySplit(dateFrom: Date, dateTo: Date): TripMont
 }
 
 /**
+ * Migrates every LEGACY DRIVER_SALARY line on this Trip (one still
+ * targeting Trip in Progress) over to Driver Salary Payable, IN
+ * PLACE (the same JournalLine row, just its own accountId changed) -
+ * never a new JournalEntry, never touching the line's own amount/
+ * date/description. Called by closeCarrierTrip right before Entry B/
+ * Entry C are computed, so a Trip whose carrier configured a monthly
+ * salary AFTER the Trip's own salary lines were posted never double-
+ * counts them (once via the OLD line as a trip expense, once via the
+ * NEW day-based accrual) - see this module's own "SALARY ALLOCATION"
+ * header comment and isDriverSalaryConfigured's own doc comment. A
+ * no-op when the carrier has no monthly salary configured (the
+ * ORIGINAL behavior is correct as-is, nothing to migrate) or no such
+ * legacy line exists on this Trip. Returns the migrated line's own
+ * ids so the caller (the Close API route) can write a single audit
+ * log entry naming them - this function itself never writes an audit
+ * log entry, consistent with every other mutator in this module.
+ */
+async function migrateLegacySalaryLinesToPayable(tx: Tx, input: { tripId: string; carrierId: string }): Promise<string[]> {
+  const carrier = await tx.ownCarrier.findUnique({ where: { id: input.carrierId }, select: { driverMonthlySalary: true } });
+  if (!carrier || !isDriverSalaryConfigured(carrier)) return [];
+
+  const tripInProgressAccountId = await getOrCreateTripInProgressAccountId(tx, input.carrierId);
+  const salaryLines = await tx.carrierTripLine.findMany({
+    where: { tripId: input.tripId, isDeleted: false, lineType: "DRIVER_SALARY" },
+    include: { journalEntry: { include: { lines: true } } },
+  });
+  if (salaryLines.length === 0) return [];
+
+  const salaryPayableAccountId = await getOrCreateDriverSalaryPayableAccountId(tx, input.carrierId);
+  const migratedLineIds: string[] = [];
+  for (const line of salaryLines) {
+    const drLine = line.journalEntry.lines.find((jl) => jl.accountId === tripInProgressAccountId && Number(jl.debit) > 0);
+    if (!drLine) continue; // already migrated (or never targeted Trip in Progress to begin with).
+    await tx.journalLine.update({ where: { id: drLine.id }, data: { accountId: salaryPayableAccountId } });
+    migratedLineIds.push(line.id);
+  }
+  return migratedLineIds;
+}
+
+/**
  * Builds and posts Entry C - one JournalEntry PER CONTRIBUTING
  * CALENDAR MONTH (see this file's own "TRIP CLOSE..." header comment)
  * - Dr Trip in Progress / Cr Driver Salary Payable, each tied 1:1 to
@@ -2334,16 +2398,32 @@ async function recognizeCarrierTripExpenseClearing(
   tx: Tx,
   input: { tripId: string; tripNo: string; route: string | null; carrierId: string; entryDate: Date; createdById: string; extraAmount: number }
 ): Promise<boolean> {
-  // DRIVER_SALARY is deliberately excluded here - paying salary no
-  // longer debits Trip in Progress at all (see postDriverSalaryLine's
-  // own doc comment). `extraAmount` (Entry C's own salary-accrual
-  // total + Entry D's own oil-issue amount, computed by the caller)
-  // is what actually represents the Trip's own salary/oil cost now.
-  const expenseLines = await tx.carrierTripLine.findMany({
-    where: { tripId: input.tripId, isDeleted: false, lineType: { in: ["EXPENSE_CASH", "EXPENSE_OFFICE", "EXPENSE_CREDIT"] } },
-    select: { amount: true },
+  // DRIVER_SALARY is included here ONLY when its own Dr side
+  // CURRENTLY targets Trip in Progress - true for a carrier with no
+  // monthly salary configured (postDriverSalaryLine's own original,
+  // kept-for-compatibility shape), or a legacy line not yet migrated
+  // (see migrateLegacySalaryLinesToPayable, called by closeCarrierTrip
+  // just before this). A line already pointing at Driver Salary
+  // Payable is excluded - its real cost comes from the day-based
+  // accrual instead (`extraAmount`, Entry C's own total + Entry D's
+  // own oil-issue amount, computed by the caller). Checking the
+  // line's own CURRENTLY POSTED account (never "is salary configured
+  // right now") is what makes this correct regardless of whether the
+  // carrier's own setting changed since the line was posted.
+  const tripInProgressAccountIdForCheck = await getOrCreateTripInProgressAccountId(tx, input.carrierId);
+  const candidateLines = await tx.carrierTripLine.findMany({
+    where: { tripId: input.tripId, isDeleted: false, lineType: { in: ["EXPENSE_CASH", "EXPENSE_OFFICE", "EXPENSE_CREDIT", "DRIVER_SALARY"] } },
+    include: { journalEntry: { select: { lines: { select: { accountId: true, debit: true } } } } },
   });
-  const expenseTotal = round2(expenseLines.reduce((s, l) => s + Number(l.amount), 0) + input.extraAmount);
+  let lineTotal = 0;
+  for (const l of candidateLines) {
+    if (l.lineType === "DRIVER_SALARY") {
+      const targetsTripInProgress = l.journalEntry.lines.some((jl) => jl.accountId === tripInProgressAccountIdForCheck && Number(jl.debit) > 0);
+      if (!targetsTripInProgress) continue;
+    }
+    lineTotal += Number(l.amount);
+  }
+  const expenseTotal = round2(lineTotal + input.extraAmount);
   if (expenseTotal <= 0) return false;
 
   const links = await tx.carrierTripDocument.findMany({
@@ -2385,21 +2465,24 @@ async function recognizeCarrierTripExpenseClearing(
 /**
  * Orchestrates Trip CLOSE: sets status CLOSED (auto-filling dateTo
  * with today if the user never set one - Close never blocks on a
- * missing end date), then posts Entry A (Carrier Rent), Entry C
- * (Driver Salary accrual, one per contributing month), Entry D
+ * missing end date), migrates any legacy DRIVER_SALARY line
+ * (migrateLegacySalaryLinesToPayable - see its own doc comment for
+ * why this must run FIRST), then posts Entry A (Carrier Rent), Entry
+ * C (Driver Salary accrual, one per contributing month), Entry D
  * (Engine Oil issued), and finally Entry B (Expenses, this Trip's
- * own EXPENSE_CASH/OFFICE/CREDIT total PLUS Entry C's PLUS Entry D's -
- * B must run LAST so its own sweep total already includes both), all
- * dated the Trip's own end date - see this section's own header
- * comment for the full shape. Each is simply skipped when it would
- * have nothing to post.
+ * own EXPENSE_CASH/OFFICE/CREDIT/still-unmigrated-DRIVER_SALARY total
+ * PLUS Entry C's PLUS Entry D's - B must run LAST so its own sweep
+ * total already includes both), all dated the Trip's own end date -
+ * see this section's own header comment for the full shape. Each is
+ * simply skipped when it would have nothing to post.
  *
  * `oilIssueLiters` (from the Close confirmation dialog, when
  * distanceKm is set) always wins over the suggested default computed
  * from distanceKm; `confirmInsufficientOilStock` overrides Entry D's
  * own "not enough stock" warning (see recognizeCarrierTripOilIssue's
  * own doc comment) - both optional, and irrelevant when this Trip has
- * nothing to issue.
+ * nothing to issue. The returned object's own `migratedSalaryLineIds`
+ * is for the caller's own audit log entry - never persisted itself.
  */
 export async function closeCarrierTrip(
   tx: Tx,
@@ -2416,6 +2499,14 @@ export async function closeCarrierTrip(
     where: { id: input.tripId },
     data: { status: "CLOSED", dateTo, updatedById: input.updatedById },
   });
+
+  // Migrate any LEGACY DRIVER_SALARY line (posted before this
+  // carrier had a monthly salary configured, still debiting Trip in
+  // Progress) over to Driver Salary Payable BEFORE computing Entry
+  // B/Entry C below - otherwise a Trip reopened+re-closed after the
+  // carrier later configures a salary would double-count those days
+  // (once via the old line, once via the fresh accrual).
+  const migratedSalaryLineIds = await migrateLegacySalaryLinesToPayable(tx, { tripId: input.tripId, carrierId: trip.carrierId });
 
   await recognizeCarrierTripIncome(tx, { tripId: input.tripId, tripNo: trip.tripNo, route: trip.route, carrierId: trip.carrierId, entryDate: dateTo, createdById: input.updatedById });
 
@@ -2452,7 +2543,7 @@ export async function closeCarrierTrip(
     extraAmount: round2(salaryResult.amount + oilResult.amount),
   });
 
-  return updated;
+  return { ...updated, migratedSalaryLineIds };
 }
 
 /**
@@ -3037,12 +3128,22 @@ export interface CarrierPageSummary {
    * every Trip is closed - this account never carries a balance
    * across a closed Trip. */
   tripInProgress: number;
+  /** This carrier's own "Driver Salary Payable" account's own net
+   * ledger balance (debit - credit, the SAME sign convention every
+   * other account balance on this page already uses, e.g.
+   * driverCashBalance above) - negative means a genuine payable (owed
+   * TO the driver: accrued more than paid), positive means an advance
+   * (paid the driver more than accrued so far). 0 when this carrier
+   * has never had a salary line posted at all (no account created
+   * yet - getOrCreateDriverSalaryPayableAccountId only creates one
+   * lazily, on first use). */
+  driverSalaryPayableNet: number;
 }
 
 export async function getCarrierPageSummary(tx: Tx, carrierId: string): Promise<CarrierPageSummary> {
   const carrier = await tx.ownCarrier.findUnique({
     where: { id: carrierId },
-    include: { driverCashAccount: true, ownCarrierIncomeAccount: true, tripInProgressAccount: true },
+    include: { driverCashAccount: true, ownCarrierIncomeAccount: true, tripInProgressAccount: true, salaryPayableAccount: true },
   });
   if (!carrier) throw new CarrierTripError("OWN_CARRIER_NOT_FOUND", "Own Carrier not found.");
 
@@ -3101,7 +3202,16 @@ export async function getCarrierPageSummary(tx: Tx, carrierId: string): Promise<
     challanReceivable = round2(challanReceivable + (outstanding || 0));
   }
 
-  return { driverCashBalance, vendorsPayable, totalVendorsPayable, challanReceivable, carrierProfit, tripInProgress };
+  let driverSalaryPayableNet = 0;
+  if (carrier.salaryPayableAccount) {
+    const agg = await tx.journalLine.aggregate({
+      where: { accountId: carrier.salaryPayableAccount.id, journalEntry: { isDeleted: false } },
+      _sum: { debit: true, credit: true },
+    });
+    driverSalaryPayableNet = round2(Number(agg._sum.debit || 0) - Number(agg._sum.credit || 0));
+  }
+
+  return { driverCashBalance, vendorsPayable, totalVendorsPayable, challanReceivable, carrierProfit, tripInProgress, driverSalaryPayableNet };
 }
 
 /**
