@@ -54,6 +54,23 @@ export interface BiltyPaidVerificationState {
    * silently clamped. Should never occur if every Daily Posting is
    * validated through this same module. */
   isInconsistent: boolean;
+  /** True when there is nothing to attribute (paidAmount <= 0), or a
+   * real PAID SettlementPayment row (Dr responsiblePartyAccountId /
+   * Cr Gross Bilty Receivable) already exists for this Bilty - i.e.
+   * the Paid amount has actually been MOVED OUT of Gross onto the
+   * resolved party's own account, not merely that a party happens to
+   * be resolvable. `verifiedReceivedAmount` above only measures Daily
+   * Posting credits against the resolved party's account - it stays
+   * fully "verified" even when that account was credited with NO
+   * offsetting debit ever posted (production Challan 6405 / Bilty
+   * 395: Finalize Settlement's own "nothing to settle" path skipped
+   * establishing this attribution entirely - see that route's own
+   * comment - leaving DS Motors with a false Payable and Gross still
+   * holding the full Paid amount, while this state's own
+   * unverifiedAmount already read 0). Callers showing a "Paid
+   * Verified" badge must gate on isAttributed too, never
+   * unverifiedAmount alone. */
+  isAttributed: boolean;
 }
 
 export async function getBiltyPaidVerification(
@@ -199,6 +216,15 @@ export async function getBiltyPaidVerification(
   const isInconsistent = verifiedReceivedAmount > paidAmount + EPS;
   const unverifiedAmount = isInconsistent ? 0 : Math.max(0, round2(paidAmount - verifiedReceivedAmount));
 
+  let isAttributed = paidAmount <= EPS;
+  if (!isAttributed) {
+    const paidRow = await tx.settlementPayment.findFirst({
+      where: { component: "PAID", biltyId, isActive: true },
+      select: { id: true },
+    });
+    isAttributed = Boolean(paidRow);
+  }
+
   return {
     biltyId,
     paidAmount,
@@ -207,6 +233,7 @@ export async function getBiltyPaidVerification(
     verifiedReceivedAmount,
     unverifiedAmount,
     isInconsistent,
+    isAttributed,
   };
 }
 
@@ -350,6 +377,15 @@ export async function getBiltyPaidVerificationBatch(
     grossNetByBiltyId.set(line.sourceId, (grossNetByBiltyId.get(line.sourceId) || 0) + Number(line.credit) - Number(line.debit));
   }
 
+  // Real PAID SettlementPayment rows - same "isAttributed" check as
+  // getBiltyPaidVerification(), batched (one query for every Bilty
+  // instead of one per Bilty).
+  const paidRows = await tx.settlementPayment.findMany({
+    where: { component: "PAID", biltyId: { in: biltyIds }, isActive: true },
+    select: { biltyId: true },
+  });
+  const attributedBiltyIds = new Set(paidRows.map((r) => r.biltyId).filter((id): id is string => Boolean(id)));
+
   for (const biltyId of biltyIds) {
     const paidAmount = paidAmountByBiltyId.get(biltyId) ?? 0;
     const responsible = responsibleByBiltyId.get(biltyId) ?? null;
@@ -360,6 +396,7 @@ export async function getBiltyPaidVerificationBatch(
 
     const isInconsistent = verifiedReceivedAmount > paidAmount + EPS;
     const unverifiedAmount = isInconsistent ? 0 : Math.max(0, round2(paidAmount - verifiedReceivedAmount));
+    const isAttributed = paidAmount <= EPS || attributedBiltyIds.has(biltyId);
 
     result.set(biltyId, {
       biltyId,
@@ -369,6 +406,7 @@ export async function getBiltyPaidVerificationBatch(
       verifiedReceivedAmount,
       unverifiedAmount,
       isInconsistent,
+      isAttributed,
     });
   }
 

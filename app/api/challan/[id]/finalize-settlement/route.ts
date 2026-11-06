@@ -18,6 +18,7 @@ import {
   getUnclaimedGrossBiltyReceivableAmountForCollectionBatch,
 } from "@/lib/gross-accounts";
 import { createSettlementPayment, SettlementPaymentError } from "@/lib/settlement-payments";
+import { resolveBiltyPaidResponsibleParty } from "@/lib/document-party-resolution";
 import { auditSettlement, auditUpdate, actorFromUser, requestContext } from "@/lib/audit-log";
 
 // ============================================================
@@ -438,6 +439,45 @@ export async function POST(
     // is reduced here - see the Area 2 comment above.
     const carrierRentForDefault = Math.max(0, carrierRentAmount - sameRequestCarrierRentCovered);
 
+    // PAID attribution - a THIRD, independent financial component this
+    // route previously never touched at all, trusting it to have
+    // already been established at the Bilty's own creation/edit time
+    // (app/api/bilty/route.ts / [id]/route.ts, same resolution). A
+    // Bilty whose Paid-responsible party only became resolvable later
+    // (or was simply never re-attempted) is left with its full Paid
+    // amount sitting raw in Gross Bilty Receivable forever - invisible
+    // to collectionAmount above (toPay is already 0 for a fully Paid
+    // Bilty, so there is genuinely nothing left to reclassify as
+    // Collection) and therefore invisible to the "nothing to settle"
+    // check below too, even though Gross still holds the full amount
+    // unclaimed (production Challan 6405 / Bilty 395: Paid 150,000,
+    // Paid Account "DS Motors" shown in the UI, Settlement never
+    // established it - Daily Posting's own later "Paid Verified"
+    // credit landed on DS Motors with no offsetting debit ever
+    // posted, leaving DS Motors with a false Payable and Gross still
+    // holding the full 150,000 debit).
+    //
+    // Established here as a REAL safety net, every time Finalize
+    // Settlement runs (not just when Collection/Carrier Rent also have
+    // something to post) - idempotent (skipped if a PAID row already
+    // exists for this Bilty) and re-checked fresh inside the
+    // transaction below before actually writing, same discipline as
+    // every other write in this route.
+    const paidEstablishmentCandidates: { biltyId: string; payerAccountId: string; amount: number }[] = [];
+    for (const cb of challan.bilties) {
+      const advance = round2(Number(cb.bilty.advance));
+      if (advance <= 0) continue;
+      const existingPaidRow = await prisma.settlementPayment.findFirst({
+        where: { component: "PAID", biltyId: cb.biltyId, isActive: true },
+        select: { id: true },
+      });
+      if (existingPaidRow) continue;
+      const resolved = await resolveBiltyPaidResponsibleParty(cb.biltyId, prisma);
+      if (!resolved) continue; // genuinely unresolvable (never guessed) - left exactly as before
+      paidEstablishmentCandidates.push({ biltyId: cb.biltyId, payerAccountId: resolved.accountId, amount: advance });
+    }
+    const anyPaidToEstablish = paidEstablishmentCandidates.length > 0;
+
     const settlementResult = buildSettlementEntries({
       challanId: challan.id,
       challanNo: challan.challanNo,
@@ -485,10 +525,23 @@ export async function POST(
     // error keeps failing exactly as before - its Collection/Carrier
     // Rent must always resolve to a real party at Settlement, so
     // genuinely nothing-to-settle should not normally happen there and
-    // stays a surfaced error, never silently accepted.
-    const ownCarrierNothingToSettle = Boolean(challan.ownCarrierId) && nothingLeftForDefault && allocations.length === 0;
+    // stays a surfaced error, never silently accepted. Gated on
+    // `!anyPaidToEstablish` too now - Gross still holding an
+    // unattributed Paid amount for ANY of this Challan's own Bilties
+    // means this is NOT "genuinely nothing to settle" (see
+    // paidEstablishmentCandidates' own comment above) regardless of
+    // own-carrier status; the transaction below establishes it via
+    // its own createSettlementPayment() calls and the Challan is
+    // still marked settled normally (its own zero-line marker entry
+    // already handles settlementResult.entries being empty).
+    const ownCarrierNothingToSettle = Boolean(challan.ownCarrierId) && nothingLeftForDefault && allocations.length === 0 && !anyPaidToEstablish;
 
-    if (!settlementResult.isValid && !(nothingLeftForDefault && allocations.length > 0) && !ownCarrierNothingToSettle) {
+    if (
+      !settlementResult.isValid &&
+      !(nothingLeftForDefault && allocations.length > 0) &&
+      !ownCarrierNothingToSettle &&
+      !(nothingLeftForDefault && allocations.length === 0 && anyPaidToEstablish)
+    ) {
       return NextResponse.json(
         { success: false, message: settlementResult.errors.map((e) => e.message).join(", ") },
         { status: 400 }
@@ -637,6 +690,32 @@ export async function POST(
           // above, and actively wrong once a Challan has been through
           // Unsettle, which legitimately leaves its original,
           // non-deleted SETTLEMENT entry in place.)
+
+          // PAID attribution (see paidEstablishmentCandidates' own
+          // comment above) - re-checked fresh here, inside the SAME
+          // SERIALIZABLE transaction, before writing (a concurrent
+          // Bilty edit could have already established it since the
+          // pre-transaction read above; createSettlementPayment()
+          // itself would reject a genuine double-create, but skipping
+          // the already-established case here keeps this loop a true
+          // no-op rather than a surfaced error on an ordinary retry).
+          for (const candidate of paidEstablishmentCandidates) {
+            const stillUnestablished = await tx.settlementPayment.findFirst({
+              where: { component: "PAID", biltyId: candidate.biltyId, isActive: true },
+              select: { id: true },
+            });
+            if (stillUnestablished) continue;
+            await createSettlementPayment(
+              {
+                component: "PAID",
+                biltyId: candidate.biltyId,
+                payerAccountId: candidate.payerAccountId,
+                amount: candidate.amount,
+                createdById: currentUser.userId,
+              },
+              tx
+            );
+          }
 
           const journalEntries = await Promise.all(
             settlementResult.entries.map((entrySpec) =>

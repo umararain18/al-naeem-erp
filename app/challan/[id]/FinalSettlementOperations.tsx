@@ -727,6 +727,7 @@ function BiltySettlementBlock({
         verifiedReceivedAmount: number;
         unverifiedAmount: number;
         isInconsistent: boolean;
+        isAttributed: boolean;
       }
     | undefined;
   // Own-Carrier Bilties only (undefined for a normal Challan) - the
@@ -745,7 +746,16 @@ function BiltySettlementBlock({
   const paidAmount = paidVerification?.paidAmount ?? Number(bilty.advance || 0);
   const verified = paidVerification?.verifiedReceivedAmount ?? 0;
   const unverified = paidVerification?.unverifiedAmount ?? Math.max(0, paidAmount - verified);
-  const isFullyVerified = paidAmount > 0 && unverified <= 0.009;
+  // See BiltyPaidVerificationState.isAttributed's own doc comment
+  // (lib/bilty-paid-verification.ts) - a Daily Posting credit against
+  // the resolved party's account counts as "verified" above
+  // regardless of whether the underlying Dr [party] / Cr Gross
+  // attribution was ever actually posted, so "Paid Verified" must
+  // gate on BOTH, never unverifiedAmount alone (the Challan 6405 /
+  // Bilty 395 bug: a false "🟢 Paid Verified" while Gross still held
+  // the full amount and the party showed a false Payable).
+  const isAttributed = paidVerification?.isAttributed ?? true;
+  const isFullyVerified = paidAmount > 0 && unverified <= 0.009 && isAttributed;
 
   const responsibleLabel = paidVerification?.responsiblePartyName || null;
   // Plain derived value, not memoized: this is a read-only display
@@ -819,7 +829,11 @@ function BiltySettlementBlock({
               </p>
             </div>
             <div>
-              {isFullyVerified ? (
+              {!isAttributed ? (
+                <span className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-semibold bg-red-100 text-red-700">
+                  ⚠ Unattributed (Gross not cleared)
+                </span>
+              ) : isFullyVerified ? (
                 <span className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-semibold bg-green-100 text-green-700">
                   🟢 Paid Verified
                 </span>
@@ -827,8 +841,13 @@ function BiltySettlementBlock({
                 <VerifiedBadge label="Verified" amount={verified} tone="green" />
               )}
             </div>
-            <div>{!isFullyVerified && <VerifiedBadge label="Paid but Not Received" amount={unverified} tone="amber" />}</div>
+            <div>{!isFullyVerified && isAttributed && <VerifiedBadge label="Paid but Not Received" amount={unverified} tone="amber" />}</div>
           </div>
+          {!isAttributed && (
+            <p className="mt-2 text-xs text-red-600">
+              ⚠ This Paid amount has not been reclassified out of Gross Bilty Receivable onto {responsibleLabel || "the resolved party"}&apos;s own account yet - re-run Finalize Settlement to establish it.
+            </p>
+          )}
           {paidVerification?.isInconsistent && (
             <p className="mt-2 text-xs text-red-600">
               ⚠ Verified amount exceeds Paid amount for this Bilty - please review its Daily Posting entries.

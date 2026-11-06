@@ -59,6 +59,7 @@ export type BiltyPaidVerification = {
   verifiedReceivedAmount: number;
   unverifiedAmount: number;
   isInconsistent: boolean;
+  isAttributed: boolean;
 };
 
 type ChallanStatus = "IN_TRANSIT" | "DELIVERED" | "CANCELLED";
