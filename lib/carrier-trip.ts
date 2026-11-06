@@ -2922,9 +2922,14 @@ export interface TripProfitReport {
   /** diesel (whichever of EXPENSE_CASH/EXPENSE_OFFICE/EXPENSE_CREDIT
    * it was paid through) + every other EXPENSE_CASH/EXPENSE_OFFICE/
    * EXPENSE_CREDIT line - every real cost of running the Trip,
-   * regardless of payment source. DRIVER_SALARY lines are NEVER
-   * included here any more - paying salary doesn't cost the Trip
-   * anything of its own; see salaryShare below for the real cost. */
+   * regardless of payment source. A DRIVER_SALARY line is included
+   * here ONLY when its own Dr side is CURRENTLY STILL Trip in
+   * Progress (ledger-true, the exact same per-line check Entry B's
+   * own sweep uses - see recognizeCarrierTripExpenseClearing's doc
+   * comment) - true for a carrier with no monthly salary configured,
+   * or a legacy line never migrated. A salary line already migrated
+   * to Driver Salary Payable is excluded - its real cost shows via
+   * salaryShare below instead. */
   expenses: { lineId: string; lineType: string; category: string | null; description: string; amount: number; isDiesel: boolean }[];
   /** This Trip's own ACTUALLY POSTED Driver Salary accrual (Entry C) -
    * read live from CarrierSalaryMonthAllocation, never recomputed
@@ -2937,6 +2942,16 @@ export interface TripProfitReport {
    * null for an OPEN Trip, or one where no oil was issued. */
   oilIssueAmount: number;
   oilIssueLiters: number | null;
+  /** For a CLOSED Trip: read directly off its own actually-posted
+   * Entry B (CARRIER_TRIP_CLOSE_EXPENSE) JournalEntry - the real
+   * amount that was swept into Carrier Profit, ledger-true, never
+   * recomputed from CarrierTripLine sums (which could drift from what
+   * was ACTUALLY posted, e.g. a historical Trip closed under an
+   * earlier version of this module's own sweep rules). 0 when Entry B
+   * was skipped (nothing to sweep). For an OPEN Trip (no Entry B
+   * posted yet): the same expenses+salaryShare+oilIssueAmount ESTIMATE
+   * as before - this is the only case where no sweep exists yet to
+   * read. */
   totalCarrierExpense: number;
   /** The isDiesel subset of totalCarrierExpense - see CarrierTripLine.
    * isDiesel's own schema doc comment. Never description-text based. */
@@ -2967,10 +2982,13 @@ export async function getTripProfitReport(tx: Tx, tripId: string): Promise<TripP
   const driverCashAccountId = trip.carrier.driverCashAccount?.id;
   const previousBalance = driverCashAccountId ? await getTripOpeningBalance(tx, tripId, trip.dateFrom, driverCashAccountId) : 0;
 
-  const [documents, lines, salaryRows, oilEntry] = await Promise.all([
+  const tripInProgressAccountId = await getOrCreateTripInProgressAccountId(tx, trip.carrierId);
+
+  const [documents, rawLines, salaryRows, oilEntry, expenseEntry] = await Promise.all([
     tx.carrierTripDocument.findMany({ where: { tripId, unlinkedAt: null } }),
     tx.carrierTripLine.findMany({
-      where: { tripId, isDeleted: false, lineType: { in: ["EXPENSE_CASH", "EXPENSE_OFFICE", "EXPENSE_CREDIT"] } },
+      where: { tripId, isDeleted: false, lineType: { in: ["EXPENSE_CASH", "EXPENSE_OFFICE", "EXPENSE_CREDIT", "DRIVER_SALARY"] } },
+      include: { journalEntry: { select: { lines: { select: { accountId: true, debit: true } } } } },
     }),
     tx.carrierSalaryMonthAllocation.findMany({
       where: { tripId, source: "TRIP", journalEntry: { isDeleted: false } },
@@ -2980,7 +2998,25 @@ export async function getTripProfitReport(tx: Tx, tripId: string): Promise<TripP
       where: { referenceType: CARRIER_TRIP_CLOSE_OIL_REFERENCE_TYPE, referenceId: tripId, isDeleted: false },
       include: { lines: true },
     }),
+    // Entry B's own ACTUAL posted amount - the authoritative
+    // totalCarrierExpense for a CLOSED Trip (see this field's own doc
+    // comment on TripProfitReport). Fetched unconditionally alongside
+    // everything else purely for one round trip; simply unused below
+    // when the Trip is still OPEN.
+    tx.journalEntry.findFirst({
+      where: { referenceType: CARRIER_TRIP_CLOSE_EXPENSE_REFERENCE_TYPE, referenceId: tripId, isDeleted: false },
+      include: { lines: true },
+    }),
   ]);
+
+  // A DRIVER_SALARY line only counts as a trip expense here when its
+  // own Dr side is STILL Trip in Progress (ledger-true) - see this
+  // function's own `expenses` field doc comment and
+  // recognizeCarrierTripExpenseClearing's identical check.
+  const lines = rawLines.filter((l) => {
+    if (l.lineType !== "DRIVER_SALARY") return true;
+    return l.journalEntry.lines.some((jl) => jl.accountId === tripInProgressAccountId && Number(jl.debit) > 0);
+  });
 
   const salaryShare = round2(salaryRows.reduce((s, r) => s + Number(r.amount), 0));
   const oilIssueAmount = oilEntry ? round2(oilEntry.lines.reduce((s, l) => s + Number(l.debit), 0)) : 0;
@@ -3022,7 +3058,12 @@ export async function getTripProfitReport(tx: Tx, tripId: string): Promise<TripP
   const totalBiltyRent = round2(challanIncome.reduce((s, c) => s + c.biltyRent, 0));
   const totalCarrierRent = round2(challanIncome.reduce((s, c) => s + c.carrierRent, 0));
   const totalBookingIncome = round2(challanIncome.reduce((s, c) => s + c.bookingIncome, 0));
-  const totalCarrierExpense = round2(expenses.reduce((s, e) => s + e.amount, 0) + salaryShare + oilIssueAmount);
+  const totalCarrierExpense =
+    trip.status === "CLOSED"
+      ? expenseEntry
+        ? round2(expenseEntry.lines.reduce((s, l) => s + Number(l.debit), 0))
+        : 0
+      : round2(expenses.reduce((s, e) => s + e.amount, 0) + salaryShare + oilIssueAmount);
   const totalDiesel = round2(expenses.filter((e) => e.isDiesel).reduce((s, e) => s + e.amount, 0));
 
   const categoryTotals = new Map<string, number>();
