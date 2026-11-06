@@ -89,6 +89,7 @@ type CashBookRow = {
   officeAccountId: string | null;
   vendorPartyId: string | null;
   employeeId: string | null;
+  expenseAccountId: string | null;
   isDiesel: boolean;
   liters: number | null;
   ratePerLiter: number | null;
@@ -127,7 +128,20 @@ const LINE_TYPE_LABELS: Record<string, string> = {
   EXPENSE_CREDIT: "Expense (Udhaar)",
   DRIVER_SALARY: "Salary",
   DEPOSIT_TO_OFFICE: "Office mein jama",
+  OWNER_DRAWING: "Owner personal expense",
+  OFFICE_OVERHEAD: "Office expense",
 };
+
+// "Owner"/"Office" badge (item 1) - shown next to a Cash Book row's
+// own description for OWNER_DRAWING/OFFICE_OVERHEAD lines, the ONE
+// visual marker that these are excluded from Trip in Progress/
+// Carrier Profit/the Profit Report (never shown for a plain Carrier
+// expense row).
+function expenseTypeBadge(lineType: string): { label: string; className: string } | null {
+  if (lineType === "OWNER_DRAWING") return { label: "Owner", className: "bg-purple-50 text-purple-700" };
+  if (lineType === "OFFICE_OVERHEAD") return { label: "Office", className: "bg-sky-50 text-sky-700" };
+  return null;
+}
 
 /**
  * Fast keyboard entry: "20k" -> 20000, "1.5L" -> 150000 (Lakh, the
@@ -152,24 +166,52 @@ function parseAmountExpression(raw: string): number | null {
   return Math.round((total + Number.EPSILON) * 100) / 100;
 }
 
+// Drafts show DESCRIPTION (free text, `note`) instead of an account
+// head - EXPENSE_OFFICE/EXPENSE_CREDIT collapse into EXPENSE_CASH
+// (see lib/carrier-trip.ts's getPreviousTripExpenseTemplates doc
+// comment: the office-account/vendor payment-source distinction gets
+// baked into the description text instead of staying a separate
+// pickable field). `category`/`expenseAccountId` are kept internally
+// (never shown as a picker here) so a row left on its ORIGINAL type
+// still posts with full fidelity - only EXPLICITLY switching the
+// Carrier/Owner/Office chip overrides them (see applyDraftType).
 type DraftRow = {
   id: string;
-  lineType: "EXPENSE_CASH" | "EXPENSE_OFFICE" | "EXPENSE_CREDIT" | "DRIVER_SALARY";
+  lineType: "EXPENSE_CASH" | "DRIVER_SALARY" | "OWNER_DRAWING" | "OFFICE_OVERHEAD";
   category: string | null;
-  vendorPartyId: string | null;
-  vendorPartyName: string | null;
-  officeAccountId: string | null;
-  officeAccountName: string | null;
-  employeeId: string | null;
-  employeeName: string | null;
   isDiesel: boolean;
   pumpPartyId: string | null;
   pumpPartyName: string | null;
+  // OFFICE_OVERHEAD only - no safe default exists, so this is the
+  // ONE field still shown as a small inline picker on the row.
+  expenseAccountId: string | null;
+  expenseAccountName: string | null;
   liters: string;
   ratePerLiter: string;
   amount: string;
   note: string;
+  date: string;
 };
+
+type DraftExpenseType = "CARRIER" | "OWNER" | "OFFICE";
+
+function draftExpenseType(lineType: DraftRow["lineType"]): DraftExpenseType {
+  if (lineType === "OWNER_DRAWING") return "OWNER";
+  if (lineType === "OFFICE_OVERHEAD") return "OFFICE";
+  return "CARRIER";
+}
+
+/** Switching a draft row's Carrier/Owner/Office chip (item 1: "Edit
+ * can switch type", applied here pre-save) - a no-op when the row is
+ * already in that bucket (so an untouched DRIVER_SALARY/EXPENSE_CASH
+ * row keeps its own category/fidelity, never silently reset to
+ * "Other" just because the SAME bucket's chip was clicked again). */
+function applyDraftType(row: DraftRow, next: DraftExpenseType): Partial<DraftRow> {
+  if (draftExpenseType(row.lineType) === next) return {};
+  if (next === "OWNER") return { lineType: "OWNER_DRAWING", category: null, expenseAccountId: null, expenseAccountName: null, isDiesel: false };
+  if (next === "OFFICE") return { lineType: "OFFICE_OVERHEAD", category: null, expenseAccountId: null, expenseAccountName: null, isDiesel: false };
+  return { lineType: "EXPENSE_CASH", category: "OTHER", expenseAccountId: null, expenseAccountName: null };
+}
 
 function draftsStorageKey(tripId: string): string {
   return `oc-drafts-${tripId}`;
@@ -192,37 +234,33 @@ function saveDraftsToStorage(tripId: string, drafts: DraftRow[]) {
   }
 }
 
-function templateToDraft(t: {
-  lineType: DraftRow["lineType"];
-  category: string | null;
-  vendorPartyId: string | null;
-  vendorPartyName: string | null;
-  officeAccountId: string | null;
-  officeAccountName: string | null;
-  employeeId: string | null;
-  employeeName: string | null;
-  description: string | null;
-  isDiesel: boolean;
-  pumpPartyId: string | null;
-  pumpPartyName: string | null;
-}): DraftRow {
+function templateToDraft(
+  t: {
+    lineType: DraftRow["lineType"];
+    category: string | null;
+    description: string | null;
+    isDiesel: boolean;
+    pumpPartyId: string | null;
+    pumpPartyName: string | null;
+    expenseAccountId: string | null;
+    expenseAccountName: string | null;
+  },
+  date: string
+): DraftRow {
   return {
     id: `draft-${Math.random().toString(36).slice(2)}`,
     lineType: t.lineType,
     category: t.category,
-    vendorPartyId: t.vendorPartyId,
-    vendorPartyName: t.vendorPartyName,
-    officeAccountId: t.officeAccountId,
-    officeAccountName: t.officeAccountName,
-    employeeId: t.employeeId,
-    employeeName: t.employeeName,
     isDiesel: t.isDiesel,
     pumpPartyId: t.pumpPartyId,
     pumpPartyName: t.pumpPartyName,
+    expenseAccountId: t.expenseAccountId,
+    expenseAccountName: t.expenseAccountName,
     liters: "",
     ratePerLiter: "",
     amount: "",
     note: t.isDiesel ? "" : t.description || "",
+    date,
   };
 }
 
@@ -286,7 +324,8 @@ export default function CarrierTripDetailPage() {
       if (!options.silent) alert("This carrier has no previous Trip to copy from.");
       return;
     }
-    const copied: DraftRow[] = data.templates.map(templateToDraft);
+    const seedDate = draftDate || lastDate || (trip ? toYMD(trip.dateFrom) : todayYMD());
+    const copied: DraftRow[] = data.templates.map((t: Parameters<typeof templateToDraft>[0]) => templateToDraft(t, seedDate));
     setDrafts((prev) => {
       const next = options.replace ? copied : [...prev, ...copied];
       saveDraftsToStorage(tripId, next);
@@ -302,30 +341,39 @@ export default function CarrierTripDetailPage() {
     });
   }
 
-  async function saveDraft(draft: DraftRow, date: string): Promise<string | null> {
+  // Posts ONE draft row - never calls refresh() itself, so a bulk
+  // "Save All" (saveAllDrafts below) can post every filled row first
+  // and refresh the Cash Book exactly once at the end, rather than
+  // once per row.
+  async function postOneDraft(draft: DraftRow): Promise<string | null> {
     const amount = parseAmountExpression(draft.amount);
     if (!amount || amount <= 0) return "Enter a valid amount.";
+    if (!draft.date) return "Enter a date.";
 
     const description = draft.isDiesel ? buildDieselDescription(draft.pumpPartyName || "", draft.liters, draft.note) : draft.note.trim() || undefined;
-    const payload: Record<string, unknown> = { lineType: draft.lineType, date, amount, description };
-    if (draft.lineType === "EXPENSE_OFFICE") payload.officeAccountId = draft.officeAccountId;
-    if (draft.lineType === "EXPENSE_CREDIT") payload.vendorPartyId = draft.vendorPartyId;
-    if (draft.lineType === "EXPENSE_CASH" || draft.lineType === "EXPENSE_OFFICE" || draft.lineType === "EXPENSE_CREDIT") {
-      payload.category = draft.category;
-    }
-    if (draft.lineType === "DRIVER_SALARY") {
+    const payload: Record<string, unknown> = { lineType: draft.lineType, date: draft.date, amount, description };
+    if (draft.lineType === "EXPENSE_CASH") {
+      payload.category = draft.category || "OTHER";
+      if (draft.isDiesel) {
+        payload.isDiesel = true;
+        payload.liters = draft.liters.trim() ? Number(draft.liters) : undefined;
+        payload.ratePerLiter = draft.ratePerLiter.trim() ? Number(draft.ratePerLiter) : undefined;
+        payload.pumpPartyId = draft.pumpPartyId || undefined;
+      }
+    } else if (draft.lineType === "DRIVER_SALARY") {
       // Driver = carrier's CURRENT driver, resolved fresh at save time
       // - never the old template's employeeId (the driver may have
       // changed since the previous Trip) - see item 9's own "prefilled,
       // only amount needed" design.
       if (!trip?.carrier.currentDriverId) return "Set this carrier's current driver first (Carrier Settings).";
       payload.employeeId = trip.carrier.currentDriverId;
-    }
-    if (draft.isDiesel) {
-      payload.isDiesel = true;
-      payload.liters = draft.liters.trim() ? Number(draft.liters) : undefined;
-      payload.ratePerLiter = draft.ratePerLiter.trim() ? Number(draft.ratePerLiter) : undefined;
-      payload.pumpPartyId = draft.pumpPartyId || undefined;
+    } else if (draft.lineType === "OWNER_DRAWING") {
+      // Optional - the server defaults to the system "Owner Drawings -
+      // Naeem Shb" account when left blank.
+      if (draft.expenseAccountId) payload.expenseAccountId = draft.expenseAccountId;
+    } else if (draft.lineType === "OFFICE_OVERHEAD") {
+      if (!draft.expenseAccountId) return "Select an office expense account.";
+      payload.expenseAccountId = draft.expenseAccountId;
     }
 
     const res = await fetch(`/api/own-carrier/${carrierId}/trips/${tripId}/lines`, {
@@ -337,8 +385,36 @@ export default function CarrierTripDetailPage() {
     if (!res.ok || !data.success) return data.message || "Unable to save draft.";
 
     removeDraft(draft.id);
-    refresh();
     return null;
+  }
+
+  async function saveDraft(draft: DraftRow): Promise<string | null> {
+    const err = await postOneDraft(draft);
+    if (!err) refresh();
+    return err;
+  }
+
+  // "Blank amount = skip. Save all posts all filled rows." (item 2) -
+  // skips any row with no (or invalid) amount, posts every other one,
+  // refreshes the Cash Book once at the end. `errors` is keyed by
+  // draft id so the panel can show each failed row's own message
+  // inline (a row that posted successfully is already gone from
+  // `drafts` by the time this returns - removeDraft inside
+  // postOneDraft - so it never appears in `errors`).
+  async function saveAllDrafts(): Promise<{ saved: number; errors: Record<string, string> }> {
+    const toSave = drafts.filter((d) => {
+      const amt = parseAmountExpression(d.amount);
+      return amt != null && amt > 0;
+    });
+    let saved = 0;
+    const errors: Record<string, string> = {};
+    for (const d of toSave) {
+      const err = await postOneDraft(d);
+      if (err) errors[d.id] = err;
+      else saved++;
+    }
+    refresh();
+    return { saved, errors };
   }
 
   function updateDraft(draftId: string, patch: Partial<DraftRow>) {
@@ -447,6 +523,12 @@ export default function CarrierTripDetailPage() {
   async function toggleStatus() {
     if (!trip) return;
     const nextStatus = trip.status === "OPEN" ? "CLOSED" : "OPEN";
+    if (nextStatus === "OPEN") {
+      const confirmed = window.confirm(
+        `Reopen Trip ${trip.tripNo}? Its Close entries (Carrier Rent recognition + Expense clearing) will be removed - re-close this Trip afterward to post them fresh.`
+      );
+      if (!confirmed) return;
+    }
     const res = await fetch(`/api/own-carrier/${carrierId}/trips/${tripId}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
@@ -608,6 +690,7 @@ export default function CarrierTripDetailPage() {
             onRemove={removeDraft}
             onUpdate={updateDraft}
             onSave={saveDraft}
+            onSaveAll={saveAllDrafts}
           />
         )}
 
@@ -822,6 +905,10 @@ function CashList({
                   {row.source === "EXTERNAL" && (
                     <span className="ml-2 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-medium text-amber-700">Daily Posting</span>
                   )}
+                  {(() => {
+                    const badge = expenseTypeBadge(row.lineType);
+                    return badge ? <span className={`ml-2 rounded-full px-2 py-0.5 text-[10px] font-medium ${badge.className}`}>{badge.label}</span> : null;
+                  })()}
                 </p>
                 <p className="text-xs text-gray-500">{formatBusinessDate(row.date)}</p>
               </div>
@@ -866,7 +953,16 @@ function Drawer({ open, onClose, title, children }: { open: boolean; onClose: ()
   );
 }
 
-type AccountOption = { id: string; accountName: string; accountType: string; category: string };
+type AccountOption = {
+  id: string;
+  accountName: string;
+  accountType: string;
+  category: string;
+  isActive: boolean;
+  ownCarrierId: string | null;
+  ownCarrierIncomeId: string | null;
+  ownCarrierTripInProgressId: string | null;
+};
 
 function CarrierRentEditor({ link, canEdit, onSave }: { link: DocumentLink; canEdit: boolean; onSave: (link: DocumentLink, value: string) => Promise<void> }) {
   // 0 reads as "never entered yet" here (per spec: Carrier Rent stays
@@ -916,8 +1012,15 @@ function CarrierRentEditor({ link, canEdit, onSave }: { link: DocumentLink; canE
 // behavior - no custom keyboard-handling code needed for either.
 // ============================================================
 
-type QuickTypeKey = "WASOOLI" | "DIESEL" | "TOLL" | "KHANA" | "MARAMMAT" | "OTHER_EXPENSE" | "SALARY" | "OFFICE_CASH" | "OFFICE_DEPOSIT";
-type QuickKind = "COLLECTION" | "EXPENSE" | "DRIVER_SALARY" | "CASH_FROM_OFFICE" | "DEPOSIT_TO_OFFICE";
+type QuickTypeKey = "WASOOLI" | "DIESEL" | "TOLL" | "KHANA" | "MARAMMAT" | "OTHER_EXPENSE" | "SALARY" | "OFFICE_CASH" | "OFFICE_DEPOSIT" | "OWNER_EXPENSE" | "OFFICE_OVERHEAD_EXPENSE";
+// OWNER_DRAWING/OFFICE_OVERHEAD - the Owner's own personal expense /
+// a genuine office overhead expense, both Dr a selected Account / Cr
+// Driver Cash (never Trip in Progress - see lib/carrier-trip.ts's own
+// TRIP CLOSE header comment for why these are excluded from Carrier
+// Profit/the Profit Report). Peers of "Carrier expense" at the chip
+// level, not a payment-source variant of it - no category, no Paid
+// From toggle, just one Account picker each.
+type QuickKind = "COLLECTION" | "EXPENSE" | "DRIVER_SALARY" | "CASH_FROM_OFFICE" | "DEPOSIT_TO_OFFICE" | "OWNER_DRAWING" | "OFFICE_OVERHEAD";
 type PaymentSource = "DRIVER_CASH" | "OFFICE" | "UDHAAR";
 
 // Category chip + Amount + Note - no account picker any more (every
@@ -934,6 +1037,8 @@ const QUICK_TYPES: { key: QuickTypeKey; label: string; kind: QuickKind; category
   { key: "SALARY", label: "Salary", kind: "DRIVER_SALARY" },
   { key: "OFFICE_CASH", label: "Office se cash", kind: "CASH_FROM_OFFICE" },
   { key: "OFFICE_DEPOSIT", label: "Office mein jama", kind: "DEPOSIT_TO_OFFICE" },
+  { key: "OWNER_EXPENSE", label: "Owner", kind: "OWNER_DRAWING" },
+  { key: "OFFICE_OVERHEAD_EXPENSE", label: "Office", kind: "OFFICE_OVERHEAD" },
 ];
 
 // category -> QuickTypeKey, for re-deriving the chip when prefilling
@@ -1085,6 +1190,19 @@ function QuickEntryRow({
     [documents]
   );
   const officeAccounts = useMemo(() => accounts.filter((a) => a.accountType !== "EXPENSE" && a.accountType !== "PARTY"), [accounts]);
+  // OWNER_DRAWING's own picker - any active OWNER_DRAWING-category
+  // Account (mirrors lib/own-carrier.ts's own default-account
+  // category, but never hardcoded to just the one default - a second
+  // owner's own drawings account, if one is ever set up in Accounts,
+  // shows up here too).
+  const ownerDrawingAccounts = useMemo(() => accounts.filter((a) => a.category === "OWNER_DRAWING" && a.isActive), [accounts]);
+  // OFFICE_OVERHEAD's own picker - mirrors lib/own-carrier.ts's own
+  // isEligibleOfficeOverheadAccount() exactly: any active EXPENSE
+  // Account that does NOT belong to a specific carrier.
+  const officeOverheadAccounts = useMemo(
+    () => accounts.filter((a) => a.accountType === "EXPENSE" && a.isActive && !a.ownCarrierId && !a.ownCarrierIncomeId && !a.ownCarrierTripInProgressId),
+    [accounts]
+  );
   const vendorParties = useMemo(() => parties.filter((p) => p.account), [parties]);
   // Pump/vendor is purely informational (CarrierTripLine.pumpPartyId's
   // own schema doc comment) - unlike the Udhaar vendor above, it never
@@ -1120,6 +1238,14 @@ function QuickEntryRow({
       setQuickTypeKey("OFFICE_DEPOSIT");
       setItemValue(editingLine.officeAccountId || "");
       setNote("");
+    } else if (lt === "OWNER_DRAWING") {
+      setQuickTypeKey("OWNER_EXPENSE");
+      setItemValue(editingLine.expenseAccountId || "");
+      setNote(editingLine.description || "");
+    } else if (lt === "OFFICE_OVERHEAD") {
+      setQuickTypeKey("OFFICE_OVERHEAD_EXPENSE");
+      setItemValue(editingLine.expenseAccountId || "");
+      setNote(editingLine.description || "");
     } else if (lt === "DRIVER_SALARY") {
       // Driver is never picked any more (item 9: carrier's current
       // driver, prefilled) - editingLine.employeeId is kept only for
@@ -1173,9 +1299,17 @@ function QuickEntryRow({
       // - always cleared; payment source (and, for Diesel, the pump/
       // vendor/rate) are kept, since the common case is several of
       // the same category in a row.
-      if (quickType.kind === "COLLECTION" || quickType.kind === "CASH_FROM_OFFICE" || quickType.kind === "DEPOSIT_TO_OFFICE") {
+      if (
+        quickType.kind === "COLLECTION" ||
+        quickType.kind === "CASH_FROM_OFFICE" ||
+        quickType.kind === "DEPOSIT_TO_OFFICE" ||
+        quickType.kind === "OFFICE_OVERHEAD"
+      ) {
         setItemValue("");
       }
+      // OWNER_DRAWING's own itemValue (the selected account) is KEPT
+      // across consecutive rows - unlike Office, it has a safe
+      // default and is usually the SAME owner each time in a row.
     }
     focusFirstField();
   }
@@ -1222,7 +1356,12 @@ function QuickEntryRow({
   }
 
   const resolvedLineType =
-    quickType.kind === "COLLECTION" || quickType.kind === "CASH_FROM_OFFICE" || quickType.kind === "DEPOSIT_TO_OFFICE" || quickType.kind === "DRIVER_SALARY"
+    quickType.kind === "COLLECTION" ||
+    quickType.kind === "CASH_FROM_OFFICE" ||
+    quickType.kind === "DEPOSIT_TO_OFFICE" ||
+    quickType.kind === "DRIVER_SALARY" ||
+    quickType.kind === "OWNER_DRAWING" ||
+    quickType.kind === "OFFICE_OVERHEAD"
       ? quickType.kind
       : paymentSource === "DRIVER_CASH"
         ? "EXPENSE_CASH"
@@ -1339,6 +1478,16 @@ function QuickEntryRow({
         return;
       }
       payload.employeeId = carrierDefaults.currentDriverId;
+    } else if (quickType.kind === "OWNER_DRAWING") {
+      // Optional - the server defaults to the system "Owner Drawings
+      // - Naeem Shb" account when left blank.
+      if (itemValue) payload.expenseAccountId = itemValue;
+    } else if (quickType.kind === "OFFICE_OVERHEAD") {
+      if (!itemValue) {
+        setError("Select an office expense account.");
+        return;
+      }
+      payload.expenseAccountId = itemValue;
     } else {
       // EXPENSE - category is the chip itself, never a picker.
       payload.category = quickType.category;
@@ -1462,6 +1611,34 @@ function QuickEntryRow({
               <select ref={itemRef} value={itemValue} onChange={(e) => setItemValue(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500">
                 <option value="">Select account...</option>
                 {officeAccounts.map((a) => (
+                  <option key={a.id} value={a.id}>
+                    {a.accountName}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          {quickType.kind === "OWNER_DRAWING" && (
+            <div className="min-w-[200px] flex-1">
+              <label className="mb-1 block text-xs font-medium text-gray-600">Owner Drawings Account</label>
+              <select ref={itemRef} value={itemValue} onChange={(e) => setItemValue(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500">
+                <option value="">Owner Drawings - Naeem Shb (default)</option>
+                {ownerDrawingAccounts.map((a) => (
+                  <option key={a.id} value={a.id}>
+                    {a.accountName}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          {quickType.kind === "OFFICE_OVERHEAD" && (
+            <div className="min-w-[200px] flex-1">
+              <label className="mb-1 block text-xs font-medium text-gray-600">Office Expense Account</label>
+              <select ref={itemRef} value={itemValue} onChange={(e) => setItemValue(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500">
+                <option value="">Select account (Kitchen, Office Repair, Utility...)</option>
+                {officeOverheadAccounts.map((a) => (
                   <option key={a.id} value={a.id}>
                     {a.accountName}
                   </option>
@@ -1682,6 +1859,7 @@ function DraftsPanel({
   onRemove,
   onUpdate,
   onSave,
+  onSaveAll,
 }: {
   drafts: DraftRow[];
   draftDate: string;
@@ -1689,33 +1867,50 @@ function DraftsPanel({
   onCopyFromPrevious: () => void;
   onRemove: (id: string) => void;
   onUpdate: (id: string, patch: Partial<DraftRow>) => void;
-  onSave: (draft: DraftRow, date: string) => Promise<string | null>;
+  onSave: (draft: DraftRow) => Promise<string | null>;
+  onSaveAll: () => Promise<{ saved: number; errors: Record<string, string> }>;
 }) {
   const [savingId, setSavingId] = useState<string | null>(null);
-  const [errorId, setErrorId] = useState<string | null>(null);
-  const [errorMsg, setErrorMsg] = useState("");
+  const [savingAll, setSavingAll] = useState(false);
+  const [rowErrors, setRowErrors] = useState<Record<string, string>>({});
+  const [statusMsg, setStatusMsg] = useState("");
+  // OFFICE_OVERHEAD's own inline account picker - see
+  // lib/own-carrier.ts's isEligibleOfficeOverheadAccount() (mirrored
+  // client-side the same way QuickEntryRow's own officeOverheadAccounts
+  // memo does).
+  const [officeOverheadAccounts, setOfficeOverheadAccounts] = useState<AccountOption[]>([]);
 
-  async function handleSave(draft: DraftRow, focusNextAmountId?: string) {
+  useEffect(() => {
+    (async () => {
+      const res = await fetch("/api/accounts");
+      const data = await res.json();
+      if (res.ok && data.success !== false) {
+        const all: AccountOption[] = data.accounts || [];
+        setOfficeOverheadAccounts(all.filter((a) => a.accountType === "EXPENSE" && a.isActive && !a.ownCarrierId && !a.ownCarrierIncomeId && !a.ownCarrierTripInProgressId));
+      }
+    })();
+  }, []);
+
+  async function handleSave(draft: DraftRow) {
     setSavingId(draft.id);
-    setErrorId(null);
-    const err = await onSave(draft, draftDate);
+    setRowErrors((prev) => { const next = { ...prev }; delete next[draft.id]; return next; });
+    const err = await onSave(draft);
     setSavingId(null);
-    if (err) {
-      setErrorId(draft.id);
-      setErrorMsg(err);
-      return;
-    }
-    if (focusNextAmountId) {
-      window.setTimeout(() => document.getElementById(`draft-amount-${focusNextAmountId}`)?.focus(), 0);
-    }
+    if (err) setRowErrors((prev) => ({ ...prev, [draft.id]: err }));
   }
 
-  function itemLabel(d: DraftRow): string {
-    // category + description/note only - never an account name (item 11).
-    if (d.lineType === "DRIVER_SALARY") return "Salary";
-    if (d.lineType === "EXPENSE_CREDIT") return `${categoryLabel(d.category)} (Udhaar - ${d.vendorPartyName || "Vendor"})`;
-    if (d.lineType === "EXPENSE_OFFICE") return `${categoryLabel(d.category)} (Office)`;
-    return categoryLabel(d.category);
+  async function handleSaveAll() {
+    setSavingAll(true);
+    setStatusMsg("");
+    const { saved, errors } = await onSaveAll();
+    setRowErrors(errors);
+    setSavingAll(false);
+    const failedCount = Object.keys(errors).length;
+    setStatusMsg(failedCount > 0 ? `Saved ${saved}, ${failedCount} failed (see row(s) below).` : `Saved ${saved}.`);
+  }
+
+  function setDraftType(d: DraftRow, next: DraftExpenseType) {
+    onUpdate(d.id, applyDraftType(d, next));
   }
 
   return (
@@ -1724,7 +1919,7 @@ function DraftsPanel({
         <h2 className="text-sm font-semibold text-gray-900">Drafts (previous Trip&apos;s expenses)</h2>
         <div className="flex items-center gap-3">
           <label className="flex items-center gap-1.5 text-xs text-gray-600">
-            Date for saved drafts
+            Date for new drafts
             <input type="date" value={draftDate} onChange={(e) => onDateChange(e.target.value)} className="rounded-md border border-gray-300 px-2 py-1 text-xs outline-none focus:border-blue-500" />
           </label>
           <button type="button" onClick={onCopyFromPrevious} className="rounded-md border border-blue-200 px-3 py-1.5 text-xs font-medium text-blue-600 hover:bg-blue-50">
@@ -1735,57 +1930,110 @@ function DraftsPanel({
       {drafts.length === 0 ? (
         <div className="px-5 py-5 text-center text-sm text-gray-500">No drafts. Use &quot;Copy from previous Trip&quot; to bring in last Trip&apos;s recurring expenses.</div>
       ) : (
-        <div className="divide-y">
-          {drafts.map((d) => (
-            <div key={d.id} className="flex flex-wrap items-center gap-2 px-5 py-2.5 text-sm">
-              <span className="min-w-[160px] flex-1 font-medium text-gray-900">
-                {itemLabel(d)}
-                {d.isDiesel && d.pumpPartyName && <span className="ml-1 text-xs text-gray-500">({d.pumpPartyName})</span>}
-              </span>
-              {d.isDiesel && (
-                <>
+        <>
+          <div className="divide-y">
+            {drafts.map((d) => {
+              const type = draftExpenseType(d.lineType);
+              return (
+                <div key={d.id} className="flex flex-wrap items-center gap-2 px-5 py-2.5 text-sm">
+                  <div className="flex gap-1">
+                    {(["CARRIER", "OWNER", "OFFICE"] as DraftExpenseType[]).map((t) => (
+                      <button
+                        key={t}
+                        type="button"
+                        onClick={() => setDraftType(d, t)}
+                        className={`rounded-full border px-2 py-1 text-[11px] font-medium ${
+                          type === t ? "border-blue-500 bg-blue-50 text-blue-700" : "border-gray-300 text-gray-500 hover:bg-gray-50"
+                        }`}
+                      >
+                        {t === "CARRIER" ? "Carrier" : t === "OWNER" ? "Owner" : "Office"}
+                      </button>
+                    ))}
+                  </div>
                   <input
-                    value={d.liters}
-                    onChange={(e) => onUpdate(d.id, { liters: e.target.value })}
-                    placeholder="Liters"
-                    className="w-20 rounded-md border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-blue-500"
+                    value={d.note}
+                    onChange={(e) => onUpdate(d.id, { note: e.target.value })}
+                    placeholder="Description"
+                    className="min-w-[160px] flex-1 rounded-md border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-blue-500"
+                  />
+                  {type === "OFFICE" && (
+                    <select
+                      value={d.expenseAccountId || ""}
+                      onChange={(e) => onUpdate(d.id, { expenseAccountId: e.target.value || null })}
+                      className="min-w-[160px] rounded-md border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-blue-500"
+                    >
+                      <option value="">Select office account...</option>
+                      {officeOverheadAccounts.map((a) => (
+                        <option key={a.id} value={a.id}>
+                          {a.accountName}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                  {d.isDiesel && (
+                    <>
+                      <input
+                        value={d.liters}
+                        onChange={(e) => onUpdate(d.id, { liters: e.target.value })}
+                        placeholder="Liters"
+                        className="w-20 rounded-md border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-blue-500"
+                      />
+                      <input
+                        value={d.ratePerLiter}
+                        onChange={(e) => {
+                          const rate = Number(e.target.value);
+                          const litersNum = Number(d.liters);
+                          onUpdate(d.id, { ratePerLiter: e.target.value, ...(rate > 0 && litersNum > 0 ? { amount: String(round2(rate * litersNum)) } : {}) });
+                        }}
+                        placeholder="Rate/Liter"
+                        className="w-24 rounded-md border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-blue-500"
+                      />
+                    </>
+                  )}
+                  <input
+                    type="date"
+                    value={d.date}
+                    onChange={(e) => onUpdate(d.id, { date: e.target.value })}
+                    className="w-36 rounded-md border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-blue-500"
                   />
                   <input
-                    value={d.ratePerLiter}
-                    onChange={(e) => {
-                      const rate = Number(e.target.value);
-                      const litersNum = Number(d.liters);
-                      onUpdate(d.id, { ratePerLiter: e.target.value, ...(rate > 0 && litersNum > 0 ? { amount: String(round2(rate * litersNum)) } : {}) });
+                    id={`draft-amount-${d.id}`}
+                    value={d.amount}
+                    onChange={(e) => onUpdate(d.id, { amount: e.target.value })}
+                    onKeyDown={(e) => {
+                      // Enter = Save all (item 2) - Tab between amounts
+                      // already works natively (DOM tab order).
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        void handleSaveAll();
+                      }
                     }}
-                    placeholder="Rate/Liter"
-                    className="w-24 rounded-md border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-blue-500"
+                    placeholder="Amount"
+                    className="w-32 rounded-md border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-blue-500"
                   />
-                </>
-              )}
-              <input
-                id={`draft-amount-${d.id}`}
-                value={d.amount}
-                onChange={(e) => onUpdate(d.id, { amount: e.target.value })}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    const nextId = drafts[drafts.indexOf(d) + 1]?.id;
-                    handleSave(d, nextId);
-                  }
-                }}
-                placeholder="Amount (Enter to save)"
-                className="w-40 rounded-md border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-blue-500"
-              />
-              <button type="button" disabled={savingId === d.id} onClick={() => handleSave(d)} className="rounded-md border border-green-200 px-2.5 py-1.5 text-xs font-medium text-green-700 hover:bg-green-50 disabled:opacity-50">
-                {savingId === d.id ? "..." : "Save"}
-              </button>
-              <button type="button" onClick={() => onRemove(d.id)} className="rounded-md border border-red-200 px-2.5 py-1.5 text-xs text-red-600 hover:bg-red-50">
-                Remove
-              </button>
-              {errorId === d.id && <span className="w-full text-xs text-red-600">{errorMsg}</span>}
-            </div>
-          ))}
-        </div>
+                  <button type="button" disabled={savingId === d.id} onClick={() => handleSave(d)} className="rounded-md border border-green-200 px-2.5 py-1.5 text-xs font-medium text-green-700 hover:bg-green-50 disabled:opacity-50">
+                    {savingId === d.id ? "..." : "Save"}
+                  </button>
+                  <button type="button" onClick={() => onRemove(d.id)} className="rounded-md border border-red-200 px-2.5 py-1.5 text-xs text-red-600 hover:bg-red-50">
+                    Remove
+                  </button>
+                  {rowErrors[d.id] && <span className="w-full text-xs text-red-600">{rowErrors[d.id]}</span>}
+                </div>
+              );
+            })}
+          </div>
+          <div className="flex items-center justify-between gap-2 border-t px-5 py-3">
+            {statusMsg && <span className="text-xs text-gray-600">{statusMsg}</span>}
+            <button
+              type="button"
+              disabled={savingAll}
+              onClick={handleSaveAll}
+              className="ml-auto rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700 disabled:opacity-50"
+            >
+              {savingAll ? "Saving..." : "Save All"}
+            </button>
+          </div>
+        </>
       )}
     </div>
   );
@@ -1797,7 +2045,7 @@ function DraftsPanel({
 // preview, invalid rows highlighted; nothing posts until Save All.
 // ============================================================
 
-type PasteRowKind = "COLLECTION" | "DIESEL" | "EXPENSE" | "SALARY" | "OFFICE_CASH" | "OFFICE_DEPOSIT";
+type PasteRowKind = "COLLECTION" | "DIESEL" | "EXPENSE" | "SALARY" | "OFFICE_CASH" | "OFFICE_DEPOSIT" | "OWNER" | "OFFICE_OVERHEAD";
 
 type PasteRow = {
   id: string;
@@ -1827,6 +2075,8 @@ const PASTE_KEYWORDS: { re: RegExp; kind: PasteRowKind; category?: string }[] = 
   { re: /^salary$/i, kind: "SALARY" },
   { re: /^officecash$/i, kind: "OFFICE_CASH" },
   { re: /^officejama$/i, kind: "OFFICE_DEPOSIT" },
+  { re: /^owner$/i, kind: "OWNER" },
+  { re: /^office(overhead)?$/i, kind: "OFFICE_OVERHEAD" },
 ];
 
 function parsePasteLine(raw: string, documents: DocumentLink[]): PasteRow {
@@ -1880,7 +2130,7 @@ function parsePasteLine(raw: string, documents: DocumentLink[]): PasteRow {
     return { ...base, kind: "SALARY", amount: rest[0], note, error: amount != null && amount > 0 ? null : `Could not read amount from "${rest[0]}"` };
   }
 
-  if (keyword.kind === "OFFICE_CASH" || keyword.kind === "OFFICE_DEPOSIT") {
+  if (keyword.kind === "OFFICE_CASH" || keyword.kind === "OFFICE_DEPOSIT" || keyword.kind === "OFFICE_OVERHEAD") {
     // Needs a specific office account the paste grammar can't safely
     // guess - parsed far enough to show the amount, but always
     // flagged for the user to finish in Quick Entry instead.
@@ -1888,6 +2138,16 @@ function parsePasteLine(raw: string, documents: DocumentLink[]): PasteRow {
     const amount = parseAmountExpression(rest[0]);
     const note = [tokens[0], ...rest.slice(1)].join(" ");
     return { ...base, kind: keyword.kind, amount: rest[0], note, error: amount != null && amount > 0 ? "Use Quick Entry for this type - needs a specific office account" : `Could not read amount from "${rest[0]}"` };
+  }
+
+  if (keyword.kind === "OWNER") {
+    // Has a safe default account (lib/own-carrier.ts's
+    // getOrCreateDefaultOwnerDrawingAccountId), unlike Office above -
+    // posts directly, no "use Quick Entry" fallback needed.
+    if (rest.length < 1) return { ...base, kind: "OWNER", error: "Expected an amount" };
+    const amount = parseAmountExpression(rest[0]);
+    const note = rest.slice(1).join(" ");
+    return { ...base, kind: "OWNER", amount: rest[0], note, error: amount != null && amount > 0 ? null : `Could not read amount from "${rest[0]}"` };
   }
 
   return { ...base, error: "Unrecognized line" };
@@ -1933,7 +2193,7 @@ function PasteListBox({
     let saved = 0;
     let failed = 0;
     for (const row of preview) {
-      if (row.error || !row.kind || row.kind === "OFFICE_CASH" || row.kind === "OFFICE_DEPOSIT") {
+      if (row.error || !row.kind || row.kind === "OFFICE_CASH" || row.kind === "OFFICE_DEPOSIT" || row.kind === "OFFICE_OVERHEAD") {
         failed++;
         continue;
       }
@@ -1973,6 +2233,11 @@ function PasteListBox({
         payload.lineType = "DRIVER_SALARY";
         payload.employeeId = currentDriverId;
         payload.description = row.note || undefined;
+      } else if (row.kind === "OWNER") {
+        // Optional - the server defaults to the system "Owner Drawings
+        // - Naeem Shb" account when left blank.
+        payload.lineType = "OWNER_DRAWING";
+        payload.description = row.note || undefined;
       } else {
         payload.lineType = "EXPENSE_CASH";
         payload.category = row.category;
@@ -1998,8 +2263,8 @@ function PasteListBox({
       <p className="mb-2 text-xs text-gray-500">
         One line each, e.g. <code className="rounded bg-gray-100 px-1">Toll 500</code>, <code className="rounded bg-gray-100 px-1">Khana 1200</code>,{" "}
         <code className="rounded bg-gray-100 px-1">Diesel 205L 50000 Attock</code>, <code className="rounded bg-gray-100 px-1">Wasooli 4025 25000</code>,{" "}
-        <code className="rounded bg-gray-100 px-1">Salary 30000</code> (driver = carrier&apos;s current driver). Nothing posts until Save All. Office se cash/jama need Quick Entry (a specific
-        office account).
+        <code className="rounded bg-gray-100 px-1">Salary 30000</code> (driver = carrier&apos;s current driver), <code className="rounded bg-gray-100 px-1">Owner 5000 personal</code>. Nothing
+        posts until Save All (Enter in an amount box also triggers it). Office se cash/jama/Office (overhead) need Quick Entry (a specific office account).
       </p>
       <textarea
         value={text}
@@ -2027,14 +2292,26 @@ function PasteListBox({
                       ? "Office Cash"
                       : row.kind === "OFFICE_DEPOSIT"
                         ? "Office Jama"
-                        : row.kind
-                          ? categoryLabel(row.category)
-                          : "?"}
+                        : row.kind === "OWNER"
+                          ? "Owner"
+                          : row.kind === "OFFICE_OVERHEAD"
+                            ? "Office"
+                            : row.kind
+                              ? categoryLabel(row.category)
+                              : "?"}
               </span>
               <span className="min-w-[100px] flex-1 truncate text-gray-600">{row.documentLabel || row.note || row.raw}</span>
               <input
                 value={row.amount}
                 onChange={(e) => updateRow(row.id, { amount: e.target.value })}
+                onKeyDown={(e) => {
+                  // "Same for Paste List preview" (item 2) - Enter = Save
+                  // all here too.
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    void handleSaveAll();
+                  }
+                }}
                 className="w-28 rounded-md border border-gray-300 px-2 py-1 text-xs outline-none focus:border-blue-500"
               />
               {row.error && <span className="w-full text-xs font-medium text-red-600">{row.error}</span>}

@@ -1582,6 +1582,25 @@ enum CarrierTripLineType {
   EXPENSE_CREDIT // OUT - trip expense, Udhaar (credit) to a Vendor Party.
   DRIVER_SALARY // OUT - salary paid to an Employee from Driver Cash.
   DEPOSIT_TO_OFFICE // OUT - driver hands cash back to an office account.
+  // OUT - the Owner's own personal expense, paid from Driver Cash but
+  // NEVER a cost of running the trip: Dr a selected OWNER_DRAWING-
+  // category Account (see CarrierTripLine.expenseAccountId) / Cr
+  // Driver Cash. Reduces Driver Cash exactly like EXPENSE_CASH, but
+  // deliberately excluded from Trip in Progress/Carrier Profit/the
+  // Profit Report/Trip CLOSE's own Entry B - see
+  // lib/carrier-trip.ts's recognizeCarrierTripExpenseClearing, whose
+  // lineType filter never includes this one.
+  OWNER_DRAWING
+  // OUT - a genuine OFFICE overhead expense (Kitchen, Office Repair,
+  // Utility, ...), paid from Driver Cash but NOT a cost of running
+  // THIS trip: Dr a selected, non-carrier EXPENSE-type Account (see
+  // CarrierTripLine.expenseAccountId) / Cr Driver Cash. Same
+  // exclusion from Trip in Progress/Carrier Profit/the Profit
+  // Report/Entry B as OWNER_DRAWING above - never confused with
+  // EXPENSE_OFFICE, which is the OPPOSITE direction (a CARRIER
+  // expense merely PAID VIA an office account, still debiting Trip
+  // in Progress).
+  OFFICE_OVERHEAD
 }
 
 // Expense category - set on EXPENSE_CASH / EXPENSE_OFFICE /
@@ -1626,12 +1645,21 @@ model CarrierTripLine {
   documentType String?
   documentId   String?
 
-  // EXPENSE_CASH / EXPENSE_OFFICE / EXPENSE_CREDIT only - an EXISTING
-  // Expense-category Account, reusing the Accounts page's own picker
-  // as-is (never a new account-management feature). The Diesel UI
-  // section is not a distinct lineType - it is one of these three,
-  // flagged by isDiesel below (never by sniffing `description` text,
-  // once this field exists - see this field's own comment).
+  // OWNER_DRAWING / OFFICE_OVERHEAD only - the specific Account
+  // selected to Dr: an OWNER_DRAWING-category Account for
+  // OWNER_DRAWING (defaults to the system "Owner Drawings - Naeem
+  // Shb" account when none is explicitly chosen - see
+  // lib/gross-accounts.ts's getOrCreateDefaultOwnerDrawingAccountId),
+  // or any non-carrier EXPENSE-type Account for OFFICE_OVERHEAD (no
+  // default - always explicitly chosen, since there is no single
+  // right office-overhead account to assume). Reuses the Accounts
+  // page's own picker as-is (never a new account-management
+  // feature). Previously reserved for EXPENSE_CASH/EXPENSE_OFFICE/
+  // EXPENSE_CREDIT by an earlier design that was never actually
+  // implemented that way (every expense/salary line of those three
+  // types debits the shared Trip in Progress account instead, see
+  // getOrCreateTripInProgressAccountId) - this column sat fully
+  // unused until OWNER_DRAWING/OFFICE_OVERHEAD gave it a real job.
   expenseAccountId String?
   expenseAccount   Account? @relation("CarrierTripLineExpenseAccount", fields: [expenseAccountId], references: [id], onDelete: Restrict)
 

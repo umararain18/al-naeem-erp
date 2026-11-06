@@ -22,7 +22,10 @@
 // cashDelta() exactly (the real, server-side source of truth for
 // which lineTypes move Driver Cash) - EXPENSE_OFFICE/EXPENSE_CREDIT
 // never touch Driver Cash regardless of isDiesel, so they're
-// excluded here the same way. An EXTERNAL row (source: "EXTERNAL" -
+// excluded here the same way. OWNER_DRAWING/OFFICE_OVERHEAD DO move
+// Driver Cash (always Cr it directly) even though both are excluded
+// from Trip in Progress/Carrier Profit/the Profit Report - this bar
+// is about Driver Cash movement only, unrelated to that exclusion. An EXTERNAL row (source: "EXTERNAL" -
 // Daily Posting/Direct Entry) is a REAL Driver Cash movement
 // regardless of its own lineType label ("DAILY_POSTING" is a display
 // label, not one of CarrierTripLine's own lineTypes) - getTripCashBook
@@ -55,7 +58,7 @@ export interface TripSummaryBar {
   dieselTotal: number;
 }
 
-const DRIVER_CASH_OUT_LINE_TYPES = new Set(["EXPENSE_CASH", "DRIVER_SALARY", "DEPOSIT_TO_OFFICE"]);
+const DRIVER_CASH_OUT_LINE_TYPES = new Set(["EXPENSE_CASH", "DRIVER_SALARY", "DEPOSIT_TO_OFFICE", "OWNER_DRAWING", "OFFICE_OVERHEAD"]);
 
 function round2(n: number): number {
   return Math.round((n + Number.EPSILON) * 100) / 100;

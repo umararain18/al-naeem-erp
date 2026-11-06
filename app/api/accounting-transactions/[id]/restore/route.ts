@@ -38,7 +38,7 @@ export async function POST(
       const entry = await prisma.$transaction(async (tx) => {
         const currentEntry = await tx.journalEntry.findUnique({
           where: { id },
-          select: { id: true, isDeleted: true },
+          select: { id: true, isDeleted: true, referenceType: true },
         });
 
         if (!currentEntry) {
@@ -47,6 +47,18 @@ export async function POST(
 
         if (!currentEntry.isDeleted) {
           throw new Error("NOT_BINNED");
+        }
+
+        // Own Carrier Trip CLOSE's own Entry A/Entry B - soft-deleted
+        // directly by Reopen (lib/carrier-trip.ts's
+        // softDeleteLiveCloseEntry), never restorable through this
+        // generic route: restoring one independently would desync
+        // CarrierTrip.status (still OPEN while a close entry is live
+        // again). The only sanctioned way back is Re-close, which
+        // posts an entirely fresh entry - never a restore of the old
+        // one.
+        if (currentEntry.referenceType === "CARRIER_TRIP_CLOSE" || currentEntry.referenceType === "CARRIER_TRIP_CLOSE_EXPENSE") {
+          throw new Error("TRIP_CLOSE_ENTRY");
         }
 
         // A Bin'd entry's document-linked lines (BILTY/PHONCH/
@@ -97,6 +109,12 @@ export async function POST(
       if (error instanceof Error && error.message === "NOT_BINNED") {
         return NextResponse.json(
           { success: false, message: "Only binned transactions can be restored" },
+          { status: 400 }
+        );
+      }
+      if (error instanceof Error && error.message === "TRIP_CLOSE_ENTRY") {
+        return NextResponse.json(
+          { success: false, message: "This is a Trip Close entry - restore it by re-closing the Trip instead." },
           { status: 400 }
         );
       }

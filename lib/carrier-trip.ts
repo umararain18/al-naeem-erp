@@ -10,7 +10,13 @@ import {
 } from "@/lib/document-party-resolution";
 import { assertPhonchReceiptNotExceeded } from "@/lib/phonch-accounting";
 import { assertPrivatePhonchPaymentNotExceeded } from "@/lib/private-phonch-accounting";
-import { getDriverCashBalance, getOrCreateCarrierProfitAccountId, getOrCreateTripInProgressAccountId } from "@/lib/own-carrier";
+import {
+  getDriverCashBalance,
+  getOrCreateCarrierProfitAccountId,
+  getOrCreateTripInProgressAccountId,
+  getOrCreateDefaultOwnerDrawingAccountId,
+  isEligibleOfficeOverheadAccount,
+} from "@/lib/own-carrier";
 import {
   getUnearnedRevenueAccountId,
   getGrossBiltyReceivableAccountId,
@@ -91,31 +97,36 @@ export async function suggestNextTripNo(tx: Tx, carrierId: string): Promise<stri
 }
 
 export interface CarrierTripLineTemplate {
-  lineType: "EXPENSE_CASH" | "EXPENSE_OFFICE" | "EXPENSE_CREDIT" | "DRIVER_SALARY";
+  // EXPENSE_OFFICE/EXPENSE_CREDIT collapse into EXPENSE_CASH here -
+  // Drafts trade the detailed office-account/vendor payment-source
+  // picker for speed, baking that information into `description`
+  // text instead (see this function's own doc comment).
+  lineType: "EXPENSE_CASH" | "DRIVER_SALARY" | "OWNER_DRAWING" | "OFFICE_OVERHEAD";
   category: string | null;
-  vendorPartyId: string | null;
-  vendorPartyName: string | null;
-  officeAccountId: string | null;
-  officeAccountName: string | null;
-  employeeId: string | null;
-  employeeName: string | null;
   description: string | null;
   isDiesel: boolean;
   pumpPartyId: string | null;
   pumpPartyName: string | null;
+  // OFFICE_OVERHEAD only - carried forward as a convenience (no safe
+  // default account exists for it, unlike OWNER_DRAWING) - still
+  // shown/reselectable in the Drafts row, never silently reused
+  // without being visible.
+  expenseAccountId: string | null;
+  expenseAccountName: string | null;
 }
 
 /**
  * "Previous slip expenses as blank drafts" - the carrier's own most
- * recent OTHER Trip's recurring expense/salary lines (EXPENSE_CASH/
- * EXPENSE_OFFICE/EXPENSE_CREDIT/DRIVER_SALARY only - COLLECTION/
- * CASH_FROM_OFFICE/DEPOSIT_TO_OFFICE are one-off cash movements, never
- * a recurring pattern worth re-offering), as pure templates: every
- * field EXCEPT amount/liters/ratePerLiter, which the UI leaves blank
- * for the user to fill. A pure read - this never creates anything;
- * the resulting draft rows this feeds are UI-only state (localStorage)
- * until each is actually saved through the normal lines POST/PATCH
- * endpoints, so they can never create a JournalEntry by themselves.
+ * recent OTHER Trip's recurring expense/salary/owner/office lines
+ * (EXPENSE_CASH/EXPENSE_OFFICE/EXPENSE_CREDIT/DRIVER_SALARY/
+ * OWNER_DRAWING/OFFICE_OVERHEAD only - COLLECTION/CASH_FROM_OFFICE/
+ * DEPOSIT_TO_OFFICE are one-off cash movements, never a recurring
+ * pattern worth re-offering), as pure templates: every field EXCEPT
+ * amount/liters/ratePerLiter, which the UI leaves blank for the user
+ * to fill. A pure read - this never creates anything; the resulting
+ * draft rows this feeds are UI-only state (localStorage) until each
+ * is actually saved through the normal lines POST/PATCH endpoints, so
+ * they can never create a JournalEntry by themselves.
  */
 export async function getPreviousTripExpenseTemplates(
   tx: Tx,
@@ -130,30 +141,66 @@ export async function getPreviousTripExpenseTemplates(
   if (!previousTrip) return null;
 
   const lines = await tx.carrierTripLine.findMany({
-    where: { tripId: previousTrip.id, isDeleted: false, lineType: { in: ["EXPENSE_CASH", "EXPENSE_OFFICE", "EXPENSE_CREDIT", "DRIVER_SALARY"] } },
+    where: {
+      tripId: previousTrip.id,
+      isDeleted: false,
+      lineType: { in: ["EXPENSE_CASH", "EXPENSE_OFFICE", "EXPENSE_CREDIT", "DRIVER_SALARY", "OWNER_DRAWING", "OFFICE_OVERHEAD"] },
+    },
     orderBy: [{ date: "asc" }, { createdAt: "asc" }],
     include: {
       vendorParty: { select: { partyName: true } },
       officeAccount: { select: { accountName: true } },
+      expenseAccount: { select: { accountName: true } },
       employee: { select: { name: true } },
       pumpParty: { select: { partyName: true } },
     },
   });
 
-  const templates: CarrierTripLineTemplate[] = lines.map((l) => ({
-    lineType: l.lineType as CarrierTripLineTemplate["lineType"],
-    category: l.category,
-    vendorPartyId: l.vendorPartyId,
-    vendorPartyName: l.vendorParty?.partyName || null,
-    officeAccountId: l.officeAccountId,
-    officeAccountName: l.officeAccount?.accountName || null,
-    employeeId: l.employeeId,
-    employeeName: l.employee?.name || null,
-    description: l.description,
-    isDiesel: l.isDiesel,
-    pumpPartyId: l.pumpPartyId,
-    pumpPartyName: l.pumpParty?.partyName || null,
-  }));
+  const templates: CarrierTripLineTemplate[] = lines.map((l) => {
+    if (l.lineType === "OWNER_DRAWING" || l.lineType === "DRIVER_SALARY") {
+      return {
+        lineType: l.lineType,
+        category: null,
+        description: l.description || (l.lineType === "DRIVER_SALARY" ? "Salary" : "Owner personal expense"),
+        isDiesel: false,
+        pumpPartyId: null,
+        pumpPartyName: null,
+        expenseAccountId: null,
+        expenseAccountName: null,
+      };
+    }
+    if (l.lineType === "OFFICE_OVERHEAD") {
+      return {
+        lineType: "OFFICE_OVERHEAD",
+        category: null,
+        description: l.description || (l.expenseAccount ? `Office expense (${l.expenseAccount.accountName})` : "Office expense"),
+        isDiesel: false,
+        pumpPartyId: null,
+        pumpPartyName: null,
+        expenseAccountId: l.expenseAccountId,
+        expenseAccountName: l.expenseAccount?.accountName || null,
+      };
+    }
+    // EXPENSE_CASH / EXPENSE_OFFICE / EXPENSE_CREDIT - collapsed into
+    // one simplified EXPENSE_CASH template, per this function's own
+    // doc comment.
+    const descriptionSuffix =
+      l.lineType === "EXPENSE_OFFICE" && l.officeAccount
+        ? ` (Office - ${l.officeAccount.accountName})`
+        : l.lineType === "EXPENSE_CREDIT" && l.vendorParty
+          ? ` (Udhaar - ${l.vendorParty.partyName})`
+          : "";
+    return {
+      lineType: "EXPENSE_CASH",
+      category: l.category,
+      description: (l.description || categoryLabel(l.category)) + descriptionSuffix,
+      isDiesel: l.isDiesel,
+      pumpPartyId: l.pumpPartyId,
+      pumpPartyName: l.pumpParty?.partyName || null,
+      expenseAccountId: null,
+      expenseAccountName: null,
+    };
+  });
 
   return { previousTripId: previousTrip.id, previousTripNo: previousTrip.tripNo, templates };
 }
@@ -1006,7 +1053,98 @@ export async function postDepositToOfficeLine(tx: Tx, input: PostOfficeTransferI
   );
 }
 
-export const TRIP_LINE_TYPES = ["COLLECTION", "CASH_FROM_OFFICE", "EXPENSE_CASH", "EXPENSE_OFFICE", "EXPENSE_CREDIT", "DRIVER_SALARY", "DEPOSIT_TO_OFFICE"] as const;
+export interface PostOwnerDrawingInput extends PostSimpleInput {
+  /** Optional - defaults to the system "Owner Drawings - Naeem Shb"
+   * account when omitted (see getOrCreateDefaultOwnerDrawingAccountId).
+   * When given explicitly, must be an ACTIVE OWNER_DRAWING-category
+   * Account. */
+  expenseAccountId?: string | null;
+}
+
+/** OUT - the Owner's own personal expense, taken from Driver Cash but
+ * NEVER a cost of running the trip. Dr a selected OWNER_DRAWING-
+ * category Account (default: the system "Owner Drawings - Naeem Shb"
+ * account) / Cr Driver Cash. Deliberately never debits Trip in
+ * Progress - see this module's own TRIP CLOSE header comment and
+ * cashDelta's doc comment for the full exclusion rationale. */
+export async function postOwnerDrawingLine(tx: Tx, input: PostOwnerDrawingInput) {
+  const trip = await getTripOrThrow(tx, input.tripId);
+  if (trip.status !== "OPEN") throw new CarrierTripError("TRIP_CLOSED", "This Trip is closed.");
+  if (input.amount <= 0) throw new CarrierTripError("INVALID_AMOUNT", "Amount must be greater than zero.");
+
+  let ownerAccountId = input.expenseAccountId || null;
+  if (ownerAccountId) {
+    const account = await tx.account.findUnique({ where: { id: ownerAccountId } });
+    if (!account || !account.isActive || account.category !== "OWNER_DRAWING") {
+      throw new CarrierTripError("INVALID_ACCOUNT", "Selected account is not an active Owner Drawings account.");
+    }
+  } else {
+    ownerAccountId = await getOrCreateDefaultOwnerDrawingAccountId(tx);
+  }
+
+  const driverCashId = trip.carrier.driverCashAccount!.id;
+  const description = input.description?.trim() || "Owner personal expense";
+
+  return createTripLineEntry(
+    tx,
+    trip,
+    {
+      date: input.date,
+      createdById: input.createdById,
+      description,
+      lines: [
+        { accountId: ownerAccountId, debit: input.amount, credit: 0 },
+        { accountId: driverCashId, debit: 0, credit: input.amount },
+      ],
+    },
+    { lineType: "OWNER_DRAWING", date: input.date, description, amount: input.amount, expenseAccountId: ownerAccountId }
+  );
+}
+
+export interface PostOfficeOverheadInput extends PostSimpleInput {
+  expenseAccountId: string;
+}
+
+/** OUT - a genuine office overhead expense (Kitchen, Office Repair,
+ * Utility, ...), taken from Driver Cash but NOT a cost of running
+ * THIS trip. Dr a selected, non-carrier EXPENSE-type Account (always
+ * explicitly chosen - no safe default exists) / Cr Driver Cash. Never
+ * confused with EXPENSE_OFFICE, which is the OPPOSITE direction (a
+ * CARRIER expense merely paid VIA an office account, still debiting
+ * Trip in Progress). Deliberately never debits Trip in Progress - see
+ * this module's own TRIP CLOSE header comment and cashDelta's doc
+ * comment for the full exclusion rationale. */
+export async function postOfficeOverheadLine(tx: Tx, input: PostOfficeOverheadInput) {
+  const trip = await getTripOrThrow(tx, input.tripId);
+  if (trip.status !== "OPEN") throw new CarrierTripError("TRIP_CLOSED", "This Trip is closed.");
+  if (input.amount <= 0) throw new CarrierTripError("INVALID_AMOUNT", "Amount must be greater than zero.");
+  if (!input.expenseAccountId) throw new CarrierTripError("MISSING_ACCOUNT", "Office expense account is required.");
+
+  const account = await tx.account.findUnique({ where: { id: input.expenseAccountId } });
+  if (!account || !isEligibleOfficeOverheadAccount(account)) {
+    throw new CarrierTripError("INVALID_ACCOUNT", "Selected account is not an active, non-carrier Expense account.");
+  }
+
+  const driverCashId = trip.carrier.driverCashAccount!.id;
+  const description = input.description?.trim() || `Office expense (${account.accountName})`;
+
+  return createTripLineEntry(
+    tx,
+    trip,
+    {
+      date: input.date,
+      createdById: input.createdById,
+      description,
+      lines: [
+        { accountId: account.id, debit: input.amount, credit: 0 },
+        { accountId: driverCashId, debit: 0, credit: input.amount },
+      ],
+    },
+    { lineType: "OFFICE_OVERHEAD", date: input.date, description, amount: input.amount, expenseAccountId: account.id }
+  );
+}
+
+export const TRIP_LINE_TYPES = ["COLLECTION", "CASH_FROM_OFFICE", "EXPENSE_CASH", "EXPENSE_OFFICE", "EXPENSE_CREDIT", "DRIVER_SALARY", "DEPOSIT_TO_OFFICE", "OWNER_DRAWING", "OFFICE_OVERHEAD"] as const;
 export type TripLineType = (typeof TRIP_LINE_TYPES)[number];
 
 /**
@@ -1121,6 +1259,11 @@ export async function postTripLineByType(
     case "DRIVER_SALARY":
       if (!rawInput.employeeId) throw new CarrierTripError("MISSING_EMPLOYEE", "Employee is required for a salary line.");
       return postDriverSalaryLine(tx, { ...base, employeeId: rawInput.employeeId as string });
+    case "OWNER_DRAWING":
+      return postOwnerDrawingLine(tx, { ...base, expenseAccountId: (rawInput.expenseAccountId as string) || null });
+    case "OFFICE_OVERHEAD":
+      if (!rawInput.expenseAccountId) throw new CarrierTripError("MISSING_ACCOUNT", "Office expense account is required.");
+      return postOfficeOverheadLine(tx, { ...base, expenseAccountId: rawInput.expenseAccountId as string });
     default:
       throw new CarrierTripError("INVALID_LINE_TYPE", "Invalid line type.");
   }
@@ -1281,6 +1424,43 @@ export async function editCarrierTripLine(
       carrierTripLineData = { employeeId, category: "SALARY" };
       lineUpdates = [
         { id: tipLine.id, accountId: tripInProgressAccountId, debit: amount, credit: 0 },
+        { id: cashLine.id, accountId: driverCashId, debit: 0, credit: amount },
+      ];
+      break;
+    }
+    case "OWNER_DRAWING": {
+      let ownerAccountId = (input.rawInput.expenseAccountId as string) || null;
+      if (ownerAccountId) {
+        const account = await tx.account.findUnique({ where: { id: ownerAccountId } });
+        if (!account || !account.isActive || account.category !== "OWNER_DRAWING") {
+          throw new CarrierTripError("INVALID_ACCOUNT", "Selected account is not an active Owner Drawings account.");
+        }
+      } else {
+        ownerAccountId = await getOrCreateDefaultOwnerDrawingAccountId(tx);
+      }
+      const cashLine = findLineByAccount(entryLines, driverCashId) || entryLines[0];
+      const ownerLine = otherLine(entryLines, cashLine.id);
+      description = input.description?.trim() || "Owner personal expense";
+      carrierTripLineData = { expenseAccountId: ownerAccountId };
+      lineUpdates = [
+        { id: ownerLine.id, accountId: ownerAccountId, debit: amount, credit: 0 },
+        { id: cashLine.id, accountId: driverCashId, debit: 0, credit: amount },
+      ];
+      break;
+    }
+    case "OFFICE_OVERHEAD": {
+      if (!input.rawInput.expenseAccountId) throw new CarrierTripError("MISSING_ACCOUNT", "Office expense account is required.");
+      const expenseAccountId = input.rawInput.expenseAccountId as string;
+      const account = await tx.account.findUnique({ where: { id: expenseAccountId } });
+      if (!account || !isEligibleOfficeOverheadAccount(account)) {
+        throw new CarrierTripError("INVALID_ACCOUNT", "Selected account is not an active, non-carrier Expense account.");
+      }
+      const cashLine = findLineByAccount(entryLines, driverCashId) || entryLines[0];
+      const officeOverheadLine = otherLine(entryLines, cashLine.id);
+      description = input.description?.trim() || `Office expense (${account.accountName})`;
+      carrierTripLineData = { expenseAccountId };
+      lineUpdates = [
+        { id: officeOverheadLine.id, accountId: expenseAccountId, debit: amount, credit: 0 },
         { id: cashLine.id, accountId: driverCashId, debit: 0, credit: amount },
       ];
       break;
@@ -1515,16 +1695,21 @@ export async function restoreCarrierTripLine(tx: Tx, input: { lineId: string; re
 // is the common case, not an invariant enforced by fabricating a
 // zero-line entry.
 //
-// Reopen reverses whichever of the two is currently live, each dated
-// the SAME entryDate it was posted at (the Trip's own dateTo - never
-// "today"; a reversal is a correction of something that happened on
-// its own date, not a new event happening today) - never a
-// per-Challan loop any more.
+// Reopen soft-deletes whichever of the two is currently live straight
+// into the Bin (see softDeleteLiveCloseEntry's own doc comment) -
+// never a reversal entry any more, never a per-Challan loop. Re-close
+// afterward posts entirely fresh Entry A/Entry B.
 // ============================================================
 
 export const CARRIER_TRIP_CLOSE_REFERENCE_TYPE = "CARRIER_TRIP_CLOSE";
-export const CARRIER_TRIP_CLOSE_REVERSAL_REFERENCE_TYPE = "CARRIER_TRIP_CLOSE_REVERSAL";
 export const CARRIER_TRIP_CLOSE_EXPENSE_REFERENCE_TYPE = "CARRIER_TRIP_CLOSE_EXPENSE";
+// Both REVERSAL referenceTypes below are write-path DEAD since Reopen
+// moved to soft-delete (above) - kept only so
+// getChallanCloseRecognitionNet's own read still nets correctly
+// against any HISTORICAL Trip that was reopened under the old
+// reversal-based design before this change shipped. Never produced by
+// any code going forward.
+export const CARRIER_TRIP_CLOSE_REVERSAL_REFERENCE_TYPE = "CARRIER_TRIP_CLOSE_REVERSAL";
 export const CARRIER_TRIP_CLOSE_EXPENSE_REVERSAL_REFERENCE_TYPE = "CARRIER_TRIP_CLOSE_EXPENSE_REVERSAL";
 
 /** Ledger-true net (debit - credit) on Unearned Revenue for this ONE
@@ -1601,38 +1786,31 @@ async function findLiveCloseEntry(tx: Tx, referenceType: string, referenceId: st
   return entries.find((e) => !reversedIds.has(e.id)) ?? null;
 }
 
-/** Reverses one live close-side entry found by findLiveCloseEntry,
- * dated the SAME entryDate as the original (never "today") - a
- * no-op (returns false) if none is currently live. */
-async function reverseLiveCloseEntry(
+/** Soft-deletes one live close-side entry found by findLiveCloseEntry
+ * directly into the Bin - never a reversal entry (that was this
+ * function's own previous design; see the git history of this file
+ * for the old reverseLiveCloseEntry it replaces). A Trip's own
+ * CARRIER_TRIP_CLOSE/CARRIER_TRIP_CLOSE_EXPENSE entries are never
+ * read/attributed-to by anything outside this Trip's own Reopen/
+ * Re-close cycle (unlike, say, a Settlement Payment's own
+ * establishment entry, which other documents can separately
+ * reference) - there is nothing a reversal pair would protect here
+ * that a plain soft-delete doesn't already give for free: every
+ * reader already filters `journalEntry.isDeleted: false` (e.g.
+ * getChallanCloseRecognitionNet), so the deleted entry simply stops
+ * counting, with no reversal-pair clutter left behind. A no-op
+ * (returns false) if none is currently live - e.g. Entry B never
+ * posted because the Trip had zero expense. */
+async function softDeleteLiveCloseEntry(
   tx: Tx,
-  input: { referenceType: string; reversalReferenceType: string; tripId: string; entryDate: Date; reason: string; createdById: string }
+  input: { referenceType: string; tripId: string; deletedById: string }
 ): Promise<boolean> {
   const entry = await findLiveCloseEntry(tx, input.referenceType, input.tripId);
   if (!entry) return false;
 
-  const description = `Trip reopened - ${input.reason} - reversing: ${entry.description}`;
-
-  await tx.journalEntry.create({
-    data: {
-      entryDate: input.entryDate,
-      referenceType: input.reversalReferenceType,
-      referenceId: input.tripId,
-      reversesEntryId: entry.id,
-      description,
-      createdById: input.createdById,
-      lines: {
-        create: entry.lines.map((l) => ({
-          accountId: l.accountId,
-          debit: Number(l.credit),
-          credit: Number(l.debit),
-          description,
-          sourceType: l.sourceType,
-          sourceId: l.sourceId,
-          sourceNumber: l.sourceNumber,
-        })),
-      },
-    },
+  await tx.journalEntry.update({
+    where: { id: entry.id },
+    data: { isDeleted: true, deletedAt: new Date(), deletedById: input.deletedById },
   });
 
   return true;
@@ -1820,11 +1998,13 @@ export async function closeCarrierTrip(tx: Tx, input: { tripId: string; updatedB
 }
 
 /**
- * Orchestrates Trip REOPEN: reverses whichever of Entry A/Entry B is
- * currently live (safe no-op for either that was never posted - e.g.
- * zero trip expense), each dated the Trip's own dateTo (never
- * "today" - see this section's own header comment), then sets status
- * back to OPEN.
+ * Orchestrates Trip REOPEN: soft-deletes whichever of Entry A/Entry B
+ * is currently live straight into the Bin (safe no-op for either
+ * that was never posted - e.g. zero trip expense) - never a reversal
+ * entry (see softDeleteLiveCloseEntry's own doc comment for why) -
+ * then sets status back to OPEN. Re-closing afterward
+ * (closeCarrierTrip) posts entirely fresh Entry A/Entry B, dated the
+ * Trip's own (possibly since-edited) dateTo.
  */
 export async function reopenCarrierTrip(tx: Tx, input: { tripId: string; updatedById: string; reason?: string }) {
   const trip = await getTripOrThrow(tx, input.tripId);
@@ -1832,24 +2012,15 @@ export async function reopenCarrierTrip(tx: Tx, input: { tripId: string; updated
     throw new CarrierTripError("ALREADY_OPEN", "This Trip is already open.");
   }
 
-  const reason = input.reason?.trim() || `Trip ${trip.tripNo} reopened`;
-  const entryDate = trip.dateTo ?? new Date();
-
-  await reverseLiveCloseEntry(tx, {
+  await softDeleteLiveCloseEntry(tx, {
     referenceType: CARRIER_TRIP_CLOSE_REFERENCE_TYPE,
-    reversalReferenceType: CARRIER_TRIP_CLOSE_REVERSAL_REFERENCE_TYPE,
     tripId: input.tripId,
-    entryDate,
-    reason,
-    createdById: input.updatedById,
+    deletedById: input.updatedById,
   });
-  await reverseLiveCloseEntry(tx, {
+  await softDeleteLiveCloseEntry(tx, {
     referenceType: CARRIER_TRIP_CLOSE_EXPENSE_REFERENCE_TYPE,
-    reversalReferenceType: CARRIER_TRIP_CLOSE_EXPENSE_REVERSAL_REFERENCE_TYPE,
     tripId: input.tripId,
-    entryDate,
-    reason,
-    createdById: input.updatedById,
+    deletedById: input.updatedById,
   });
 
   return tx.carrierTrip.update({
@@ -1962,6 +2133,9 @@ export interface TripCashBookRow {
   officeAccountId: string | null;
   vendorPartyId: string | null;
   employeeId: string | null;
+  // OWNER_DRAWING/OFFICE_OVERHEAD only - the selected Account to Dr
+  // (see CarrierTripLine.expenseAccountId's own schema doc comment).
+  expenseAccountId: string | null;
   // Diesel structured fields (CarrierTripLine.isDiesel's own schema
   // doc comment) - isDiesel is the real flag the Diesel box/total and
   // the Profit Report filter by, never a "Diesel - ..." description
@@ -1990,7 +2164,12 @@ export interface TripCashBookRow {
  * that could silently drift from it. */
 export function cashDelta(lineType: string, amount: number): number {
   if (lineType === "COLLECTION" || lineType === "CASH_FROM_OFFICE") return amount;
-  if (lineType === "EXPENSE_CASH" || lineType === "DRIVER_SALARY" || lineType === "DEPOSIT_TO_OFFICE") return -amount;
+  // OWNER_DRAWING/OFFICE_OVERHEAD always Cr Driver Cash directly
+  // (never Udhaar/an office account) - a real cash effect exactly
+  // like EXPENSE_CASH, just excluded from Trip in Progress/Carrier
+  // Profit/the Profit Report/Entry B (see this module's own TRIP
+  // CLOSE header comment).
+  if (lineType === "EXPENSE_CASH" || lineType === "DRIVER_SALARY" || lineType === "DEPOSIT_TO_OFFICE" || lineType === "OWNER_DRAWING" || lineType === "OFFICE_OVERHEAD") return -amount;
   return 0; // EXPENSE_CREDIT / EXPENSE_OFFICE
 }
 
@@ -2116,6 +2295,7 @@ export async function getTripCashBook(tx: Tx, tripId: string): Promise<{ opening
           officeAccountId: l.officeAccountId,
           vendorPartyId: l.vendorPartyId,
           employeeId: l.employeeId,
+          expenseAccountId: l.expenseAccountId,
           isDiesel: l.isDiesel,
           liters: l.liters != null ? Number(l.liters) : null,
           ratePerLiter: l.ratePerLiter != null ? Number(l.ratePerLiter) : null,
@@ -2146,6 +2326,7 @@ export async function getTripCashBook(tx: Tx, tripId: string): Promise<{ opening
           officeAccountId: null,
           vendorPartyId: null,
           employeeId: null,
+          expenseAccountId: null,
           isDiesel: false,
           liters: null,
           ratePerLiter: null,

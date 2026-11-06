@@ -196,3 +196,69 @@ export async function getOrCreateTripInProgressAccountId(tx: Tx, carrierId: stri
   });
   return created.id;
 }
+
+// ============================================================
+// OWNER_DRAWING / OFFICE_OVERHEAD trip lines (lib/carrier-trip.ts) -
+// see CarrierTripLine.expenseAccountId's own schema doc comment for
+// why both reuse that one column.
+// ============================================================
+
+const DEFAULT_OWNER_DRAWING_ACCOUNT_CODE = "OWNER-DRAWINGS-DEFAULT";
+
+/**
+ * Lazy find-or-create for the ONE default Owner Drawings account
+ * ("Owner Drawings - Naeem Shb") - a global, non-per-carrier system
+ * account (isSystem: true, found/kept by accountCode, same precedent
+ * as lib/gross-accounts.ts's getOrCreateSystemAccount), auto-created
+ * on first use rather than requiring a manual Accounts-page setup
+ * step. Only ever used as OWNER_DRAWING's own DEFAULT selection - the
+ * UI still lets a different OWNER_DRAWING-category account be picked
+ * instead (e.g. a second owner), so this is never the only valid
+ * choice, just the one that always exists.
+ */
+export async function getOrCreateDefaultOwnerDrawingAccountId(tx: Tx): Promise<string> {
+  const existing = await tx.account.findFirst({
+    where: { accountCode: DEFAULT_OWNER_DRAWING_ACCOUNT_CODE, isSystem: true },
+    select: { id: true },
+  });
+  if (existing) return existing.id;
+
+  const created = await tx.account.create({
+    data: {
+      accountName: "Owner Drawings - Naeem Shb",
+      accountCode: DEFAULT_OWNER_DRAWING_ACCOUNT_CODE,
+      accountType: "EQUITY",
+      category: "OWNER_DRAWING",
+      description: "Default Owner Drawings account - debited for the Owner's own personal expenses taken from a carrier's Driver Cash (OWNER_DRAWING trip lines). Never a cost of running any trip.",
+      isSystem: true,
+      isActive: true,
+    },
+    select: { id: true },
+  });
+  return created.id;
+}
+
+/**
+ * True for an Account that may be selected as an OFFICE_OVERHEAD trip
+ * line's own Dr target - any ACTIVE EXPENSE-type Account that does
+ * NOT belong to a specific carrier (not Driver Cash, not Carrier
+ * Profit, not Trip in Progress). Deliberately excludes every
+ * carrier-specific account so an office overhead expense (Kitchen,
+ * Office Repair, Utility, ...) can never be miscategorized as, or
+ * collide with, a carrier's own trip accounting.
+ */
+export function isEligibleOfficeOverheadAccount(account: {
+  accountType: string;
+  isActive: boolean;
+  ownCarrierId: string | null;
+  ownCarrierIncomeId: string | null;
+  ownCarrierTripInProgressId: string | null;
+}): boolean {
+  return (
+    account.accountType === "EXPENSE" &&
+    account.isActive &&
+    account.ownCarrierId === null &&
+    account.ownCarrierIncomeId === null &&
+    account.ownCarrierTripInProgressId === null
+  );
+}

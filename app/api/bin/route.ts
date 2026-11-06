@@ -338,8 +338,33 @@ export async function GET(request: NextRequest) {
         orderBy: [{ deletedAt: "desc" }, { entryDate: "desc" }],
       });
 
+      // Trip CLOSE's own Entry A/Entry B (and any pre-existing
+      // historical reversal of either) - soft-deleted directly by
+      // Reopen (lib/carrier-trip.ts's softDeleteLiveCloseEntry), never
+      // restorable through this generic route: restoring one
+      // independently would desync CarrierTrip.status (still OPEN
+      // while a close entry is live again) - the only sanctioned way
+      // back is Re-close, which posts an entirely FRESH entry, never
+      // a restore of the old one. Shown here for visibility/audit
+      // only, with its own moduleUrl pointing at the Trip itself when
+      // resolvable.
+      const TRIP_CLOSE_REFERENCE_TYPES = new Set([
+        "CARRIER_TRIP_CLOSE",
+        "CARRIER_TRIP_CLOSE_REVERSAL",
+        "CARRIER_TRIP_CLOSE_EXPENSE",
+        "CARRIER_TRIP_CLOSE_EXPENSE_REVERSAL",
+      ]);
+      const tripCloseTripIds = [...new Set(entries.filter((e) => e.referenceType && TRIP_CLOSE_REFERENCE_TYPES.has(e.referenceType)).map((e) => e.referenceId!))];
+      const tripCarrierById = new Map(
+        tripCloseTripIds.length
+          ? (await prisma.carrierTrip.findMany({ where: { id: { in: tripCloseTripIds } }, select: { id: true, carrierId: true } })).map((t) => [t.id, t.carrierId])
+          : []
+      );
+
       for (const entry of entries) {
+        const isTripCloseEntry = Boolean(entry.referenceType && TRIP_CLOSE_REFERENCE_TYPES.has(entry.referenceType));
         const entryType = entry.referenceType === "DAILY_POSTING" ? "DAILY_POSTING" : "JOURNAL_ENTRY";
+        const tripCarrierId = isTripCloseEntry ? tripCarrierById.get(entry.referenceId!) : undefined;
         items.push({
           type: entryType,
           id: entry.id,
@@ -347,9 +372,9 @@ export async function GET(request: NextRequest) {
           title: entry.description || entry.referenceId || entry.id,
           deletedAt: entry.deletedAt ? new Date(entry.deletedAt).toISOString() : "",
           deletedBy: entry.deletedBy,
-          moduleUrl: `/cash-book`,
+          moduleUrl: tripCarrierId ? `/own-carrier/${tripCarrierId}/trip/${entry.referenceId}` : `/cash-book`,
           capabilities: {
-            canRestore: journalCanRestore,
+            canRestore: journalCanRestore && !isTripCloseEntry,
             canPermanentlyDelete: journalCanPermanentlyDelete,
           },
         });

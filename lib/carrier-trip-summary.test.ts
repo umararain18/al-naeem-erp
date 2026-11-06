@@ -109,6 +109,17 @@ test("Trip 52 bug: a Daily Posting (EXTERNAL) OUT line must be included in Total
   assertSummaryBarInvariant(rows, 100000);
 });
 
+test("OWNER_DRAWING/OFFICE_OVERHEAD are real Driver Cash outflows, counted in Total OUT like EXPENSE_CASH", () => {
+  const rows: TripSummaryBarRow[] = [
+    tripLineRow({ in: 0, out: 5000, isDiesel: false, lineType: "OWNER_DRAWING" }),
+    tripLineRow({ in: 0, out: 3000, isDiesel: false, lineType: "OFFICE_OVERHEAD" }),
+    tripLineRow({ in: 0, out: 2000, isDiesel: false, lineType: "EXPENSE_CASH" }),
+  ];
+  const bar = computeTripSummaryBar(rows);
+  assert.equal(bar.totalOutDriverCash, 10000, "5,000 (Owner) + 3,000 (Office) + 2,000 (Carrier) - all three reduce Driver Cash");
+  assertSummaryBarInvariant(rows, 20000);
+});
+
 test("Trip 52 bug: a Daily Posting (EXTERNAL) IN line must also be included in Total IN", () => {
   const rows: TripSummaryBarRow[] = [
     tripLineRow({ in: 30000, out: 0, isDiesel: false, lineType: "COLLECTION" }),
