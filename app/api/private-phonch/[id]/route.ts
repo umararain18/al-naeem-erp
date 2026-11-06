@@ -293,6 +293,10 @@ export async function GET(
         ...phonch,
         vehicles: vehiclesWithBillInfo,
         totals: { totalRent, totalDeliveryCharges, totalCarrierPayable, totalCaPayable, totalDeliveryRecovery },
+        // Record only - no JournalEntry exists for this Private Phonch
+        // at all (see lib/private-phonch-accounting.ts's
+        // resolvePrivatePhonchInput() doc comment).
+        isRecordOnly: totalRent <= 0.009 && totalDeliveryCharges <= 0.009,
         transporterState,
         clearingAgentRecoveryStates,
         transporterDeliveryRecoveryState,
@@ -593,16 +597,22 @@ export async function PATCH(
               lines.push({ accountId: deliveryIncomeId, debit: 0, credit: resolved.totalDeliveryCharges, description: `Private Phonch ${resolved.phonchNo} - Delivery Charges`, sourceType: "PRIVATE_PHONCH", sourceId: id, sourceNumber: resolved.phonchNo });
             }
 
-            await tx.journalEntry.create({
-              data: {
-                entryDate: resolved.date,
-                referenceType: "PRIVATE_PHONCH",
-                referenceId: id,
-                description: transporterDescription,
-                createdById: currentUser.userId,
-                lines: { create: lines },
-              },
-            });
+            // A "record only" Private Phonch (every vehicle's Total
+            // Rent/Delivery Charges edited down to blank) posts NO
+            // fresh JournalEntry - the old one was already soft-deleted
+            // above, so this correctly ends with no active accounting.
+            if (lines.length > 0) {
+              await tx.journalEntry.create({
+                data: {
+                  entryDate: resolved.date,
+                  referenceType: "PRIVATE_PHONCH",
+                  referenceId: id,
+                  description: transporterDescription,
+                  createdById: currentUser.userId,
+                  lines: { create: lines },
+                },
+              });
+            }
           } else {
             // --------------------------------------------------------
             // PARTY IDENTITY CHANGED - surgical reconciliation. The
@@ -654,17 +664,23 @@ export async function PATCH(
               where: { referenceType: "PRIVATE_PHONCH", referenceId: id, isDeleted: false },
               include: { lines: true },
             });
-            if (!activeEntry) {
+            // A "record only" result (desired is empty - every role
+            // reassigned/zeroed away to blank) never creates a fresh
+            // JournalEntry just to hold a party reassignment with no
+            // financial content. An EXISTING entry that this edit
+            // empties out entirely is cleaned up below, after the
+            // reconciliation loop removes its last line.
+            if (!activeEntry && desired.size > 0) {
               activeEntry = await tx.journalEntry.create({
                 data: { entryDate: resolved.date, referenceType: "PRIVATE_PHONCH", referenceId: id, description: transporterDescription, createdById: currentUser.userId },
                 include: { lines: true },
               });
-            } else {
+            } else if (activeEntry) {
               await tx.journalEntry.update({ where: { id: activeEntry.id }, data: { entryDate: resolved.date, description: transporterDescription } });
             }
 
-            const existingByRole = new Map<string, (typeof activeEntry.lines)[number]>();
-            for (const line of activeEntry.lines) {
+            const existingByRole = new Map<string, NonNullable<typeof activeEntry>["lines"][number]>();
+            for (const line of activeEntry?.lines || []) {
               let role: string;
               if (line.accountId === carrierRentExpenseId) role = "CARRIER_RENT_EXPENSE";
               else if (deliveryIncomeId && line.accountId === deliveryIncomeId) role = "DELIVERY_INCOME";
@@ -709,9 +725,11 @@ export async function PATCH(
                 }
                 await tx.journalLine.delete({ where: { id: existingLine.id } });
               } else if (!existingLine && target) {
+                // target exists => desired is non-empty => activeEntry
+                // was guaranteed to be created/found above.
                 await tx.journalLine.create({
                   data: {
-                    journalEntryId: activeEntry.id,
+                    journalEntryId: activeEntry!.id,
                     accountId: target.accountId,
                     debit: target.debit,
                     credit: target.credit,
@@ -720,6 +738,22 @@ export async function PATCH(
                     sourceId: id,
                     sourceNumber: resolved.phonchNo,
                   },
+                });
+              }
+            }
+
+            // This edit may have reassigned/zeroed away every role
+            // that existed, leaving an existing entry with no lines at
+            // all - soft-delete it, matching the "record only posts NO
+            // JournalEntry" rule exactly (desired.size === 0 already
+            // skipped creating a NEW entry above; this covers an
+            // EXISTING one instead).
+            if (activeEntry) {
+              const remainingLineCount = await tx.journalLine.count({ where: { journalEntryId: activeEntry.id } });
+              if (remainingLineCount === 0) {
+                await tx.journalEntry.update({
+                  where: { id: activeEntry.id },
+                  data: { isDeleted: true, deletedAt: new Date(), deletedById: currentUser.userId },
                 });
               }
             }

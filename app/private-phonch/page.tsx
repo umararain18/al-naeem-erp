@@ -33,6 +33,7 @@ type PrivatePhonchListItem = {
   vehicleNames: string[];
   vehicleBillLabels: string[];
   billSummary: { billId: string; billNo: string; amount: number; status: "UNPAID" | "PARTIALLY_PAID" | "PAID" } | null;
+  isRecordOnly: boolean;
   totalCarrierPayable: number;
   totalCaPayable: number;
   totalDeliveryRecovery: number;
@@ -246,7 +247,13 @@ export default function PrivatePhonchPage() {
                           )}
                         </td>
                         <td className="px-4 py-3">
-                          <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${statusClass}`}>{statusLabel}</span>
+                          {p.isRecordOnly ? (
+                            <span className="rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium text-gray-600">
+                              Record only
+                            </span>
+                          ) : (
+                            <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${statusClass}`}>{statusLabel}</span>
+                          )}
                         </td>
                         <td className="px-4 py-3">
                           <div className="flex gap-2">

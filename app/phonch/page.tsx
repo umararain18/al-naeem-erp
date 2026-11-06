@@ -164,6 +164,12 @@ export default function PhonchPage() {
                     // the backend now validates financial edits per-
                     // amount rather than blocking outright).
                     const isUnpaid = p.receivedAmount <= 0.009;
+                    // Record only - Total Amount is 0 (every Delivery
+                    // Charges/Other Expense/Claim left blank), so this
+                    // Phonch has no JournalEntry at all. "Cleared /
+                    // Received" would be misleading here (nothing was
+                    // ever due), so it gets its own badge.
+                    const isRecordOnly = p.totalAmount <= 0.009;
                     return (
                       <tr
                         key={p.id}
@@ -187,13 +193,19 @@ export default function PhonchPage() {
                         <td className="px-4 py-3">{formatCurrency(p.receivedAmount)}</td>
                         <td className="px-4 py-3">{formatCurrency(p.remainingDue)}</td>
                         <td className="px-4 py-3">
-                          <span
-                            className={`rounded-full px-2 py-0.5 text-xs font-medium ${
-                              p.status === "CLEARED" ? "bg-green-50 text-green-700" : "bg-amber-50 text-amber-700"
-                            }`}
-                          >
-                            {p.status === "CLEARED" ? "Cleared / Received" : "Receivable"}
-                          </span>
+                          {isRecordOnly ? (
+                            <span className="rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium text-gray-600">
+                              Record only
+                            </span>
+                          ) : (
+                            <span
+                              className={`rounded-full px-2 py-0.5 text-xs font-medium ${
+                                p.status === "CLEARED" ? "bg-green-50 text-green-700" : "bg-amber-50 text-amber-700"
+                              }`}
+                            >
+                              {p.status === "CLEARED" ? "Cleared / Received" : "Receivable"}
+                            </span>
+                          )}
                         </td>
                         <td className="px-4 py-3">
                           <div className="flex gap-2">

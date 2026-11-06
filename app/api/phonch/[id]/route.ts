@@ -297,75 +297,81 @@ export async function PATCH(
             transporterParty.partyName
           );
 
-          const lines: {
-            accountId: string;
-            debit: number;
-            credit: number;
-            description: string;
-            sourceType: string;
-            sourceId: string;
-            sourceNumber: string;
-          }[] = [
-            {
-              accountId: transporterParty.account.id,
-              debit: resolved.totalAmount,
-              credit: 0,
-              description,
-              sourceType: "PHONCH",
-              sourceId: id,
-              sourceNumber: resolved.phonchNo,
-            },
-          ];
+          // A "record only" Phonch (Total Amount = 0 after this edit)
+          // posts NO fresh JournalEntry - the old one was already
+          // soft-deleted above, so an amount edited DOWN to 0 correctly
+          // ends up with no active accounting at all for this Phonch.
+          if (resolved.totalAmount > 0) {
+            const lines: {
+              accountId: string;
+              debit: number;
+              credit: number;
+              description: string;
+              sourceType: string;
+              sourceId: string;
+              sourceNumber: string;
+            }[] = [
+              {
+                accountId: transporterParty.account.id,
+                debit: resolved.totalAmount,
+                credit: 0,
+                description,
+                sourceType: "PHONCH",
+                sourceId: id,
+                sourceNumber: resolved.phonchNo,
+              },
+            ];
 
-          if (resolved.totalDeliveryCharges > 0 || resolved.totalOtherExpense > 0) {
-            const showroomIncomeId = await getShowroomDeliveryIncomeAccountId(tx);
-            if (resolved.totalDeliveryCharges > 0) {
+            if (resolved.totalDeliveryCharges > 0 || resolved.totalOtherExpense > 0) {
+              const showroomIncomeId = await getShowroomDeliveryIncomeAccountId(tx);
+              if (resolved.totalDeliveryCharges > 0) {
+                lines.push({
+                  accountId: showroomIncomeId,
+                  debit: 0,
+                  credit: resolved.totalDeliveryCharges,
+                  description: `Phonch ${resolved.phonchNo} - Delivery Charges`,
+                  sourceType: "PHONCH",
+                  sourceId: id,
+                  sourceNumber: resolved.phonchNo,
+                });
+              }
+              if (resolved.totalOtherExpense > 0) {
+                lines.push({
+                  accountId: showroomIncomeId,
+                  debit: 0,
+                  credit: resolved.totalOtherExpense,
+                  description: `Phonch ${resolved.phonchNo} - Other Expense Recovery`,
+                  sourceType: "PHONCH",
+                  sourceId: id,
+                  sourceNumber: resolved.phonchNo,
+                });
+              }
+            }
+
+            if (resolved.totalClaim > 0) {
+              const claimRecoveryId = await getClaimRecoveryAccountId(tx);
               lines.push({
-                accountId: showroomIncomeId,
+                accountId: claimRecoveryId,
                 debit: 0,
-                credit: resolved.totalDeliveryCharges,
-                description: `Phonch ${resolved.phonchNo} - Delivery Charges`,
+                credit: resolved.totalClaim,
+                description: `Phonch ${resolved.phonchNo} - Claim Recovery`,
                 sourceType: "PHONCH",
                 sourceId: id,
                 sourceNumber: resolved.phonchNo,
               });
             }
-            if (resolved.totalOtherExpense > 0) {
-              lines.push({
-                accountId: showroomIncomeId,
-                debit: 0,
-                credit: resolved.totalOtherExpense,
-                description: `Phonch ${resolved.phonchNo} - Other Expense Recovery`,
-                sourceType: "PHONCH",
-                sourceId: id,
-                sourceNumber: resolved.phonchNo,
-              });
-            }
-          }
 
-          if (resolved.totalClaim > 0) {
-            const claimRecoveryId = await getClaimRecoveryAccountId(tx);
-            lines.push({
-              accountId: claimRecoveryId,
-              debit: 0,
-              credit: resolved.totalClaim,
-              description: `Phonch ${resolved.phonchNo} - Claim Recovery`,
-              sourceType: "PHONCH",
-              sourceId: id,
-              sourceNumber: resolved.phonchNo,
+            await tx.journalEntry.create({
+              data: {
+                entryDate: resolved.date,
+                referenceType: "PHONCH",
+                referenceId: id,
+                description,
+                createdById: currentUser.userId,
+                lines: { create: lines },
+              },
             });
           }
-
-          await tx.journalEntry.create({
-            data: {
-              entryDate: resolved.date,
-              referenceType: "PHONCH",
-              referenceId: id,
-              description,
-              createdById: currentUser.userId,
-              lines: { create: lines },
-            },
-          });
 
           const currentTotals = {
             phonchNo: current.phonchNo,

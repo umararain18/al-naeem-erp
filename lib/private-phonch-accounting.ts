@@ -272,10 +272,9 @@ export function resolvePrivatePhonchInput(data: PrivatePhonchInput): ResolvedPri
       );
     }
 
-    if (vTotalRent <= 0 && deliveryCharges <= 0 && carrierPayable <= 0) {
-      throw new PrivatePhonchValidationError(`${label}: Total Rent must be greater than zero`);
-    }
-
+    // A vehicle with Total Rent = Delivery Charges = Carrier Payable =
+    // 0 is a legitimate "record only" delivery line (every amount
+    // left blank) - never rejected here.
     totalRent = round2(totalRent + vTotalRent);
     totalDeliveryCharges = round2(totalDeliveryCharges + deliveryCharges);
     totalNetRent = round2(totalNetRent + netRent);
@@ -312,14 +311,12 @@ export function resolvePrivatePhonchInput(data: PrivatePhonchInput): ResolvedPri
     }
   }
 
-  // Previously "Total Rent must be greater than zero" - now a
-  // fully-paid-vehicle-only Private Phonch (Total Rent = 0 overall,
-  // Delivery Recovery > 0) is legitimate, so the guard widens to
-  // "must have SOME economic content", matching Showroom Phonch's own
-  // analogous "Total Phonch Amount must be greater than zero" check.
-  if (totalRent <= 0 && totalDeliveryRecovery <= 0) {
-    throw new PrivatePhonchValidationError("Private Phonch must have some Total Rent or Delivery Charges");
-  }
+  // A Private Phonch with every vehicle at Total Rent = Delivery
+  // Charges = 0 is a legitimate "record only" delivery (every amount
+  // left blank) - see the caller's own handling of
+  // resolved.totalRent === 0 && resolved.totalDeliveryCharges === 0,
+  // which posts NO JournalEntry at all for such a document rather
+  // than rejecting it outright.
 
   return {
     phonchNo: data.phonchNo.trim(),
@@ -1063,16 +1060,23 @@ export async function syncPrivatePhonchVehicleAmountsFromBill(
     });
   }
 
-  await tx.journalEntry.create({
-    data: {
-      entryDate: resolved.date,
-      referenceType: "PRIVATE_PHONCH",
-      referenceId: phonch.id,
-      description: transporterDescription,
-      createdById: params.userId,
-      lines: { create: lines },
-    },
-  });
+  // Skipped entirely when the Bill sync left this Private Phonch with
+  // no financial content at all (every vehicle now Total Rent =
+  // Delivery Charges = 0) - a "record only" document posts no
+  // JournalEntry (see this module's own resolvePrivatePhonchInput()
+  // doc comment).
+  if (lines.length > 0) {
+    await tx.journalEntry.create({
+      data: {
+        entryDate: resolved.date,
+        referenceType: "PRIVATE_PHONCH",
+        referenceId: phonch.id,
+        description: transporterDescription,
+        createdById: params.userId,
+        lines: { create: lines },
+      },
+    });
+  }
 
   return { phonchId: phonch.id, phonchNo: phonch.phonchNo, lineNo: targetVehicle.lineNo };
 }

@@ -171,10 +171,11 @@ export function resolvePhonchInput(data: PhonchInput): ResolvedPhonch {
     };
   });
 
+  // Total Amount = 0 is a legitimate "record only" delivery (every
+  // charge/expense/claim left blank) - see the caller's own handling
+  // of resolved.totalAmount === 0, which posts NO JournalEntry at all
+  // for such a Phonch rather than rejecting it outright.
   const totalAmount = round2(totalDeliveryCharges + totalOtherExpense + totalClaim);
-  if (totalAmount <= 0) {
-    throw new PhonchValidationError("Total Phonch Amount must be greater than zero");
-  }
 
   return {
     phonchNo: data.phonchNo.trim(),

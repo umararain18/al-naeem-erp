@@ -59,6 +59,7 @@ type PrivatePhonchDetail = {
   transporterParty: { id: string; partyName: string };
   vehicles: PrivatePhonchVehicle[];
   totals: { totalRent: number; totalDeliveryCharges: number; totalCarrierPayable: number; totalCaPayable: number };
+  isRecordOnly: boolean;
   transporterState: PaymentState;
   // Independent receivable (opposite polarity from transporterState's
   // own Carrier Rent Payable) - already computed server-side, never
@@ -317,25 +318,31 @@ export default function PrivatePhonchDetailPage({ params }: { params: Promise<{ 
           </div>
           <div>
             <div className="text-xs uppercase text-gray-500">Status</div>
-            <span
-              className={`mt-1 inline-block rounded-full px-2 py-0.5 text-xs font-medium ${
-                phonch.overallStatus === "CLEARED"
-                  ? "bg-green-50 text-green-700"
+            {phonch.isRecordOnly ? (
+              <span className="mt-1 inline-block rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium text-gray-600">
+                Record only
+              </span>
+            ) : (
+              <span
+                className={`mt-1 inline-block rounded-full px-2 py-0.5 text-xs font-medium ${
+                  phonch.overallStatus === "CLEARED"
+                    ? "bg-green-50 text-green-700"
+                    : phonch.overallStatus === "RECEIVABLE"
+                    ? "bg-blue-50 text-blue-700"
+                    : phonch.overallStatus === "MIXED"
+                    ? "bg-purple-50 text-purple-700"
+                    : "bg-amber-50 text-amber-700"
+                }`}
+              >
+                {phonch.overallStatus === "CLEARED"
+                  ? "Cleared"
                   : phonch.overallStatus === "RECEIVABLE"
-                  ? "bg-blue-50 text-blue-700"
+                  ? "Receivable"
                   : phonch.overallStatus === "MIXED"
-                  ? "bg-purple-50 text-purple-700"
-                  : "bg-amber-50 text-amber-700"
-              }`}
-            >
-              {phonch.overallStatus === "CLEARED"
-                ? "Cleared"
-                : phonch.overallStatus === "RECEIVABLE"
-                ? "Receivable"
-                : phonch.overallStatus === "MIXED"
-                ? "Mixed"
-                : "Payable"}
-            </span>
+                  ? "Mixed"
+                  : "Payable"}
+              </span>
+            )}
           </div>
         </div>
 

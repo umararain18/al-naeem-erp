@@ -129,6 +129,13 @@ export async function GET(request: NextRequest) {
         );
         const billSummary =
           phonchBillIds.size === 1 ? billSummaryById.get([...phonchBillIds][0]) || null : null;
+        // Record only - every vehicle's Total Rent AND Delivery
+        // Charges left blank (see lib/private-phonch-accounting.ts's
+        // resolvePrivatePhonchInput() doc comment) - no JournalEntry
+        // was posted for this Private Phonch at all.
+        const isRecordOnly =
+          p.vehicles.every((v) => Number(v.totalRent) <= 0.009) &&
+          p.vehicles.every((v) => Number(v.deliveryCharges) <= 0.009);
         const totalCarrierPayable = Math.round(p.vehicles.reduce((s, v) => s + Number(v.carrierPayable), 0) * 100) / 100;
         const totalCaPayable = Math.round(
           p.vehicles.reduce(
@@ -252,6 +259,7 @@ export async function GET(request: NextRequest) {
           vehicleNames,
           vehicleBillLabels,
           billSummary,
+          isRecordOnly,
           totalCarrierPayable,
           totalCaPayable,
           totalDeliveryRecovery,
@@ -532,16 +540,23 @@ export async function POST(request: NextRequest) {
             });
           }
 
-          await tx.journalEntry.create({
-            data: {
-              entryDate: resolved.date,
-              referenceType: "PRIVATE_PHONCH",
-              referenceId: createdPhonch.id,
-              description: transporterDescription,
-              createdById: currentUser.userId,
-              lines: { create: lines },
-            },
-          });
+          // A "record only" Private Phonch (every vehicle's Total
+          // Rent/Delivery Charges left blank) posts NO JournalEntry at
+          // all - `lines` is empty by construction (every push above
+          // is itself gated on a positive amount), so there is nothing
+          // to post and no accounting effect to record.
+          if (lines.length > 0) {
+            await tx.journalEntry.create({
+              data: {
+                entryDate: resolved.date,
+                referenceType: "PRIVATE_PHONCH",
+                referenceId: createdPhonch.id,
+                description: transporterDescription,
+                createdById: currentUser.userId,
+                lines: { create: lines },
+              },
+            });
+          }
 
           await auditCreate(tx, {
             actor: actorFromUser(currentUser),

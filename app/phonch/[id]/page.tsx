@@ -281,13 +281,19 @@ export default function PhonchDetailPage({ params }: { params: Promise<{ id: str
           </div>
           <div>
             <div className="text-xs uppercase text-gray-500">Status</div>
-            <span
-              className={`mt-1 inline-block rounded-full px-2 py-0.5 text-xs font-medium ${
-                phonch.status === "CLEARED" ? "bg-green-50 text-green-700" : "bg-amber-50 text-amber-700"
-              }`}
-            >
-              {phonch.status === "CLEARED" ? "Cleared / Received" : "Receivable"}
-            </span>
+            {phonch.totals.totalAmount <= 0.009 ? (
+              <span className="mt-1 inline-block rounded-full bg-gray-100 px-2 py-0.5 text-xs font-medium text-gray-600">
+                Record only
+              </span>
+            ) : (
+              <span
+                className={`mt-1 inline-block rounded-full px-2 py-0.5 text-xs font-medium ${
+                  phonch.status === "CLEARED" ? "bg-green-50 text-green-700" : "bg-amber-50 text-amber-700"
+                }`}
+              >
+                {phonch.status === "CLEARED" ? "Cleared / Received" : "Receivable"}
+              </span>
+            )}
           </div>
           {phonch.description && (
             <div className="md:col-span-4">
