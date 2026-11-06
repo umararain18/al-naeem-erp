@@ -18,6 +18,7 @@ import {
   getUnclaimedGrossBiltyReceivableAmountForCollectionBatch,
 } from "@/lib/gross-accounts";
 import { createSettlementPayment, SettlementPaymentError } from "@/lib/settlement-payments";
+import { getLedgerTruePaidAttributedAmount } from "@/lib/paid-attribution";
 import { resolveBiltyPaidResponsibleParty } from "@/lib/document-party-resolution";
 import { auditSettlement, auditUpdate, actorFromUser, requestContext } from "@/lib/audit-log";
 
@@ -459,22 +460,33 @@ export async function POST(
     //
     // Established here as a REAL safety net, every time Finalize
     // Settlement runs (not just when Collection/Carrier Rent also have
-    // something to post) - idempotent (skipped if a PAID row already
-    // exists for this Bilty) and re-checked fresh inside the
-    // transaction below before actually writing, same discipline as
-    // every other write in this route.
+    // something to post) - idempotent (skipped once the amount is
+    // ALREADY fully, ledger-truly attributed - never merely "a PAID
+    // row exists," which goes stale once Unsettle reverses the
+    // underlying entry without touching the row - see lib/paid-
+    // attribution.ts's own header comment) and re-checked fresh
+    // inside the transaction below before actually writing, same
+    // discipline as every other write in this route. Two shapes:
+    //   - noExistingRow: nothing was ever established for this Bilty -
+    //     createSettlementPayment() below creates the row AND the
+    //     entry together, exactly as before.
+    //   - a row exists (biltyId resolves a row) but its own ledger-
+    //     true attributed amount is still short of `advance` (fully
+    //     short, as in production, or - defensively - only partially)
+    //     - a direct correction entry closes the shortfall without
+    //     touching createSettlementPayment()'s own PAID_ALREADY_
+    //     ESTABLISHED guard, and syncs the row's own payerAccountId
+    //     if the resolved party has since changed.
     const paidEstablishmentCandidates: { biltyId: string; payerAccountId: string; amount: number }[] = [];
     for (const cb of challan.bilties) {
       const advance = round2(Number(cb.bilty.advance));
       if (advance <= 0) continue;
-      const existingPaidRow = await prisma.settlementPayment.findFirst({
-        where: { component: "PAID", biltyId: cb.biltyId, isActive: true },
-        select: { id: true },
-      });
-      if (existingPaidRow) continue;
       const resolved = await resolveBiltyPaidResponsibleParty(cb.biltyId, prisma);
       if (!resolved) continue; // genuinely unresolvable (never guessed) - left exactly as before
-      paidEstablishmentCandidates.push({ biltyId: cb.biltyId, payerAccountId: resolved.accountId, amount: advance });
+      const attributed = await getLedgerTruePaidAttributedAmount(prisma, cb.biltyId, advance);
+      const shortfall = round2(advance - attributed);
+      if (shortfall <= 0.009) continue; // already fully, ledger-truly attributed - nothing to do
+      paidEstablishmentCandidates.push({ biltyId: cb.biltyId, payerAccountId: resolved.accountId, amount: shortfall });
     }
     const anyPaidToEstablish = paidEstablishmentCandidates.length > 0;
 
@@ -700,21 +712,63 @@ export async function POST(
           // the already-established case here keeps this loop a true
           // no-op rather than a surfaced error on an ordinary retry).
           for (const candidate of paidEstablishmentCandidates) {
-            const stillUnestablished = await tx.settlementPayment.findFirst({
-              where: { component: "PAID", biltyId: candidate.biltyId, isActive: true },
-              select: { id: true },
+            const bilty = challan.bilties.find((cb) => cb.biltyId === candidate.biltyId)!.bilty;
+            const advance = round2(Number(bilty.advance));
+            // Re-check the ledger-true shortfall fresh, inside this
+            // SAME transaction, before writing (a concurrent Bilty
+            // edit or Daily Posting could have changed it since the
+            // pre-transaction read above).
+            const attributedNow = await getLedgerTruePaidAttributedAmount(tx, candidate.biltyId, advance);
+            const shortfall = round2(advance - attributedNow);
+            if (shortfall <= 0.009) continue;
+
+            const existingRow = await tx.settlementPayment.findFirst({
+              where: { component: "PAID", biltyId: candidate.biltyId },
+              select: { id: true, payerAccountId: true },
             });
-            if (stillUnestablished) continue;
-            await createSettlementPayment(
-              {
-                component: "PAID",
-                biltyId: candidate.biltyId,
-                payerAccountId: candidate.payerAccountId,
-                amount: candidate.amount,
+
+            if (!existingRow) {
+              // Nothing ever established for this Bilty - the normal
+              // path, creates the row AND the entry together.
+              await createSettlementPayment(
+                { component: "PAID", biltyId: candidate.biltyId, payerAccountId: candidate.payerAccountId, amount: shortfall, createdById: currentUser.userId },
+                tx
+              );
+              continue;
+            }
+
+            // A row already exists but its own ledger-true attribution
+            // is short (production Challan 6405 / Bilty 395: Unsettle
+            // reversed the original establishment without touching
+            // this row at all) - close the shortfall directly, tagged
+            // exactly like every other Paid-component entry (sourceType
+            // "BILTY"/sourceId:biltyId, referenceType/referenceId
+            // matching what lib/paid-attribution.ts's own ledger-true
+            // query already looks for), without going through
+            // createSettlementPayment()'s own PAID_ALREADY_ESTABLISHED
+            // guard (which exists to block a genuine SECOND row, not
+            // this re-establishment of the first).
+            const description = `Settlement Payment Correction - Bilty ${bilty.biltyNo} Paid - establishing ${shortfall} (ledger-true attribution was short)`;
+            await tx.journalEntry.create({
+              data: {
+                entryDate: new Date(),
+                referenceType: "SETTLEMENT_PAYMENT_CORRECTION",
+                referenceId: candidate.biltyId,
+                description,
                 createdById: currentUser.userId,
+                lines: {
+                  create: [
+                    { accountId: candidate.payerAccountId, debit: shortfall, credit: 0, description, sourceType: "BILTY", sourceId: candidate.biltyId, sourceNumber: bilty.biltyNo },
+                    { accountId: grossBiltyReceivableId, debit: 0, credit: shortfall, description, sourceType: "BILTY", sourceId: candidate.biltyId, sourceNumber: bilty.biltyNo },
+                  ],
+                },
               },
-              tx
-            );
+            });
+            // Keep the row's own bookkeeping in sync if the resolved
+            // party has changed since the row was first established.
+            if (existingRow.payerAccountId !== candidate.payerAccountId) {
+              await tx.settlementPayment.update({ where: { id: existingRow.id }, data: { payerAccountId: candidate.payerAccountId } });
+            }
           }
 
           const journalEntries = await Promise.all(

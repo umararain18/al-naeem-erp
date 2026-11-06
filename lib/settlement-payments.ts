@@ -13,6 +13,7 @@ import {
   getPartyNetFromSettlement,
 } from "@/lib/settlement-correction";
 import { getBiltyPaidVerification } from "@/lib/bilty-paid-verification";
+import { getPaidAccountNetBalances } from "@/lib/paid-attribution";
 
 // ============================================================
 // MULTI-PAYER / MULTI-COLLECTOR SETTLEMENT PAYMENT ENGINE
@@ -1765,51 +1766,16 @@ export interface ReassignPaidResponsibilityResult {
   amountMoved: number;
 }
 
-/**
- * Every account's own net balance (debit - credit) from PAID-
- * component-tagged JournalLines for this Bilty - establishment
- * (SETTLEMENT_PAYMENT), correction, reversal, or a prior
- * reassignment (PAID_RESPONSIBILITY_REASSIGNMENT). This is the SAME
- * referenceType scoping getBiltyPaidVerification() uses to find
- * "every account ever tagged by a PAID-component line" - just kept
- * per-account instead of merged into one Bilty-wide total, so a
- * caller can see exactly which account(s) still hold a stray balance
- * rather than only whether the Bilty as a whole is "verified".
- *
- * Used by reassignPaidResponsibility() (the OLD party's own entry)
- * and by scripts/scan-and-correct-party-mismatches.ts (every account
- * AT ALL, read-only, to find Bilties where a past reassignment moved the
- * SettlementPayment row's payerAccountId without ever posting the
- * matching reclassification entry - the exact shape of the bug this
- * function's own fix was written to close).
- */
-export async function getPaidAccountNetBalances(tx: Tx, biltyId: string): Promise<Map<string, number>> {
-  const paidTaggedLines = await tx.journalLine.findMany({
-    where: {
-      sourceType: "BILTY",
-      sourceId: biltyId,
-      OR: [
-        {
-          journalEntry: {
-            isDeleted: false,
-            referenceType: { in: ["SETTLEMENT_PAYMENT", "SETTLEMENT_PAYMENT_CORRECTION", "SETTLEMENT_PAYMENT_REVERSAL"] },
-            referenceId: biltyId,
-          },
-        },
-        {
-          journalEntry: { isDeleted: false, referenceType: "PAID_RESPONSIBILITY_REASSIGNMENT" },
-        },
-      ],
-    },
-    select: { accountId: true, debit: true, credit: true },
-  });
-  const byAccount = new Map<string, number>();
-  for (const line of paidTaggedLines) {
-    const prior = byAccount.get(line.accountId) || 0;
-    byAccount.set(line.accountId, round2(prior + Number(line.debit) - Number(line.credit)));
-  }
-  return byAccount;
-}
+// getPaidAccountNetBalances() / getLedgerTruePaidAttributedAmount()
+// now live in lib/paid-attribution.ts (a dependency-free leaf, so
+// lib/bilty-paid-verification.ts and lib/gross-accounts.ts can import
+// them too without a circular dependency - this file already imports
+// FROM lib/bilty-paid-verification.ts) - re-exported here so every
+// EXISTING caller of this module (reassignPaidResponsibility() below,
+// scripts/scan-and-correct-party-mismatches.ts) keeps working
+// unchanged. See that module's own header comment for the full
+// "ledger-true, not row-exists" rationale.
+export { getPaidAccountNetBalances, getLedgerTruePaidAttributedAmount } from "@/lib/paid-attribution";
 
 export async function reassignPaidResponsibility(
   tx: Tx,

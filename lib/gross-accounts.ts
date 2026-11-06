@@ -1,4 +1,5 @@
 import type { Prisma, PrismaClient } from "@prisma/client";
+import { getLedgerTruePaidAttributedAmountBatch } from "@/lib/paid-attribution";
 
 // ============================================================
 // GROSS / SUSPENSE SYSTEM ACCOUNTS
@@ -251,13 +252,15 @@ async function getBiltyPaidClaimOnGrossBatch(
   const biltiesWithAdvance = bilties.filter((b) => Number(b.advance) > 0);
   if (biltiesWithAdvance.length === 0) return result;
 
-  const paidRows = await tx.settlementPayment.findMany({
-    where: { component: "PAID", biltyId: { in: biltiesWithAdvance.map((b) => b.id) } },
-    select: { biltyId: true },
-  });
-  const hasPaidRow = new Set(paidRows.map((r) => r.biltyId));
+  // Ledger-true, not "a PAID row exists" - see lib/paid-attribution.ts's
+  // own header comment for why mere row existence goes stale once
+  // Unsettle reverses the underlying entry (production Challan 6405 /
+  // Bilty 395: the row still existed, but nothing was actually, truly
+  // moved out of Gross).
+  const paidAmountCapByBiltyId = new Map(biltiesWithAdvance.map((b) => [b.id, Number(b.advance)]));
+  const attributedByBiltyId = await getLedgerTruePaidAttributedAmountBatch(tx, paidAmountCapByBiltyId);
 
-  const stillInGross = biltiesWithAdvance.filter((b) => !hasPaidRow.has(b.id));
+  const stillInGross = biltiesWithAdvance.filter((b) => (attributedByBiltyId.get(b.id) || 0) < Number(b.advance) - 0.009);
   if (stillInGross.length === 0) return result;
 
   const dailyPostingLines = await tx.journalLine.findMany({
@@ -276,8 +279,9 @@ async function getBiltyPaidClaimOnGrossBatch(
   }
 
   for (const b of stillInGross) {
-    const grossVerified = Math.max(0, grossVerifiedByBiltyId.get(b.id) || 0);
-    result.set(b.id, Math.max(0, Number(b.advance) - grossVerified));
+    const remainingAfterAttribution = Math.max(0, Number(b.advance) - (attributedByBiltyId.get(b.id) || 0));
+    const grossVerified = Math.max(0, Math.min(remainingAfterAttribution, grossVerifiedByBiltyId.get(b.id) || 0));
+    result.set(b.id, Math.max(0, remainingAfterAttribution - grossVerified));
   }
 
   return result;

@@ -1,6 +1,7 @@
 import type { Prisma, PrismaClient } from "@prisma/client";
 import { resolveBiltyPaidResponsibleParty } from "@/lib/document-party-resolution";
 import { getGrossBiltyReceivableAccountId, getUnclaimedGrossBiltyReceivableTotalAmount } from "@/lib/gross-accounts";
+import { getLedgerTruePaidAttributedAmount, getLedgerTruePaidAttributedAmountBatch } from "@/lib/paid-attribution";
 
 // ============================================================
 // BILTY PAID -> VERIFIED ANC RECEIPT (derived, no new stored state)
@@ -216,13 +217,14 @@ export async function getBiltyPaidVerification(
   const isInconsistent = verifiedReceivedAmount > paidAmount + EPS;
   const unverifiedAmount = isInconsistent ? 0 : Math.max(0, round2(paidAmount - verifiedReceivedAmount));
 
+  // Ledger-true, not "a PAID row exists / isActive" - see
+  // lib/paid-attribution.ts's own header comment for why that row-
+  // level signal goes stale once Unsettle reverses the underlying
+  // entry (production Challan 6405 / Bilty 395).
   let isAttributed = paidAmount <= EPS;
   if (!isAttributed) {
-    const paidRow = await tx.settlementPayment.findFirst({
-      where: { component: "PAID", biltyId, isActive: true },
-      select: { id: true },
-    });
-    isAttributed = Boolean(paidRow);
+    const attributed = await getLedgerTruePaidAttributedAmount(tx, biltyId, paidAmount);
+    isAttributed = attributed >= paidAmount - EPS;
   }
 
   return {
@@ -377,14 +379,12 @@ export async function getBiltyPaidVerificationBatch(
     grossNetByBiltyId.set(line.sourceId, (grossNetByBiltyId.get(line.sourceId) || 0) + Number(line.credit) - Number(line.debit));
   }
 
-  // Real PAID SettlementPayment rows - same "isAttributed" check as
-  // getBiltyPaidVerification(), batched (one query for every Bilty
-  // instead of one per Bilty).
-  const paidRows = await tx.settlementPayment.findMany({
-    where: { component: "PAID", biltyId: { in: biltyIds }, isActive: true },
-    select: { biltyId: true },
-  });
-  const attributedBiltyIds = new Set(paidRows.map((r) => r.biltyId).filter((id): id is string => Boolean(id)));
+  // Ledger-true attribution, batched - same "isAttributed" check as
+  // getBiltyPaidVerification(), never "a PAID row exists / isActive"
+  // (see lib/paid-attribution.ts's own header comment for why that
+  // row-level signal goes stale once Unsettle reverses the underlying
+  // entry).
+  const attributedAmountByBiltyId = await getLedgerTruePaidAttributedAmountBatch(tx, paidAmountByBiltyId);
 
   for (const biltyId of biltyIds) {
     const paidAmount = paidAmountByBiltyId.get(biltyId) ?? 0;
@@ -396,7 +396,7 @@ export async function getBiltyPaidVerificationBatch(
 
     const isInconsistent = verifiedReceivedAmount > paidAmount + EPS;
     const unverifiedAmount = isInconsistent ? 0 : Math.max(0, round2(paidAmount - verifiedReceivedAmount));
-    const isAttributed = paidAmount <= EPS || attributedBiltyIds.has(biltyId);
+    const isAttributed = paidAmount <= EPS || (attributedAmountByBiltyId.get(biltyId) ?? 0) >= paidAmount - EPS;
 
     result.set(biltyId, {
       biltyId,
