@@ -209,6 +209,13 @@ function CarrierDrawer({ state, onClose, onSaved }: { state: { mode: "new" | "ed
   const [isActive, setIsActive] = useState(true);
   const [defaultPumpPartyId, setDefaultPumpPartyId] = useState("");
   const [defaultPaidFrom, setDefaultPaidFrom] = useState("");
+  const [driverMonthlySalary, setDriverMonthlySalary] = useState("");
+  const [driverMonthlySalaryEffectiveFrom, setDriverMonthlySalaryEffectiveFrom] = useState("");
+  const [avgKmPerLiter, setAvgKmPerLiter] = useState("");
+  const [tankCapacityLiters, setTankCapacityLiters] = useState("");
+  const [oilIssueThresholdKm, setOilIssueThresholdKm] = useState("");
+  const [oilIssueLitersAboveThreshold, setOilIssueLitersAboveThreshold] = useState("");
+  const [oilIssueLitersAtOrBelowThreshold, setOilIssueLitersAtOrBelowThreshold] = useState("");
   const [employees, setEmployees] = useState<{ id: string; name: string; employeeCode: string }[]>([]);
   const [parties, setParties] = useState<{ id: string; partyName: string }[]>([]);
   const [saving, setSaving] = useState(false);
@@ -237,6 +244,13 @@ function CarrierDrawer({ state, onClose, onSaved }: { state: { mode: "new" | "ed
       setIsActive(true);
       setDefaultPumpPartyId("");
       setDefaultPaidFrom("");
+      setDriverMonthlySalary("");
+      setDriverMonthlySalaryEffectiveFrom("");
+      setAvgKmPerLiter("");
+      setTankCapacityLiters("");
+      setOilIssueThresholdKm("");
+      setOilIssueLitersAboveThreshold("");
+      setOilIssueLitersAtOrBelowThreshold("");
     } else if (state.id) {
       (async () => {
         const res = await fetch(`/api/own-carrier/${state.id}`);
@@ -251,6 +265,13 @@ function CarrierDrawer({ state, onClose, onSaved }: { state: { mode: "new" | "ed
           setIsActive(c.isActive);
           setDefaultPumpPartyId(c.defaultPumpPartyId || "");
           setDefaultPaidFrom(c.defaultPaidFrom || "");
+          setDriverMonthlySalary(c.driverMonthlySalary != null ? String(c.driverMonthlySalary) : "");
+          setDriverMonthlySalaryEffectiveFrom(c.driverMonthlySalaryEffectiveFrom ? String(c.driverMonthlySalaryEffectiveFrom).slice(0, 10) : "");
+          setAvgKmPerLiter(c.avgKmPerLiter != null ? String(c.avgKmPerLiter) : "");
+          setTankCapacityLiters(c.tankCapacityLiters != null ? String(c.tankCapacityLiters) : "");
+          setOilIssueThresholdKm(c.oilIssueThresholdKm != null ? String(c.oilIssueThresholdKm) : "");
+          setOilIssueLitersAboveThreshold(c.oilIssueLitersAboveThreshold != null ? String(c.oilIssueLitersAboveThreshold) : "");
+          setOilIssueLitersAtOrBelowThreshold(c.oilIssueLitersAtOrBelowThreshold != null ? String(c.oilIssueLitersAtOrBelowThreshold) : "");
         }
       })();
     }
@@ -272,6 +293,13 @@ function CarrierDrawer({ state, onClose, onSaved }: { state: { mode: "new" | "ed
         currentDriverId: currentDriverId || null,
         defaultPumpPartyId: defaultPumpPartyId || null,
         defaultPaidFrom: defaultPaidFrom || null,
+        driverMonthlySalary: driverMonthlySalary.trim() ? Number(driverMonthlySalary) : null,
+        driverMonthlySalaryEffectiveFrom: driverMonthlySalaryEffectiveFrom || null,
+        avgKmPerLiter: avgKmPerLiter.trim() ? Number(avgKmPerLiter) : null,
+        tankCapacityLiters: tankCapacityLiters.trim() ? Number(tankCapacityLiters) : null,
+        oilIssueThresholdKm: oilIssueThresholdKm.trim() ? Number(oilIssueThresholdKm) : null,
+        oilIssueLitersAboveThreshold: oilIssueLitersAboveThreshold.trim() ? Number(oilIssueLitersAboveThreshold) : null,
+        oilIssueLitersAtOrBelowThreshold: oilIssueLitersAtOrBelowThreshold.trim() ? Number(oilIssueLitersAtOrBelowThreshold) : null,
         ...(state?.mode === "edit" ? { isActive } : {}),
       };
       const url = state?.mode === "edit" ? `/api/own-carrier/${state.id}` : "/api/own-carrier";
@@ -329,6 +357,50 @@ function CarrierDrawer({ state, onClose, onSaved }: { state: { mode: "new" | "ed
                 <option value="OFFICE">Office Account</option>
                 <option value="UDHAAR">Udhaar</option>
               </select>
+            </div>
+          </div>
+        </div>
+        <div className="border-t pt-4">
+          <p className="mb-3 text-xs font-semibold uppercase tracking-wide text-gray-400">Driver Salary Allocation</p>
+          <div className="space-y-4">
+            <div>
+              <label className="mb-1 block text-xs font-medium text-gray-600">Monthly Salary (Rs.)</label>
+              <input type="number" min="0" step="0.01" value={driverMonthlySalary} onChange={(e) => setDriverMonthlySalary(e.target.value)} placeholder="Not set" className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
+              <p className="mt-1 text-xs text-gray-400">No history is kept - editing this replaces the value used for every future Trip Close, regardless of that Trip&apos;s own dates.</p>
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-gray-600">Effective From (informational only)</label>
+              <input type="date" value={driverMonthlySalaryEffectiveFrom} onChange={(e) => setDriverMonthlySalaryEffectiveFrom(e.target.value)} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
+            </div>
+          </div>
+        </div>
+        <div className="border-t pt-4">
+          <p className="mb-3 text-xs font-semibold uppercase tracking-wide text-gray-400">Diesel efficiency (reference only)</p>
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="mb-1 block text-xs font-medium text-gray-600">Avg KM / Liter</label>
+              <input type="number" min="0" step="0.01" value={avgKmPerLiter} onChange={(e) => setAvgKmPerLiter(e.target.value)} placeholder="Not set" className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-gray-600">Tank Capacity (L)</label>
+              <input type="number" min="0" step="0.01" value={tankCapacityLiters} onChange={(e) => setTankCapacityLiters(e.target.value)} placeholder="Not set" className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
+            </div>
+          </div>
+        </div>
+        <div className="border-t pt-4">
+          <p className="mb-3 text-xs font-semibold uppercase tracking-wide text-gray-400">Engine Oil issue thresholds (defaults: 400 KM / 14 L / 7 L)</p>
+          <div className="grid grid-cols-3 gap-4">
+            <div>
+              <label className="mb-1 block text-xs font-medium text-gray-600">Threshold (KM)</label>
+              <input type="number" min="0" step="0.01" value={oilIssueThresholdKm} onChange={(e) => setOilIssueThresholdKm(e.target.value)} placeholder="400" className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-gray-600">Liters (&gt; threshold)</label>
+              <input type="number" min="0" step="0.01" value={oilIssueLitersAboveThreshold} onChange={(e) => setOilIssueLitersAboveThreshold(e.target.value)} placeholder="14" className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-gray-600">Liters (&le; threshold)</label>
+              <input type="number" min="0" step="0.01" value={oilIssueLitersAtOrBelowThreshold} onChange={(e) => setOilIssueLitersAtOrBelowThreshold(e.target.value)} placeholder="7" className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
             </div>
           </div>
         </div>

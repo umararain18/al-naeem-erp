@@ -68,6 +68,15 @@ const lineSchema = z.object({
   sourceId: z.string().optional(),
 
   sourceNumber: z.string().optional(),
+
+  // Engine Oil Stock purchase lines only (see lib/own-carrier.ts's
+  // getOrCreateEngineOilStockAccountId) - stored on the COUNTER line
+  // (never the main Cash/Bank line), validated against that specific
+  // account below. ratePerLiter is informational (amount is always
+  // the one real posted value, same precedent as CarrierTripLine's
+  // own Diesel isDiesel/liters/ratePerLiter fields).
+  liters: z.number().positive().optional(),
+  ratePerLiter: z.number().positive().optional(),
 });
 
 const dailyPostingSchema = z.object({
@@ -1235,6 +1244,9 @@ export async function POST(request: NextRequest) {
           sourceType: line.sourceType || "DIRECT",
           sourceId: line.sourceId || null,
           sourceNumber: line.sourceNumber || null,
+          // Only ever meaningful (and only ever stored) on the COUNTER
+          // line - the main Cash/Bank line never carries a quantity.
+          ...(line.liters != null ? { liters: line.liters, ratePerLiter: line.ratePerLiter ?? null } : {}),
         },
       ];
     }

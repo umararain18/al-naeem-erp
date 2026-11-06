@@ -37,6 +37,11 @@ type Trip = {
   dateTo: string | null;
   notes: string | null;
   status: "OPEN" | "CLOSED";
+  // Raw Prisma Decimal passthrough - a numeric string, same as every
+  // other Decimal field on this raw `trip` object (never pre-
+  // converted server-side here, unlike derived report figures
+  // elsewhere in this file).
+  distanceKm: string | null;
   carrier: {
     id: string;
     carrierNumber: string;
@@ -47,6 +52,15 @@ type Trip = {
     currentDriverId: string | null;
     currentDriver: { id: string; name: string } | null;
   };
+};
+
+// Engine Oil issue preview for the Close confirmation flow (Own
+// Carrier Part 3) - see the GET route's own comment for exactly what
+// this is (a PREVIEW only; the server recomputes independently at
+// actual Close time).
+type ClosePreview = {
+  suggestedOilLiters: number | null;
+  oilStock: { liters: number; valueRs: number; avgRatePerLiter: number | null };
 };
 
 type DocumentLink = {
@@ -300,6 +314,7 @@ export default function CarrierTripDetailPage() {
   const [documents, setDocuments] = useState<DocumentLink[]>([]);
   const [cashBook, setCashBook] = useState<CashBook | null>(null);
   const [capabilities, setCapabilities] = useState({ canEdit: false, canBin: false, canCloseReopen: false });
+  const [closePreview, setClosePreview] = useState<ClosePreview | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [refreshToken, setRefreshToken] = useState(0);
@@ -456,6 +471,7 @@ export default function CarrierTripDetailPage() {
       setTrip(data.trip);
       setDocuments(data.documents || []);
       setCashBook(data.cashBook);
+      setClosePreview(data.closePreview || null);
       setCapabilities(data.capabilities || { canEdit: false, canBin: false, canCloseReopen: false });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unable to load Trip");
@@ -520,6 +536,26 @@ export default function CarrierTripDetailPage() {
     refresh();
   }
 
+  async function submitStatusChange(nextStatus: "OPEN" | "CLOSED", extra?: Record<string, unknown>) {
+    const res = await fetch(`/api/own-carrier/${carrierId}/trips/${tripId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status: nextStatus, ...extra }),
+    });
+    const data = await res.json();
+    if (!res.ok && data.code === "OIL_STOCK_INSUFFICIENT") {
+      if (window.confirm(`${data.message}\n\nOK = issue anyway, Cancel = go back and adjust the liters.`)) {
+        return submitStatusChange(nextStatus, { ...extra, confirmInsufficientOilStock: true });
+      }
+      return;
+    }
+    if (!res.ok || !data.success) {
+      alert(data.message || "Unable to update Trip status.");
+      return;
+    }
+    refresh();
+  }
+
   async function toggleStatus() {
     if (!trip) return;
     const nextStatus = trip.status === "OPEN" ? "CLOSED" : "OPEN";
@@ -528,18 +564,35 @@ export default function CarrierTripDetailPage() {
         `Reopen Trip ${trip.tripNo}? Its Close entries (Carrier Rent recognition + Expense clearing) will be removed - re-close this Trip afterward to post them fresh.`
       );
       if (!confirmed) return;
+      return submitStatusChange(nextStatus);
     }
-    const res = await fetch(`/api/own-carrier/${carrierId}/trips/${tripId}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ status: nextStatus }),
-    });
-    const data = await res.json();
-    if (!res.ok || !data.success) {
-      alert(data.message || "Unable to update Trip status.");
-      return;
+
+    // CLOSING - Engine Oil issue (Own Carrier Part 3): only prompted
+    // when this Trip's own distanceKm produced a suggestion. The
+    // suggested value is PRE-FILLED and editable (per spec's own
+    // "user can edit liters") - clearing the box entirely skips
+    // issuing oil for this Trip.
+    let oilIssueLiters: number | undefined;
+    if (closePreview?.suggestedOilLiters != null) {
+      const stockLabel = `current stock: ${closePreview.oilStock.liters} L${closePreview.oilStock.avgRatePerLiter != null ? ` @ Rs. ${closePreview.oilStock.avgRatePerLiter}/L` : " (no rate established yet)"}`;
+      const input = window.prompt(
+        `Issue Engine Oil for this Trip? Suggested: ${closePreview.suggestedOilLiters} L (${stockLabel}).\n\nEdit the liters below, or clear the box to skip issuing oil. Cancel aborts Close entirely.`,
+        String(closePreview.suggestedOilLiters)
+      );
+      if (input === null) return; // Cancel - abort Close entirely, same as every other confirm() in this file.
+      if (input.trim()) {
+        const liters = Number(input);
+        if (!Number.isFinite(liters) || liters < 0) {
+          alert("Invalid liters value.");
+          return;
+        }
+        oilIssueLiters = liters;
+      } else {
+        oilIssueLiters = 0;
+      }
     }
-    refresh();
+
+    return submitStatusChange(nextStatus, oilIssueLiters !== undefined ? { oilIssueLiters } : undefined);
   }
 
   // ------------------------------------------------------------
@@ -2360,6 +2413,7 @@ function EditTripDrawer({
   const [notes, setNotes] = useState(trip.notes || "");
   const [dateFrom, setDateFrom] = useState(toYMD(trip.dateFrom));
   const [dateTo, setDateTo] = useState(trip.dateTo ? toYMD(trip.dateTo) : "");
+  const [distanceKm, setDistanceKm] = useState(trip.distanceKm || "");
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
@@ -2378,6 +2432,7 @@ function EditTripDrawer({
       notes: notes.trim() || null,
       dateFrom,
       dateTo: dateTo || null,
+      distanceKm: distanceKm.toString().trim() ? Number(distanceKm) : null,
     };
     try {
       setSaving(true);
@@ -2434,6 +2489,11 @@ function EditTripDrawer({
         <div>
           <label className="mb-1 block text-xs font-medium text-gray-600">Notes</label>
           <textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={3} className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
+        </div>
+        <div>
+          <label className="mb-1 block text-xs font-medium text-gray-600">Distance (KM)</label>
+          <input type="number" min="0" step="0.01" value={distanceKm} onChange={(e) => setDistanceKm(e.target.value)} placeholder="Not set" className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500" />
+          <p className="mt-1 text-xs text-gray-400">Drives the Engine Oil issue suggestion at Close - editable there too.</p>
         </div>
         <div className="flex justify-end gap-2 pt-2">
           <button type="button" onClick={onClose} className="rounded-lg border px-4 py-2 text-sm hover:bg-gray-50">
@@ -2579,6 +2639,9 @@ type ProfitReport = {
   totalCarrierRent: number;
   totalBookingIncome: number;
   expenses: { lineId: string; lineType: string; category: string | null; description: string; amount: number; isDiesel: boolean }[];
+  salaryShare: number;
+  oilIssueAmount: number;
+  oilIssueLiters: number | null;
   totalCarrierExpense: number;
   totalDiesel: number;
   categoryBreakdown: { category: string; amount: number }[];
@@ -2659,7 +2722,7 @@ function ProfitReportDrawer({ carrierId, tripId, onClose }: { carrierId: string;
           )}
 
           <div>
-            <h4 className="mb-2 font-semibold text-gray-700">Carrier Expense (diesel + expenses + driver salary)</h4>
+            <h4 className="mb-2 font-semibold text-gray-700">Carrier Expense (diesel + expenses + driver salary share + oil issued)</h4>
             {report.expenses.length === 0 ? (
               <p className="text-gray-500">No expenses recorded.</p>
             ) : (
@@ -2673,6 +2736,24 @@ function ProfitReportDrawer({ carrierId, tripId, onClose }: { carrierId: string;
                     <span className="font-medium">Rs. {formatMoney(e.amount)}</span>
                   </div>
                 ))}
+              </div>
+            )}
+            {report.salaryShare > 0 && (
+              <div className="mt-1 flex justify-between">
+                <span className="text-gray-600">
+                  <span className="mr-1.5 inline-block rounded bg-purple-50 px-1.5 py-0.5 text-[11px] font-medium text-purple-700">Salary</span>
+                  Driver Salary accrual (this Trip&apos;s own day share)
+                </span>
+                <span className="font-medium">Rs. {formatMoney(report.salaryShare)}</span>
+              </div>
+            )}
+            {report.oilIssueAmount > 0 && (
+              <div className="mt-1 flex justify-between">
+                <span className="text-gray-600">
+                  <span className="mr-1.5 inline-block rounded bg-sky-50 px-1.5 py-0.5 text-[11px] font-medium text-sky-700">Oil</span>
+                  Engine Oil issued{report.oilIssueLiters != null ? ` (${report.oilIssueLiters} L)` : ""}
+                </span>
+                <span className="font-medium">Rs. {formatMoney(report.oilIssueAmount)}</span>
               </div>
             )}
             {report.categoryBreakdown.length > 0 && (

@@ -3,7 +3,16 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
-import { getTripCashBook, closeCarrierTrip, reopenCarrierTrip, getDocumentOutstandingAmount, validateTripDateRangeChange, CarrierTripError } from "@/lib/carrier-trip";
+import {
+  getTripCashBook,
+  closeCarrierTrip,
+  reopenCarrierTrip,
+  getDocumentOutstandingAmount,
+  validateTripDateRangeChange,
+  suggestEngineOilIssueLiters,
+  CarrierTripError,
+} from "@/lib/carrier-trip";
+import { getEngineOilStockState } from "@/lib/own-carrier";
 import { auditUpdate, auditDelete, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 
 async function loadDocumentLabels(
@@ -73,6 +82,9 @@ export async function GET(
             defaultPumpParty: { select: { id: true, partyName: true } },
             currentDriverId: true,
             currentDriver: { select: { id: true, name: true } },
+            oilIssueThresholdKm: true,
+            oilIssueLitersAboveThreshold: true,
+            oilIssueLitersAtOrBelowThreshold: true,
           },
         },
         documents: { where: { unlinkedAt: null }, orderBy: { linkedAt: "asc" } },
@@ -94,16 +106,34 @@ export async function GET(
       });
     }
 
-    const [documents, cashBook] = await Promise.all([
+    const [documents, cashBook, oilStock] = await Promise.all([
       loadDocumentLabels(trip.documents),
       getTripCashBook(prisma, tripId),
+      getEngineOilStockState(prisma),
     ]);
+
+    // Engine Oil issue preview for the Close confirmation dialog (Own
+    // Carrier Part 3) - the SAME suggestion recognizeCarrierTripOilIssue
+    // would compute server-side at actual Close time, surfaced here
+    // purely so the UI can show/let the user edit it BEFORE
+    // confirming. Null when this Trip has no distanceKm set - the UI
+    // then shows no oil section at all unless the user types one in.
+    const distanceKm = trip.distanceKm != null ? Number(trip.distanceKm) : null;
+    const suggestedOilLiters =
+      distanceKm != null && distanceKm > 0
+        ? suggestEngineOilIssueLiters(distanceKm, {
+            oilIssueThresholdKm: trip.carrier.oilIssueThresholdKm != null ? Number(trip.carrier.oilIssueThresholdKm) : null,
+            oilIssueLitersAboveThreshold: trip.carrier.oilIssueLitersAboveThreshold != null ? Number(trip.carrier.oilIssueLitersAboveThreshold) : null,
+            oilIssueLitersAtOrBelowThreshold: trip.carrier.oilIssueLitersAtOrBelowThreshold != null ? Number(trip.carrier.oilIssueLitersAtOrBelowThreshold) : null,
+          })
+        : null;
 
     return NextResponse.json({
       success: true,
       trip: { ...trip, documents: undefined },
       documents,
       cashBook,
+      closePreview: { suggestedOilLiters, oilStock },
       capabilities: {
         canEdit: hasPermission(currentUser, "ownCarrier.edit") && trip.status === "OPEN",
         canBin: hasPermission(currentUser, "ownCarrier.bin"),
@@ -159,7 +189,7 @@ export async function PATCH(
     // happens - but no OTHER field may change in the same request
     // while still closed, so a reopen is always a deliberate,
     // separate step before any data edit, never an implicit side effect.
-    const isEditingDetails = ["tripNo", "route", "notes", "dateFrom", "dateTo"].some((k) => body[k] !== undefined);
+    const isEditingDetails = ["tripNo", "route", "notes", "dateFrom", "dateTo", "distanceKm"].some((k) => body[k] !== undefined);
     if (existing.status === "CLOSED" && isEditingDetails) {
       return NextResponse.json(
         { success: false, message: "This Trip is closed - reopen it first (pehle reopen karein) before editing its details." },
@@ -187,6 +217,17 @@ export async function PATCH(
 
     if (body.route !== undefined) updateData.route = body.route?.trim() || null;
     if (body.notes !== undefined) updateData.notes = body.notes?.trim() || null;
+    if (body.distanceKm !== undefined) {
+      if (body.distanceKm === null || body.distanceKm === "") {
+        updateData.distanceKm = null;
+      } else {
+        const km = Number(body.distanceKm);
+        if (!Number.isFinite(km) || km < 0) {
+          return NextResponse.json({ success: false, message: "Distance KM must be a non-negative number" }, { status: 400 });
+        }
+        updateData.distanceKm = km;
+      }
+    }
     if (body.dateFrom !== undefined) {
       const dateFrom = new Date(`${body.dateFrom}T00:00:00`);
       if (Number.isNaN(dateFrom.getTime())) {
@@ -258,7 +299,12 @@ export async function PATCH(
         let updatedTrip = await tx.carrierTrip.findUniqueOrThrow({ where: { id: tripId } });
 
         if (targetStatus === "CLOSED") {
-          updatedTrip = await closeCarrierTrip(tx, { tripId, updatedById: currentUser.userId });
+          updatedTrip = await closeCarrierTrip(tx, {
+            tripId,
+            updatedById: currentUser.userId,
+            oilIssueLiters: body.oilIssueLiters != null ? Number(body.oilIssueLiters) : undefined,
+            confirmInsufficientOilStock: Boolean(body.confirmInsufficientOilStock),
+          });
         } else if (targetStatus === "OPEN") {
           updatedTrip = await reopenCarrierTrip(tx, { tripId, updatedById: currentUser.userId, reason: body.reason });
         }
@@ -291,7 +337,7 @@ export async function PATCH(
         return NextResponse.json({ success: false, message: "This Trip No. already exists for this carrier" }, { status: 409 });
       }
       if (error instanceof CarrierTripError) {
-        return NextResponse.json({ success: false, message: error.message }, { status: 400 });
+        return NextResponse.json({ success: false, code: error.code, message: error.message }, { status: 400 });
       }
       throw error;
     }

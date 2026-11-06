@@ -57,6 +57,14 @@ type PostingLine = {
   sourceType: string;
   sourceId: string;
   sourceNumber: string;
+  // Engine Oil Stock lines only (counterAccountId's own account has
+  // accountCode "ENGINE-OIL-STOCK") - liters + Rate/Liter, auto-
+  // computing `amount` (mirrors the Diesel UX already established on
+  // the Own Carrier Trip page's own quick-entry row). Blank/unused on
+  // every other account - never sent to the server in that case (see
+  // buildLinePayload).
+  liters: string;
+  ratePerLiter: string;
   // Client-side only - not sent to the server. Tracks the party
   // auto-resolved from the selected document ("" = none), purely
   // so the UI can show "Resolved Party: X" / explain why Counter
@@ -108,6 +116,13 @@ function isDocumentNumberExemptAccount(
   );
 }
 
+const ENGINE_OIL_STOCK_ACCOUNT_CODE = "ENGINE-OIL-STOCK";
+
+function isEngineOilStockAccount(accounts: Account[], accountId: string): boolean {
+  if (!accountId) return false;
+  return accounts.find((a) => a.id === accountId)?.accountCode === ENGINE_OIL_STOCK_ACCOUNT_CODE;
+}
+
 function createLine(): PostingLine {
   return {
     id: crypto.randomUUID(),
@@ -118,6 +133,8 @@ function createLine(): PostingLine {
     sourceType: "DIRECT",
     sourceId: "",
     sourceNumber: "",
+    liters: "",
+    ratePerLiter: "",
     resolvedPartyLabel: "",
     eligibleParties: [],
   };
@@ -145,6 +162,10 @@ function validatePostingLine(line: PostingLine, accounts: Account[]): string | n
 
   if (!line.amount || Number(line.amount) <= 0) {
     return "Please enter a valid amount.";
+  }
+
+  if (isEngineOilStockAccount(accounts, line.counterAccountId) && (!line.liters || Number(line.liters) <= 0)) {
+    return "Please enter Liters for this Engine Oil Stock line.";
   }
 
   if (
@@ -195,6 +216,8 @@ type ExistingJournalLine = {
   sourceType: string | null;
   sourceId: string | null;
   sourceNumber: string | null;
+  liters: number | null;
+  ratePerLiter: number | null;
 };
 
 type ExistingJournalEntry = {
@@ -251,6 +274,9 @@ type ExistingCounterLine = {
   sourceType: string;
   sourceId: string | null;
   sourceNumber: string;
+  // Engine Oil Stock lines only - see PostingLine.liters's own comment.
+  liters: number | null;
+  ratePerLiter: number | null;
 };
 
 // ONE row = ONE Daily Posting JournalEntry (one logical transaction),
@@ -350,6 +376,8 @@ function buildExistingRow(entry: ExistingJournalEntry): ExistingRow {
     sourceType: l.sourceType || "DIRECT",
     sourceId: l.sourceId,
     sourceNumber: l.sourceNumber || "",
+    liters: l.liters != null ? Number(l.liters) : null,
+    ratePerLiter: l.ratePerLiter != null ? Number(l.ratePerLiter) : null,
   }));
 
   return {
@@ -583,15 +611,60 @@ function LineFieldsCells({
       </td>
 
       <td className="px-4 py-4">
-        <input
-          type="number"
-          min="0"
-          step="0.01"
-          value={line.amount}
-          onChange={(e) => onUpdate("amount", e.target.value)}
-          placeholder="0.00"
-          className="w-36 rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
-        />
+        {isEngineOilStockAccount(accounts, line.counterAccountId) ? (
+          <div className="flex gap-1.5">
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              value={line.liters}
+              onChange={(e) => {
+                const liters = e.target.value;
+                onUpdate("liters", liters);
+                const rate = Number(line.ratePerLiter);
+                const litersNum = Number(liters);
+                if (rate > 0 && litersNum > 0) onUpdate("amount", String(Math.round(rate * litersNum * 100) / 100));
+              }}
+              placeholder="Liters"
+              className="w-20 rounded-lg border border-gray-300 px-2 py-2 text-sm outline-none focus:border-blue-500"
+            />
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              value={line.ratePerLiter}
+              onChange={(e) => {
+                const rate = e.target.value;
+                onUpdate("ratePerLiter", rate);
+                const rateNum = Number(rate);
+                const litersNum = Number(line.liters);
+                if (rateNum > 0 && litersNum > 0) onUpdate("amount", String(Math.round(rateNum * litersNum * 100) / 100));
+              }}
+              placeholder="Rate/L"
+              className="w-20 rounded-lg border border-gray-300 px-2 py-2 text-sm outline-none focus:border-blue-500"
+            />
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              value={line.amount}
+              onChange={(e) => onUpdate("amount", e.target.value)}
+              placeholder="0.00"
+              title="Amount (auto-computed from Liters × Rate/Liter - editable)"
+              className="w-24 rounded-lg border border-gray-300 px-2 py-2 text-sm outline-none focus:border-blue-500"
+            />
+          </div>
+        ) : (
+          <input
+            type="number"
+            min="0"
+            step="0.01"
+            value={line.amount}
+            onChange={(e) => onUpdate("amount", e.target.value)}
+            placeholder="0.00"
+            className="w-36 rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
+          />
+        )}
       </td>
     </>
   );
@@ -921,6 +994,9 @@ export default function DailyPostingPage() {
             line.sourceId.trim() || undefined,
           sourceNumber:
             line.sourceNumber.trim() || undefined,
+          ...(isEngineOilStockAccount(accounts, line.counterAccountId) && line.liters
+            ? { liters: Number(line.liters), ratePerLiter: line.ratePerLiter ? Number(line.ratePerLiter) : undefined }
+            : {}),
         })),
       };
 
@@ -1004,6 +1080,8 @@ export default function DailyPostingPage() {
           sourceType: cl.sourceType,
           sourceId: cl.sourceId || "",
           sourceNumber: cl.sourceNumber,
+          liters: cl.liters != null ? String(cl.liters) : "",
+          ratePerLiter: cl.ratePerLiter != null ? String(cl.ratePerLiter) : "",
           resolvedPartyLabel: cl.counterLabel,
           eligibleParties: [],
         })),
@@ -1113,6 +1191,9 @@ export default function DailyPostingPage() {
       sourceType: line.sourceType,
       sourceId: line.sourceId.trim() || undefined,
       sourceNumber: line.sourceNumber.trim() || undefined,
+      ...(isEngineOilStockAccount(accounts, line.counterAccountId) && line.liters
+        ? { liters: Number(line.liters), ratePerLiter: line.ratePerLiter ? Number(line.ratePerLiter) : undefined }
+        : {}),
     }));
   }
 

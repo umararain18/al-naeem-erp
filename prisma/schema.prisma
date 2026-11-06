@@ -51,6 +51,7 @@ model User {
   updatedCarrierTrips          CarrierTrip[]         @relation("CarrierTripUpdatedBy")
   deletedCarrierTrips          CarrierTrip[]         @relation("CarrierTripDeletedBy")
   linkedCarrierTripDocuments   CarrierTripDocument[] @relation("CarrierTripDocumentLinkedBy")
+  createdCarrierSalaryMonthAllocations CarrierSalaryMonthAllocation[] @relation("CarrierSalaryMonthAllocationCreatedBy")
   unlinkedCarrierTripDocuments CarrierTripDocument[] @relation("CarrierTripDocumentUnlinkedBy")
   createdCarrierTripLines      CarrierTripLine[]     @relation("CarrierTripLineCreatedBy")
   deletedCarrierTripLines      CarrierTripLine[]     @relation("CarrierTripLineDeletedBy")
@@ -209,6 +210,10 @@ model Account {
   // shot (Dr Carrier Profit / Cr Trip in Progress). Driver Cash/
   // vendor/office sides of each expense line are unchanged.
   ownCarrierTripInProgressId  String?             @unique
+  // 1:1 with OwnCarrier's own dedicated "<carrier> — Driver Salary
+  // Payable" account (LIABILITY/EMPLOYEE_PAYABLE) - see that field's
+  // own schema comment on OwnCarrier.salaryPayableAccount.
+  ownCarrierSalaryPayableId   String?             @unique
   createdAt                   DateTime            @default(now())
   updatedAt                   DateTime            @updatedAt
   parent                      Account?            @relation("AccountHierarchy", fields: [parentId], references: [id], onDelete: Restrict)
@@ -218,6 +223,7 @@ model Account {
   ownCarrier                  OwnCarrier?         @relation("OwnCarrierDriverCashAccount", fields: [ownCarrierId], references: [id])
   ownCarrierIncomeFor         OwnCarrier?         @relation("OwnCarrierIncomeAccount", fields: [ownCarrierIncomeId], references: [id])
   ownCarrierTripInProgressFor OwnCarrier?         @relation("OwnCarrierTripInProgressAccount", fields: [ownCarrierTripInProgressId], references: [id])
+  ownCarrierSalaryPayableFor  OwnCarrier?         @relation("OwnCarrierSalaryPayableAccount", fields: [ownCarrierSalaryPayableId], references: [id])
   ledgerEntries               JournalLine[]
   settlementPayments          SettlementPayment[]
   carrierTripExpenseLines     CarrierTripLine[]   @relation("CarrierTripLineExpenseAccount")
@@ -348,6 +354,7 @@ model JournalEntry {
   settledChallans   Challan[]          @relation("ChallanSettlement")
   settlementPayment SettlementPayment?
   carrierTripLine   CarrierTripLine?
+  carrierSalaryMonthAllocation CarrierSalaryMonthAllocation?
 
   // Nullable, additive self-reference: when THIS entry is itself a
   // reversal (e.g. referenceType "SETTLEMENT_UNSETTLE_REVERSAL" - see
@@ -394,6 +401,17 @@ model JournalLine {
   sourceId           String?
   sourceNumber       String?
   sourceType         String?
+  // Engine Oil Stock lines only (sourceType "ENGINE_OIL") - the
+  // quantity side of a purchase (Daily Posting, Dr this line) or an
+  // issue (Trip CLOSE, Cr this line). Current stock liters and the
+  // moving weighted-average rate are both derived straight from
+  // these two columns across every live line on the Engine Oil Stock
+  // account - never a separate inventory table. Mirrors
+  // CarrierTripLine.liters/ratePerLiter's own Diesel precedent, one
+  // level down (the ledger line itself, since an Engine Oil purchase
+  // has no CarrierTripLine of its own).
+  liters             Decimal?            @db.Decimal(10, 2)
+  ratePerLiter       Decimal?            @db.Decimal(10, 2)
   account            Account             @relation(fields: [accountId], references: [id])
   journalEntry       JournalEntry        @relation(fields: [journalEntryId], references: [id], onDelete: Cascade)
   paymentAllocations PaymentAllocation[]
@@ -1445,9 +1463,54 @@ model OwnCarrier {
   defaultPumpParty   Party?  @relation("OwnCarrierDefaultPump", fields: [defaultPumpPartyId], references: [id], onDelete: SetNull)
   defaultPaidFrom    String?
 
+  // ============================================================
+  // DRIVER SALARY ALLOCATION (Own Carrier Part 1/2) - see
+  // lib/carrier-trip.ts's own "SALARY ALLOCATION" module comment for
+  // the full accrual design. driverMonthlySalary is the CURRENT
+  // value only - no history is kept (editing it replaces this value
+  // outright); driverMonthlySalaryEffectiveFrom is informational only
+  // (shown in Carrier Settings so the admin can see when the current
+  // figure started), never consulted by the accrual calculation
+  // itself, which always uses whatever is CURRENTLY stored here
+  // regardless of a Trip's own dates. Both null until explicitly set
+  // - a carrier with no salary configured simply never accrues one
+  // (every accrual function below is a no-op for it).
+  // ============================================================
+  driverMonthlySalary             Decimal?  @db.Decimal(15, 2)
+  driverMonthlySalaryEffectiveFrom DateTime?
+
+  // Diesel efficiency reference figures - pure data points shown on
+  // Carrier Settings for the admin's own reference; not consulted by
+  // any posting/calculation in this codebase (no feature currently
+  // reads them back) - distinct from the Engine Oil issue thresholds
+  // below, which ARE consulted.
+  avgKmPerLiter      Decimal? @db.Decimal(10, 2)
+  tankCapacityLiters Decimal? @db.Decimal(10, 2)
+
+  // ============================================================
+  // ENGINE OIL ISSUE THRESHOLDS (Own Carrier Part 3) - "configurable"
+  // per carrier; a null value falls back to the documented default
+  // (400 km / 14 L / 7 L) in lib/carrier-trip.ts's own
+  // suggestEngineOilIssueLiters() - never required to be set.
+  // ============================================================
+  oilIssueThresholdKm              Decimal? @db.Decimal(10, 2)
+  oilIssueLitersAboveThreshold     Decimal? @db.Decimal(10, 2)
+  oilIssueLitersAtOrBelowThreshold Decimal? @db.Decimal(10, 2)
+
   driverCashAccount       Account? @relation("OwnCarrierDriverCashAccount")
   ownCarrierIncomeAccount Account? @relation("OwnCarrierIncomeAccount")
   tripInProgressAccount   Account? @relation("OwnCarrierTripInProgressAccount")
+  // 1:1 with this carrier's own dedicated "<carrier> — Driver Salary
+  // Payable" account (LIABILITY/EMPLOYEE_PAYABLE) - see
+  // lib/own-carrier.ts's getOrCreateDriverSalaryPayableAccountId.
+  // Credited (increased) by the day-based accrual at Trip CLOSE and
+  // by "Allocate idle salary"; debited (decreased) whenever salary is
+  // actually PAID OUT (a DRIVER_SALARY trip line, or a direct Daily
+  // Posting against this account) - this account's own net balance
+  // IS what is currently owed to the driver.
+  salaryPayableAccount Account? @relation("OwnCarrierSalaryPayableAccount")
+
+  salaryMonthAllocations CarrierSalaryMonthAllocation[]
 
   // Bin
   isDeleted   Boolean   @default(false)
@@ -1498,6 +1561,13 @@ model CarrierTrip {
   dateTo   DateTime?
   notes    String?
 
+  // Own Carrier Part 3 - total distance covered this Trip. Optional;
+  // when set and > 0, Trip CLOSE suggests an Engine Oil issue amount
+  // from it (lib/carrier-trip.ts's suggestEngineOilIssueLiters) -
+  // never required, and editable by the user at close time before
+  // confirming.
+  distanceKm Decimal? @db.Decimal(10, 2)
+
   // OPEN -> CLOSED is a status/reporting flag only (closing balance =
   // whatever Driver Cash's own ledger balance already is at that
   // moment - never a separately stored number) - it additionally
@@ -1524,10 +1594,59 @@ model CarrierTrip {
 
   documents CarrierTripDocument[]
   lines     CarrierTripLine[]
+  salaryMonthAllocations CarrierSalaryMonthAllocation[]
 
   @@unique([carrierId, tripNo])
   @@index([carrierId])
   @@index([isDeleted])
+}
+
+// Own Carrier Part 2 - one row per calendar month a carrier's driver
+// salary gets allocated to, either via a closed Trip's own day-based
+// share (source "TRIP", tripId set) or the month-end "Allocate idle
+// salary" top-up (source "IDLE", tripId null). Exists so "how many
+// days of month M are already allocated for carrier C" can be
+// answered precisely (sum allocatedDays, filtered to LIVE rows via
+// journalEntry.isDeleted - never re-derived from Trip date ranges
+// directly, which would double-count on an edit, or miss a Reopen
+// that un-allocates a trip's own days) - the exact "ledger-true, not
+// row-exists" precedent used throughout this codebase, applied here
+// via the row's own JournalEntry rather than a second isActive flag.
+// A row is NEVER deleted once created (even after its own
+// JournalEntry is later soft-deleted by Reopen) - it stays as an
+// honest historical record of what WAS allocated and when; only the
+// LIVE read filters it out.
+model CarrierSalaryMonthAllocation {
+  id        String     @id @default(cuid())
+  carrierId String
+  carrier   OwnCarrier @relation(fields: [carrierId], references: [id], onDelete: Restrict)
+
+  // Always the first-of-month (e.g. 2026-11-01) - never a specific
+  // day - so "this month's own rows" is always an exact equality
+  // match, never a range query.
+  month DateTime
+
+  source String // "TRIP" | "IDLE"
+
+  // TRIP only - which Trip's own Close produced this row. Restrict
+  // (never cascade) - a Trip's own history here must outlive any
+  // future schema change to Trip deletion, though Trip itself is
+  // Bin-only (soft-delete) today regardless.
+  tripId String?
+  trip   CarrierTrip? @relation(fields: [tripId], references: [id], onDelete: Restrict)
+
+  allocatedDays Int
+  amount        Decimal @db.Decimal(15, 2)
+
+  journalEntryId String       @unique
+  journalEntry   JournalEntry @relation(fields: [journalEntryId], references: [id], onDelete: Restrict)
+
+  createdById String?
+  createdBy   User?   @relation("CarrierSalaryMonthAllocationCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt   DateTime @default(now())
+
+  @@index([carrierId, month])
+  @@index([tripId])
 }
 
 // Links a Trip to an EXISTING Challan/Phonch/Private Phonch - a pure

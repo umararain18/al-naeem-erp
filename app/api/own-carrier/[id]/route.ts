@@ -173,6 +173,43 @@ export async function PATCH(
       updateData.defaultPaidFrom = body.defaultPaidFrom || null;
     }
 
+    // Driver Salary Allocation + Engine Oil settings (Own Carrier Part
+    // 1) - every field optional, non-negative when given. No history
+    // is kept for driverMonthlySalary (see that field's own schema doc
+    // comment) - driverMonthlySalaryEffectiveFrom is informational
+    // only, never validated against anything.
+    const numericSettingsFields: { key: keyof Prisma.OwnCarrierUncheckedUpdateInput; label: string }[] = [
+      { key: "driverMonthlySalary", label: "Driver monthly salary" },
+      { key: "avgKmPerLiter", label: "Avg KM per liter" },
+      { key: "tankCapacityLiters", label: "Tank capacity" },
+      { key: "oilIssueThresholdKm", label: "Oil issue threshold (KM)" },
+      { key: "oilIssueLitersAboveThreshold", label: "Oil issue liters (above threshold)" },
+      { key: "oilIssueLitersAtOrBelowThreshold", label: "Oil issue liters (at/below threshold)" },
+    ];
+    for (const { key, label } of numericSettingsFields) {
+      if (body[key] === undefined) continue;
+      if (body[key] === null || body[key] === "") {
+        (updateData as Record<string, unknown>)[key] = null;
+        continue;
+      }
+      const num = Number(body[key]);
+      if (!Number.isFinite(num) || num < 0) {
+        return NextResponse.json({ success: false, message: `${label} must be a non-negative number` }, { status: 400 });
+      }
+      (updateData as Record<string, unknown>)[key] = num;
+    }
+    if (body.driverMonthlySalaryEffectiveFrom !== undefined) {
+      if (!body.driverMonthlySalaryEffectiveFrom) {
+        updateData.driverMonthlySalaryEffectiveFrom = null;
+      } else {
+        const date = new Date(`${body.driverMonthlySalaryEffectiveFrom}T00:00:00`);
+        if (Number.isNaN(date.getTime())) {
+          return NextResponse.json({ success: false, message: "Invalid effective-from date" }, { status: 400 });
+        }
+        updateData.driverMonthlySalaryEffectiveFrom = date;
+      }
+    }
+
     try {
       const updated = await prisma.$transaction(async (tx) => {
         const updatedCarrier = await tx.ownCarrier.update({ where: { id }, data: updateData });

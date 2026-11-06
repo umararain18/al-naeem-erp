@@ -145,6 +145,34 @@ export default function OwnCarrierDetailPage() {
     setRefreshToken((k) => k + 1);
   }
 
+  // "Allocate idle salary" (Own Carrier Part 2) - month-end action,
+  // not scoped to any one Trip. A lightweight window.prompt (same
+  // precedent as the Trip page's own Reopen/Oil-issue prompts) rather
+  // than a dedicated drawer - defaults to the current month.
+  async function handleAllocateIdleSalary() {
+    const now = new Date();
+    const defaultMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+    const month = window.prompt('Allocate idle salary for which month? ("YYYY-MM")', defaultMonth);
+    if (!month) return;
+    if (!/^\d{4}-\d{2}$/.test(month)) {
+      alert('Month must be in "YYYY-MM" format.');
+      return;
+    }
+    try {
+      const res = await fetch(`/api/own-carrier/${carrierId}/allocate-idle-salary`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ month }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data.success) throw new Error(data.message || "Unable to allocate idle salary.");
+      alert(data.message);
+      if (data.posted) refresh();
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "Unable to allocate idle salary.");
+    }
+  }
+
   async function handleBinTrip(trip: TripItem) {
     if (trip.lineCount > 0 || trip.documentCount > 0) {
       alert("This Trip still has active lines/linked documents - reverse/unlink them first.");
@@ -278,11 +306,18 @@ export default function OwnCarrierDetailPage() {
 
         <div className="mb-4 flex items-center justify-between">
           <h2 className="text-lg font-semibold text-gray-900">Trips</h2>
-          {capabilities.canEdit && (
-            <button type="button" onClick={() => setNewTripOpen(true)} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700">
-              + New Trip
-            </button>
-          )}
+          <div className="flex gap-2">
+            {capabilities.canEdit && (
+              <button type="button" onClick={handleAllocateIdleSalary} className="rounded-lg border border-purple-200 px-4 py-2 text-sm font-medium text-purple-700 hover:bg-purple-50">
+                Allocate idle salary...
+              </button>
+            )}
+            {capabilities.canEdit && (
+              <button type="button" onClick={() => setNewTripOpen(true)} className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white hover:bg-blue-700">
+                + New Trip
+              </button>
+            )}
+          </div>
         </div>
 
         <div className="overflow-hidden rounded-xl border bg-white shadow-sm">

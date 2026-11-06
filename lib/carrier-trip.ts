@@ -16,6 +16,10 @@ import {
   getOrCreateTripInProgressAccountId,
   getOrCreateDefaultOwnerDrawingAccountId,
   isEligibleOfficeOverheadAccount,
+  getOrCreateDriverSalaryPayableAccountId,
+  getOrCreateEngineOilStockAccountId,
+  getEngineOilStockState,
+  ENGINE_OIL_SOURCE_TYPE,
 } from "@/lib/own-carrier";
 import {
   getUnearnedRevenueAccountId,
@@ -73,6 +77,8 @@ const VALID_DOCUMENT_TYPES: CarrierTripDocumentType[] = ["CHALLAN", "PHONCH", "P
 function round2(value: number): number {
   return Math.round((value + Number.EPSILON) * 100) / 100;
 }
+
+const EPS = 0.009;
 
 /** Convenience default only (like lib/payroll-accounting.ts's
  * nextEmployeeCode() / scripts' own suggestNextSlipNo precedent) -
@@ -985,11 +991,15 @@ export async function postExpenseCreditLine(tx: Tx, input: PostExpenseCreditInpu
   );
 }
 
-/** OUT - driver salary is a carrier expense now (never a Payslip/
- * employee-account posting): Dr this carrier's own "Trip in Progress"
- * clearing account / Cr Driver Cash. No "employee must have a linked
- * account" requirement any more - the Employee row only needs to
- * exist and not be binned, since salary no longer touches that
+/** OUT - driver salary PAID is NEVER a trip expense any more (see
+ * this module's own SALARY ALLOCATION header comment below): Dr this
+ * carrier's own "Driver Salary Payable" account (paying down what is
+ * owed) / Cr Driver Cash. The real cost is recognized separately, by
+ * DAYS, at Trip CLOSE (recognizeCarrierTripSalaryAccrual) and at
+ * month-end (allocateIdleSalary) - this function only ever moves cash
+ * against the payable, with zero P&L effect of its own. No "employee
+ * must have a linked account" requirement - the Employee row only
+ * needs to exist and not be binned, since salary never touches that
  * employee's own account at all. category is always "SALARY" - not
  * user-supplied, since DRIVER_SALARY is its own distinct lineType
  * already. */
@@ -1004,7 +1014,7 @@ export async function postDriverSalaryLine(tx: Tx, input: PostSalaryInput) {
   }
 
   const driverCashId = trip.carrier.driverCashAccount!.id;
-  const tripInProgressAccountId = await getOrCreateTripInProgressAccountId(tx, trip.carrierId);
+  const salaryPayableAccountId = await getOrCreateDriverSalaryPayableAccountId(tx, trip.carrierId);
   const description = input.description?.trim() || `Salary paid to ${employee.name}`;
 
   return createTripLineEntry(
@@ -1015,7 +1025,7 @@ export async function postDriverSalaryLine(tx: Tx, input: PostSalaryInput) {
       createdById: input.createdById,
       description,
       lines: [
-        { accountId: tripInProgressAccountId, debit: input.amount, credit: 0 },
+        { accountId: salaryPayableAccountId, debit: input.amount, credit: 0 },
         { accountId: driverCashId, debit: 0, credit: input.amount },
       ],
     },
@@ -1417,13 +1427,19 @@ export async function editCarrierTripLine(
       if (!employee || employee.isDeleted) {
         throw new CarrierTripError("INVALID_EMPLOYEE", "Selected employee was not found.");
       }
-      const tripInProgressAccountId = await getOrCreateTripInProgressAccountId(tx, existing.trip.carrierId);
-      const tipLine = findLineByAccount(entryLines, tripInProgressAccountId) || entryLines[0];
-      const cashLine = otherLine(entryLines, tipLine.id);
+      // Finds the OTHER (non-Driver-Cash) side by account id when it
+      // already is the Payable account; falls back to entryLines[0]
+      // (same precedent as every other case here) for a line posted
+      // BEFORE this change, whose Dr side still points at Trip in
+      // Progress - editing it this way correctly migrates that one
+      // line's own accounting over to the Payable account.
+      const salaryPayableAccountId = await getOrCreateDriverSalaryPayableAccountId(tx, existing.trip.carrierId);
+      const payableLine = findLineByAccount(entryLines, salaryPayableAccountId) || entryLines[0];
+      const cashLine = otherLine(entryLines, payableLine.id);
       description = input.description?.trim() || `Salary paid to ${employee.name}`;
       carrierTripLineData = { employeeId, category: "SALARY" };
       lineUpdates = [
-        { id: tipLine.id, accountId: tripInProgressAccountId, debit: amount, credit: 0 },
+        { id: payableLine.id, accountId: salaryPayableAccountId, debit: amount, credit: 0 },
         { id: cashLine.id, accountId: driverCashId, debit: 0, credit: amount },
       ];
       break;
@@ -1662,12 +1678,14 @@ export async function restoreCarrierTripLine(tx: Tx, input: { lineId: string; re
 // Challan.ownCarrierId's own schema doc comment for the income-
 // deferral rationale. An own-carrier Challan's Bilty rent sits
 // untouched in Unearned Revenue from booking all the way through
-// dispatch; a Trip's own expense/diesel/salary lines sit in "Trip in
-// Progress" (never Carrier Profit directly - see postExpenseCashLine's
-// own doc comment) for as long as the Trip stays OPEN. Closing the
-// Trip is the ONE moment both get resolved into Carrier Profit, in
-// EXACTLY TWO JournalEntries (never one per linked Challan, never one
-// per expense line):
+// dispatch; a Trip's own expense/diesel lines (plus, since the Own
+// Carrier Part 1/2 salary accrual + Part 3 Engine Oil features, its
+// own salary share and oil issue) sit in "Trip in Progress" (never
+// Carrier Profit directly - see postExpenseCashLine's own doc
+// comment) for as long as the Trip stays OPEN. Closing the Trip is
+// the ONE moment all of it gets resolved into Carrier Profit, in UP
+// TO FOUR JournalEntries (or entry GROUPS - see Entry C below), each
+// independently skipped when it has nothing to post:
 //
 //   Entry A ("...Carrier Rent"), referenceType CARRIER_TRIP_CLOSE,
 //   referenceId = the TRIP's own id (never a Challan's - a Trip can
@@ -1682,27 +1700,59 @@ export async function restoreCarrierTripLine(tx: Tx, input: { lineId: string; re
 //   out of this entry entirely - exactly as recognizeBiltyBookingIncome()'s
 //   own idempotency already works per-Bilty.
 //
+//   Entry C ("...Driver Salary accrual"), referenceType
+//   CARRIER_TRIP_CLOSE_SALARY, referenceId = the TRIP's own id: Dr
+//   Trip in Progress / Cr this carrier's own Driver Salary Payable,
+//   for the carrier's CURRENT driverMonthlySalary (OwnCarrier - no
+//   history kept, see that field's own schema doc comment) divided by
+//   days-in-month × this Trip's own days falling in that month -
+//   recognizeCarrierTripSalaryAccrual's own computeTripMonthDaySplit.
+//   ONE JournalEntry PER CONTRIBUTING CALENDAR MONTH (a Trip spanning
+//   2 months posts 2 small entries here, not 1 combined one) - each
+//   tied 1:1 to its own CarrierSalaryMonthAllocation row, which is
+//   what lets "Allocate idle salary" (below) read "days already
+//   allocated for month M" precisely. Skipped entirely when the
+//   carrier has no monthly salary configured.
+//
+//   Entry D ("...Engine Oil issued"), referenceType
+//   CARRIER_TRIP_CLOSE_OIL, referenceId = the TRIP's own id: Dr Trip
+//   in Progress / Cr Engine Oil Stock, for (liters × Engine Oil
+//   Stock's own CURRENT moving weighted-average rate) - liters is
+//   either explicitly given (the user edited the suggested value) or
+//   computed from the Trip's own distanceKm via
+//   suggestEngineOilIssueLiters. Skipped when distanceKm is unset (or
+//   0) and no liters were explicitly given.
+//
 //   Entry B ("...Expenses"), referenceType CARRIER_TRIP_CLOSE_EXPENSE,
 //   referenceId = the TRIP's own id: Dr Carrier Profit / Cr Trip in
 //   Progress, for this Trip's own total EXPENSE_CASH/EXPENSE_OFFICE/
-//   EXPENSE_CREDIT/DRIVER_SALARY amount (read straight off
-//   CarrierTripLine.tripId/lineType/amount - the SAME figure
-//   getTripProfitReport's own totalCarrierExpense already is, not a
-//   second calculation).
+//   EXPENSE_CREDIT amount PLUS Entry C's own total PLUS Entry D's own
+//   amount - i.e. EVERYTHING that was debited into Trip in Progress
+//   for this Trip, swept out in one shot. DRIVER_SALARY lines
+//   themselves never contribute here any more (paying salary no
+//   longer touches Trip in Progress at all - see postDriverSalaryLine's
+//   own doc comment).
 //
-// Either entry is simply never created when it would have nothing to
-// post (no Challan contributes / zero trip expense) - "exactly two"
-// is the common case, not an invariant enforced by fabricating a
-// zero-line entry.
+// Every entry above is simply never created when it would have
+// nothing to post - "up to four" is the ceiling, not an invariant
+// enforced by fabricating a zero-line entry.
 //
-// Reopen soft-deletes whichever of the two is currently live straight
-// into the Bin (see softDeleteLiveCloseEntry's own doc comment) -
-// never a reversal entry any more, never a per-Challan loop. Re-close
-// afterward posts entirely fresh Entry A/Entry B.
+// Reopen soft-deletes every currently-live entry among A/C(all)/D/B
+// straight into the Bin (see softDeleteLiveCloseEntry/
+// softDeleteAllLiveEntriesForTrip's own doc comments) - never a
+// reversal entry, never a per-Challan loop. Re-close afterward posts
+// entirely fresh entries, picking up any edit made while reopened
+// (a changed CarrierTripLine amount, a changed distanceKm, a changed
+// Carrier salary setting).
 // ============================================================
 
 export const CARRIER_TRIP_CLOSE_REFERENCE_TYPE = "CARRIER_TRIP_CLOSE";
 export const CARRIER_TRIP_CLOSE_EXPENSE_REFERENCE_TYPE = "CARRIER_TRIP_CLOSE_EXPENSE";
+export const CARRIER_TRIP_CLOSE_SALARY_REFERENCE_TYPE = "CARRIER_TRIP_CLOSE_SALARY";
+export const CARRIER_TRIP_CLOSE_OIL_REFERENCE_TYPE = "CARRIER_TRIP_CLOSE_OIL";
+// Month-end "Allocate idle salary" (referenceId = the CARRIER's own
+// id, never a Trip's - this action is not scoped to any one Trip).
+export const CARRIER_SALARY_IDLE_REFERENCE_TYPE = "CARRIER_SALARY_IDLE_ALLOCATION";
 // Both REVERSAL referenceTypes below are write-path DEAD since Reopen
 // moved to soft-delete (above) - kept only so
 // getChallanCloseRecognitionNet's own read still nets correctly
@@ -1817,6 +1867,34 @@ async function softDeleteLiveCloseEntry(
 }
 
 /**
+ * Same as softDeleteLiveCloseEntry, but soft-deletes EVERY live entry
+ * of this referenceType/tripId, not just one - needed for Entry C
+ * (CARRIER_TRIP_CLOSE_SALARY), which posts one JournalEntry PER
+ * CONTRIBUTING CALENDAR MONTH (a 2-month-spanning Trip has two live
+ * entries at once, both sharing the same referenceId). Never needs
+ * findLiveCloseEntry's own "already reversed" exclusion logic - this
+ * referenceType was introduced alongside the soft-delete-only Reopen
+ * design and has never had a reversal-based predecessor to filter
+ * out.
+ */
+async function softDeleteAllLiveEntriesForTrip(
+  tx: Tx,
+  input: { referenceType: string; tripId: string; deletedById: string }
+): Promise<number> {
+  const entries = await tx.journalEntry.findMany({
+    where: { referenceType: input.referenceType, referenceId: input.tripId, isDeleted: false },
+    select: { id: true },
+  });
+  for (const entry of entries) {
+    await tx.journalEntry.update({
+      where: { id: entry.id },
+      data: { isDeleted: true, deletedAt: new Date(), deletedById: input.deletedById },
+    });
+  }
+  return entries.length;
+}
+
+/**
  * Builds and posts Entry A ("...Carrier Rent") for every currently
  * ACTIVE, not-yet-recognized, nonzero-Bilty-Rent CHALLAN link on this
  * Trip, combined into ONE JournalEntry - see this section's own
@@ -1831,6 +1909,336 @@ async function softDeleteLiveCloseEntry(
  * automatically, with no separate fix needed there. */
 function tripLabel(tripNo: string, route: string | null): string {
   return route ? `Trip ${tripNo} (${route})` : `Trip ${tripNo}`;
+}
+
+// ============================================================
+// DRIVER SALARY ALLOCATION (Own Carrier Part 1/2) - see this file's
+// own "TRIP CLOSE..." header comment above for Entry C's exact shape,
+// and OwnCarrier.driverMonthlySalary's own schema doc comment for why
+// there is no salary HISTORY (the CURRENT value is always used,
+// regardless of a Trip's own dates).
+// ============================================================
+
+export interface TripMonthDayShare {
+  /** First-of-month. */
+  month: Date;
+  /** This Trip's own days falling within `month` (inclusive day
+   * count on both ends). */
+  daysInTrip: number;
+  daysInMonth: number;
+}
+
+function dateOnly(d: Date): Date {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+}
+
+function startOfMonth(d: Date): Date {
+  return new Date(d.getFullYear(), d.getMonth(), 1);
+}
+
+function daysInCalendarMonth(year: number, monthIndex: number): number {
+  return new Date(year, monthIndex + 1, 0).getDate();
+}
+
+/**
+ * Splits a Trip's own [dateFrom, dateTo] (inclusive) into one share
+ * per calendar month it touches - handles a Trip spanning any number
+ * of months (not just 2), though 2 is the common case this feature
+ * was asked for. Both dates are taken at day resolution only (never
+ * time-of-day) - a Trip's own dateFrom/dateTo are already stored at
+ * midnight, same as every other date in this schema.
+ */
+export function computeTripMonthDaySplit(dateFrom: Date, dateTo: Date): TripMonthDayShare[] {
+  const shares: TripMonthDayShare[] = [];
+  let cursor = dateOnly(dateFrom);
+  const end = dateOnly(dateTo);
+  if (cursor.getTime() > end.getTime()) return shares;
+
+  while (cursor.getTime() <= end.getTime()) {
+    const monthStart = startOfMonth(cursor);
+    const monthLastDay = new Date(cursor.getFullYear(), cursor.getMonth() + 1, 0);
+    const segmentEnd = monthLastDay.getTime() < end.getTime() ? monthLastDay : end;
+    const daysInTrip = Math.round((segmentEnd.getTime() - cursor.getTime()) / 86400000) + 1;
+    shares.push({ month: monthStart, daysInTrip, daysInMonth: daysInCalendarMonth(cursor.getFullYear(), cursor.getMonth()) });
+    cursor = new Date(segmentEnd.getFullYear(), segmentEnd.getMonth(), segmentEnd.getDate() + 1);
+  }
+  return shares;
+}
+
+/**
+ * Builds and posts Entry C - one JournalEntry PER CONTRIBUTING
+ * CALENDAR MONTH (see this file's own "TRIP CLOSE..." header comment)
+ * - Dr Trip in Progress / Cr Driver Salary Payable, each tied 1:1 to
+ * its own CarrierSalaryMonthAllocation row. A no-op (posts nothing)
+ * when the carrier has no monthly salary configured, or the Trip's
+ * own date range is empty/invalid.
+ */
+async function recognizeCarrierTripSalaryAccrual(
+  tx: Tx,
+  input: { tripId: string; tripNo: string; route: string | null; carrierId: string; dateFrom: Date; dateTo: Date; entryDate: Date; createdById: string }
+): Promise<{ posted: boolean; amount: number }> {
+  const carrier = await tx.ownCarrier.findUnique({ where: { id: input.carrierId }, select: { driverMonthlySalary: true } });
+  const monthlySalary = carrier?.driverMonthlySalary != null ? round2(Number(carrier.driverMonthlySalary)) : 0;
+  if (monthlySalary <= 0) return { posted: false, amount: 0 };
+
+  const shares = computeTripMonthDaySplit(input.dateFrom, input.dateTo)
+    .map((s) => ({ ...s, amount: round2((monthlySalary / s.daysInMonth) * s.daysInTrip) }))
+    .filter((s) => s.amount > 0);
+  if (shares.length === 0) return { posted: false, amount: 0 };
+
+  const [tripInProgressAccountId, salaryPayableAccountId] = await Promise.all([
+    getOrCreateTripInProgressAccountId(tx, input.carrierId),
+    getOrCreateDriverSalaryPayableAccountId(tx, input.carrierId),
+  ]);
+
+  let total = 0;
+  for (const s of shares) {
+    const monthLabel = s.month.toLocaleDateString("en-US", { month: "short", year: "numeric" });
+    const description = `${tripLabel(input.tripNo, input.route)} – Driver Salary accrual (${monthLabel}, ${s.daysInTrip}/${s.daysInMonth} days)`;
+
+    const entry = await tx.journalEntry.create({
+      data: {
+        entryDate: input.entryDate,
+        referenceType: CARRIER_TRIP_CLOSE_SALARY_REFERENCE_TYPE,
+        referenceId: input.tripId,
+        description,
+        createdById: input.createdById,
+        lines: {
+          create: [
+            { accountId: tripInProgressAccountId, debit: s.amount, credit: 0, description, sourceType: "CARRIER_TRIP", sourceId: input.tripId, sourceNumber: input.tripNo },
+            { accountId: salaryPayableAccountId, debit: 0, credit: s.amount, description, sourceType: "CARRIER_TRIP", sourceId: input.tripId, sourceNumber: input.tripNo },
+          ],
+        },
+      },
+    });
+
+    await tx.carrierSalaryMonthAllocation.create({
+      data: {
+        carrierId: input.carrierId,
+        month: s.month,
+        source: "TRIP",
+        tripId: input.tripId,
+        allocatedDays: s.daysInTrip,
+        amount: s.amount,
+        journalEntryId: entry.id,
+        createdById: input.createdById,
+      },
+    });
+
+    total = round2(total + s.amount);
+  }
+
+  return { posted: true, amount: total };
+}
+
+/**
+ * Month-end "Allocate idle salary" - the carrier's own CURRENT
+ * monthly salary divided by days-in-month × whatever days of that
+ * month are NOT already allocated to a closed Trip (read live, via
+ * CarrierSalaryMonthAllocation's own JournalEntry.isDeleted - see
+ * that model's own schema doc comment), posted Dr Carrier Profit /
+ * Cr Driver Salary Payable, dated the month's own last day. Naturally
+ * idempotent - calling this again for a month that is already fully
+ * allocated (idleDays <= 0) is a no-op, since the idle row posted the
+ * first time now itself counts as "already allocated".
+ *
+ * KNOWN LIMITATION (by design, not a bug): this should be run ONCE,
+ * after every Trip touching that month has already been closed. If a
+ * Trip touching an already-idle-allocated month is closed
+ * AFTERWARDS, that Trip's own Entry C and this action's own idle
+ * allocation will double-count those days - there is no automatic
+ * reconciliation between them. Re-running this action after such a
+ * Trip closes will NOT correct it (idleDays would already read as
+ * negative-or-zero from the stale idle row still being live) - the
+ * idle row would need to be manually corrected (Bin it, then re-run
+ * this action) in that situation.
+ */
+export async function allocateIdleSalary(
+  tx: Tx,
+  input: { carrierId: string; month: string; createdById: string }
+): Promise<{ posted: boolean; idleDays: number; totalDaysInMonth: number; amount: number }> {
+  const carrier = await tx.ownCarrier.findUnique({ where: { id: input.carrierId }, select: { carrierNumber: true, driverMonthlySalary: true, isDeleted: true } });
+  if (!carrier || carrier.isDeleted) throw new CarrierTripError("OWN_CARRIER_NOT_FOUND", "Own Carrier not found.");
+
+  const monthlySalary = carrier.driverMonthlySalary != null ? round2(Number(carrier.driverMonthlySalary)) : 0;
+  if (monthlySalary <= 0) {
+    throw new CarrierTripError("NO_SALARY_CONFIGURED", "This carrier has no monthly salary configured - set one in Carrier Settings first.");
+  }
+
+  const match = /^(\d{4})-(\d{2})$/.exec(input.month);
+  if (!match) throw new CarrierTripError("INVALID_MONTH", 'Month must be in "YYYY-MM" format.');
+  const year = Number(match[1]);
+  const monthIndex = Number(match[2]) - 1;
+  const monthStart = new Date(year, monthIndex, 1);
+  const totalDaysInMonth = daysInCalendarMonth(year, monthIndex);
+
+  const existingRows = await tx.carrierSalaryMonthAllocation.findMany({
+    where: { carrierId: input.carrierId, month: monthStart, journalEntry: { isDeleted: false } },
+    select: { allocatedDays: true },
+  });
+  const alreadyAllocatedDays = existingRows.reduce((s, r) => s + r.allocatedDays, 0);
+  const idleDays = totalDaysInMonth - alreadyAllocatedDays;
+  if (idleDays <= 0) return { posted: false, idleDays: 0, totalDaysInMonth, amount: 0 };
+
+  const amount = round2((monthlySalary / totalDaysInMonth) * idleDays);
+  if (amount <= 0) return { posted: false, idleDays, totalDaysInMonth, amount: 0 };
+
+  const [carrierProfitAccountId, salaryPayableAccountId] = await Promise.all([
+    getOrCreateCarrierProfitAccountId(tx, input.carrierId),
+    getOrCreateDriverSalaryPayableAccountId(tx, input.carrierId),
+  ]);
+
+  const monthLabel = monthStart.toLocaleDateString("en-US", { month: "long", year: "numeric" });
+  const description = `${carrier.carrierNumber} – Idle Salary – ${monthLabel} (${idleDays}/${totalDaysInMonth} idle days)`;
+  const monthEnd = new Date(year, monthIndex + 1, 0);
+
+  const entry = await tx.journalEntry.create({
+    data: {
+      entryDate: monthEnd,
+      referenceType: CARRIER_SALARY_IDLE_REFERENCE_TYPE,
+      referenceId: input.carrierId,
+      description,
+      createdById: input.createdById,
+      lines: {
+        create: [
+          { accountId: carrierProfitAccountId, debit: amount, credit: 0, description, sourceType: "CARRIER_SALARY_IDLE", sourceId: input.carrierId, sourceNumber: carrier.carrierNumber },
+          { accountId: salaryPayableAccountId, debit: 0, credit: amount, description, sourceType: "CARRIER_SALARY_IDLE", sourceId: input.carrierId, sourceNumber: carrier.carrierNumber },
+        ],
+      },
+    },
+  });
+
+  await tx.carrierSalaryMonthAllocation.create({
+    data: {
+      carrierId: input.carrierId,
+      month: monthStart,
+      source: "IDLE",
+      tripId: null,
+      allocatedDays: idleDays,
+      amount,
+      journalEntryId: entry.id,
+      createdById: input.createdById,
+    },
+  });
+
+  return { posted: true, idleDays, totalDaysInMonth, amount };
+}
+
+// ============================================================
+// ENGINE OIL ISSUE (Own Carrier Part 3) - see this file's own "TRIP
+// CLOSE..." header comment above for Entry D's exact shape.
+// ============================================================
+
+/**
+ * KM > threshold -> litersAbove; KM <= threshold -> litersAtOrBelow.
+ * Defaults (400 / 14 / 7) apply whenever the carrier has not
+ * configured its own override - see OwnCarrier.oilIssueThresholdKm's
+ * own schema doc comment.
+ */
+export function suggestEngineOilIssueLiters(
+  distanceKm: number,
+  carrierSettings?: {
+    oilIssueThresholdKm?: number | null;
+    oilIssueLitersAboveThreshold?: number | null;
+    oilIssueLitersAtOrBelowThreshold?: number | null;
+  } | null
+): number {
+  const threshold = carrierSettings?.oilIssueThresholdKm != null ? Number(carrierSettings.oilIssueThresholdKm) : 400;
+  const above = carrierSettings?.oilIssueLitersAboveThreshold != null ? Number(carrierSettings.oilIssueLitersAboveThreshold) : 14;
+  const atOrBelow = carrierSettings?.oilIssueLitersAtOrBelowThreshold != null ? Number(carrierSettings.oilIssueLitersAtOrBelowThreshold) : 7;
+  return distanceKm > threshold ? above : atOrBelow;
+}
+
+/**
+ * Builds and posts Entry D - Dr Trip in Progress / Cr Engine Oil
+ * Stock, liters × Engine Oil Stock's own CURRENT moving weighted-
+ * average rate. `litersOverride` (the user's own edited value, from
+ * the Close confirmation dialog) always wins over the suggestion
+ * computed from `distanceKm`. A no-op (posts nothing) when there is
+ * no liters figure at all (no override, no/zero distanceKm).
+ *
+ * Throws OIL_STOCK_INSUFFICIENT (overridable via
+ * confirmInsufficientStock, same "warn but allow override" pattern as
+ * tripDateRangeWarning/confirmOutsideRange elsewhere in this module)
+ * when liters exceeds what Engine Oil Stock currently holds.
+ * Separately throws the NON-overridable OIL_NO_RATE_ESTABLISHED when
+ * Engine Oil Stock has never been purchased at all (no rate exists to
+ * value the issue at) - confirming through the insufficient-stock
+ * warning on a never-purchased account would otherwise silently post
+ * a zero-value, zero-liters entry.
+ */
+async function recognizeCarrierTripOilIssue(
+  tx: Tx,
+  input: {
+    tripId: string;
+    tripNo: string;
+    route: string | null;
+    carrierId: string;
+    distanceKm: number | null;
+    litersOverride?: number | null;
+    confirmInsufficientStock?: boolean;
+    entryDate: Date;
+    createdById: string;
+  }
+): Promise<{ posted: boolean; amount: number; liters: number | null }> {
+  let liters: number | null = input.litersOverride != null ? round2(input.litersOverride) : null;
+  if (liters == null) {
+    if (input.distanceKm == null || input.distanceKm <= 0) return { posted: false, amount: 0, liters: null };
+    const carrier = await tx.ownCarrier.findUnique({
+      where: { id: input.carrierId },
+      select: { oilIssueThresholdKm: true, oilIssueLitersAboveThreshold: true, oilIssueLitersAtOrBelowThreshold: true },
+    });
+    liters = round2(
+      suggestEngineOilIssueLiters(input.distanceKm, {
+        oilIssueThresholdKm: carrier?.oilIssueThresholdKm != null ? Number(carrier.oilIssueThresholdKm) : null,
+        oilIssueLitersAboveThreshold: carrier?.oilIssueLitersAboveThreshold != null ? Number(carrier.oilIssueLitersAboveThreshold) : null,
+        oilIssueLitersAtOrBelowThreshold: carrier?.oilIssueLitersAtOrBelowThreshold != null ? Number(carrier.oilIssueLitersAtOrBelowThreshold) : null,
+      })
+    );
+  }
+  if (liters == null || liters <= 0) return { posted: false, amount: 0, liters: null };
+
+  const stock = await getEngineOilStockState(tx);
+  if (liters > stock.liters + EPS && !input.confirmInsufficientStock) {
+    throw new CarrierTripError(
+      "OIL_STOCK_INSUFFICIENT",
+      `Engine Oil Stock only has ${stock.liters} L remaining - issuing ${liters} L would go negative. Continue anyway?`
+    );
+  }
+  if (stock.avgRatePerLiter == null || stock.avgRatePerLiter <= 0) {
+    throw new CarrierTripError(
+      "OIL_NO_RATE_ESTABLISHED",
+      "No Engine Oil Stock purchase has been recorded yet - record at least one purchase (with liters + rate, via Daily Posting) before issuing oil at Trip Close."
+    );
+  }
+
+  const amount = round2(liters * stock.avgRatePerLiter);
+  if (amount <= 0) return { posted: false, amount: 0, liters: null };
+
+  const [tripInProgressAccountId, oilStockAccountId] = await Promise.all([
+    getOrCreateTripInProgressAccountId(tx, input.carrierId),
+    getOrCreateEngineOilStockAccountId(tx),
+  ]);
+
+  const description = `${tripLabel(input.tripNo, input.route)} – Engine Oil issued: ${liters} L @ Rs. ${stock.avgRatePerLiter}/L`;
+
+  await tx.journalEntry.create({
+    data: {
+      entryDate: input.entryDate,
+      referenceType: CARRIER_TRIP_CLOSE_OIL_REFERENCE_TYPE,
+      referenceId: input.tripId,
+      description,
+      createdById: input.createdById,
+      lines: {
+        create: [
+          { accountId: tripInProgressAccountId, debit: amount, credit: 0, description, sourceType: "CARRIER_TRIP", sourceId: input.tripId, sourceNumber: input.tripNo },
+          { accountId: oilStockAccountId, debit: 0, credit: amount, liters, description, sourceType: ENGINE_OIL_SOURCE_TYPE, sourceId: input.tripId, sourceNumber: input.tripNo },
+        ],
+      },
+    },
+  });
+
+  return { posted: true, amount, liters };
 }
 
 async function recognizeCarrierTripIncome(
@@ -1924,13 +2332,18 @@ async function recognizeCarrierTripIncome(
  */
 async function recognizeCarrierTripExpenseClearing(
   tx: Tx,
-  input: { tripId: string; tripNo: string; route: string | null; carrierId: string; entryDate: Date; createdById: string }
+  input: { tripId: string; tripNo: string; route: string | null; carrierId: string; entryDate: Date; createdById: string; extraAmount: number }
 ): Promise<boolean> {
+  // DRIVER_SALARY is deliberately excluded here - paying salary no
+  // longer debits Trip in Progress at all (see postDriverSalaryLine's
+  // own doc comment). `extraAmount` (Entry C's own salary-accrual
+  // total + Entry D's own oil-issue amount, computed by the caller)
+  // is what actually represents the Trip's own salary/oil cost now.
   const expenseLines = await tx.carrierTripLine.findMany({
-    where: { tripId: input.tripId, isDeleted: false, lineType: { in: ["EXPENSE_CASH", "EXPENSE_OFFICE", "EXPENSE_CREDIT", "DRIVER_SALARY"] } },
+    where: { tripId: input.tripId, isDeleted: false, lineType: { in: ["EXPENSE_CASH", "EXPENSE_OFFICE", "EXPENSE_CREDIT"] } },
     select: { amount: true },
   });
-  const expenseTotal = round2(expenseLines.reduce((s, l) => s + Number(l.amount), 0));
+  const expenseTotal = round2(expenseLines.reduce((s, l) => s + Number(l.amount), 0) + input.extraAmount);
   if (expenseTotal <= 0) return false;
 
   const links = await tx.carrierTripDocument.findMany({
@@ -1972,13 +2385,26 @@ async function recognizeCarrierTripExpenseClearing(
 /**
  * Orchestrates Trip CLOSE: sets status CLOSED (auto-filling dateTo
  * with today if the user never set one - Close never blocks on a
- * missing end date), then posts Entry A (Carrier Rent, every
- * contributing linked Challan combined) and Entry B (Expenses, this
- * Trip's own total), both dated the Trip's own end date - see this
- * section's own header comment. Either is simply skipped when it
- * would have nothing to post.
+ * missing end date), then posts Entry A (Carrier Rent), Entry C
+ * (Driver Salary accrual, one per contributing month), Entry D
+ * (Engine Oil issued), and finally Entry B (Expenses, this Trip's
+ * own EXPENSE_CASH/OFFICE/CREDIT total PLUS Entry C's PLUS Entry D's -
+ * B must run LAST so its own sweep total already includes both), all
+ * dated the Trip's own end date - see this section's own header
+ * comment for the full shape. Each is simply skipped when it would
+ * have nothing to post.
+ *
+ * `oilIssueLiters` (from the Close confirmation dialog, when
+ * distanceKm is set) always wins over the suggested default computed
+ * from distanceKm; `confirmInsufficientOilStock` overrides Entry D's
+ * own "not enough stock" warning (see recognizeCarrierTripOilIssue's
+ * own doc comment) - both optional, and irrelevant when this Trip has
+ * nothing to issue.
  */
-export async function closeCarrierTrip(tx: Tx, input: { tripId: string; updatedById: string }) {
+export async function closeCarrierTrip(
+  tx: Tx,
+  input: { tripId: string; updatedById: string; oilIssueLiters?: number | null; confirmInsufficientOilStock?: boolean }
+) {
   const trip = await getTripOrThrow(tx, input.tripId);
   if (trip.status === "CLOSED") {
     throw new CarrierTripError("ALREADY_CLOSED", "This Trip is already closed.");
@@ -1992,19 +2418,51 @@ export async function closeCarrierTrip(tx: Tx, input: { tripId: string; updatedB
   });
 
   await recognizeCarrierTripIncome(tx, { tripId: input.tripId, tripNo: trip.tripNo, route: trip.route, carrierId: trip.carrierId, entryDate: dateTo, createdById: input.updatedById });
-  await recognizeCarrierTripExpenseClearing(tx, { tripId: input.tripId, tripNo: trip.tripNo, route: trip.route, carrierId: trip.carrierId, entryDate: dateTo, createdById: input.updatedById });
+
+  const salaryResult = await recognizeCarrierTripSalaryAccrual(tx, {
+    tripId: input.tripId,
+    tripNo: trip.tripNo,
+    route: trip.route,
+    carrierId: trip.carrierId,
+    dateFrom: trip.dateFrom,
+    dateTo,
+    entryDate: dateTo,
+    createdById: input.updatedById,
+  });
+
+  const oilResult = await recognizeCarrierTripOilIssue(tx, {
+    tripId: input.tripId,
+    tripNo: trip.tripNo,
+    route: trip.route,
+    carrierId: trip.carrierId,
+    distanceKm: trip.distanceKm != null ? Number(trip.distanceKm) : null,
+    litersOverride: input.oilIssueLiters,
+    confirmInsufficientStock: input.confirmInsufficientOilStock,
+    entryDate: dateTo,
+    createdById: input.updatedById,
+  });
+
+  await recognizeCarrierTripExpenseClearing(tx, {
+    tripId: input.tripId,
+    tripNo: trip.tripNo,
+    route: trip.route,
+    carrierId: trip.carrierId,
+    entryDate: dateTo,
+    createdById: input.updatedById,
+    extraAmount: round2(salaryResult.amount + oilResult.amount),
+  });
 
   return updated;
 }
 
 /**
- * Orchestrates Trip REOPEN: soft-deletes whichever of Entry A/Entry B
- * is currently live straight into the Bin (safe no-op for either
- * that was never posted - e.g. zero trip expense) - never a reversal
- * entry (see softDeleteLiveCloseEntry's own doc comment for why) -
- * then sets status back to OPEN. Re-closing afterward
- * (closeCarrierTrip) posts entirely fresh Entry A/Entry B, dated the
- * Trip's own (possibly since-edited) dateTo.
+ * Orchestrates Trip REOPEN: soft-deletes every currently-live entry
+ * among Entry A/Entry C(all contributing months)/Entry D/Entry B
+ * straight into the Bin (safe no-op for any that were never posted) -
+ * never a reversal entry (see softDeleteLiveCloseEntry's own doc
+ * comment for why) - then sets status back to OPEN. Re-closing
+ * afterward (closeCarrierTrip) posts entirely fresh entries, dated
+ * the Trip's own (possibly since-edited) dateTo.
  */
 export async function reopenCarrierTrip(tx: Tx, input: { tripId: string; updatedById: string; reason?: string }) {
   const trip = await getTripOrThrow(tx, input.tripId);
@@ -2014,6 +2472,16 @@ export async function reopenCarrierTrip(tx: Tx, input: { tripId: string; updated
 
   await softDeleteLiveCloseEntry(tx, {
     referenceType: CARRIER_TRIP_CLOSE_REFERENCE_TYPE,
+    tripId: input.tripId,
+    deletedById: input.updatedById,
+  });
+  await softDeleteAllLiveEntriesForTrip(tx, {
+    referenceType: CARRIER_TRIP_CLOSE_SALARY_REFERENCE_TYPE,
+    tripId: input.tripId,
+    deletedById: input.updatedById,
+  });
+  await softDeleteLiveCloseEntry(tx, {
+    referenceType: CARRIER_TRIP_CLOSE_OIL_REFERENCE_TYPE,
     tripId: input.tripId,
     deletedById: input.updatedById,
   });
@@ -2362,9 +2830,22 @@ export interface TripProfitReport {
   totalBookingIncome: number;
   /** diesel (whichever of EXPENSE_CASH/EXPENSE_OFFICE/EXPENSE_CREDIT
    * it was paid through) + every other EXPENSE_CASH/EXPENSE_OFFICE/
-   * EXPENSE_CREDIT + DRIVER_SALARY line - every real cost of running
-   * the Trip, regardless of payment source. */
+   * EXPENSE_CREDIT line - every real cost of running the Trip,
+   * regardless of payment source. DRIVER_SALARY lines are NEVER
+   * included here any more - paying salary doesn't cost the Trip
+   * anything of its own; see salaryShare below for the real cost. */
   expenses: { lineId: string; lineType: string; category: string | null; description: string; amount: number; isDiesel: boolean }[];
+  /** This Trip's own ACTUALLY POSTED Driver Salary accrual (Entry C) -
+   * read live from CarrierSalaryMonthAllocation, never recomputed
+   * from the carrier's CURRENT salary setting. 0 for an OPEN Trip
+   * (accrual only happens at Close) or a carrier with no salary
+   * configured. */
+  salaryShare: number;
+  /** This Trip's own ACTUALLY POSTED Engine Oil issue (Entry D) - Rs
+   * value and liters, read live from the JournalEntry itself. Both 0/
+   * null for an OPEN Trip, or one where no oil was issued. */
+  oilIssueAmount: number;
+  oilIssueLiters: number | null;
   totalCarrierExpense: number;
   /** The isDiesel subset of totalCarrierExpense - see CarrierTripLine.
    * isDiesel's own schema doc comment. Never description-text based. */
@@ -2395,12 +2876,24 @@ export async function getTripProfitReport(tx: Tx, tripId: string): Promise<TripP
   const driverCashAccountId = trip.carrier.driverCashAccount?.id;
   const previousBalance = driverCashAccountId ? await getTripOpeningBalance(tx, tripId, trip.dateFrom, driverCashAccountId) : 0;
 
-  const [documents, lines] = await Promise.all([
+  const [documents, lines, salaryRows, oilEntry] = await Promise.all([
     tx.carrierTripDocument.findMany({ where: { tripId, unlinkedAt: null } }),
     tx.carrierTripLine.findMany({
-      where: { tripId, isDeleted: false, lineType: { in: ["EXPENSE_CASH", "EXPENSE_OFFICE", "EXPENSE_CREDIT", "DRIVER_SALARY"] } },
+      where: { tripId, isDeleted: false, lineType: { in: ["EXPENSE_CASH", "EXPENSE_OFFICE", "EXPENSE_CREDIT"] } },
+    }),
+    tx.carrierSalaryMonthAllocation.findMany({
+      where: { tripId, source: "TRIP", journalEntry: { isDeleted: false } },
+      select: { amount: true },
+    }),
+    tx.journalEntry.findFirst({
+      where: { referenceType: CARRIER_TRIP_CLOSE_OIL_REFERENCE_TYPE, referenceId: tripId, isDeleted: false },
+      include: { lines: true },
     }),
   ]);
+
+  const salaryShare = round2(salaryRows.reduce((s, r) => s + Number(r.amount), 0));
+  const oilIssueAmount = oilEntry ? round2(oilEntry.lines.reduce((s, l) => s + Number(l.debit), 0)) : 0;
+  const oilIssueLiters = oilEntry ? round2(Number(oilEntry.lines.find((l) => l.liters != null)?.liters ?? 0)) || null : null;
 
   const challanIncome: TripProfitReport["challanIncome"] = [];
   const otherIncome: TripProfitReport["otherIncome"] = [];
@@ -2438,7 +2931,7 @@ export async function getTripProfitReport(tx: Tx, tripId: string): Promise<TripP
   const totalBiltyRent = round2(challanIncome.reduce((s, c) => s + c.biltyRent, 0));
   const totalCarrierRent = round2(challanIncome.reduce((s, c) => s + c.carrierRent, 0));
   const totalBookingIncome = round2(challanIncome.reduce((s, c) => s + c.bookingIncome, 0));
-  const totalCarrierExpense = round2(expenses.reduce((s, e) => s + e.amount, 0));
+  const totalCarrierExpense = round2(expenses.reduce((s, e) => s + e.amount, 0) + salaryShare + oilIssueAmount);
   const totalDiesel = round2(expenses.filter((e) => e.isDiesel).reduce((s, e) => s + e.amount, 0));
 
   const categoryTotals = new Map<string, number>();
@@ -2456,6 +2949,9 @@ export async function getTripProfitReport(tx: Tx, tripId: string): Promise<TripP
     totalCarrierRent,
     totalBookingIncome,
     expenses,
+    salaryShare,
+    oilIssueAmount,
+    oilIssueLiters,
     totalCarrierExpense,
     totalDiesel,
     categoryBreakdown,

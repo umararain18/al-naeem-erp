@@ -103,7 +103,19 @@ export async function createOwnCarrierWithAccount(
     },
   });
 
-  return { carrier, account, profitAccount, tripInProgressAccount };
+  const salaryPayableAccount = await tx.account.create({
+    data: {
+      accountName: `${carrier.carrierNumber} — Driver Salary Payable`,
+      accountType: "LIABILITY",
+      category: "EMPLOYEE_PAYABLE",
+      description: `Automatic Driver Salary Payable account for own carrier: ${carrier.carrierNumber} - credited (increased) by the day-based salary accrual at Trip CLOSE and by "Allocate idle salary"; debited (decreased) whenever salary is actually paid out. Its own net balance IS what is currently owed to the driver.`,
+      ownCarrierSalaryPayableId: carrier.id,
+      isSystem: false,
+      isActive: true,
+    },
+  });
+
+  return { carrier, account, profitAccount, tripInProgressAccount, salaryPayableAccount };
 }
 
 /**
@@ -130,6 +142,7 @@ export async function getOwnCarrierOrThrow(tx: Tx, carrierId: string) {
       driverCashAccount: true,
       ownCarrierIncomeAccount: true,
       tripInProgressAccount: true,
+      salaryPayableAccount: true,
       currentDriver: { select: { id: true, name: true } },
     },
   });
@@ -195,6 +208,120 @@ export async function getOrCreateTripInProgressAccountId(tx: Tx, carrierId: stri
     select: { id: true },
   });
   return created.id;
+}
+
+/**
+ * Lazy find-or-create for a carrier's own "<carrier> — Driver Salary
+ * Payable" account - same defensive-fallback precedent as
+ * getOrCreateCarrierProfitAccountId/getOrCreateTripInProgressAccountId
+ * above, for any carrier row that predates this account existing.
+ */
+export async function getOrCreateDriverSalaryPayableAccountId(tx: Tx, carrierId: string): Promise<string> {
+  const existing = await tx.account.findUnique({ where: { ownCarrierSalaryPayableId: carrierId }, select: { id: true } });
+  if (existing) return existing.id;
+
+  const carrier = await tx.ownCarrier.findUnique({ where: { id: carrierId }, select: { carrierNumber: true } });
+  if (!carrier) throw new OwnCarrierError("OWN_CARRIER_NOT_FOUND", "Own Carrier not found.");
+
+  const created = await tx.account.create({
+    data: {
+      accountName: `${carrier.carrierNumber} — Driver Salary Payable`,
+      accountType: "LIABILITY",
+      category: "EMPLOYEE_PAYABLE",
+      description: `Automatic Driver Salary Payable account for own carrier: ${carrier.carrierNumber} - credited (increased) by the day-based salary accrual at Trip CLOSE and by "Allocate idle salary"; debited (decreased) whenever salary is actually paid out.`,
+      ownCarrierSalaryPayableId: carrierId,
+      isSystem: false,
+      isActive: true,
+    },
+    select: { id: true },
+  });
+  return created.id;
+}
+
+// ============================================================
+// ENGINE OIL STOCK (Own Carrier Part 3) - a single, global (never
+// per-carrier) system account. Current stock liters and the moving
+// weighted-average rate are both derived live from JournalLine.
+// liters/ratePerLiter across every live line on this account tagged
+// sourceType "ENGINE_OIL" - never a separate inventory table (see
+// that field's own schema doc comment).
+// ============================================================
+
+const ENGINE_OIL_STOCK_ACCOUNT_CODE = "ENGINE-OIL-STOCK";
+export const ENGINE_OIL_SOURCE_TYPE = "ENGINE_OIL";
+
+export async function getOrCreateEngineOilStockAccountId(tx: Tx): Promise<string> {
+  const existing = await tx.account.findFirst({
+    where: { accountCode: ENGINE_OIL_STOCK_ACCOUNT_CODE, isSystem: true },
+    select: { id: true },
+  });
+  if (existing) return existing.id;
+
+  const created = await tx.account.create({
+    data: {
+      accountName: "Engine Oil Stock",
+      accountCode: ENGINE_OIL_STOCK_ACCOUNT_CODE,
+      accountType: "ASSET",
+      category: "OTHER_ASSET",
+      description: "Engine Oil inventory, valued at a moving weighted-average rate - debited (liters + Rs) on purchase (Daily Posting), credited (liters + Rs, at the CURRENT average rate) on issue to a Trip at CLOSE.",
+      isSystem: true,
+      isActive: true,
+    },
+    select: { id: true },
+  });
+  return created.id;
+}
+
+export interface EngineOilStockState {
+  accountId: string;
+  liters: number;
+  /** Rs value of the remaining stock - debit minus credit on the
+   * account itself, the real ledger balance (never liters × rate
+   * computed independently - this IS the numerator rate is derived
+   * from). */
+  valueRs: number;
+  /** valueRs / liters - null when liters is 0 (nothing in stock, rate
+   * is undefined) or negative (a data inconsistency: more issued than
+   * ever purchased - never divided by a non-positive quantity). */
+  avgRatePerLiter: number | null;
+}
+
+function round2(value: number): number {
+  return Math.round((value + Number.EPSILON) * 100) / 100;
+}
+
+/**
+ * Reads Engine Oil Stock's own current state straight from the
+ * ledger: every live JournalLine on this account (both the Rs amount
+ * AND its own liters) summed debit-minus-credit. A purchase posted
+ * WITHOUT liters (e.g. a generic Journal Entry, never Daily Posting's
+ * own dedicated fields) contributes to valueRs but not to liters -
+ * documented as the one way liters tracking can under-count, never
+ * silently guessed around.
+ */
+export async function getEngineOilStockState(tx: Tx): Promise<EngineOilStockState> {
+  const accountId = await getOrCreateEngineOilStockAccountId(tx);
+  // `liters` is always a plain positive magnitude on every line (same
+  // convention as debit/credit themselves) - net stock liters is
+  // therefore debit-liters MINUS credit-liters, never a blind sum,
+  // read row-by-row (purchase/issue counts stay low enough that this
+  // never needs a second aggregate query).
+  const lines = await tx.journalLine.findMany({
+    where: { accountId, journalEntry: { isDeleted: false } },
+    select: { debit: true, credit: true, liters: true },
+  });
+  let valueRs = 0;
+  let liters = 0;
+  for (const l of lines) {
+    const debit = Number(l.debit);
+    const credit = Number(l.credit);
+    valueRs += debit - credit;
+    if (l.liters != null) liters += debit > 0 ? Number(l.liters) : -Number(l.liters);
+  }
+  valueRs = round2(valueRs);
+  liters = round2(liters);
+  const avgRatePerLiter = liters > 0.009 ? round2(valueRs / liters) : null;
+  return { accountId, liters, valueRs, avgRatePerLiter };
 }
 
 // ============================================================
