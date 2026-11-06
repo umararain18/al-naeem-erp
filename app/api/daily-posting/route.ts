@@ -22,6 +22,7 @@ import { assertPaidVerificationNotExceeded, BiltyPaidVerificationError } from "@
 import { assertPhonchReceiptNotExceeded, PhonchAccountingError } from "@/lib/phonch-accounting";
 import { assertPrivatePhonchPaymentNotExceeded, PrivatePhonchAccountingError } from "@/lib/private-phonch-accounting";
 import { assertBillReceiptNotExceeded, BillAccountingError } from "@/lib/bill-accounting";
+import { postExpenseOfficeLine, CarrierTripError } from "@/lib/carrier-trip";
 import { auditPost, actorFromUser, requestContext } from "@/lib/audit-log";
 
 const lineSchema = z.object({
@@ -77,6 +78,16 @@ const lineSchema = z.object({
   // own Diesel isDiesel/liters/ratePerLiter fields).
   liters: z.number().positive().optional(),
   ratePerLiter: z.number().positive().optional(),
+
+  // Optional - only meaningful when the RESOLVED counterAccountId
+  // turns out to be some Own Carrier's own "Carrier Profit" or "Trip
+  // in Progress" account. Lets this line land INSIDE that Trip
+  // (posted via lib/carrier-trip.ts's own postExpenseOfficeLine, as a
+  // genuine EXPENSE_OFFICE CarrierTripLine - Dr Trip in Progress / Cr
+  // this Main Account) instead of hitting Carrier Profit directly and
+  // outside any Trip. See the TRIP-LINKED LINES section below for the
+  // full validation/routing.
+  tripId: z.string().optional(),
 });
 
 const dailyPostingSchema = z.object({
@@ -903,6 +914,10 @@ export async function POST(request: NextRequest) {
           accountType: true,
           category: true,
           isActive: true,
+          // Own Carrier-owned 1:1 accounts - see the TRIP-LINKED LINES
+          // section below for why these two specifically matter here.
+          ownCarrierIncomeId: true,
+          ownCarrierTripInProgressId: true,
           party: {
             select: {
               id: true,
@@ -1085,6 +1100,110 @@ export async function POST(request: NextRequest) {
     });
 
     // ========================================================
+    // TRIP-LINKED LINES
+    //
+    // A line whose RESOLVED counter account is some Own Carrier's own
+    // "Carrier Profit" (ownCarrierIncomeId) or "Trip in Progress"
+    // (ownCarrierTripInProgressId) account can optionally carry a
+    // tripId, so it lands INSIDE that Trip (via
+    // lib/carrier-trip.ts's postExpenseOfficeLine - Dr Trip in
+    // Progress / Cr this Main Account, a genuine EXPENSE_OFFICE
+    // CarrierTripLine) instead of posting straight to Carrier Profit
+    // and staying outside every Trip's own accounting forever (see
+    // getCarrierPageSummary's own directCarrierExpense field, which is
+    // exactly what surfaces a line that did NOT take this path).
+    //
+    // Only the EXPENSE direction is supported here (the carrier
+    // account debited) - postExpenseOfficeLine has no "income" shape,
+    // and a credit straight to Carrier Profit outside any Trip is a
+    // legitimate direct posting on its own, same as before this
+    // feature existed.
+    //
+    // Hitting "Trip in Progress" directly with NO tripId is rejected
+    // outright - that account is a shared per-carrier clearing account
+    // (lib/carrier-trip.ts's own closeCarrierTrip sweeps it per-Trip,
+    // from each Trip's own CarrierTripLine rows, never from this
+    // account's own raw balance) so an un-attributed line posted to it
+    // would sit there forever, never swept by any Trip's own Close.
+    // ========================================================
+
+    const carrierAccountByCounterId = new Map<string, { carrierId: string; isTripInProgress: boolean }>();
+    for (const account of counterAccounts) {
+      if (account.ownCarrierIncomeId) {
+        carrierAccountByCounterId.set(account.id, { carrierId: account.ownCarrierIncomeId, isTripInProgress: false });
+      } else if (account.ownCarrierTripInProgressId) {
+        carrierAccountByCounterId.set(account.id, { carrierId: account.ownCarrierTripInProgressId, isTripInProgress: true });
+      }
+    }
+
+    const tripIdsToValidate = Array.from(
+      new Set(resolvedLines.filter((l) => l.tripId && carrierAccountByCounterId.has(l.counterAccountId)).map((l) => l.tripId!))
+    );
+    const tripsById = new Map(
+      tripIdsToValidate.length > 0
+        ? (
+            await prisma.carrierTrip.findMany({
+              where: { id: { in: tripIdsToValidate } },
+              select: { id: true, tripNo: true, carrierId: true, status: true, isDeleted: true },
+            })
+          ).map((t) => [t.id, t] as const)
+        : []
+    );
+
+    const tripRoutedLineIndices = new Set<number>();
+
+    for (const { line, index } of resolvedLines.map((line, index) => ({ line, index }))) {
+      const carrierAccount = carrierAccountByCounterId.get(line.counterAccountId);
+      if (!carrierAccount) continue;
+
+      if (!line.tripId) {
+        if (carrierAccount.isTripInProgress) {
+          return NextResponse.json(
+            {
+              success: false,
+              message: `Entry ${index + 1}: Posting directly to "Trip in Progress" requires picking a Trip. Pick a Trip above, or select this carrier's Carrier Profit account for a direct expense outside any Trip.`,
+            },
+            { status: 400 }
+          );
+        }
+        continue; // Direct Carrier Profit posting, unchanged - see directCarrierExpense.
+      }
+
+      const trip = tripsById.get(line.tripId);
+      if (!trip || trip.isDeleted || trip.carrierId !== carrierAccount.carrierId) {
+        return NextResponse.json(
+          { success: false, message: `Entry ${index + 1}: Selected Trip was not found for this carrier.` },
+          { status: 400 }
+        );
+      }
+      if (trip.status !== "OPEN") {
+        return NextResponse.json(
+          {
+            success: false,
+            message: `Entry ${index + 1}: Trip ${trip.tripNo} is closed - reopen it first (pehle reopen karein) before posting this expense to it.`,
+          },
+          { status: 400 }
+        );
+      }
+      // The carrier account must be the one DEBITED (an expense) -
+      // i.e. the MAIN account is the one credited/paying.
+      if (line.direction !== "CREDIT") {
+        return NextResponse.json(
+          {
+            success: false,
+            message: `Entry ${index + 1}: Linking to a Trip is only supported for an expense (the Carrier Profit/Trip in Progress side must be debited).`,
+          },
+          { status: 400 }
+        );
+      }
+
+      tripRoutedLineIndices.add(index);
+    }
+
+    const tripRoutedLines = resolvedLines.filter((_, i) => tripRoutedLineIndices.has(i));
+    const normalLines = resolvedLines.filter((_, i) => !tripRoutedLineIndices.has(i));
+
+    // ========================================================
     // DUPLICATE DOCUMENT WARNING
     //
     // IMPORTANT:
@@ -1097,7 +1216,7 @@ export async function POST(request: NextRequest) {
     // legitimate and must not be flagged as duplicates.
     // ========================================================
 
-    const documentLines = resolvedLines.filter(
+    const documentLines = normalLines.filter(
       (line) =>
         line.sourceType &&
         line.sourceType !== "DIRECT" &&
@@ -1273,7 +1392,10 @@ export async function POST(request: NextRequest) {
     const groups = new Map<string, typeof resolvedLines>();
     const DIRECT_GROUP = "__DIRECT__";
 
-    for (const line of resolvedLines) {
+    // tripRoutedLines are deliberately excluded here - they post via
+    // postExpenseOfficeLine inside the transaction below instead (see
+    // the TRIP-LINKED LINES section above).
+    for (const line of normalLines) {
       const key =
         (line.sourceType === "CHALLAN" || line.sourceType === "BILTY") &&
         line.sourceId
@@ -1369,7 +1491,7 @@ export async function POST(request: NextRequest) {
         // any entry - all-or-nothing, and race-safe against a
         // concurrent Daily Posting for the same Bilty, which is why
         // this transaction is now SERIALIZABLE.
-        for (const line of resolvedLines) {
+        for (const line of normalLines) {
           if (line.sourceType === "BILTY" && line.sourceId) {
             await assertPaidVerificationNotExceeded(tx, line.sourceId, line.counterAccountId, line.amount, line.direction);
           }
@@ -1382,6 +1504,36 @@ export async function POST(request: NextRequest) {
           if (line.sourceType === "BILL" && line.sourceId) {
             await assertBillReceiptNotExceeded(tx, line.sourceId, line.counterAccountId, line.amount, line.direction);
           }
+        }
+
+        // TRIP-LINKED LINES - post each as a genuine EXPENSE_OFFICE
+        // CarrierTripLine on its own Trip (Dr Trip in Progress / Cr
+        // this Main Account), never through the generic DAILY_POSTING
+        // grouping above. category "OTHER" since Daily Posting has no
+        // DIESEL/TOLL/KHANA/MARAMMAT category concept of its own - the
+        // user's own free-text description is kept as-is.
+        for (const line of tripRoutedLines) {
+          await postExpenseOfficeLine(tx, {
+            tripId: line.tripId!,
+            officeAccountId: data.accountId,
+            category: "OTHER",
+            amount: line.amount,
+            date: postingDate,
+            description: line.description,
+            createdById: currentUser.userId,
+          });
+
+          const trip = tripsById.get(line.tripId!);
+          await auditPost(tx, {
+            actor: actorFromUser(currentUser),
+            module: "CARRIER_TRIP",
+            entityType: "CarrierTrip",
+            entityId: line.tripId!,
+            documentNo: trip?.tripNo,
+            description: `Posted via Daily Posting on ${mainAccount.accountName}: Rs. ${line.amount.toLocaleString()} to Trip ${trip?.tripNo || line.tripId} (${line.description})`,
+            newValues: { officeAccountId: data.accountId, amount: line.amount, description: line.description },
+            ...requestContext(request),
+          });
         }
 
         const created = [];
@@ -1464,6 +1616,13 @@ export async function POST(request: NextRequest) {
         );
       }
 
+      if (error instanceof CarrierTripError) {
+        return NextResponse.json(
+          { success: false, code: error.code, message: error.message },
+          { status: 400 }
+        );
+      }
+
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2034") {
         return NextResponse.json(
           { success: false, message: "Another Daily Posting for the same Bilty/Challan happened at the same time. Please retry." },
@@ -1520,8 +1679,9 @@ export async function POST(request: NextRequest) {
 
         idempotentReplay: idempotentReplay || undefined,
 
-        journalEntry: journalEntries[0],
+        journalEntry: journalEntries[0] || null,
         journalEntries,
+        tripLinkedCount: tripRoutedLines.length || undefined,
 
         duplicateWarnings:
           duplicateWarnings.length > 0

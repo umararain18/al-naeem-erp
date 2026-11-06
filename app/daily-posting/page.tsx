@@ -29,7 +29,26 @@ type Account = {
     id: string;
     partyName: string;
   } | null;
+  // Own Carrier-owned 1:1 accounts - set only on that ONE carrier's own
+  // Carrier Profit / Trip in Progress account (see app/api/accounts's
+  // own GET, which already returns every scalar column). Used to offer
+  // the optional "Link to Trip" picker - see getCarrierLinkForAccount.
+  ownCarrierIncomeId?: string | null;
+  ownCarrierTripInProgressId?: string | null;
 };
+
+// Non-null only when `accountId` is some Own Carrier's own Carrier
+// Profit or Trip in Progress account - see app/api/daily-posting/
+// route.ts's own TRIP-LINKED LINES section, which this UI mirrors.
+function getCarrierLinkForAccount(accounts: Account[], accountId: string): { carrierId: string; isTripInProgress: boolean } | null {
+  const account = accounts.find((a) => a.id === accountId);
+  if (!account) return null;
+  if (account.ownCarrierIncomeId) return { carrierId: account.ownCarrierIncomeId, isTripInProgress: false };
+  if (account.ownCarrierTripInProgressId) return { carrierId: account.ownCarrierTripInProgressId, isTripInProgress: true };
+  return null;
+}
+
+type TripOption = { id: string; tripNo: string; status: "OPEN" | "CLOSED" };
 
 // Traced to app/api/daily-posting/route.ts's `duplicateWarnings` array
 // (the 409 response's `duplicates` field) - narrowed to only the
@@ -76,6 +95,11 @@ type PostingLine = {
   // whatever the count - used only to offer an explicit selector
   // when there is more than one (see setLineEligibleParties()).
   eligibleParties: EligibleParty[];
+  // Optional - only meaningful when counterAccountId resolves to some
+  // carrier's Carrier Profit/Trip in Progress account (see
+  // getCarrierLinkForAccount). "" means this line stays a direct
+  // posting outside any Trip.
+  tripId: string;
 };
 
 // The 5 true document types - a line tagged with one of these can
@@ -137,6 +161,7 @@ function createLine(): PostingLine {
     ratePerLiter: "",
     resolvedPartyLabel: "",
     eligibleParties: [],
+    tripId: "",
   };
 }
 
@@ -441,12 +466,21 @@ function LineFieldsCells({
   mainAccountId,
   onUpdate,
   onEligibleParties,
+  tripLink,
 }: {
   line: PostingLine;
   accounts: Account[];
   mainAccountId: string;
   onUpdate: (field: keyof PostingLine, value: string) => void;
   onEligibleParties: (parties: EligibleParty[]) => void;
+  // Only passed by the New Transactions create flow (see
+  // app/api/daily-posting/route.ts's TRIP-LINKED LINES section) -
+  // omitted for the Existing Transactions inline editor, whose own
+  // PATCH /api/cash-book/{lineId} route has no tripId concept.
+  tripLink?: {
+    tripsByCarrierId: Record<string, TripOption[] | undefined>;
+    onLoadTripsForCarrier: (carrierId: string) => void;
+  };
 }) {
   const counterAccountOptions = useMemo(
     () =>
@@ -503,6 +537,8 @@ function LineFieldsCells({
     ? "Optional - auto-resolved from document"
     : "Search account...";
 
+  const carrierLink = tripLink ? getCarrierLinkForAccount(accounts, line.counterAccountId) : null;
+
   return (
     <>
       <td className="px-4 py-4">
@@ -512,6 +548,7 @@ function LineFieldsCells({
           placeholder={placeholder}
           onChange={(value) => {
             onUpdate("counterAccountId", value);
+            onUpdate("tripId", "");
             const eligibleMatch = line.eligibleParties.find(
               (party) => party.accountId === value
             );
@@ -538,6 +575,37 @@ function LineFieldsCells({
               No party could be auto-resolved - please select a Counter Account.
             </p>
           )}
+        {carrierLink && tripLink && (
+          <div className="mt-2">
+            {line.direction !== "CREDIT" ? (
+              <p className="text-[11px] text-gray-400">Link to Trip only applies when this account is debited (Direction = Credit).</p>
+            ) : (
+              <>
+                <label className="mb-1 block text-[11px] font-medium text-gray-500">Link to Trip (optional)</label>
+                <select
+                  value={line.tripId}
+                  onFocus={() => tripLink.onLoadTripsForCarrier(carrierLink.carrierId)}
+                  onChange={(e) => onUpdate("tripId", e.target.value)}
+                  className="w-64 rounded-lg border border-gray-300 px-2 py-1.5 text-xs outline-none focus:border-blue-500"
+                >
+                  <option value="">
+                    {carrierLink.isTripInProgress
+                      ? "— Select a Trip (required for Trip in Progress) —"
+                      : "— Direct to Carrier Profit (outside any Trip) —"}
+                  </option>
+                  {(tripLink.tripsByCarrierId[carrierLink.carrierId] || []).map((t) => (
+                    <option key={t.id} value={t.id} disabled={t.status !== "OPEN"}>
+                      {t.tripNo} ({t.status === "OPEN" ? "Open" : "Closed - reopen first"})
+                    </option>
+                  ))}
+                </select>
+                {carrierLink.isTripInProgress && !line.tripId && (
+                  <p className="mt-1 text-[11px] text-amber-600">Posting directly to Trip in Progress requires picking an open Trip above.</p>
+                )}
+              </>
+            )}
+          </div>
+        )}
       </td>
 
       <td className="px-4 py-4">
@@ -602,7 +670,10 @@ function LineFieldsCells({
       <td className="px-4 py-4">
         <select
           value={line.direction}
-          onChange={(e) => onUpdate("direction", e.target.value)}
+          onChange={(e) => {
+            onUpdate("direction", e.target.value);
+            if (e.target.value !== "CREDIT") onUpdate("tripId", "");
+          }}
           className="w-28 rounded-lg border border-gray-300 px-3 py-2 text-sm outline-none focus:border-blue-500"
         >
           <option value="DEBIT">Debit</option>
@@ -679,6 +750,25 @@ export default function DailyPostingPage() {
 
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [lines, setLines] = useState<PostingLine[]>([createLine()]);
+
+  // "Link to Trip" picker data (see getCarrierLinkForAccount) - loaded
+  // lazily per carrier, the first time its own Carrier Profit/Trip in
+  // Progress account is picked as a counter account, then cached.
+  const [tripsByCarrierId, setTripsByCarrierId] = useState<Record<string, TripOption[] | undefined>>({});
+  const loadingCarrierTripsRef = useState(() => new Set<string>())[0];
+
+  function loadTripsForCarrier(carrierId: string) {
+    if (tripsByCarrierId[carrierId] || loadingCarrierTripsRef.has(carrierId)) return;
+    loadingCarrierTripsRef.add(carrierId);
+    fetch(`/api/own-carrier/${carrierId}/trips`)
+      .then((res) => res.json())
+      .then((data) => {
+        if (data?.success) {
+          setTripsByCarrierId((current) => ({ ...current, [carrierId]: data.items || [] }));
+        }
+      })
+      .finally(() => loadingCarrierTripsRef.delete(carrierId));
+  }
 
   const [loadingAccounts, setLoadingAccounts] = useState(true);
   const [posting, setPosting] = useState(false);
@@ -997,6 +1087,7 @@ export default function DailyPostingPage() {
           ...(isEngineOilStockAccount(accounts, line.counterAccountId) && line.liters
             ? { liters: Number(line.liters), ratePerLiter: line.ratePerLiter ? Number(line.ratePerLiter) : undefined }
             : {}),
+          tripId: line.tripId || undefined,
         })),
       };
 
@@ -1084,6 +1175,7 @@ export default function DailyPostingPage() {
           ratePerLiter: cl.ratePerLiter != null ? String(cl.ratePerLiter) : "",
           resolvedPartyLabel: cl.counterLabel,
           eligibleParties: [],
+          tripId: "",
         })),
         saving: false,
         error: "",
@@ -1564,6 +1656,7 @@ export default function DailyPostingPage() {
                       mainAccountId={accountId}
                       onUpdate={(field, value) => updateLine(line.id, field, value)}
                       onEligibleParties={(parties) => setLineEligibleParties(line.id, parties)}
+                      tripLink={{ tripsByCarrierId, onLoadTripsForCarrier: loadTripsForCarrier }}
                     />
 
                     <td className="px-4 py-4">

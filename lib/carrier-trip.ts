@@ -3062,7 +3062,25 @@ export interface CarrierAllTripsSummary {
 /** "Carrier page: all-trips summary" - sums every non-deleted Trip's
  * own getTripProfitReport() across the carrier's whole life, open and
  * closed alike (same "adequate for a profit ESTIMATE" status as the
- * per-Trip report itself - never a second, independent calculation). */
+ * per-Trip report itself - never a second, independent calculation).
+ * Deliberately pure Trip arithmetic, NEVER a read of the Carrier
+ * Profit account's own ledger balance - that's what lets it still
+ * mean something useful while Trips are open (the ledger hasn't
+ * received their own Entry A/B yet). The consequence: this function's
+ * own `totalOwnCarrierProfit` IGNORES any JournalLine posted straight
+ * to Carrier Profit outside of Trip close (see
+ * CarrierPageSummary.directCarrierExpense's own doc comment) and any
+ * month-end "Allocate idle salary" top-up (the latter not accounted
+ * for below either - a known, narrower gap than directCarrierExpense,
+ * left as-is since nothing in this module currently surfaces it as a
+ * user-visible "Own Carrier Profit" figure the way direct postings
+ * are). Once every Trip is CLOSED and no idle-salary allocation has
+ * ever run for this carrier, `totalOwnCarrierProfit -
+ * directCarrierExpense.total` must equal getCarrierPageSummary's own
+ * ledger-true `carrierProfit` exactly (no open Trip left "pending" in
+ * the ledger) - the caller (the carrier page) computes that
+ * subtraction itself; this function never reaches into the other
+ * summary to do it. */
 export async function getCarrierAllTripsSummary(tx: Tx, carrierId: string): Promise<CarrierAllTripsSummary> {
   const trips = await tx.carrierTrip.findMany({ where: { carrierId, isDeleted: false }, select: { id: true } });
 
@@ -3138,6 +3156,28 @@ export interface CarrierPageSummary {
    * yet - getOrCreateDriverSalaryPayableAccountId only creates one
    * lazily, on first use). */
   driverSalaryPayableNet: number;
+  /** Every live JournalLine sitting directly on this carrier's own
+   * Carrier Profit account whose OWN JournalEntry was NOT produced by
+   * this module's own Trip-close machinery (i.e. every referenceType
+   * OTHER than CARRIER_TRIP_CLOSE/CARRIER_TRIP_CLOSE_EXPENSE/
+   * CARRIER_SALARY_IDLE_ALLOCATION and the two dead REVERSAL types) -
+   * in practice, a Daily Posting or Manual Journal line someone
+   * pointed straight at this carrier's own Carrier Profit account
+   * instead of going through a Trip (e.g. an office-paid repair billed
+   * straight to the carrier with no Trip open). Excluded BY
+   * EXCLUSION, never by an allowlist of "external" referenceTypes, so
+   * any future non-Trip posting path is still caught here by default.
+   * `total` is net (debit - credit) - positive means these lines were
+   * net EXPENSE (reduced this carrier's own profit), matching this
+   * card's own "expenses" framing; see getCarrierAllTripsSummary's own
+   * doc comment for why this total must be subtracted from that
+   * function's own totalOwnCarrierProfit to keep the "all Trips
+   * closed -> Own Carrier Profit == Carrier Profit ledger balance"
+   * invariant true once any such direct line exists. */
+  directCarrierExpense: {
+    lines: { id: string; date: Date; description: string; debit: number; credit: number }[];
+    total: number;
+  };
 }
 
 export async function getCarrierPageSummary(tx: Tx, carrierId: string): Promise<CarrierPageSummary> {
@@ -3156,6 +3196,38 @@ export async function getCarrierPageSummary(tx: Tx, carrierId: string): Promise<
       _sum: { debit: true, credit: true },
     });
     carrierProfit = round2(netIncome({ debit: Number(agg._sum.debit || 0), credit: Number(agg._sum.credit || 0) }));
+  }
+
+  let directCarrierExpense: CarrierPageSummary["directCarrierExpense"] = { lines: [], total: 0 };
+  if (carrier.ownCarrierIncomeAccount) {
+    const directLines = await tx.journalLine.findMany({
+      where: {
+        accountId: carrier.ownCarrierIncomeAccount.id,
+        journalEntry: {
+          isDeleted: false,
+          referenceType: {
+            notIn: [
+              CARRIER_TRIP_CLOSE_REFERENCE_TYPE,
+              CARRIER_TRIP_CLOSE_EXPENSE_REFERENCE_TYPE,
+              CARRIER_SALARY_IDLE_REFERENCE_TYPE,
+              CARRIER_TRIP_CLOSE_REVERSAL_REFERENCE_TYPE,
+              CARRIER_TRIP_CLOSE_EXPENSE_REVERSAL_REFERENCE_TYPE,
+            ],
+          },
+        },
+      },
+      include: { journalEntry: { select: { entryDate: true, description: true } } },
+      orderBy: { journalEntry: { entryDate: "desc" } },
+    });
+    const lines = directLines.map((l) => ({
+      id: l.id,
+      date: l.journalEntry.entryDate,
+      description: l.description || l.journalEntry.description || "",
+      debit: Number(l.debit),
+      credit: Number(l.credit),
+    }));
+    const total = round2(lines.reduce((sum, l) => sum + (l.debit - l.credit), 0));
+    directCarrierExpense = { lines, total };
   }
 
   let tripInProgress = 0;
@@ -3211,7 +3283,16 @@ export async function getCarrierPageSummary(tx: Tx, carrierId: string): Promise<
     driverSalaryPayableNet = round2(Number(agg._sum.debit || 0) - Number(agg._sum.credit || 0));
   }
 
-  return { driverCashBalance, vendorsPayable, totalVendorsPayable, challanReceivable, carrierProfit, tripInProgress, driverSalaryPayableNet };
+  return {
+    driverCashBalance,
+    vendorsPayable,
+    totalVendorsPayable,
+    challanReceivable,
+    carrierProfit,
+    tripInProgress,
+    driverSalaryPayableNet,
+    directCarrierExpense,
+  };
 }
 
 /**

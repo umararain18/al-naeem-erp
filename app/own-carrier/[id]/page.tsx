@@ -16,6 +16,14 @@ function formatSignedMoney(value: number) {
   return `${value < 0 ? "-" : ""}Rs. ${formatMoney(value)}`;
 }
 
+// Purely a display-side rounding for a value DERIVED client-side
+// (allTripsSummary.totalOwnCarrierProfit - directCarrierExpense.total)
+// - never the source of truth, which stays server-computed in both
+// its own inputs.
+function round2DisplayOnly(value: number) {
+  return Math.round(value * 100) / 100;
+}
+
 function Drawer({ open, onClose, title, children }: { open: boolean; onClose: () => void; title: string; children: React.ReactNode }) {
   if (!open) return null;
   return (
@@ -60,6 +68,10 @@ type CarrierSummary = {
   carrierProfit: number;
   tripInProgress: number;
   driverSalaryPayableNet: number;
+  directCarrierExpense: {
+    lines: { id: string; date: string; description: string; debit: number; credit: number }[];
+    total: number;
+  };
 };
 
 type UnlinkedChallan = { id: string; challanNo: string; loadingDate: string };
@@ -307,9 +319,51 @@ export default function OwnCarrierDetailPage() {
             </div>
             <div>
               <p className="text-xs text-gray-500">Own Carrier Profit</p>
-              <p className={`text-base font-semibold ${allTripsSummary.totalOwnCarrierProfit >= 0 ? "text-green-700" : "text-red-700"}`}>
-                {formatSignedMoney(allTripsSummary.totalOwnCarrierProfit)}
+              {/* allTripsSummary.totalOwnCarrierProfit is pure Trip
+                  arithmetic (see getCarrierAllTripsSummary's own doc
+                  comment) - it never sees a line posted straight to
+                  Carrier Profit outside any Trip, so that effect is
+                  subtracted here. Once every Trip is closed this makes
+                  the figure shown equal carrierSummary.carrierProfit
+                  (the real ledger balance) exactly - the invariant
+                  this page is built to hold. */}
+              {(() => {
+                const ownCarrierProfit = round2DisplayOnly(
+                  allTripsSummary.totalOwnCarrierProfit - (carrierSummary?.directCarrierExpense.total || 0)
+                );
+                return (
+                  <p className={`text-base font-semibold ${ownCarrierProfit >= 0 ? "text-green-700" : "text-red-700"}`}>
+                    {formatSignedMoney(ownCarrierProfit)}
+                  </p>
+                );
+              })()}
+            </div>
+          </div>
+        )}
+
+        {carrierSummary && carrierSummary.directCarrierExpense.lines.length > 0 && (
+          <div className="mb-6 rounded-xl border bg-white p-4 shadow-sm">
+            <div className="mb-2 flex items-center justify-between">
+              <p className="text-xs font-semibold uppercase text-gray-500">Direct carrier expenses (outside trips)</p>
+              <p className={`text-sm font-semibold ${carrierSummary.directCarrierExpense.total >= 0 ? "text-red-700" : "text-green-700"}`}>
+                {formatSignedMoney(carrierSummary.directCarrierExpense.total)}
               </p>
+            </div>
+            <p className="mb-2 text-[11px] text-gray-400">
+              Posted straight to this carrier's own Carrier Profit account via Daily Posting/Journal Entry, not through any Trip.
+            </p>
+            <div className="space-y-1">
+              {carrierSummary.directCarrierExpense.lines.map((l) => (
+                <div key={l.id} className="flex items-center justify-between gap-3 border-t border-gray-100 py-1 text-sm first:border-t-0">
+                  <div className="min-w-0 truncate">
+                    <span className="text-gray-900">{l.description || "—"}</span>
+                    <span className="ml-2 text-xs text-gray-400">{formatBusinessDate(l.date)}</span>
+                  </div>
+                  <span className={`shrink-0 font-medium ${l.debit > 0 ? "text-red-700" : "text-green-700"}`}>
+                    {formatSignedMoney(l.debit - l.credit)}
+                  </span>
+                </div>
+              ))}
             </div>
           </div>
         )}
