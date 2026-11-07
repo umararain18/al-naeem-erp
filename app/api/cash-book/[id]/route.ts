@@ -389,6 +389,10 @@ export async function PATCH(
                 sourceNumber: typeof documentNo === "string" ? documentNo.trim() : undefined,
                 counterAccountId: documentUnchanged ? counterLine.accountId : undefined,
                 direction: newDebit > 0 ? "DEBIT" : "CREDIT",
+                // This entry's own prior contribution must never count
+                // against itself - see getBiltyLegitimatePartyAccountIds's
+                // own doc comment (lib/document-party-resolution.ts).
+                excludeJournalEntryId: currentLine.journalEntryId,
               });
 
               finalSourceId = resolved.sourceId;

@@ -209,7 +209,11 @@ export async function resolveCounterAccountForDailyPostingLine(
   sourceNumberForMessage: string | undefined,
   // Only consulted for CHALLAN - see resolveChallanParty() in
   // lib/document-party-resolution.ts.
-  direction?: "DEBIT" | "CREDIT"
+  direction?: "DEBIT" | "CREDIT",
+  // BILTY only - see resolveBiltyParty's own doc comment in
+  // lib/document-party-resolution.ts. Set only when editing an
+  // existing line, never by Create.
+  excludeJournalEntryId?: string
 ): Promise<{ counterAccountId: string; wasManuallySupplied: boolean }> {
   if (manualCounterAccountId) {
     return { counterAccountId: manualCounterAccountId, wasManuallySupplied: true };
@@ -221,7 +225,8 @@ export async function resolveCounterAccountForDailyPostingLine(
   const resolved = await resolveDocumentPartyAccount(
     sourceType as "CHALLAN" | "BILTY" | "PHONCH" | "PRIVATE_PHONCH" | "BILL",
     sourceId!,
-    direction
+    direction,
+    excludeJournalEntryId
   );
 
   if (!resolved) {
@@ -242,23 +247,32 @@ export async function resolveCounterAccountForDailyPostingLine(
 // (wasManuallySupplied === false).
 // ------------------------------------------------------------
 export async function assertCounterAccountLegitimateForBilty(
+  tx: Tx,
   sourceType: DailyPostingSourceType,
   sourceId: string | undefined,
   counterAccountId: string,
   wasManuallySupplied: boolean,
   // Only consulted for the Gross Bilty Receivable exception - see
   // getBiltyLegitimatePartyAccountIds().
-  direction?: "DEBIT" | "CREDIT"
+  direction?: "DEBIT" | "CREDIT",
+  // Excludes this one JournalEntry's own prior contribution - set
+  // only when editing an existing line against this SAME Bilty, so
+  // its own already-posted amount is never mistaken for "already
+  // claimed" against itself (the walk-in-Bilty regression this
+  // parameter exists to fix). Never set by Create.
+  excludeJournalEntryId?: string
 ): Promise<void> {
   if (sourceType !== "BILTY" || !wasManuallySupplied || !sourceId) return;
 
-  const legitimateAccountIds = await getBiltyLegitimatePartyAccountIds(sourceId, direction);
+  const legitimateAccountIds = await getBiltyLegitimatePartyAccountIds(sourceId, direction, excludeJournalEntryId);
 
   if (!legitimateAccountIds.has(counterAccountId)) {
+    const bilty = await tx.bilty.findUnique({ where: { id: sourceId }, select: { biltyNo: true } });
+    const biltyLabel = bilty ? `Bilty ${bilty.biltyNo}` : "this Bilty";
     throw new DailyPostingValidationError(
       legitimateAccountIds.size > 0
-        ? "The selected Counter Account does not match this Bilty's established responsible Party. Select the correct Party, or leave Counter Account blank to auto-resolve."
-        : "This Bilty has no established or identifiable responsible Party (no valid Consignor/Consignee/Clearing Agent account, no Collection or Paid responsibility). Please verify the Bilty's parties before posting against it."
+        ? `${biltyLabel}: the selected Counter Account does not match its established responsible Party. Select the correct Party, or leave Counter Account blank to auto-resolve.`
+        : `${biltyLabel}: no established or identifiable responsible Party (no valid Consignor/Consignee/Clearing Agent account, no Collection or Paid responsibility). Please verify the Bilty's parties before posting against it.`
     );
   }
 }
@@ -421,6 +435,13 @@ export interface ResolveDailyPostingLineParams {
   // consulted for a CHALLAN source (see resolveChallanParty() in
   // lib/document-party-resolution.ts).
   direction?: "DEBIT" | "CREDIT";
+  // BILTY only (see resolveBiltyParty's own doc comment in lib/
+  // document-party-resolution.ts) - the JournalEntry currently being
+  // edited, excluded from every "already claimed" ledger read below
+  // so this line's own prior amount is never counted against itself.
+  // Set only by an Edit caller (lib/daily-posting-edit.ts, app/api/
+  // cash-book/[id]/route.ts); never by Create.
+  excludeJournalEntryId?: string;
 }
 
 export interface ResolvedDailyPostingLine {
@@ -434,7 +455,7 @@ export interface ResolvedDailyPostingLine {
 export async function resolveDailyPostingLine(
   params: ResolveDailyPostingLineParams
 ): Promise<ResolvedDailyPostingLine> {
-  const { tx, mainAccountId, mainCategory, sourceType, sourceId, sourceNumber, counterAccountId, direction } = params;
+  const { tx, mainAccountId, mainCategory, sourceType, sourceId, sourceNumber, counterAccountId, direction, excludeJournalEntryId } = params;
 
   await validateDailyPostingLineShape(tx, { sourceType, sourceId, sourceNumber, counterAccountId });
 
@@ -450,14 +471,15 @@ export async function resolveDailyPostingLine(
       sourceId,
       counterAccountId,
       canonicalNumber || undefined,
-      direction
+      direction,
+      excludeJournalEntryId
     );
 
   if (resolvedCounterId === mainAccountId) {
     throw new DailyPostingValidationError("Main account cannot be its own counter account");
   }
 
-  await assertCounterAccountLegitimateForBilty(sourceType, sourceId, resolvedCounterId, wasManuallySupplied, direction);
+  await assertCounterAccountLegitimateForBilty(tx, sourceType, sourceId, resolvedCounterId, wasManuallySupplied, direction, excludeJournalEntryId);
   await assertCounterAccountLegitimateForChallan(sourceType, sourceId, resolvedCounterId, wasManuallySupplied, direction);
   await assertCounterAccountLegitimateForPrivatePhonch(sourceType, sourceId, resolvedCounterId, wasManuallySupplied, direction);
 

@@ -748,14 +748,20 @@ export async function POST(request: NextRequest) {
       // destination at all, so EVERY manually-supplied account is
       // rejected here, not just a mismatched one - closing the "allow
       // anything because nothing is known" gap the Step 1 audit found.
+      // NOTE: a walk-in Bilty (no resolvable party at all) is NOT the
+      // empty-set case in practice - getBiltyLegitimatePartyAccountIds
+      // itself already offers Gross Bilty Receivable directly for a
+      // RECEIPT (direction DEBIT) once something is still genuinely
+      // unclaimed there; see that function's own doc comment.
       if (!legitimateAccountIds.has(line.counterAccountId)) {
+        const biltyNo = biltyNoById.get(line.sourceId) || line.sourceNumber || line.sourceId;
         return NextResponse.json(
           {
             success: false,
             message:
               legitimateAccountIds.size > 0
-                ? `Entry ${index + 1}: The selected Counter Account does not match this Bilty's established responsible Party. Select the correct Party, or leave Counter Account blank to auto-resolve.`
-                : `Entry ${index + 1}: This Bilty has no established or identifiable responsible Party (no valid Consignor/Consignee/Clearing Agent account, no Collection or Paid responsibility). Please verify the Bilty's parties before posting against it.`,
+                ? `Entry ${index + 1} (Bilty ${biltyNo}): the selected Counter Account does not match this Bilty's established responsible Party. Select the correct Party, or leave Counter Account blank to auto-resolve.`
+                : `Entry ${index + 1} (Bilty ${biltyNo}): no established or identifiable responsible Party (no valid Consignor/Consignee/Clearing Agent account, no Collection or Paid responsibility). Please verify the Bilty's parties before posting against it.`,
           },
           { status: 400 }
         );

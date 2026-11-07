@@ -221,8 +221,25 @@ export async function getBiltyPaidVerification(
   // lib/paid-attribution.ts's own header comment for why that row-
   // level signal goes stale once Unsettle reverses the underlying
   // entry (production Challan 6405 / Bilty 395).
+  //
+  // WALK-IN (no resolvable Paid-responsible party at all, `responsible`
+  // null): getLedgerTruePaidAttributedAmount only ever looks at
+  // SETTLEMENT_PAYMENT*/PAID_RESPONSIBILITY_REASSIGNMENT-tagged
+  // entries - a real party-establishment mechanism this Bilty, by
+  // definition, never has anything to establish (there is no party to
+  // establish it TO; see resolveBiltyPaidResponsibleParty's own null
+  // return and getBiltyLegitimatePartyAccountIds's own Gross Bilty
+  // Receivable fallback, which is this Bilty's own correct, final
+  // destination). For a walk-in, "attributed" instead means "verified
+  // straight into Gross" - `grossVerifiedAmount` above already
+  // computes exactly that, capped at paidAmount - so a walk-in Bilty
+  // whose Paid amount was fully received via a Daily Posting credit to
+  // Gross is correctly reported as attributed, never forced through a
+  // party it structurally cannot have.
   let isAttributed = paidAmount <= EPS;
-  if (!isAttributed) {
+  if (!isAttributed && !responsible) {
+    isAttributed = grossVerifiedAmount >= paidAmount - EPS;
+  } else if (!isAttributed) {
     const attributed = await getLedgerTruePaidAttributedAmount(tx, biltyId, paidAmount);
     isAttributed = attributed >= paidAmount - EPS;
   }
@@ -396,7 +413,17 @@ export async function getBiltyPaidVerificationBatch(
 
     const isInconsistent = verifiedReceivedAmount > paidAmount + EPS;
     const unverifiedAmount = isInconsistent ? 0 : Math.max(0, round2(paidAmount - verifiedReceivedAmount));
-    const isAttributed = paidAmount <= EPS || (attributedAmountByBiltyId.get(biltyId) ?? 0) >= paidAmount - EPS;
+    // WALK-IN (no resolvable Paid-responsible party) - see
+    // getBiltyPaidVerification's own identical comment above.
+    // `getLedgerTruePaidAttributedAmountBatch` only ever sees a real
+    // party-establishment mechanism this Bilty structurally cannot
+    // have, so attribution instead means "verified straight into
+    // Gross" (grossVerifiedAmount, already capped at paidAmount).
+    const isAttributed =
+      paidAmount <= EPS ||
+      (responsible
+        ? (attributedAmountByBiltyId.get(biltyId) ?? 0) >= paidAmount - EPS
+        : grossVerifiedAmount >= paidAmount - EPS);
 
     result.set(biltyId, {
       biltyId,

@@ -53,7 +53,15 @@ export interface ResolvedDocumentParty {
 
 async function resolveBiltyParty(
   biltyId: string,
-  direction: "DEBIT" | "CREDIT" | undefined
+  direction: "DEBIT" | "CREDIT" | undefined,
+  // Excludes this one JournalEntry's own Gross-Bilty-Receivable
+  // contribution from the "already claimed" ledger reads below - set
+  // only when EDITING an existing Daily Posting line against this
+  // SAME Bilty, so that line's own prior amount is not double-counted
+  // against itself (the exact regression this parameter exists to
+  // fix - see getBiltyLegitimatePartyAccountIds's own doc comment).
+  // Never set by Create.
+  excludeJournalEntryId?: string
 ): Promise<ResolvedDocumentParty | null> {
   const bilty = await prisma.bilty.findUnique({
     where: { id: biltyId },
@@ -159,7 +167,7 @@ async function resolveBiltyParty(
   // slice vs. this Bilty's own outstanding To-Pay) - see the
   // precedence rule just below.
   if (!collectionResult && direction === "DEBIT") {
-    const unclaimedForCollection = await getUnclaimedGrossBiltyReceivableAmountForCollection(prisma, biltyId);
+    const unclaimedForCollection = await getUnclaimedGrossBiltyReceivableAmountForCollection(prisma, biltyId, excludeJournalEntryId);
     if (unclaimedForCollection > 0.01) {
       collectionResult = {
         accountId: await getGrossBiltyReceivableAccountId(prisma),
@@ -181,7 +189,7 @@ async function resolveBiltyParty(
   // legitimate destination in this account at all.
   let grossReceivableResult: ResolvedDocumentParty | null = null;
   if (direction === "DEBIT" && !paidResult) {
-    grossReceivableResult = await resolveUnclaimedGrossBiltyReceivable(biltyId);
+    grossReceivableResult = await resolveUnclaimedGrossBiltyReceivable(biltyId, excludeJournalEntryId);
   }
 
   // The Collection/To-Pay side's own resolved destination - whether a
@@ -257,8 +265,8 @@ async function resolveBiltyParty(
 // wrote to.
 // ============================================================
 
-async function resolveUnclaimedGrossBiltyReceivable(biltyId: string): Promise<ResolvedDocumentParty | null> {
-  const unclaimed = await getUnclaimedGrossBiltyReceivableAmount(prisma, biltyId);
+async function resolveUnclaimedGrossBiltyReceivable(biltyId: string, excludeJournalEntryId?: string): Promise<ResolvedDocumentParty | null> {
+  const unclaimed = await getUnclaimedGrossBiltyReceivableAmount(prisma, biltyId, excludeJournalEntryId);
   if (unclaimed <= 0.01) return null;
 
   const grossAccountId = await getGrossBiltyReceivableAccountId(prisma);
@@ -370,9 +378,11 @@ export async function resolveDocumentPartyAccount(
   // PRIVATE_PHONCH's own multi-party eligibility (see
   // resolvePrivatePhonchParty() above) - PHONCH/BILL resolution is
   // entirely unaffected by this parameter.
-  direction?: "DEBIT" | "CREDIT"
+  direction?: "DEBIT" | "CREDIT",
+  // BILTY only - see resolveBiltyParty's own doc comment.
+  excludeJournalEntryId?: string
 ): Promise<ResolvedDocumentParty | null> {
-  if (sourceType === "BILTY") return resolveBiltyParty(sourceId, direction);
+  if (sourceType === "BILTY") return resolveBiltyParty(sourceId, direction, excludeJournalEntryId);
   if (sourceType === "PHONCH") return resolvePhonchParty(sourceId);
   if (sourceType === "PRIVATE_PHONCH") return resolvePrivatePhonchParty(sourceId, direction);
   if (sourceType === "BILL") return resolveBillParty(sourceId);
@@ -744,7 +754,17 @@ export async function getBiltyLegitimatePartyAccountIds(
   biltyId: string,
   // Only consulted for the Gross Bilty Receivable exception below -
   // RECEIPT only, see resolveUnclaimedGrossBiltyReceivable().
-  direction?: "DEBIT" | "CREDIT"
+  direction?: "DEBIT" | "CREDIT",
+  // Excludes this one JournalEntry's own prior contribution from the
+  // "already claimed" ledger reads below - set only when EDITING an
+  // existing Daily Posting line against this SAME Bilty. Without
+  // this, re-validating an existing walk-in Bilty receipt on every
+  // save of its own entry would see its OWN prior amount as already
+  // having consumed the unclaimed balance, incorrectly shrinking
+  // Gross Bilty Receivable's own fallback below to nothing and
+  // rejecting the line that posted it in the first place - the exact
+  // regression this parameter exists to fix. Never set by Create.
+  excludeJournalEntryId?: string
 ): Promise<Set<string>> {
   const result = new Set<string>();
 
@@ -796,7 +816,7 @@ export async function getBiltyLegitimatePartyAccountIds(
   // RECEIPT (DEBIT) only, capped at Bilty.toPay exactly like the
   // write-time ceiling check.
   if (result.size === 0 && direction === "DEBIT") {
-    const unclaimedForCollection = await getUnclaimedGrossBiltyReceivableAmountForCollection(prisma, biltyId);
+    const unclaimedForCollection = await getUnclaimedGrossBiltyReceivableAmountForCollection(prisma, biltyId, excludeJournalEntryId);
     if (unclaimedForCollection > 0.01) {
       result.add(await getGrossBiltyReceivableAccountId(prisma));
     }
@@ -811,7 +831,7 @@ export async function getBiltyLegitimatePartyAccountIds(
   // fallback below so its presence correctly takes precedence over
   // that cruder, unestablished-party fallback.
   if (direction === "DEBIT" && !paidResponsible) {
-    const grossReceivable = await resolveUnclaimedGrossBiltyReceivable(biltyId);
+    const grossReceivable = await resolveUnclaimedGrossBiltyReceivable(biltyId, excludeJournalEntryId);
     if (grossReceivable) result.add(grossReceivable.accountId);
   }
 

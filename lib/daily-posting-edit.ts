@@ -165,7 +165,7 @@ export async function updateDailyPostingEntry({
     sourceNumber: string | null;
   }[] = [];
 
-  for (const line of lines) {
+  for (const [lineIndex, line] of lines.entries()) {
     const requestedSourceType = line.sourceType.trim();
     if (!DAILY_POSTING_SOURCE_TYPES.includes(requestedSourceType as DailyPostingSourceType)) {
       throw new DailyPostingValidationError(`Invalid document type for line "${line.description}"`);
@@ -180,16 +180,69 @@ export async function updateDailyPostingEntry({
     const existing = line.id ? existingCounterLineById.get(line.id) : undefined;
     const finalSourceType = requestedSourceType as DailyPostingSourceType;
 
-    const resolved = await resolveDailyPostingLine({
-      tx,
-      mainAccountId,
-      mainCategory: mainAccount.category,
-      sourceType: finalSourceType,
-      sourceId: line.sourceId,
-      sourceNumber: line.sourceNumber,
-      counterAccountId: line.counterAccountId,
-      direction: line.direction,
-    });
+    // UNCHANGED LINE - skip re-resolution/re-validation entirely when
+    // every field the validation pipeline actually cares about
+    // (Counter Account, document identity, direction, amount) is
+    // identical to what is already stored. This is not just an
+    // optimization: re-running resolveDailyPostingLine on an
+    // untouched line re-reads this SAME entry's own already-posted
+    // ledger effect as "already claimed" (see
+    // getBiltyLegitimatePartyAccountIds's own doc comment) unless
+    // excludeJournalEntryId is threaded through correctly - skipping
+    // entirely for a genuinely untouched line removes that risk
+    // altogether, rather than relying solely on the exclusion below.
+    const existingDirection: "DEBIT" | "CREDIT" | undefined = existing
+      ? Number(existing.debit) > 0
+        ? "CREDIT"
+        : "DEBIT"
+      : undefined;
+    const existingAmount = existing ? (Number(existing.debit) > 0 ? Number(existing.debit) : Number(existing.credit)) : undefined;
+    const isUnchanged =
+      existing != null &&
+      (line.counterAccountId || "") === existing.accountId &&
+      finalSourceType === (existing.sourceType || "DIRECT") &&
+      (line.sourceId || "") === (existing.sourceId || "") &&
+      (line.sourceNumber || "") === (existing.sourceNumber || "") &&
+      line.direction === existingDirection &&
+      Math.abs(line.amount - (existingAmount || 0)) < 0.01;
+
+    if (isUnchanged) {
+      resolvedLines.push({
+        id: existing.id,
+        counterAccountId: existing.accountId,
+        description: line.description.trim(),
+        amount: line.amount,
+        direction: line.direction,
+        sourceType: finalSourceType,
+        sourceId: existing.sourceId,
+        sourceNumber: existing.sourceNumber,
+      });
+      continue;
+    }
+
+    let resolved;
+    try {
+      resolved = await resolveDailyPostingLine({
+        tx,
+        mainAccountId,
+        mainCategory: mainAccount.category,
+        sourceType: finalSourceType,
+        sourceId: line.sourceId,
+        sourceNumber: line.sourceNumber,
+        counterAccountId: line.counterAccountId,
+        direction: line.direction,
+        // This entry's own prior contribution (if this line existed
+        // before and is being changed) must never count against
+        // itself - see getBiltyLegitimatePartyAccountIds's own doc
+        // comment.
+        excludeJournalEntryId: entry.id,
+      });
+    } catch (err) {
+      if (err instanceof DailyPostingValidationError) {
+        throw new DailyPostingValidationError(`Row ${lineIndex + 1}: ${err.message}`, err.status);
+      }
+      throw err;
+    }
 
     resolvedLines.push({
       id: existing?.id || null,
