@@ -143,6 +143,7 @@ type BillDetail = {
   remainingDue: number;
   isInconsistent: boolean;
   status: "UNPAID" | "PARTIALLY_PAID" | "PAID";
+  isRecordOnly: boolean;
 };
 
 export default function BillDetailPage({ params }: { params: Promise<{ id: string }> }) {
@@ -309,11 +310,27 @@ export default function BillDetailPage({ params }: { params: Promise<{ id: strin
     );
   }
 
-  const statusLabel = bill.status === "PAID" ? "Paid" : bill.status === "PARTIALLY_PAID" ? "Partially Paid" : "Unpaid";
-  const statusClass =
-    bill.status === "PAID" ? "bg-green-50 text-green-700" : bill.status === "PARTIALLY_PAID" ? "bg-blue-50 text-blue-700" : "bg-amber-50 text-amber-700";
-  const statusNote =
-    bill.status === "PAID" ? "Payment received in full" : bill.status === "PARTIALLY_PAID" ? "Payment partially received" : "No payment received yet";
+  const statusLabel = bill.isRecordOnly
+    ? "Cleared (record only)"
+    : bill.status === "PAID"
+    ? "Paid"
+    : bill.status === "PARTIALLY_PAID"
+    ? "Partially Paid"
+    : "Unpaid";
+  const statusClass = bill.isRecordOnly
+    ? "bg-gray-100 text-gray-600"
+    : bill.status === "PAID"
+    ? "bg-green-50 text-green-700"
+    : bill.status === "PARTIALLY_PAID"
+    ? "bg-blue-50 text-blue-700"
+    : "bg-amber-50 text-amber-700";
+  const statusNote = bill.isRecordOnly
+    ? "Zero-amount Bill - nothing was ever due, no entry posted"
+    : bill.status === "PAID"
+    ? "Payment received in full"
+    : bill.status === "PARTIALLY_PAID"
+    ? "Payment partially received"
+    : "No payment received yet";
   const currency = presentation.invoice.currencyLabel || "Rs.";
   const addressLine = [presentation.business.address, presentation.business.city, presentation.business.province, presentation.business.country].filter(
     (v): v is string => !!v && v.trim().length > 0

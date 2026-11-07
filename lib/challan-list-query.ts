@@ -205,6 +205,7 @@ export async function computeFilteredChallanPositions(
       return {
         id: c.id,
         isSettled: c.isSettled,
+        settlementJournalEntryId: c.settlementJournalEntryId,
         outstandingReceivable: c.outstandingReceivable,
         outstandingPayable: c.outstandingPayable,
         biltyIds: c.bilties.map((cb) => cb.biltyId),

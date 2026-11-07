@@ -533,25 +533,44 @@ export async function POST(
     // queries by referenceType/referenceId, never by this id) - "just
     // clears the flag" falls out for free, no change needed there.
     //
+    // ZERO-AMOUNT CHALLAN - every Bilty's own rent is 0 AND Carrier
+    // Rent is 0 (literally nothing was ever billed, not merely
+    // "already collected elsewhere") - a deliberate record-only
+    // Challan, same shape as a record-only Private/Showroom Phonch
+    // (see lib/private-phonch-accounting.ts's own "record only"
+    // doc comment). Checked against the Bilty's own `total` directly,
+    // never against `nothingLeftForDefault` alone - that flag is ALSO
+    // true once a genuinely nonzero Challan's Collection/Carrier Rent
+    // happens to already be fully claimed elsewhere, which must stay a
+    // surfaced error below for a normal (non-own-carrier) Challan, not
+    // silently accepted as "zero-amount".
+    const allBiltyRentZero = challan.bilties.every((cb) => Number(cb.bilty.total) <= 0.009);
+    const genuinelyZeroAmountChallan = allBiltyRentZero && carrierRentAmount <= 0.009;
+
     // A NORMAL (non-own-carrier) Challan hitting this same "lines"
-    // error keeps failing exactly as before - its Collection/Carrier
-    // Rent must always resolve to a real party at Settlement, so
-    // genuinely nothing-to-settle should not normally happen there and
-    // stays a surfaced error, never silently accepted. Gated on
+    // error keeps failing exactly as before UNLESS it is genuinely a
+    // zero-amount Challan (above) - its Collection/Carrier Rent must
+    // always resolve to a real party at Settlement otherwise, so
+    // nothing-to-settle should not normally happen there and stays a
+    // surfaced error, never silently accepted. Gated on
     // `!anyPaidToEstablish` too now - Gross still holding an
     // unattributed Paid amount for ANY of this Challan's own Bilties
     // means this is NOT "genuinely nothing to settle" (see
     // paidEstablishmentCandidates' own comment above) regardless of
-    // own-carrier status; the transaction below establishes it via
-    // its own createSettlementPayment() calls and the Challan is
+    // own-carrier/zero-amount status; the transaction below establishes
+    // it via its own createSettlementPayment() calls and the Challan is
     // still marked settled normally (its own zero-line marker entry
     // already handles settlementResult.entries being empty).
-    const ownCarrierNothingToSettle = Boolean(challan.ownCarrierId) && nothingLeftForDefault && allocations.length === 0 && !anyPaidToEstablish;
+    const nothingToSettleNoEntry =
+      (Boolean(challan.ownCarrierId) || genuinelyZeroAmountChallan) &&
+      nothingLeftForDefault &&
+      allocations.length === 0 &&
+      !anyPaidToEstablish;
 
     if (
       !settlementResult.isValid &&
       !(nothingLeftForDefault && allocations.length > 0) &&
-      !ownCarrierNothingToSettle &&
+      !nothingToSettleNoEntry &&
       !(nothingLeftForDefault && allocations.length === 0 && anyPaidToEstablish)
     ) {
       return NextResponse.json(
@@ -560,7 +579,7 @@ export async function POST(
       );
     }
 
-    if (ownCarrierNothingToSettle) {
+    if (nothingToSettleNoEntry) {
       try {
         const updatedChallan = await prisma.$transaction(
           async (tx) => {
@@ -610,7 +629,9 @@ export async function POST(
               entityType: "Challan",
               entityId: id,
               documentNo: settled.challanNo,
-              description: `Finalized Settlement for Challan ${settled.challanNo} - nothing to settle (Own Carrier, fully Paid/collected, no Carrier Rent) - no journal entry posted`,
+              description: challan.ownCarrierId
+                ? `Finalized Settlement for Challan ${settled.challanNo} - nothing to settle (Own Carrier, fully Paid/collected, no Carrier Rent) - no journal entry posted`
+                : `Finalized Settlement for Challan ${settled.challanNo} - nothing to settle (zero-amount Challan, no Bilty rent or Carrier Rent) - no journal entry posted`,
               newValues: {
                 settlementNotes: data.settlementNotes || null,
                 outstandingReceivable: 0,

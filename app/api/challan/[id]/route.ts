@@ -307,6 +307,7 @@ export async function GET(
     const position = await computeChallanPosition({
       id: challan.id,
       isSettled: challan.isSettled,
+      settlementJournalEntryId: challan.settlementJournalEntryId,
       outstandingReceivable: challan.outstandingReceivable,
       outstandingPayable: challan.outstandingPayable,
       biltyIds: challan.bilties.map((cb) => cb.biltyId),

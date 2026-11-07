@@ -226,6 +226,7 @@ export type ChallanPosition = {
   lines: ChallanPositionLine[];
   totalReceivable: number;
   totalPayable: number;
+  recordOnly?: boolean;
 };
 
 type ResponsibilityChoiceUI = {
@@ -428,7 +429,9 @@ function PositionDisplay({ challan }: { challan: Challan }) {
   if (position.lines.length === 0) {
     return (
       <div className="rounded-lg border p-3 bg-gray-50 mt-3">
-        <span className="inline-block rounded-full px-2 py-0.5 text-xs font-semibold bg-gray-100 text-gray-700">Cleared</span>
+        <span className="inline-block rounded-full px-2 py-0.5 text-xs font-semibold bg-gray-100 text-gray-700">
+          {position.recordOnly ? "Cleared (record only)" : "Cleared"}
+        </span>
       </div>
     );
   }

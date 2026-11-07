@@ -32,6 +32,11 @@ type BillListItem = {
   receivedAmount: number;
   remainingDue: number;
   status: "UNPAID" | "PARTIALLY_PAID" | "PAID";
+  // totalAmount <= 0.009 - see lib/bill-accounting.ts's own
+  // BillPaymentState.isRecordOnly doc comment. Shown as its own badge
+  // instead of plain "Paid" (which would be misleading - nothing was
+  // ever due).
+  isRecordOnly: boolean;
 };
 
 function formatCurrency(value: number) {
@@ -203,9 +208,13 @@ export default function BillPage() {
                         <td className="px-4 py-3">{formatCurrency(b.receivedAmount)}</td>
                         <td className="px-4 py-3">{formatCurrency(b.remainingDue)}</td>
                         <td className="px-4 py-3">
-                          <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${statusClass(b.status)}`}>
-                            {statusLabel(b.status)}
-                          </span>
+                          {b.isRecordOnly ? (
+                            <span className="rounded-full px-2 py-0.5 text-xs font-medium bg-gray-100 text-gray-600">Cleared (record only)</span>
+                          ) : (
+                            <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${statusClass(b.status)}`}>
+                              {statusLabel(b.status)}
+                            </span>
+                          )}
                         </td>
                         <td className="px-4 py-3">
                           <div className="flex gap-2">

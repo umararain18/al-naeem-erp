@@ -132,6 +132,15 @@ export interface ChallanPosition {
   // filtered Challan, so cards and filter can never disagree.
   totalReceivable: number;
   totalPayable: number;
+  // Set only on a CLEARED Challan that was settled with NO journal
+  // entry at all (see ChallanPositionInput.settlementJournalEntryId's
+  // own doc comment) - a deliberate zero-amount/own-carrier "nothing
+  // to settle" Challan, never a normal Challan that merely nets to
+  // zero after real postings. Lets the UI show "Cleared (record
+  // only)" instead of plain "Cleared", the same distinction
+  // app/phonch/page.tsx already draws for a record-only Phonch.
+  // Undefined (never true) for every other bucket/path.
+  recordOnly?: boolean;
 }
 
 export interface ChallanPositionLivePayer {
@@ -146,6 +155,16 @@ export interface ChallanPositionInput {
   outstandingReceivable: number | string | Decimal;
   outstandingPayable: number | string | Decimal;
   biltyIds: string[];
+  // Optional - when provided AND `isSettled` is true AND this is
+  // null, the Challan was settled through the "nothing to settle, no
+  // journal entry" path (app/api/challan/[id]/finalize-settlement's
+  // own ownCarrierId/genuinely-zero-amount branch - the ONLY path
+  // that ever leaves this null on an isSettled Challan; the normal
+  // settle flow always sets it, even to a zero-line marker entry when
+  // nothing else needs posting). Omitted entirely by a caller that
+  // doesn't need the record-only distinction - never treated as
+  // record-only in that case, so existing callers are unaffected.
+  settlementJournalEntryId?: string | null;
   // TIER 1 - the Challan's own current, active, cross-component party
   // net (lib/challan-settlement-summary.ts's partyNet - computed the
   // same way getPartyNetFromSettlement() does, reading
@@ -199,6 +218,10 @@ export interface ChallanPositionInput {
 
 function clearedPosition(): ChallanPosition {
   return { bucket: "CLEARED", lines: [], totalReceivable: 0, totalPayable: 0 };
+}
+
+function recordOnlyClearedPosition(): ChallanPosition {
+  return { bucket: "CLEARED", lines: [], totalReceivable: 0, totalPayable: 0, recordOnly: true };
 }
 
 // ============================================================
@@ -275,6 +298,17 @@ export async function computeChallanPositionsBatch(
   for (const inp of inputs) {
     if (!inp.isSettled) {
       result[inp.id] = { bucket: "BEFORE_SETTLEMENT", lines: [], totalReceivable: 0, totalPayable: 0 };
+      continue;
+    }
+
+    // "Nothing to settle, no journal entry" - see
+    // ChallanPositionInput.settlementJournalEntryId's own doc comment.
+    // No ledger activity exists for this Challan's own settlement at
+    // all, so there is nothing for computeBasePosition/paidUnverified/
+    // collectionPending to meaningfully compute - skip straight to a
+    // dedicated CLEARED variant instead.
+    if (inp.settlementJournalEntryId === null) {
+      result[inp.id] = recordOnlyClearedPosition();
       continue;
     }
 

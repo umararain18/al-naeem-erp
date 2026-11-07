@@ -75,7 +75,7 @@ export async function GET(
     const clientAccountId = await resolveBillClientAccountId(prisma, bill.clientParty);
     const paymentState = clientAccountId
       ? await getBillPaymentState(prisma, id, clientAccountId, totalAmount)
-      : { totalAmount, receivedAmount: 0, remainingDue: totalAmount, isInconsistent: false, status: "UNPAID" as const };
+      : { totalAmount, receivedAmount: 0, remainingDue: totalAmount, isInconsistent: false, status: "UNPAID" as const, isRecordOnly: totalAmount <= 0.009 };
 
     return NextResponse.json({
       success: true,
@@ -330,39 +330,46 @@ export async function PATCH(
           });
 
           const description = buildBillLedgerDescription({ billNo: resolved.billNo }, resolved.items, resolved.total);
-          const billIncomeId = await getBillIncomeAccountId(tx);
 
-          await tx.journalEntry.create({
-            data: {
-              entryDate: resolved.date,
-              referenceType: "BILL",
-              referenceId: id,
-              description,
-              createdById: currentUser.userId,
-              lines: {
-                create: [
-                  {
-                    accountId: clientAccountId,
-                    debit: resolved.total,
-                    credit: 0,
-                    description,
-                    sourceType: "BILL",
-                    sourceId: id,
-                    sourceNumber: resolved.billNo,
-                  },
-                  {
-                    accountId: billIncomeId,
-                    debit: 0,
-                    credit: resolved.total,
-                    description,
-                    sourceType: "BILL",
-                    sourceId: id,
-                    sourceNumber: resolved.billNo,
-                  },
-                ],
+          // Skipped for a zero-total "record only" Bill - same as
+          // POST's own create path. The old entry is still soft-
+          // deleted above regardless, so editing a previously-nonzero
+          // Bill DOWN to 0 correctly leaves no active JournalEntry.
+          if (resolved.total > 0) {
+            const billIncomeId = await getBillIncomeAccountId(tx);
+
+            await tx.journalEntry.create({
+              data: {
+                entryDate: resolved.date,
+                referenceType: "BILL",
+                referenceId: id,
+                description,
+                createdById: currentUser.userId,
+                lines: {
+                  create: [
+                    {
+                      accountId: clientAccountId,
+                      debit: resolved.total,
+                      credit: 0,
+                      description,
+                      sourceType: "BILL",
+                      sourceId: id,
+                      sourceNumber: resolved.billNo,
+                    },
+                    {
+                      accountId: billIncomeId,
+                      debit: 0,
+                      credit: resolved.total,
+                      description,
+                      sourceType: "BILL",
+                      sourceId: id,
+                      sourceNumber: resolved.billNo,
+                    },
+                  ],
+                },
               },
-            },
-          });
+            });
+          }
 
           const changedFields = diffFields(
             { billNo: current.billNo, clientPartyId: current.clientPartyId, clientName: current.clientName, clientPhone: current.clientPhone, total: currentTotal },

@@ -124,6 +124,10 @@ type ChallanPosition = {
   lines: ChallanPositionLine[];
   totalReceivable: number;
   totalPayable: number;
+  // See lib/challan-position.ts's own doc comment - true only for a
+  // Challan settled with NO journal entry at all (own-carrier/
+  // zero-amount "nothing to settle").
+  recordOnly?: boolean;
 };
 
 type SettlementPayerBreakdown = {
@@ -334,7 +338,11 @@ function PositionCell({ challan }: { challan: Challan }) {
     return <span className="inline-block rounded-full px-2 py-0.5 text-xs font-semibold whitespace-nowrap bg-gray-100 text-gray-700">Before Settlement</span>;
   }
   if (position.lines.length === 0) {
-    return <span className="inline-block rounded-full px-2 py-0.5 text-xs font-semibold whitespace-nowrap bg-gray-100 text-gray-700">Cleared</span>;
+    return (
+      <span className="inline-block rounded-full px-2 py-0.5 text-xs font-semibold whitespace-nowrap bg-gray-100 text-gray-700">
+        {position.recordOnly ? "Cleared (record only)" : "Cleared"}
+      </span>
+    );
   }
 
   return (

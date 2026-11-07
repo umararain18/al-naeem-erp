@@ -223,8 +223,14 @@ export function resolveBillInput(data: BillInput): ResolvedBill {
     };
   });
 
-  if (total <= 0) {
-    throw new BillValidationError("Bill Total must be greater than zero");
+  // total === 0 is a legitimate "record only" Bill - same shape as a
+  // record-only Private/Showroom Phonch (lib/private-phonch-
+  // accounting.ts's own doc comment) - saved with no journal entry
+  // posted (see app/api/bill/route.ts POST / [id]/route.ts PATCH) and
+  // shown with its own distinct badge (getBillPaymentState's own
+  // isRecordOnly). Only a genuinely negative total is rejected.
+  if (total < 0) {
+    throw new BillValidationError("Bill Total cannot be negative");
   }
 
   return {
@@ -283,6 +289,15 @@ export interface BillPaymentState {
   remainingDue: number;
   isInconsistent: boolean;
   status: "UNPAID" | "PARTIALLY_PAID" | "PAID";
+  // totalAmount <= 0.009 - a "record only" Bill with nothing ever
+  // due, same computed-not-stored convention as app/phonch/page.tsx's
+  // own isRecordOnly (no schema field for this anywhere in the
+  // codebase - see resolveBillInput's own doc comment). Without this,
+  // a zero-total Bill resolves to status "PAID" above (remainingDue
+  // 0 <= EPS), which is misleading - nothing was ever received, there
+  // is simply nothing due. The UI shows a distinct "Cleared (record
+  // only)" badge instead whenever this is true.
+  isRecordOnly: boolean;
 }
 
 export async function getBillPaymentState(
@@ -338,6 +353,7 @@ export async function getBillPaymentState(
     remainingDue,
     isInconsistent,
     status,
+    isRecordOnly: totalAmount <= EPS,
   };
 }
 

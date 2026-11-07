@@ -69,7 +69,7 @@ export async function GET(request: NextRequest) {
         const clientAccountId = await resolveBillClientAccountId(prisma, b.clientParty);
         const state = clientAccountId
           ? await getBillPaymentState(prisma, b.id, clientAccountId, totalAmount)
-          : { receivedAmount: 0, remainingDue: totalAmount, status: "UNPAID" as const };
+          : { receivedAmount: 0, remainingDue: totalAmount, status: "UNPAID" as const, isRecordOnly: totalAmount <= 0.009 };
 
         const vehicleNames = b.items.map((i) => i.vehicleName).filter((n): n is string => !!n && n.trim().length > 0);
 
@@ -99,6 +99,7 @@ export async function GET(request: NextRequest) {
           receivedAmount: state.receivedAmount,
           remainingDue: state.remainingDue,
           status: state.status,
+          isRecordOnly: state.isRecordOnly,
         };
       })
     );
@@ -276,42 +277,49 @@ export async function POST(request: NextRequest) {
           // Cr Bill Income - see model Bill's own doc comment in
           // prisma/schema.prisma for why this is a NEW, independent
           // client-side transaction, never touching Private/Showroom
-          // Phonch's own carrier-side accounting.
+          // Phonch's own carrier-side accounting. Skipped entirely for
+          // a zero-total "record only" Bill (resolveBillInput's own
+          // doc comment) - same "post NO JournalEntry at all rather
+          // than a trivial zero one" precedent as
+          // lib/private-phonch-accounting.ts's record-only delivery.
           // ------------------------------------------------------------
           const description = buildBillLedgerDescription({ billNo: resolved.billNo }, resolved.items, resolved.total);
-          const billIncomeId = await getBillIncomeAccountId(tx);
 
-          await tx.journalEntry.create({
-            data: {
-              entryDate: resolved.date,
-              referenceType: "BILL",
-              referenceId: createdBill.id,
-              description,
-              createdById: currentUser.userId,
-              lines: {
-                create: [
-                  {
-                    accountId: clientAccountId,
-                    debit: resolved.total,
-                    credit: 0,
-                    description,
-                    sourceType: "BILL",
-                    sourceId: createdBill.id,
-                    sourceNumber: resolved.billNo,
-                  },
-                  {
-                    accountId: billIncomeId,
-                    debit: 0,
-                    credit: resolved.total,
-                    description,
-                    sourceType: "BILL",
-                    sourceId: createdBill.id,
-                    sourceNumber: resolved.billNo,
-                  },
-                ],
+          if (resolved.total > 0) {
+            const billIncomeId = await getBillIncomeAccountId(tx);
+
+            await tx.journalEntry.create({
+              data: {
+                entryDate: resolved.date,
+                referenceType: "BILL",
+                referenceId: createdBill.id,
+                description,
+                createdById: currentUser.userId,
+                lines: {
+                  create: [
+                    {
+                      accountId: clientAccountId,
+                      debit: resolved.total,
+                      credit: 0,
+                      description,
+                      sourceType: "BILL",
+                      sourceId: createdBill.id,
+                      sourceNumber: resolved.billNo,
+                    },
+                    {
+                      accountId: billIncomeId,
+                      debit: 0,
+                      credit: resolved.total,
+                      description,
+                      sourceType: "BILL",
+                      sourceId: createdBill.id,
+                      sourceNumber: resolved.billNo,
+                    },
+                  ],
+                },
               },
-            },
-          });
+            });
+          }
 
           await auditCreate(tx, {
             actor: actorFromUser(currentUser),
