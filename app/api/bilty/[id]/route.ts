@@ -15,6 +15,12 @@ import {
 } from "@/lib/settlement-payments";
 import { BiltyPaidVerificationError, getBiltyPaidVerification } from "@/lib/bilty-paid-verification";
 import { getUnearnedRevenueAccountId } from "@/lib/gross-accounts";
+import { isCarrierTripChallanIncomeRecognized } from "@/lib/carrier-trip";
+import {
+  BILTY_REVENUE_RECOGNITION_REFERENCE_TYPE,
+  BILTY_REVENUE_RECOGNITION_REVERSAL_REFERENCE_TYPE,
+  BILTY_REVENUE_DEFERRAL_REFERENCE_TYPE,
+} from "@/lib/bilty-revenue-recognition";
 import { auditUpdate, auditDelete, auditRestore, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 import { parseISODateStart } from "@/lib/date-range";
 
@@ -800,6 +806,7 @@ export async function PATCH(
       challanLoadingDate: Date;
       isSettled: boolean;
       settlementJournalEntryId: string | null;
+      ownCarrierId: string | null;
     } | null = null;
 
     if (totalDelta !== 0 || commissionDelta !== 0) {
@@ -816,6 +823,7 @@ export async function PATCH(
               loadingDate: true,
               isSettled: true,
               settlementJournalEntryId: true,
+              ownCarrierId: true,
             },
           },
         },
@@ -828,28 +836,50 @@ export async function PATCH(
           challanLoadingDate: activeLink.challan.loadingDate,
           isSettled: activeLink.challan.isSettled,
           settlementJournalEntryId: activeLink.challan.settlementJournalEntryId,
+          ownCarrierId: activeLink.challan.ownCarrierId,
         };
       }
     }
 
     // The COLLECTION correction's non-gross side depends on whether
-    // THIS Bilty has actually been dispatched yet (activeChallanContext
-    // truthy - an active Challan link exists, regardless of whether it
-    // is settled), never on settlement status alone: dispatch is what
-    // moves this Bilty's value out of Unearned Revenue and into real
-    // Booking Income (see lib/bilty-revenue-recognition.ts), so a
-    // rent/insurance/expense correction must target whichever one
-    // actually holds that value right now. The dispatched case is
+    // THIS Bilty's own value has actually been RECOGNIZED yet, never
+    // merely on whether an active Challan link exists (activeChallanContext
+    // truthy) and never on settlement status alone - dispatch is what
+    // moves a NORMAL Bilty's value out of Unearned Revenue and into
+    // real Booking Income (see lib/bilty-revenue-recognition.ts), but
+    // an OWN CARRIER Challan deliberately SKIPS that at dispatch (see
+    // app/api/challan/route.ts's own "SKIPPED ENTIRELY for an Own
+    // Carrier dispatch" comment) - its Bilties' rent stays in Unearned
+    // Revenue until the linking Carrier Trip is CLOSED
+    // (recognizeCarrierTripIncome in lib/carrier-trip.ts). Treating
+    // "activeChallanContext truthy" alone as "already recognized" is
+    // exactly backwards for an own-carrier Challan whose Trip has not
+    // closed yet - the correction would hit Booking Income for an
+    // amount that was never credited there, leaving a real residual
+    // Unearned Revenue balance for this Bilty (the production symptom
+    // this fixes). So: non-own-carrier dispatched -> always already
+    // recognized (recognizeBiltyBookingIncome ran synchronously at
+    // dispatch, no gap) -> Booking Income. Own-carrier -> recognized
+    // only once isCarrierTripChallanIncomeRecognized() is true (the
+    // SAME ledger-true check recognizeCarrierTripIncome itself uses) ->
+    // Booking Income; otherwise still genuinely unearned -> Unearned
+    // Revenue, same as the undispatched case. The recognized case is
     // resolved here (read-only, matching the existing pattern exactly
-    // - a dispatched Bilty's Booking Income account must already
-    // exist, since dispatch itself requires it); the undispatched case
-    // is deferred to inside the transaction below, where Unearned
-    // Revenue can be safely self-provisioned via
+    // - a recognized Bilty's Booking Income account must already
+    // exist); the unearned case is deferred to inside the transaction
+    // below, where Unearned Revenue can be safely self-provisioned via
     // getUnearnedRevenueAccountId(tx) if this genuinely is the very
     // first non-zero-total Bilty ever touched.
     let dispatchedBookingIncomeAccountId: string | undefined;
 
-    if (totalDelta !== 0 && activeChallanContext) {
+    const isRecognized =
+      totalDelta !== 0 && activeChallanContext
+        ? activeChallanContext.ownCarrierId
+          ? await isCarrierTripChallanIncomeRecognized(prisma, activeChallanContext.challanId)
+          : true
+        : false;
+
+    if (isRecognized) {
       const bookingIncomeAccount = await prisma.account.findFirst({
         where: { category: "BOOKING_INCOME", isActive: true },
         select: { id: true },
@@ -1457,9 +1487,31 @@ export async function DELETE(
       // itself, in the SAME transaction - never SETTLEMENT/
       // SETTLEMENT_PAYMENT/DAILY_POSTING etc., which this Bilty can
       // only reach via an active Challan, already excluded above.
+      //
+      // ALSO every revenue-deferral/recognition entry this Bilty can
+      // carry (lib/bilty-revenue-recognition.ts) - BILTY_REVENUE_
+      // RECOGNITION (Dr Unearned/Cr Booking Income, at dispatch),
+      // its own REVERSAL (Dr Booking Income/Cr Unearned, at
+      // un-dispatch - the SAME guard above only requires no CURRENT
+      // active link, so a Bilty that was dispatched, recognized, then
+      // un-dispatched/its Challan cancelled before being binned can
+      // reach here with either or both of these still live), and
+      // BILTY_REVENUE_DEFERRAL (scripts/reclass-legacy-bilty-revenue.ts,
+      // a legacy one-time correction). Previously missed entirely -
+      // left exactly these "orphan reclassification" entries live
+      // after the Bilty itself was binned, with no original
+      // BILTY_BOOKING entry left to net against.
       await tx.journalEntry.updateMany({
         where: {
-          referenceType: { in: ["BILTY_BOOKING", "BILTY_BOOKING_CORRECTION"] },
+          referenceType: {
+            in: [
+              "BILTY_BOOKING",
+              "BILTY_BOOKING_CORRECTION",
+              BILTY_REVENUE_RECOGNITION_REFERENCE_TYPE,
+              BILTY_REVENUE_RECOGNITION_REVERSAL_REFERENCE_TYPE,
+              BILTY_REVENUE_DEFERRAL_REFERENCE_TYPE,
+            ],
+          },
           referenceId: id,
           isDeleted: false,
         },
