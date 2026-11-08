@@ -1,7 +1,7 @@
 // BILTY REVENUE INTEGRITY - two independent checks, each with its own
 // --apply fix. Mirrors scripts/find-orphan-bilties.ts's own
-// conventions exactly (dry-run by default, --apply to write,
-// --user=<username> for audit attribution).
+// conventions (dry-run by default, --apply to write, --user=<username>
+// for audit attribution), plus --check=A|B to run/apply only one.
 //
 // CHECK A - DELETED BILTIES WITH LIVE JOURNAL LINES
 //   Root cause: the Bilty DELETE route (app/api/bilty/[id]/route.ts)
@@ -20,42 +20,68 @@
 //   is never a reversal, it is exactly what Bin already does for a
 //   Bilty binned today).
 //
-// CHECK B - UNEARNED REVENUE DRIFT ON A DISPATCHED/RECOGNIZED BILTY
+// CHECK B - UNEARNED REVENUE DRIFT ON A DISPATCHED/RECOGNIZED DOCUMENT
 //   Root cause: the Bilty rent-edit correction route used to decide
 //   "has this Bilty's revenue been recognized" from "is there an
 //   active Challan link" alone - true at dispatch for a NORMAL
 //   Challan (recognizeBiltyBookingIncome runs synchronously at
-//   dispatch, no gap), but WRONG for an Own Carrier Challan, whose
-//   Bilties are deliberately NOT recognized at dispatch - only once
-//   the linking Carrier Trip is CLOSED (lib/carrier-trip.ts's
-//   recognizeCarrierTripIncome). A rent edit on an own-carrier Bilty
-//   whose Trip had not yet closed wrongly targeted Booking Income
-//   instead of Unearned Revenue, leaving a residual Unearned Revenue
-//   balance for that Bilty, and Booking Income holding an amount it
-//   was never actually credited elsewhere for. Already FIXED going
-//   forward (app/api/bilty/[id]/route.ts now checks
+//   dispatch, per BILTY, no gap), but WRONG for an Own Carrier
+//   Challan, whose Bilties are deliberately NOT recognized at dispatch
+//   - only once the linking Carrier Trip is CLOSED, and even then
+//   recognizeCarrierTripIncome (lib/carrier-trip.ts) posts ONE
+//   CHALLAN-level recognition line (sourceType="CHALLAN",
+//   sourceId=challanId) covering every one of that Challan's own
+//   Bilties combined - it never touches any individual Bilty-tagged
+//   line. A rent edit on an own-carrier Bilty whose Trip had not yet
+//   closed wrongly targeted Booking Income instead of Unearned
+//   Revenue, leaving residual drift. Already FIXED going forward
+//   (app/api/bilty/[id]/route.ts now checks
 //   isCarrierTripChallanIncomeRecognized() per own-carrier Challan);
-//   this is the catch-up for every already-drifted Bilty.
-//   A Bilty's revenue is "recognized" exactly when:
-//     - non-own-carrier + an active Challan link exists (dispatch
-//       already recognized it, no gap), OR
-//     - own-carrier + isCarrierTripChallanIncomeRecognized() is true
-//       (its linking Trip has been closed).
-//   For a recognized Bilty, its own Unearned Revenue net (every live
-//   JournalLine tagged sourceType="BILTY"/sourceId=this Bilty on the
-//   Unearned Revenue account) must be exactly 0 - any nonzero net is
-//   drift. --apply posts ONE balanced BILTY_BOOKING_CORRECTION entry
-//   per drifted Bilty (Unearned Revenue <-> Booking Income, for
-//   exactly the drift amount) dated TODAY (an admin correction, same
-//   as any other post-the-fact correction in this codebase) - zeroing
-//   Unearned Revenue for that Bilty and correcting Booking Income by
-//   the same amount. Idempotent: once fixed, the Bilty's own net is 0
-//   and it no longer matches this check.
+//   this is the catch-up for every already-drifted document.
+//
+//   PER THE SAME GRANULARITY RECOGNITION ITSELF USES:
+//     - non-own-carrier Bilty, active Challan link exists (dispatch
+//       already recognized it per-Bilty, no gap) -> checked PER
+//       BILTY: that Bilty's own Unearned Revenue net (every live line
+//       tagged sourceType="BILTY"/sourceId=this Bilty) must be 0.
+//     - own-carrier Challan whose linking Trip has closed
+//       (isCarrierTripChallanIncomeRecognized() true) -> checked PER
+//       CHALLAN: the SUM of every live Unearned Revenue line tagged
+//       sourceType="BILTY"/sourceId=one of this Challan's own Bilties
+//       (their own original booking credits - recognition never
+//       zeroes these individually for own-carrier, by design) PLUS
+//       every live line tagged sourceType="CHALLAN"/sourceId=this
+//       Challan with referenceType CARRIER_TRIP_CLOSE/_REVERSAL (the
+//       challan-level recognition itself) must be 0. Checking only
+//       the Bilty-tagged lines here would wrongly flag EVERY
+//       recognized own-carrier Bilty by its own full original booking
+//       amount (confirmed live on production: 6402/6405/6406/6434/
+//       6435/6459/6505-6508, all correctly recognized, all false
+//       positives under that narrower check) - this is exactly the
+//       mistake this version fixes.
+//   --apply posts ONE balanced correction entry per drifted document
+//   (Unearned Revenue <-> Booking Income, for exactly the drift
+//   amount), dated TODAY (an admin correction, same as any other
+//   post-the-fact correction in this codebase):
+//     - BILTY-level drift: referenceType BILTY_BOOKING_CORRECTION,
+//       referenceId=biltyId, lines tagged sourceType="BILTY"/
+//       sourceId=biltyId - the SAME shape the normal rent-edit
+//       correction route itself already uses.
+//     - CHALLAN-level drift: a NEW referenceType,
+//       OWN_CARRIER_REVENUE_DRIFT_CORRECTION, referenceId=challanId,
+//       lines tagged sourceType="CHALLAN"/sourceId=challanId - the
+//       SAME tagging recognizeCarrierTripIncome itself uses, so this
+//       correction is indistinguishable, to any later reader, from a
+//       small adjustment to that Challan's own original recognition.
+//   Idempotent: once fixed, the document's own net is 0 and it no
+//   longer matches this check.
 //
 // Usage:
-//   npx tsx scripts/fix-bilty-revenue-integrity.ts                    (dry-run)
-//   npx tsx scripts/fix-bilty-revenue-integrity.ts --apply             (writes)
-//   npx tsx scripts/fix-bilty-revenue-integrity.ts --apply --user=umar (attribute to a specific username; defaults to the first active SUPER_ADMIN)
+//   npx tsx scripts/fix-bilty-revenue-integrity.ts                              (dry-run, both checks)
+//   npx tsx scripts/fix-bilty-revenue-integrity.ts --check=A                    (dry-run, Check A only)
+//   npx tsx scripts/fix-bilty-revenue-integrity.ts --check=B                    (dry-run, Check B only)
+//   npx tsx scripts/fix-bilty-revenue-integrity.ts --apply --check=A            (writes - Check A only)
+//   npx tsx scripts/fix-bilty-revenue-integrity.ts --apply --check=B --user=umar (writes - Check B only, attributed to a specific username; defaults to the first active SUPER_ADMIN)
 // (reads DATABASE_URL from the environment exactly like the app itself.)
 //
 // BACK UP THE DATABASE BEFORE RUNNING WITH --apply.
@@ -66,7 +92,11 @@ import {
   BILTY_REVENUE_RECOGNITION_REVERSAL_REFERENCE_TYPE,
   BILTY_REVENUE_DEFERRAL_REFERENCE_TYPE,
 } from "../lib/bilty-revenue-recognition";
-import { isCarrierTripChallanIncomeRecognized } from "../lib/carrier-trip";
+import {
+  isCarrierTripChallanIncomeRecognized,
+  CARRIER_TRIP_CLOSE_REFERENCE_TYPE,
+  CARRIER_TRIP_CLOSE_REVERSAL_REFERENCE_TYPE,
+} from "../lib/carrier-trip";
 import { getUnearnedRevenueAccountId } from "../lib/gross-accounts";
 import { auditUpdate, actorFromUser } from "../lib/audit-log";
 
@@ -75,6 +105,13 @@ const prisma = new PrismaClient();
 const apply = process.argv.includes("--apply");
 const userArg = process.argv.find((a) => a.startsWith("--user="));
 const requestedUsername = userArg ? userArg.slice("--user=".length) : null;
+const checkArg = process.argv.find((a) => a.startsWith("--check="));
+const requestedCheck = checkArg ? checkArg.slice("--check=".length).toUpperCase() : null;
+if (requestedCheck && requestedCheck !== "A" && requestedCheck !== "B") {
+  throw new Error(`Invalid --check value "${requestedCheck}" - must be A or B.`);
+}
+const runA = !requestedCheck || requestedCheck === "A";
+const runB = !requestedCheck || requestedCheck === "B";
 
 const BILTY_OWNED_REFERENCE_TYPES = [
   "BILTY_BOOKING",
@@ -83,6 +120,8 @@ const BILTY_OWNED_REFERENCE_TYPES = [
   BILTY_REVENUE_RECOGNITION_REVERSAL_REFERENCE_TYPE,
   BILTY_REVENUE_DEFERRAL_REFERENCE_TYPE,
 ];
+
+const OWN_CARRIER_REVENUE_DRIFT_CORRECTION_REFERENCE_TYPE = "OWN_CARRIER_REVENUE_DRIFT_CORRECTION";
 
 function round2(value: number): number {
   return Math.round((value + Number.EPSILON) * 100) / 100;
@@ -146,76 +185,135 @@ async function findDeletedBiltiesWithLiveLines(): Promise<OrphanLineGroup[]> {
 // CHECK B
 // ============================================================
 
-interface UnearnedDriftBilty {
-  biltyId: string;
-  biltyNo: string;
-  challanNo: string;
-  ownCarrier: boolean;
-  net: number; // the live, actual Unearned Revenue net (debit - credit) for this Bilty - should be 0
+interface ContributingLine {
+  date: string;
+  referenceType: string;
+  debit: number;
+  credit: number;
+  description: string;
+  biltyNo?: string;
 }
 
-async function findUnearnedDrift(): Promise<UnearnedDriftBilty[]> {
+interface DriftItem {
+  kind: "BILTY" | "CHALLAN";
+  id: string; // biltyId for kind BILTY, challanId for kind CHALLAN
+  label: string;
+  net: number; // live Unearned Revenue net (debit - credit) - should be 0
+  lines: ContributingLine[];
+}
+
+async function findUnearnedDrift(): Promise<DriftItem[]> {
   const unearnedAccountId = await getUnearnedRevenueAccountId(prisma);
 
-  const candidates = await prisma.bilty.findMany({
+  const challans = await prisma.challan.findMany({
     where: {
       isDeleted: false,
-      challanBilties: { some: { challan: { isDeleted: false, status: { not: "CANCELLED" } } } },
+      status: { not: "CANCELLED" },
+      bilties: { some: { bilty: { isDeleted: false } } },
     },
     select: {
       id: true,
-      biltyNo: true,
-      challanBilties: {
-        where: { challan: { isDeleted: false, status: { not: "CANCELLED" } } },
-        select: { challan: { select: { id: true, challanNo: true, ownCarrierId: true } } },
+      challanNo: true,
+      ownCarrierId: true,
+      bilties: { where: { bilty: { isDeleted: false } }, select: { bilty: { select: { id: true, biltyNo: true } } } },
+    },
+  });
+  if (challans.length === 0) return [];
+
+  const driftItems: DriftItem[] = [];
+
+  // --- Non-own-carrier: checked PER BILTY (recognized the moment it
+  // was added to the Challan - no challan-level aggregation needed). ---
+  const nonOwnCarrierBilties: { id: string; biltyNo: string }[] = [];
+  for (const c of challans) {
+    if (c.ownCarrierId) continue;
+    for (const cb of c.bilties) nonOwnCarrierBilties.push(cb.bilty);
+  }
+  if (nonOwnCarrierBilties.length > 0) {
+    const lines = await prisma.journalLine.findMany({
+      where: {
+        accountId: unearnedAccountId,
+        sourceType: "BILTY",
+        sourceId: { in: nonOwnCarrierBilties.map((b) => b.id) },
+        journalEntry: { isDeleted: false },
       },
-    },
-  });
-  if (candidates.length === 0) return [];
-
-  const recognizedByChallanId = new Map<string, boolean>();
-  async function isRecognized(challanId: string, ownCarrierId: string | null): Promise<boolean> {
-    if (!ownCarrierId) return true; // non-own-carrier dispatched -> always already recognized, no gap.
-    if (recognizedByChallanId.has(challanId)) return recognizedByChallanId.get(challanId)!;
-    const recognized = await isCarrierTripChallanIncomeRecognized(prisma, challanId);
-    recognizedByChallanId.set(challanId, recognized);
-    return recognized;
-  }
-
-  const recognizedBilties: { biltyId: string; biltyNo: string; challanNo: string; ownCarrier: boolean }[] = [];
-  for (const b of candidates) {
-    const link = b.challanBilties[0];
-    if (!link) continue;
-    const ownCarrier = Boolean(link.challan.ownCarrierId);
-    if (await isRecognized(link.challan.id, link.challan.ownCarrierId)) {
-      recognizedBilties.push({ biltyId: b.id, biltyNo: b.biltyNo, challanNo: link.challan.challanNo, ownCarrier });
+      select: { sourceId: true, debit: true, credit: true, description: true, journalEntry: { select: { referenceType: true, entryDate: true } } },
+    });
+    const byBiltyId = new Map<string, ContributingLine[]>();
+    for (const l of lines) {
+      if (!l.sourceId) continue;
+      const arr = byBiltyId.get(l.sourceId) || [];
+      arr.push({
+        date: l.journalEntry.entryDate.toISOString().slice(0, 10),
+        referenceType: l.journalEntry.referenceType || "",
+        debit: Number(l.debit),
+        credit: Number(l.credit),
+        description: l.description || "",
+      });
+      byBiltyId.set(l.sourceId, arr);
+    }
+    for (const b of nonOwnCarrierBilties) {
+      const biltyLines = byBiltyId.get(b.id) || [];
+      const net = round2(biltyLines.reduce((s, l) => s + l.debit - l.credit, 0));
+      if (Math.abs(net) > 0.01) {
+        driftItems.push({ kind: "BILTY", id: b.id, label: `Bilty ${b.biltyNo}`, net, lines: biltyLines });
+      }
     }
   }
-  if (recognizedBilties.length === 0) return [];
 
-  const unearnedLines = await prisma.journalLine.findMany({
-    where: {
-      accountId: unearnedAccountId,
-      sourceType: "BILTY",
-      sourceId: { in: recognizedBilties.map((b) => b.biltyId) },
-      journalEntry: { isDeleted: false },
-    },
-    select: { sourceId: true, debit: true, credit: true },
-  });
-  const netByBiltyId = new Map<string, number>();
-  for (const l of unearnedLines) {
-    if (!l.sourceId) continue;
-    netByBiltyId.set(l.sourceId, round2((netByBiltyId.get(l.sourceId) || 0) + Number(l.debit) - Number(l.credit)));
-  }
+  // --- Own-carrier: checked PER CHALLAN (recognition is a single
+  // Challan-level line covering every one of its own Bilties combined
+  // - see this script's own header comment). Only for a Challan whose
+  // linking Trip has actually closed (isCarrierTripChallanIncomeRecognized) -
+  // one not yet closed is correctly still fully unearned, not drift. ---
+  const ownCarrierChallans = challans.filter((c) => c.ownCarrierId);
+  for (const c of ownCarrierChallans) {
+    const recognized = await isCarrierTripChallanIncomeRecognized(prisma, c.id);
+    if (!recognized) continue;
 
-  const drifted: UnearnedDriftBilty[] = [];
-  for (const b of recognizedBilties) {
-    const net = netByBiltyId.get(b.biltyId) || 0;
+    const biltyIds = c.bilties.map((cb) => cb.bilty.id);
+    const biltyNoById = new Map(c.bilties.map((cb) => [cb.bilty.id, cb.bilty.biltyNo]));
+
+    const [biltyTaggedLines, challanTaggedLines] = await Promise.all([
+      prisma.journalLine.findMany({
+        where: { accountId: unearnedAccountId, sourceType: "BILTY", sourceId: { in: biltyIds }, journalEntry: { isDeleted: false } },
+        select: { sourceId: true, debit: true, credit: true, description: true, journalEntry: { select: { referenceType: true, entryDate: true } } },
+      }),
+      prisma.journalLine.findMany({
+        where: {
+          accountId: unearnedAccountId,
+          sourceType: "CHALLAN",
+          sourceId: c.id,
+          journalEntry: { isDeleted: false, referenceType: { in: [CARRIER_TRIP_CLOSE_REFERENCE_TYPE, CARRIER_TRIP_CLOSE_REVERSAL_REFERENCE_TYPE] } },
+        },
+        select: { debit: true, credit: true, description: true, journalEntry: { select: { referenceType: true, entryDate: true } } },
+      }),
+    ]);
+
+    const contributing: ContributingLine[] = [
+      ...biltyTaggedLines.map((l) => ({
+        date: l.journalEntry.entryDate.toISOString().slice(0, 10),
+        referenceType: l.journalEntry.referenceType || "",
+        debit: Number(l.debit),
+        credit: Number(l.credit),
+        description: l.description || "",
+        biltyNo: biltyNoById.get(l.sourceId || ""),
+      })),
+      ...challanTaggedLines.map((l) => ({
+        date: l.journalEntry.entryDate.toISOString().slice(0, 10),
+        referenceType: l.journalEntry.referenceType || "",
+        debit: Number(l.debit),
+        credit: Number(l.credit),
+        description: l.description || "",
+      })),
+    ];
+    const net = round2(contributing.reduce((s, l) => s + l.debit - l.credit, 0));
     if (Math.abs(net) > 0.01) {
-      drifted.push({ biltyId: b.biltyId, biltyNo: b.biltyNo, challanNo: b.challanNo, ownCarrier: b.ownCarrier, net });
+      driftItems.push({ kind: "CHALLAN", id: c.id, label: `Challan ${c.challanNo} (own-carrier)`, net, lines: contributing });
     }
   }
-  return drifted;
+
+  return driftItems;
 }
 
 // ============================================================
@@ -223,40 +321,62 @@ async function findUnearnedDrift(): Promise<UnearnedDriftBilty[]> {
 // ============================================================
 
 async function main() {
-  const [orphanGroups, driftedBilties] = await Promise.all([findDeletedBiltiesWithLiveLines(), findUnearnedDrift()]);
+  const [orphanGroups, driftItems] = await Promise.all([
+    runA ? findDeletedBiltiesWithLiveLines() : Promise.resolve([] as OrphanLineGroup[]),
+    runB ? findUnearnedDrift() : Promise.resolve([] as DriftItem[]),
+  ]);
 
-  console.log(`\n=== CHECK A: deleted Bilties with live JournalEntries ===`);
-  if (orphanGroups.length === 0) {
-    console.log("None found.");
-  } else {
-    for (const g of orphanGroups) {
-      console.log(`Bilty ${g.biltyNo}:`);
-      for (const e of g.entries) {
-        console.log(`  - ${e.referenceType}  entryDate=${e.entryDate.toISOString().slice(0, 10)}  amount=${e.total}  (entry ${e.id})`);
+  const unearnedAccount = await prisma.account.findFirst({ where: { id: await getUnearnedRevenueAccountId(prisma) }, select: { accountName: true } });
+  const bookingIncomeAccount = await prisma.account.findFirst({ where: { category: "BOOKING_INCOME", isActive: true }, select: { id: true, accountName: true } });
+
+  if (runA) {
+    console.log(`\n=== CHECK A: deleted Bilties with live JournalEntries ===`);
+    if (orphanGroups.length === 0) {
+      console.log("None found.");
+    } else {
+      for (const g of orphanGroups) {
+        console.log(`Bilty ${g.biltyNo}:`);
+        for (const e of g.entries) {
+          console.log(`  - ${e.referenceType}  entryDate=${e.entryDate.toISOString().slice(0, 10)}  amount=${e.total}  (entry ${e.id})  -> will be soft-deleted, entryDate unchanged`);
+        }
       }
     }
   }
 
-  console.log(`\n=== CHECK B: Unearned Revenue drift on a recognized Bilty ===`);
-  if (driftedBilties.length === 0) {
-    console.log("None found.");
-  } else {
-    for (const b of driftedBilties) {
-      console.log(
-        `Bilty ${b.biltyNo} (Challan ${b.challanNo}${b.ownCarrier ? ", own-carrier" : ""}): Unearned net=${b.net} (should be 0) - will ${
-          b.net > 0 ? "credit Unearned / debit Booking Income" : "debit Unearned / credit Booking Income"
-        } ${Math.abs(b.net)}`
-      );
+  if (runB) {
+    console.log(`\n=== CHECK B: Unearned Revenue drift on a recognized document ===`);
+    if (driftItems.length === 0) {
+      console.log("None found.");
+    } else {
+      for (const item of driftItems) {
+        console.log(`\n${item.label} - net=${item.net} (should be 0)`);
+        console.log(`  Contributing lines:`);
+        for (const l of item.lines) {
+          console.log(
+            `    ${l.date}  ${l.referenceType}${l.biltyNo ? ` (Bilty ${l.biltyNo})` : ""}  Dr ${l.debit}  Cr ${l.credit}  ${l.description}`
+          );
+        }
+        const amount = round2(Math.abs(item.net));
+        if (item.net > 0) {
+          console.log(
+            `  Proposed correction: Cr "${unearnedAccount?.accountName || "Unearned Revenue"}" ${amount}  /  Dr "${bookingIncomeAccount?.accountName || "Booking Income"}" ${amount}`
+          );
+        } else {
+          console.log(
+            `  Proposed correction: Dr "${unearnedAccount?.accountName || "Unearned Revenue"}" ${amount}  /  Cr "${bookingIncomeAccount?.accountName || "Booking Income"}" ${amount}`
+          );
+        }
+      }
     }
   }
 
   if (!apply) {
-    console.log(`\nDry-run only - no writes made. Re-run with --apply to fix these. BACK UP THE DATABASE FIRST.\n`);
+    console.log(`\nDry-run only - no writes made. Re-run with --apply (optionally --check=A or --check=B) to fix these. BACK UP THE DATABASE FIRST.\n`);
     await prisma.$disconnect();
     return;
   }
 
-  if (orphanGroups.length === 0 && driftedBilties.length === 0) {
+  if (orphanGroups.length === 0 && driftItems.length === 0) {
     console.log("\nNothing to apply.\n");
     await prisma.$disconnect();
     return;
@@ -294,26 +414,58 @@ async function main() {
     fixedA++;
   }
 
-  const bookingIncomeAccount = await prisma.account.findFirst({ where: { category: "BOOKING_INCOME", isActive: true }, select: { id: true } });
-  if (driftedBilties.length > 0 && !bookingIncomeAccount) {
+  if (driftItems.length > 0 && !bookingIncomeAccount) {
     throw new Error("No active BOOKING_INCOME account configured - cannot apply Check B corrections.");
   }
   const unearnedAccountId = await getUnearnedRevenueAccountId(prisma);
 
   let fixedB = 0;
-  for (const b of driftedBilties) {
+  for (const item of driftItems) {
     await prisma.$transaction(async (tx) => {
       // Re-check fresh inside the transaction - idempotent even on a
-      // re-run or a concurrent edit.
-      const unearnedLines = await tx.journalLine.findMany({
-        where: { accountId: unearnedAccountId, sourceType: "BILTY", sourceId: b.biltyId, journalEntry: { isDeleted: false } },
-        select: { debit: true, credit: true },
-      });
-      const freshNet = round2(unearnedLines.reduce((s, l) => s + Number(l.debit) - Number(l.credit), 0));
+      // re-run or a concurrent edit. Same aggregation shape as the
+      // scan above, just re-read live.
+      let freshNet: number;
+      if (item.kind === "BILTY") {
+        const lines = await tx.journalLine.findMany({
+          where: { accountId: unearnedAccountId, sourceType: "BILTY", sourceId: item.id, journalEntry: { isDeleted: false } },
+          select: { debit: true, credit: true },
+        });
+        freshNet = round2(lines.reduce((s, l) => s + Number(l.debit) - Number(l.credit), 0));
+      } else {
+        const challan = await tx.challan.findUnique({
+          where: { id: item.id },
+          select: { bilties: { where: { bilty: { isDeleted: false } }, select: { biltyId: true } } },
+        });
+        const biltyIds = challan?.bilties.map((cb) => cb.biltyId) || [];
+        const [biltyTaggedLines, challanTaggedLines] = await Promise.all([
+          biltyIds.length > 0
+            ? tx.journalLine.findMany({
+                where: { accountId: unearnedAccountId, sourceType: "BILTY", sourceId: { in: biltyIds }, journalEntry: { isDeleted: false } },
+                select: { debit: true, credit: true },
+              })
+            : Promise.resolve([]),
+          tx.journalLine.findMany({
+            where: {
+              accountId: unearnedAccountId,
+              sourceType: "CHALLAN",
+              sourceId: item.id,
+              journalEntry: { isDeleted: false, referenceType: { in: [CARRIER_TRIP_CLOSE_REFERENCE_TYPE, CARRIER_TRIP_CLOSE_REVERSAL_REFERENCE_TYPE] } },
+            },
+            select: { debit: true, credit: true },
+          }),
+        ]);
+        freshNet = round2(
+          [...biltyTaggedLines, ...challanTaggedLines].reduce((s, l) => s + Number(l.debit) - Number(l.credit), 0)
+        );
+      }
       if (Math.abs(freshNet) <= 0.01) return;
 
       const amount = round2(Math.abs(freshNet));
-      const description = `Bilty revenue integrity remediation - Bilty ${b.biltyNo}: Unearned Revenue drift correction - scripts/fix-bilty-revenue-integrity.ts`;
+      const description =
+        item.kind === "BILTY"
+          ? `Bilty revenue integrity remediation - ${item.label}: Unearned Revenue drift correction - scripts/fix-bilty-revenue-integrity.ts`
+          : `Own Carrier revenue integrity remediation - ${item.label}: Unearned Revenue drift correction - scripts/fix-bilty-revenue-integrity.ts`;
       const lines =
         freshNet > 0
           ? [
@@ -325,25 +477,25 @@ async function main() {
               { accountId: bookingIncomeAccount!.id, debit: 0, credit: amount },
             ];
 
+      const sourceTag = item.kind === "BILTY" ? { sourceType: "BILTY", sourceId: item.id } : { sourceType: "CHALLAN", sourceId: item.id };
+
       await tx.journalEntry.create({
         data: {
           entryDate: new Date(),
-          referenceType: "BILTY_BOOKING_CORRECTION",
-          referenceId: b.biltyId,
+          referenceType: item.kind === "BILTY" ? "BILTY_BOOKING_CORRECTION" : OWN_CARRIER_REVENUE_DRIFT_CORRECTION_REFERENCE_TYPE,
+          referenceId: item.id,
           description,
           createdById: actorUser.id,
-          lines: {
-            create: lines.map((l) => ({ ...l, description, sourceType: "BILTY", sourceId: b.biltyId, sourceNumber: b.biltyNo })),
-          },
+          lines: { create: lines.map((l) => ({ ...l, description, ...sourceTag })) },
         },
       });
 
       await auditUpdate(tx, {
         actor,
-        module: "BILTY",
-        entityType: "Bilty",
-        entityId: b.biltyId,
-        documentNo: b.biltyNo,
+        module: item.kind === "BILTY" ? "BILTY" : "CHALLAN",
+        entityType: item.kind === "BILTY" ? "Bilty" : "Challan",
+        entityId: item.id,
+        documentNo: item.label,
         description,
         changedFields: { unearnedRevenueNet: { old: freshNet, new: 0 } },
       });
@@ -352,7 +504,7 @@ async function main() {
   }
 
   console.log(
-    `\nFixed ${fixedA} Bilty(ies) under Check A and ${fixedB} Bilty(ies) under Check B, attributed to user "${actorUser.username}". Original historical JournalEntries were not touched - only new soft-deletes / a new correction entry were applied where needed.\n`
+    `\nFixed ${fixedA} Bilty(ies) under Check A and ${fixedB} document(s) under Check B, attributed to user "${actorUser.username}". Original historical JournalEntries were not touched - only new soft-deletes / a new correction entry were applied where needed.\n`
   );
   await prisma.$disconnect();
 }
