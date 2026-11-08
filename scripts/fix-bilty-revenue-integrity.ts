@@ -61,8 +61,11 @@
 //       mistake this version fixes.
 //   --apply posts ONE balanced correction entry per drifted document
 //   (Unearned Revenue <-> Booking Income, for exactly the drift
-//   amount), dated TODAY (an admin correction, same as any other
-//   post-the-fact correction in this codebase):
+//   amount), dated the SOURCE DOCUMENT's own date (Bilty.date for a
+//   BILTY-level drift, Challan.loadingDate for a CHALLAN-level one) -
+//   never "today" - so it falls on the same day as whatever rent edit
+//   it is actually correcting, not months later as a same-day
+//   transaction with no connection to it:
 //     - BILTY-level drift: referenceType BILTY_BOOKING_CORRECTION,
 //       referenceId=biltyId, lines tagged sourceType="BILTY"/
 //       sourceId=biltyId - the SAME shape the normal rent-edit
@@ -200,6 +203,12 @@ interface DriftItem {
   label: string;
   net: number; // live Unearned Revenue net (debit - credit) - should be 0
   lines: ContributingLine[];
+  // The source document's OWN date - Bilty.date for kind BILTY,
+  // Challan.loadingDate for kind CHALLAN - the correction entry is
+  // dated here, never "today", so it falls on the same day as the
+  // rent edit it is correcting rather than showing up as a same-day
+  // transaction months later.
+  sourceDate: Date;
 }
 
 async function findUnearnedDrift(): Promise<DriftItem[]> {
@@ -215,7 +224,8 @@ async function findUnearnedDrift(): Promise<DriftItem[]> {
       id: true,
       challanNo: true,
       ownCarrierId: true,
-      bilties: { where: { bilty: { isDeleted: false } }, select: { bilty: { select: { id: true, biltyNo: true } } } },
+      loadingDate: true,
+      bilties: { where: { bilty: { isDeleted: false } }, select: { bilty: { select: { id: true, biltyNo: true, date: true } } } },
     },
   });
   if (challans.length === 0) return [];
@@ -224,7 +234,7 @@ async function findUnearnedDrift(): Promise<DriftItem[]> {
 
   // --- Non-own-carrier: checked PER BILTY (recognized the moment it
   // was added to the Challan - no challan-level aggregation needed). ---
-  const nonOwnCarrierBilties: { id: string; biltyNo: string }[] = [];
+  const nonOwnCarrierBilties: { id: string; biltyNo: string; date: Date }[] = [];
   for (const c of challans) {
     if (c.ownCarrierId) continue;
     for (const cb of c.bilties) nonOwnCarrierBilties.push(cb.bilty);
@@ -256,7 +266,7 @@ async function findUnearnedDrift(): Promise<DriftItem[]> {
       const biltyLines = byBiltyId.get(b.id) || [];
       const net = round2(biltyLines.reduce((s, l) => s + l.debit - l.credit, 0));
       if (Math.abs(net) > 0.01) {
-        driftItems.push({ kind: "BILTY", id: b.id, label: `Bilty ${b.biltyNo}`, net, lines: biltyLines });
+        driftItems.push({ kind: "BILTY", id: b.id, label: `Bilty ${b.biltyNo}`, net, lines: biltyLines, sourceDate: b.date });
       }
     }
   }
@@ -309,7 +319,7 @@ async function findUnearnedDrift(): Promise<DriftItem[]> {
     ];
     const net = round2(contributing.reduce((s, l) => s + l.debit - l.credit, 0));
     if (Math.abs(net) > 0.01) {
-      driftItems.push({ kind: "CHALLAN", id: c.id, label: `Challan ${c.challanNo} (own-carrier)`, net, lines: contributing });
+      driftItems.push({ kind: "CHALLAN", id: c.id, label: `Challan ${c.challanNo} (own-carrier)`, net, lines: contributing, sourceDate: c.loadingDate });
     }
   }
 
@@ -357,13 +367,14 @@ async function main() {
           );
         }
         const amount = round2(Math.abs(item.net));
+        const entryDateStr = item.sourceDate.toISOString().slice(0, 10);
         if (item.net > 0) {
           console.log(
-            `  Proposed correction: Cr "${unearnedAccount?.accountName || "Unearned Revenue"}" ${amount}  /  Dr "${bookingIncomeAccount?.accountName || "Booking Income"}" ${amount}`
+            `  Proposed correction (dated ${entryDateStr}, the source document's own date): Cr "${unearnedAccount?.accountName || "Unearned Revenue"}" ${amount}  /  Dr "${bookingIncomeAccount?.accountName || "Booking Income"}" ${amount}`
           );
         } else {
           console.log(
-            `  Proposed correction: Dr "${unearnedAccount?.accountName || "Unearned Revenue"}" ${amount}  /  Cr "${bookingIncomeAccount?.accountName || "Booking Income"}" ${amount}`
+            `  Proposed correction (dated ${entryDateStr}, the source document's own date): Dr "${unearnedAccount?.accountName || "Unearned Revenue"}" ${amount}  /  Cr "${bookingIncomeAccount?.accountName || "Booking Income"}" ${amount}`
           );
         }
       }
@@ -424,20 +435,28 @@ async function main() {
     await prisma.$transaction(async (tx) => {
       // Re-check fresh inside the transaction - idempotent even on a
       // re-run or a concurrent edit. Same aggregation shape as the
-      // scan above, just re-read live.
+      // scan above, just re-read live. The source document's own date
+      // is re-read fresh too, same discipline - never trusted from the
+      // earlier scan.
       let freshNet: number;
+      let sourceDate: Date;
       if (item.kind === "BILTY") {
-        const lines = await tx.journalLine.findMany({
-          where: { accountId: unearnedAccountId, sourceType: "BILTY", sourceId: item.id, journalEntry: { isDeleted: false } },
-          select: { debit: true, credit: true },
-        });
+        const [lines, bilty] = await Promise.all([
+          tx.journalLine.findMany({
+            where: { accountId: unearnedAccountId, sourceType: "BILTY", sourceId: item.id, journalEntry: { isDeleted: false } },
+            select: { debit: true, credit: true },
+          }),
+          tx.bilty.findUniqueOrThrow({ where: { id: item.id }, select: { date: true } }),
+        ]);
         freshNet = round2(lines.reduce((s, l) => s + Number(l.debit) - Number(l.credit), 0));
+        sourceDate = bilty.date;
       } else {
-        const challan = await tx.challan.findUnique({
+        const challan = await tx.challan.findUniqueOrThrow({
           where: { id: item.id },
-          select: { bilties: { where: { bilty: { isDeleted: false } }, select: { biltyId: true } } },
+          select: { loadingDate: true, bilties: { where: { bilty: { isDeleted: false } }, select: { biltyId: true } } },
         });
-        const biltyIds = challan?.bilties.map((cb) => cb.biltyId) || [];
+        sourceDate = challan.loadingDate;
+        const biltyIds = challan.bilties.map((cb) => cb.biltyId);
         const [biltyTaggedLines, challanTaggedLines] = await Promise.all([
           biltyIds.length > 0
             ? tx.journalLine.findMany({
@@ -481,7 +500,7 @@ async function main() {
 
       await tx.journalEntry.create({
         data: {
-          entryDate: new Date(),
+          entryDate: sourceDate,
           referenceType: item.kind === "BILTY" ? "BILTY_BOOKING_CORRECTION" : OWN_CARRIER_REVENUE_DRIFT_CORRECTION_REFERENCE_TYPE,
           referenceId: item.id,
           description,
