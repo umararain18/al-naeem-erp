@@ -1149,6 +1149,24 @@ export async function PATCH(
         },
       });
 
+      // Keep the original Challan dispatch JournalEntry date
+      // synchronized with the Challan's own loadingDate - mirrors
+      // app/api/bilty/[id]/route.ts's identical fix for Bilty.date ->
+      // BILTY_BOOKING.entryDate exactly. CHALLAN_DISPATCH_CORRECTION
+      // entries represent independent correction moments and must NOT
+      // be touched here (same exclusion the Bilty side already
+      // applies to BILTY_BOOKING_CORRECTION). Without this,
+      // loadingDate can be edited freely (no status/settlement guard
+      // on it at all) while the original CHALLAN_DISPATCH entry's own
+      // entryDate silently keeps the stale date forever - the exact
+      // drift found on Challan 6403 in production.
+      if (updateData.loadingDate) {
+        await tx.journalEntry.updateMany({
+          where: { referenceType: "CHALLAN_DISPATCH", referenceId: id, isDeleted: false },
+          data: { entryDate: updateData.loadingDate as Date },
+        });
+      }
+
       if (newChallanNoTrimmed) {
         // JournalLine.sourceNumber is a denormalized DISPLAY copy only
         // (sourceId is the real reference every lookup actually uses -
