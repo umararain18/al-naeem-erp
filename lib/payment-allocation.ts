@@ -84,23 +84,43 @@ function round2(value: number): number {
 //     movement in this system (Settlement/Bilty/Challan creation
 //     never touch Cash/Bank).
 //  3. Its JournalEntry is not binned (isDeleted: false).
-//  4. Its JournalEntry has EXACTLY TWO lines, and the OTHER line's
-//     account.category is CASH or BANK.
+//  4. It pairs UNIQUELY with exactly one Cash/Bank line in the SAME
+//     entry.
 //
-// (4) is deliberately conservative. A single Daily Posting
-// submission can bundle several unrelated DIRECT lines into one
-// JournalEntry (see app/api/daily-posting/route.ts's per-document
-// grouping) - such an entry has no reliable way to say which
-// Cash/Bank line pairs with which Party line once persisted, so it
-// is excluded rather than guessed at. Only the unambiguous
-// single-pair shape qualifies.
+// (4) used to require the entry have EXACTLY TWO lines total - but
+// app/api/daily-posting/route.ts's own DIRECT_GROUP grouping bundles
+// EVERY non-CHALLAN/BILTY-tagged line from one submission into ONE
+// shared JournalEntry (see that route's own comment: "every DIRECT/
+// other line shares one remaining JournalEntry") - so a single
+// Daily Posting submission recording, say, three different parties'
+// lumpsum receipts in one go produces one 6-line entry (3 Cash/Bank
+// legs + 3 Party legs), and EVERY one of those three real receipts
+// was silently excluded as "AMBIGUOUS_PAYMENT" under the old
+// EXACTLY-TWO rule - confirmed as the dominant cause of near-zero
+// matches in production (most real postings ARE bundled this way).
+//
+// Fixed by pairing a line back to its own counterpart the same way
+// app/api/cash-book/[id]/route.ts's own DELETE handler already
+// re-identifies a bundled pair: match on the EXACT (sourceType,
+// sourceId, sourceNumber, description) signature buildLinePair()
+// gives both members of a pair, plus an exact opposite-amount debit/
+// credit swap. A 2-line entry needs no such matching (the other line
+// is simply whichever one isn't this one, exactly as before). For a
+// bundled (>2-line) entry, if more than one Cash/Bank line matches
+// that exact signature, the pairing is genuinely unidentifiable -
+// never guessed, excluded instead, mirroring the cash-book route's
+// own "refuse rather than guess wrong" precedent.
 //
 // A qualifying line's own sourceType MUST ALSO be something other
-// than "CHALLAN"/"BILTY" to be ELIGIBLE for NEW allocation (see
-// isEligibleForAllocation below) - a line already tagged to a
-// specific document at posting time is already fully attributed by
-// the EXISTING lib/challan-financials.ts received/paid calculation;
-// allocating it again would double-count that same money against
+// than "CHALLAN"/"BILTY"/"BILL"/"PRIVATE_PHONCH"/"PHONCH" to be
+// ELIGIBLE for NEW allocation (see isEligibleForAllocation below) -
+// a line already tagged to a specific document at posting time is
+// already fully attributed by that document's own EXISTING
+// received/paid calculation (lib/challan-financials.ts for CHALLAN/
+// BILTY, resolveBillTarget's own tagged-line sum for BILL,
+// getPrivatePhonchPartyBalances for PRIVATE_PHONCH, lib/phonch-
+// accounting.ts for the unrelated Showroom PHONCH); allocating it
+// again would double-count that same money against
 // both mechanisms.
 // ============================================================
 
@@ -115,6 +135,50 @@ export interface PaymentLineInfo {
   sourceType: string | null;
 }
 
+interface PairableEntryLine {
+  id: string;
+  debit: Prisma.Decimal | number;
+  credit: Prisma.Decimal | number;
+  sourceType: string | null;
+  sourceId: string | null;
+  sourceNumber: string | null;
+  description: string | null;
+  account: { category: string };
+}
+
+/**
+ * Finds the ONE Cash/Bank line in `entryLines` that pairs with `line`
+ * - trivial when the entry has exactly two lines (the other one, by
+ * elimination); for a bundled (>2-line) entry, matches on the exact
+ * (sourceType, sourceId, sourceNumber, description) signature
+ * buildLinePair() gives both members of a pair, plus an exact
+ * opposite-amount debit/credit swap. Returns null when zero or more
+ * than one line matches - never guesses. See this module's own
+ * "PAYMENT IDENTIFICATION" header comment for the full reasoning.
+ */
+export function findPairedCashBankLine<T extends PairableEntryLine>(line: T, entryLines: T[]): T | null {
+  if (entryLines.length === 2) {
+    const other = entryLines.find((l) => l.id !== line.id);
+    if (!other || (other.account.category !== "CASH" && other.account.category !== "BANK")) return null;
+    return other;
+  }
+
+  const debit = Number(line.debit);
+  const credit = Number(line.credit);
+
+  const matches = entryLines.filter((l) => {
+    if (l.id === line.id) return false;
+    if (l.account.category !== "CASH" && l.account.category !== "BANK") return false;
+    if (l.sourceType !== line.sourceType) return false;
+    if ((l.sourceId || null) !== (line.sourceId || null)) return false;
+    if ((l.sourceNumber || null) !== (line.sourceNumber || null)) return false;
+    if ((l.description || null) !== (line.description || null)) return false;
+    return Number(l.debit) === credit && Number(l.credit) === debit;
+  });
+
+  return matches.length === 1 ? matches[0] : null;
+}
+
 export async function getPaymentLine(tx: Tx, journalLineId: string): Promise<PaymentLineInfo> {
   const line = await tx.journalLine.findUnique({
     where: { id: journalLineId },
@@ -123,6 +187,9 @@ export async function getPaymentLine(tx: Tx, journalLineId: string): Promise<Pay
       debit: true,
       credit: true,
       sourceType: true,
+      sourceId: true,
+      sourceNumber: true,
+      description: true,
       account: { select: { id: true, category: true, partyId: true } },
       journalEntry: {
         select: {
@@ -130,7 +197,16 @@ export async function getPaymentLine(tx: Tx, journalLineId: string): Promise<Pay
           isDeleted: true,
           entryDate: true,
           lines: {
-            select: { id: true, account: { select: { category: true } } },
+            select: {
+              id: true,
+              debit: true,
+              credit: true,
+              sourceType: true,
+              sourceId: true,
+              sourceNumber: true,
+              description: true,
+              account: { select: { category: true } },
+            },
           },
         },
       },
@@ -155,19 +231,11 @@ export async function getPaymentLine(tx: Tx, journalLineId: string): Promise<Pay
     );
   }
 
-  const entryLines = line.journalEntry.lines;
-  if (entryLines.length !== 2) {
+  const other = findPairedCashBankLine(line, line.journalEntry.lines);
+  if (!other) {
     throw new AllocationError(
       "AMBIGUOUS_PAYMENT",
       "This Daily Posting entry does not represent a single, unambiguous Cash/Bank <-> Party movement and cannot be allocated."
-    );
-  }
-
-  const other = entryLines.find((l) => l.id !== line.id);
-  if (!other || (other.account.category !== "CASH" && other.account.category !== "BANK")) {
-    throw new AllocationError(
-      "NOT_A_PAYMENT",
-      "This JournalLine is not paired with a Cash/Bank movement and cannot be allocated."
     );
   }
 
@@ -191,16 +259,26 @@ export async function getPaymentLine(tx: Tx, journalLineId: string): Promise<Pay
   };
 }
 
+/** Every Daily Posting sourceType whose own document reads its
+ * tagged Daily Posting lines to compute an "already received/paid"
+ * figure of its own - allocating one of these lines a SECOND time,
+ * generically, would double-count that same money. CHALLAN/BILTY are
+ * the original two (see lib/challan-financials.ts); BILL
+ * (resolveBillTarget), PRIVATE_PHONCH (getPrivatePhonchPartyBalances),
+ * and PHONCH (lib/phonch-accounting.ts - not itself a FIFO target
+ * type, but still a document with its own received-amount tracking)
+ * were added once this feature extended FIFO past Bilty/Challan. */
+const ALREADY_DOCUMENT_LINKED_SOURCE_TYPES = ["CHALLAN", "BILTY", "BILL", "PRIVATE_PHONCH", "PHONCH"];
+
 /**
  * A qualifying payment (getPaymentLine) is ELIGIBLE for NEW
  * allocation only if it was NOT already tagged to a specific
- * Challan/Bilty at posting time - such a line is already fully
- * counted in that document's own received/paid via
- * lib/challan-financials.ts, and allocating it again would
- * double-count the same money against two mechanisms.
+ * document at posting time - such a line is already fully counted in
+ * that document's own received/paid figure, and allocating it again
+ * would double-count the same money against two mechanisms.
  */
 export function isEligibleForAllocation(payment: PaymentLineInfo): boolean {
-  return payment.sourceType !== "CHALLAN" && payment.sourceType !== "BILTY";
+  return !payment.sourceType || !ALREADY_DOCUMENT_LINKED_SOURCE_TYPES.includes(payment.sourceType);
 }
 
 // ============================================================
@@ -772,6 +850,49 @@ export function deriveOpeningBalanceFromLines(
   };
 }
 
+/**
+ * Caps a derived opening balance to the account's CURRENT total net
+ * balance (every live JournalLine on the account, not just the
+ * qualifying opening-balance-sourced ones) - the historical opening
+ * figure is, by construction, frozen at whatever it was tagged at
+ * creation/edit time, but the party's REAL outstanding balance since
+ * then may have already been reduced (even to zero) by activity this
+ * FIFO engine never tracks as a "payment" at all: a multi-line
+ * bundled Daily Posting, a direct fuel/trip expense JournalEntry, a
+ * Settlement/Settlement Correction line, etc. Treating the stale,
+ * uncapped opening figure as still fully outstanding would leave it
+ * permanently "open" even though the account has genuinely settled
+ * down to (or past) zero - exactly the bug reported against
+ * production (Ansari And Sons / NKB / Jaecco / Sitara Hilal Pump
+ * Hyderabad / Kisan Tractors / Umar Khan Dera Ismail Khan: real
+ * receipts/other postings already reduced these accounts, but
+ * Opening Balance never reflected it).
+ *
+ * `currentNetBalance` must be `debit - credit` summed across EVERY
+ * live line on the account (the same convention deriveOpeningBalance
+ * FromLines itself uses) - not just the qualifying subset.
+ *
+ * - Same direction as the opening, and its magnitude is SMALLER than
+ *   the opening amount -> the opening has been partially offset;
+ *   remaining = that smaller current magnitude.
+ * - Same direction, magnitude >= the opening amount -> the party has
+ *   only grown MORE indebted since opening via channels outside this
+ *   opening figure (e.g. real Bilty/Bill dues, already their own
+ *   separate FIFO targets) - the opening itself stays capped at its
+ *   own original amount, never inflated by unrelated activity.
+ * - Opposite direction (or exactly zero) -> the opening has been
+ *   fully offset and then some - nothing left open at all (null).
+ */
+export function capOpeningBalanceByCurrentBalance(
+  derived: { totalDue: number; direction: AllocationDirection; earliestDate: Date },
+  currentNetBalance: number
+): { totalDue: number; direction: AllocationDirection; earliestDate: Date } | null {
+  const sameDirectionMagnitude = derived.direction === "RECEIVABLE" ? Math.max(0, currentNetBalance) : Math.max(0, -currentNetBalance);
+  const cappedTotalDue = round2(Math.min(derived.totalDue, sameDirectionMagnitude));
+  if (cappedTotalDue <= 0.009) return null;
+  return { ...derived, totalDue: cappedTotalDue };
+}
+
 async function resolveOpeningBalanceTarget(tx: Tx, partyId: string): Promise<ResolvedTarget | null> {
   const party = await tx.party.findUnique({ where: { id: partyId }, select: { id: true, partyName: true, account: { select: { id: true } } } });
   if (!party?.account) return null;
@@ -790,31 +911,46 @@ async function resolveOpeningBalanceTarget(tx: Tx, partyId: string): Promise<Res
   });
 
   const qualifyingLines: OpeningBalanceQualifyingLine[] = [];
+  let currentNetBalance = 0;
   for (const line of partyLines) {
+    const debit = Number(line.debit);
+    const credit = Number(line.credit);
+    currentNetBalance += debit - credit;
+
     const isOfficiallyTagged = line.journalEntry.referenceType === "OPENING_BALANCE";
     const hasOpeningEquityContra = openingEquityAccountId != null && line.journalEntry.lines.some((l) => l.accountId === openingEquityAccountId);
     if (!isOfficiallyTagged && !hasOpeningEquityContra) continue;
-    qualifyingLines.push({ debit: Number(line.debit), credit: Number(line.credit), entryDate: line.journalEntry.entryDate });
+    qualifyingLines.push({ debit, credit, entryDate: line.journalEntry.entryDate });
   }
 
   const derived = deriveOpeningBalanceFromLines(qualifyingLines);
   if (!derived) return null;
 
+  // Cap to the account's CURRENT total net balance - see
+  // capOpeningBalanceByCurrentBalance's own doc comment.
+  const capped = capOpeningBalanceByCurrentBalance(derived, currentNetBalance);
+  if (!capped) return null;
+
   return {
     targetSourceType: "OPENING_BALANCE",
     targetSourceId: partyId,
     documentNo: "Opening Balance",
-    documentDate: derived.earliestDate,
+    documentDate: capped.earliestDate,
     responsiblePartyAccountId: party.account.id,
-    totalDue: derived.totalDue,
+    totalDue: capped.totalDue,
     existingReceivedOrPaid: 0,
-    direction: derived.direction,
+    direction: capped.direction,
   };
 }
 
 export interface OpeningBalanceBreakdown {
   taggedAmount: number;
   untaggedAmount: number;
+  /** The raw, uncapped opening figure (tagged + untagged combined). */
+  rawTotalDue: number;
+  /** debit - credit across EVERY live line on the account - see capOpeningBalanceByCurrentBalance. */
+  currentNetBalance: number;
+  /** The capped figure actually used as the OPENING_BALANCE target's totalDue (0 if fully offset). */
   totalDue: number;
   direction: AllocationDirection | null;
   earliestDate: Date | null;
@@ -845,10 +981,15 @@ export async function getOpeningBalanceBreakdown(tx: Tx, partyId: string): Promi
 
   const taggedLines: OpeningBalanceQualifyingLine[] = [];
   const untaggedLines: OpeningBalanceQualifyingLine[] = [];
+  let currentNetBalance = 0;
   for (const line of partyLines) {
+    const debit = Number(line.debit);
+    const credit = Number(line.credit);
+    currentNetBalance += debit - credit;
+
     const isOfficiallyTagged = line.journalEntry.referenceType === "OPENING_BALANCE";
     const hasOpeningEquityContra = openingEquityAccountId != null && line.journalEntry.lines.some((l) => l.accountId === openingEquityAccountId);
-    const entry: OpeningBalanceQualifyingLine = { debit: Number(line.debit), credit: Number(line.credit), entryDate: line.journalEntry.entryDate };
+    const entry: OpeningBalanceQualifyingLine = { debit, credit, entryDate: line.journalEntry.entryDate };
     if (isOfficiallyTagged) taggedLines.push(entry);
     else if (hasOpeningEquityContra) untaggedLines.push(entry);
   }
@@ -858,13 +999,16 @@ export async function getOpeningBalanceBreakdown(tx: Tx, partyId: string): Promi
   const taggedNet = taggedLines.reduce((s, l) => s + l.debit - l.credit, 0);
   const untaggedNet = untaggedLines.reduce((s, l) => s + l.debit - l.credit, 0);
   const derived = deriveOpeningBalanceFromLines([...taggedLines, ...untaggedLines]);
+  const capped = derived ? capOpeningBalanceByCurrentBalance(derived, currentNetBalance) : null;
 
   return {
     taggedAmount: round2(Math.abs(taggedNet)),
     untaggedAmount: round2(Math.abs(untaggedNet)),
-    totalDue: derived?.totalDue ?? 0,
-    direction: derived?.direction ?? null,
-    earliestDate: derived?.earliestDate ?? null,
+    rawTotalDue: derived?.totalDue ?? 0,
+    currentNetBalance: round2(currentNetBalance),
+    totalDue: capped?.totalDue ?? 0,
+    direction: capped?.direction ?? derived?.direction ?? null,
+    earliestDate: capped?.earliestDate ?? derived?.earliestDate ?? null,
   };
 }
 
@@ -1131,16 +1275,34 @@ export async function createAllocations(input: CreateAllocationsInput): Promise<
  * effectively creation order) as a stable tiebreaker - never
  * database-default/random order.
  */
-export async function getPartyDocumentStates(
+export interface AllocationCandidateRef {
+  targetSourceType: AllocationTargetType;
+  targetSourceId: string;
+}
+
+/**
+ * Gathers every RAW candidate (targetSourceType, targetSourceId)
+ * worth attempting resolveAllocationTarget against for this party +
+ * direction - deliberately a SUPERSET (each candidate is still fully
+ * re-validated, including its real responsible party, by
+ * getRemainingAllocatableAmountForDocument). Extracted out of
+ * getPartyDocumentStates so scripts/backfill-fifo-allocation.ts's own
+ * --verbose diagnostic can report WHY a specific candidate was
+ * excluded (party mismatch, direction mismatch, multi-payer guard,
+ * not settled, etc.) instead of only ever seeing the final, already-
+ * filtered list.
+ */
+export async function getPartyDocumentCandidateRefs(
   tx: Tx,
   partyAccountId: string,
-  direction: AllocationDirection,
-  options: { onlyWithRemainingBalance?: boolean } = {}
-): Promise<DocumentAllocationState[]> {
+  direction: AllocationDirection
+): Promise<AllocationCandidateRef[]> {
   const account = await tx.account.findUnique({ where: { id: partyAccountId }, select: { partyId: true } });
   const partyId = account?.partyId ?? null;
 
-  const partyLines = await tx.journalLine.findMany({
+  const refs: AllocationCandidateRef[] = [];
+
+  const settlementLines = await tx.journalLine.findMany({
     where: {
       accountId: partyAccountId,
       journalEntry: { referenceType: { in: ["SETTLEMENT", "SETTLEMENT_CORRECTION"] }, isDeleted: false },
@@ -1150,8 +1312,7 @@ export async function getPartyDocumentStates(
 
   const candidateChallanIds = new Set<string>();
   const candidateBiltyIds = new Set<string>();
-
-  for (const line of partyLines) {
+  for (const line of settlementLines) {
     const challanId = line.journalEntry.referenceId;
     if (challanId) candidateChallanIds.add(challanId);
     if (line.sourceType === "BILTY" && line.sourceId) candidateBiltyIds.add(line.sourceId);
@@ -1159,7 +1320,7 @@ export async function getPartyDocumentStates(
 
   // BILTY_PAID candidates - any Bilty where this party is explicitly
   // or implicitly the Paid-responsible party (resolveBiltyPaidTarget
-  // re-validates the exact responsibility chain below; this query is
+  // re-validates the exact responsibility chain; this query is
   // deliberately a superset).
   if (partyId && direction === "RECEIVABLE") {
     const paidBilties = await tx.bilty.findMany({
@@ -1173,13 +1334,24 @@ export async function getPartyDocumentStates(
     for (const b of paidBilties) candidateBiltyIds.add(b.id);
   }
 
-  const candidateBillIds = new Set<string>();
-  if (partyId && direction === "RECEIVABLE") {
-    const bills = await tx.bill.findMany({ where: { isDeleted: false, clientPartyId: partyId }, select: { id: true } });
-    for (const b of bills) candidateBillIds.add(b.id);
+  refs.push({ targetSourceType: "OPENING_BALANCE", targetSourceId: partyId ?? "" });
+
+  if (direction === "PAYABLE") {
+    for (const challanId of candidateChallanIds) refs.push({ targetSourceType: "CHALLAN", targetSourceId: challanId });
   }
 
-  const candidatePhonchIds = new Set<string>();
+  if (direction === "RECEIVABLE") {
+    for (const biltyId of candidateBiltyIds) {
+      refs.push({ targetSourceType: "BILTY", targetSourceId: biltyId });
+      refs.push({ targetSourceType: "BILTY_PAID", targetSourceId: biltyId });
+    }
+
+    if (partyId) {
+      const bills = await tx.bill.findMany({ where: { isDeleted: false, clientPartyId: partyId }, select: { id: true } });
+      for (const b of bills) refs.push({ targetSourceType: "BILL", targetSourceId: b.id });
+    }
+  }
+
   if (partyId) {
     const phonches = await tx.privatePhonch.findMany({
       where: {
@@ -1188,95 +1360,40 @@ export async function getPartyDocumentStates(
       },
       select: { id: true },
     });
-    for (const p of phonches) candidatePhonchIds.add(p.id);
+    const phonchTargetType = direction === "PAYABLE" ? "PRIVATE_PHONCH_PAYABLE" : "PRIVATE_PHONCH_RECOVERY";
+    for (const p of phonches) refs.push({ targetSourceType: phonchTargetType, targetSourceId: `${p.id}:${partyAccountId}` });
   }
 
+  return refs;
+}
+
+/**
+ * Finds every settled Challan/Bilty where the given party account is
+ * the SOLE responsible party for at least one component (never an
+ * ambiguous one - see resolveAllocationTarget), by reading the same
+ * SETTLEMENT/SETTLEMENT_CORRECTION ledger lines every other
+ * resolution helper in this codebase already reads. This is the
+ * single, shared "which documents belong to this party" lookup -
+ * used both by auto-allocation (filtered to a remaining balance) and
+ * by the Party Ledger 2.0 Documents/Outstanding views (unfiltered,
+ * so fully-settled documents still appear for history).
+ *
+ * Ordering is deterministic: primary by the document's own date
+ * field (Challan.loadingDate / Bilty.date), secondary by documentNo
+ * as a stable tiebreaker - never database-default/random order.
+ */
+export async function getPartyDocumentStates(
+  tx: Tx,
+  partyAccountId: string,
+  direction: AllocationDirection,
+  options: { onlyWithRemainingBalance?: boolean } = {}
+): Promise<DocumentAllocationState[]> {
+  const candidates = await getPartyDocumentCandidateRefs(tx, partyAccountId, direction);
   const results: DocumentAllocationState[] = [];
 
-  if (direction === "RECEIVABLE" || direction === "PAYABLE") {
+  for (const candidate of candidates) {
     try {
-      const openingState = await resolveOpeningBalanceTarget(tx, partyId ?? "");
-      if (openingState && openingState.direction === direction) {
-        const allocatedViaTable = await getAllocatedAmountForDocument(tx, "OPENING_BALANCE", openingState.targetSourceId);
-        const remaining = Math.max(0, round2(openingState.totalDue - openingState.existingReceivedOrPaid - allocatedViaTable));
-        if (!options.onlyWithRemainingBalance || remaining > 0.009) {
-          results.push({ ...openingState, allocatedViaTable, remainingAllocatable: remaining });
-        }
-      }
-    } catch {
-      // No opening balance established - simply not eligible.
-    }
-  }
-
-  if (direction === "PAYABLE") {
-    for (const challanId of candidateChallanIds) {
-      try {
-        const state = await getRemainingAllocatableAmountForDocument(tx, "CHALLAN", challanId);
-        if (
-          state.responsiblePartyAccountId === partyAccountId &&
-          state.direction === direction &&
-          (!options.onlyWithRemainingBalance || state.remainingAllocatable > 0.009)
-        ) {
-          results.push(state);
-        }
-      } catch {
-        // Ambiguous / not settled / not found - simply not eligible.
-      }
-    }
-  }
-
-  if (direction === "RECEIVABLE") {
-    for (const biltyId of candidateBiltyIds) {
-      try {
-        const state = await getRemainingAllocatableAmountForDocument(tx, "BILTY", biltyId);
-        if (
-          state.responsiblePartyAccountId === partyAccountId &&
-          state.direction === direction &&
-          (!options.onlyWithRemainingBalance || state.remainingAllocatable > 0.009)
-        ) {
-          results.push(state);
-        }
-      } catch {
-        // Ambiguous / not settled / not found - simply not eligible.
-      }
-
-      try {
-        const state = await getRemainingAllocatableAmountForDocument(tx, "BILTY_PAID", biltyId);
-        if (
-          state.responsiblePartyAccountId === partyAccountId &&
-          state.direction === direction &&
-          (!options.onlyWithRemainingBalance || state.remainingAllocatable > 0.009)
-        ) {
-          results.push(state);
-        }
-      } catch {
-        // Multi-payer / no advance / not found - simply not eligible.
-      }
-    }
-
-    for (const billId of candidateBillIds) {
-      try {
-        const state = await getRemainingAllocatableAmountForDocument(tx, "BILL", billId);
-        if (
-          state.responsiblePartyAccountId === partyAccountId &&
-          state.direction === direction &&
-          (!options.onlyWithRemainingBalance || state.remainingAllocatable > 0.009)
-        ) {
-          results.push(state);
-        }
-      } catch {
-        // Walk-in / record-only - simply not eligible.
-      }
-    }
-  }
-
-  for (const phonchId of candidatePhonchIds) {
-    try {
-      const state = await getRemainingAllocatableAmountForDocument(
-        tx,
-        direction === "PAYABLE" ? "PRIVATE_PHONCH_PAYABLE" : "PRIVATE_PHONCH_RECOVERY",
-        `${phonchId}:${partyAccountId}`
-      );
+      const state = await getRemainingAllocatableAmountForDocument(tx, candidate.targetSourceType, candidate.targetSourceId);
       if (
         state.responsiblePartyAccountId === partyAccountId &&
         state.direction === direction &&
@@ -1285,7 +1402,7 @@ export async function getPartyDocumentStates(
         results.push(state);
       }
     } catch {
-      // No such outstanding amount for this account on this Phonch.
+      // Ambiguous / not settled / multi-payer / wrong party / not found - simply not eligible.
     }
   }
 

@@ -4,7 +4,7 @@
 // conventions exactly (dry-run by default, --apply --user=<username>
 // to write, attributed via the same actor resolution).
 //
-// Two passes, run together every time:
+// Two passes, run together every time (unless --party narrows it):
 //
 //   PASS 1 - VERIFY/REPORT ONLY (never writes). The migration itself
 //   (prisma/migrations/20261112162129_party_payment_fifo_allocation)
@@ -17,9 +17,11 @@
 //   both directions (RECEIVABLE/PAYABLE), reports what
 //   rerunFifoForParty() would do - documents cleared, partially
 //   covered, and any advance (unallocated leftover) - without
-//   writing, plus each party's own Opening Balance amount and its
-//   source breakdown (official OPENING_BALANCE-tagged entry vs. an
-//   untagged manual JE contra-ing the Opening Balance Equity
+//   writing, plus each party's own Opening Balance figure (capped to
+//   the account's CURRENT live balance - see
+//   capOpeningBalanceByCurrentBalance in lib/payment-allocation.ts)
+//   and its source breakdown (official OPENING_BALANCE-tagged entry
+//   vs. an untagged manual JE contra-ing the Opening Balance Equity
 //   account). --apply commits it by calling the SAME rerunFifoForParty
 //   the live app uses for every other trigger - never a second,
 //   parallel write path.
@@ -28,16 +30,29 @@
 // listEligibleFifoPayments() itself (same as every other FIFO
 // rebuild) - never touched by this script either.
 //
+// DIAGNOSTICS (--party + --verbose, always read-only regardless of
+// --apply): prints, for the one matched party, (1) every JournalLine
+// on its account since opening with ELIGIBLE yes/no + a reason when
+// not, (2) every candidate document per direction with INCLUDED
+// yes/no + a reason when not, (3) the planned allocations.
+//
 // Usage:
-//   npx tsx scripts/backfill-fifo-allocation.ts                    (dry-run)
-//   npx tsx scripts/backfill-fifo-allocation.ts --apply             (writes)
-//   npx tsx scripts/backfill-fifo-allocation.ts --apply --user=umar (attribute to a specific username; defaults to the first active SUPER_ADMIN)
+//   npx tsx scripts/backfill-fifo-allocation.ts                              (dry-run, every party)
+//   npx tsx scripts/backfill-fifo-allocation.ts --apply                      (writes)
+//   npx tsx scripts/backfill-fifo-allocation.ts --apply --user=umar          (attribute to a specific username; defaults to the first active SUPER_ADMIN)
+//   npx tsx scripts/backfill-fifo-allocation.ts --party="Ansari And Sons"    (restrict the FIFO pass to one party, case-insensitive substring match)
+//   npx tsx scripts/backfill-fifo-allocation.ts --party="NKB" --verbose      (full line-by-line/document-by-document diagnostic for that party - read-only)
 
 import { PrismaClient } from "@prisma/client";
 import {
+  AllocationError,
   getOpeningBalanceBreakdown,
   getPartyDocumentStates,
+  getPartyDocumentCandidateRefs,
+  getRemainingAllocatableAmountForDocument,
   getAllocatedAmountForPayment,
+  getPaymentLine,
+  isEligibleForAllocation,
   type AllocationDirection,
 } from "../lib/payment-allocation";
 import {
@@ -51,8 +66,16 @@ import {
 const prisma = new PrismaClient();
 
 const apply = process.argv.includes("--apply");
+const verbose = process.argv.includes("--verbose");
 const userArg = process.argv.find((a) => a.startsWith("--user="));
 const requestedUsername = userArg ? userArg.slice("--user=".length) : null;
+const partyArg = process.argv.find((a) => a.startsWith("--party="));
+const requestedPartyName = partyArg ? partyArg.slice("--party=".length).replace(/^"|"$/g, "") : null;
+
+if (verbose && !requestedPartyName) {
+  console.error('--verbose requires --party="<name>" - it only ever reports on one party at a time.');
+  process.exit(1);
+}
 
 async function resolveActor() {
   const user = requestedUsername
@@ -103,18 +126,13 @@ async function reportLegacyBackfillStatus() {
 }
 
 interface PartyFifoReport {
-  partyName: string;
   direction: AllocationDirection;
   docsCleared: number;
   docsPartial: number;
   advanceLeft: number;
 }
 
-async function previewFifoForParty(
-  accountId: string,
-  partyName: string,
-  direction: AllocationDirection
-): Promise<PartyFifoReport | null> {
+async function previewFifoForParty(accountId: string, direction: AllocationDirection): Promise<PartyFifoReport | null> {
   const payments = await listEligibleFifoPayments(prisma, accountId, direction);
   if (payments.length === 0) return null;
 
@@ -151,31 +169,179 @@ async function previewFifoForParty(
   const totalAllocated = plan.reduce((s, p) => s + p.amount, 0);
   const advanceLeft = Math.round((totalPaymentAmount - totalAllocated) * 100) / 100;
 
-  return { partyName, direction, docsCleared, docsPartial, advanceLeft };
+  return { direction, docsCleared, docsPartial, advanceLeft };
 }
+
+function reasonFromError(error: unknown): string {
+  if (error instanceof AllocationError) return `${error.code}: ${error.message}`;
+  return error instanceof Error ? error.message : String(error);
+}
+
+// ============================================================
+// VERBOSE DIAGNOSTIC (--party + --verbose) - read-only.
+// ============================================================
+
+async function reportLedgerLines(accountId: string) {
+  console.log("\n  --- (1) Every JournalLine on this party's account, oldest first ---\n");
+
+  const lines = await prisma.journalLine.findMany({
+    where: { accountId },
+    select: {
+      id: true,
+      debit: true,
+      credit: true,
+      sourceType: true,
+      sourceId: true,
+      allocationMode: true,
+      journalEntry: { select: { id: true, entryDate: true, referenceType: true, referenceId: true, isDeleted: true } },
+    },
+    orderBy: { journalEntry: { entryDate: "asc" } },
+  });
+
+  for (const line of lines) {
+    const debit = Number(line.debit);
+    const credit = Number(line.credit);
+    const drCr = debit > 0 ? `Dr ${debit}` : `Cr ${credit}`;
+    const date = line.journalEntry.entryDate.toISOString().slice(0, 10);
+    const base = `  ${date}  entry=${line.journalEntry.id}  ${drCr}  sourceType=${line.sourceType ?? "-"}  referenceType=${line.journalEntry.referenceType ?? "-"}  referenceId=${line.journalEntry.referenceId ?? "-"}  allocationMode=${line.allocationMode ?? "-"}`;
+
+    if (line.journalEntry.isDeleted) {
+      console.log(`${base}  ELIGIBLE=no (entry is binned)`);
+      continue;
+    }
+
+    try {
+      const payment = await getPaymentLine(prisma, line.id);
+      if (!isEligibleForAllocation(payment)) {
+        console.log(`${base}  ELIGIBLE=no (already document-linked: sourceType=${payment.sourceType})`);
+        continue;
+      }
+      if (line.allocationMode === "MANUAL") {
+        console.log(`${base}  ELIGIBLE=no (allocationMode=MANUAL - user picked documents manually)`);
+        continue;
+      }
+      console.log(`${base}  ELIGIBLE=yes`);
+    } catch (error) {
+      console.log(`${base}  ELIGIBLE=no (${reasonFromError(error)})`);
+    }
+  }
+}
+
+async function reportCandidateDocuments(accountId: string) {
+  console.log("\n  --- (2) Every candidate document, per direction ---\n");
+
+  for (const direction of ["RECEIVABLE", "PAYABLE"] as const) {
+    const candidates = await getPartyDocumentCandidateRefs(prisma, accountId, direction);
+    if (candidates.length === 0) {
+      console.log(`  [${direction}] no candidates at all`);
+      continue;
+    }
+
+    for (const candidate of candidates) {
+      try {
+        const state = await getRemainingAllocatableAmountForDocument(prisma, candidate.targetSourceType, candidate.targetSourceId);
+        const partyMatches = state.responsiblePartyAccountId === accountId;
+        const directionMatches = state.direction === direction;
+        const alreadyPaid = Math.round((state.existingReceivedOrPaid + state.allocatedViaTable) * 100) / 100;
+        const included = partyMatches && directionMatches;
+        const reason = !partyMatches ? "responsible party is a different account" : !directionMatches ? `direction is actually ${state.direction}` : "";
+
+        console.log(
+          `  [${direction}] ${candidate.targetSourceType} ${state.documentNo} (${state.documentDate.toISOString().slice(0, 10)})` +
+            ` totalDue=${state.totalDue} alreadyPaid=${alreadyPaid} remaining=${state.remainingAllocatable}` +
+            ` INCLUDED=${included ? "yes" : "no"}${reason ? ` (${reason})` : ""}`
+        );
+      } catch (error) {
+        console.log(`  [${direction}] ${candidate.targetSourceType} ${candidate.targetSourceId} INCLUDED=no (${reasonFromError(error)})`);
+      }
+    }
+  }
+}
+
+async function reportPlannedAllocations(accountId: string) {
+  console.log("\n  --- (3) Planned allocations ---\n");
+
+  for (const direction of ["RECEIVABLE", "PAYABLE"] as const) {
+    const payments = await listEligibleFifoPayments(prisma, accountId, direction);
+    const documents = await getPartyDocumentStates(prisma, accountId, direction, { onlyWithRemainingBalance: true });
+
+    const candidatePayments = [];
+    for (const payment of payments) {
+      const alreadyAllocated = await getAllocatedAmountForPayment(prisma, payment.journalLineId);
+      candidatePayments.push({
+        journalLineId: payment.journalLineId,
+        remainingAmount: Math.round((payment.amount - alreadyAllocated) * 100) / 100,
+        entryDate: payment.entryDate,
+      });
+    }
+
+    const plan = computeFifoAllocationPlan(sortFifoPayments(candidatePayments), sortFifoDocuments(documents));
+    if (plan.length === 0) {
+      console.log(`  [${direction}] nothing planned (${payments.length} eligible payment(s), ${documents.length} open document(s))`);
+      continue;
+    }
+    for (const item of plan) {
+      console.log(`  [${direction}] payment ${item.journalLineId} -> ${item.targetSourceType} ${item.targetSourceId}: Rs. ${item.amount.toLocaleString()}`);
+    }
+  }
+}
+
+async function runVerboseDiagnostic(party: { id: string; partyName: string; account: { id: string } }) {
+  console.log(`\n\n=== VERBOSE DIAGNOSTIC: ${party.partyName} (read-only) ===`);
+
+  const openingBreakdown = await getOpeningBalanceBreakdown(prisma, party.id);
+  if (openingBreakdown) {
+    console.log(
+      `\nOpening Balance - raw Rs. ${openingBreakdown.rawTotalDue.toLocaleString()}` +
+        ` (tagged entry Rs. ${openingBreakdown.taggedAmount.toLocaleString()}, untagged manual JE Rs. ${openingBreakdown.untaggedAmount.toLocaleString()}),` +
+        ` account's current net balance Rs. ${openingBreakdown.currentNetBalance.toLocaleString()},` +
+        ` capped remaining = Rs. ${openingBreakdown.totalDue.toLocaleString()}${openingBreakdown.direction ? ` (${openingBreakdown.direction})` : " (CLEARED - fully offset by other ledger activity)"}`
+    );
+  } else {
+    console.log("\nOpening Balance - none on record for this party.");
+  }
+
+  await reportLedgerLines(party.account.id);
+  await reportCandidateDocuments(party.account.id);
+  await reportPlannedAllocations(party.account.id);
+}
+
+// ============================================================
+// PASS 2 - FIFO preview/apply.
+// ============================================================
 
 async function runFifoPass(actorId: string | null) {
   console.log(`\n=== PASS 2 - FIFO ${apply ? "APPLY" : "dry-run"} ===\n`);
 
   const parties = await prisma.party.findMany({
-    where: { isActive: true, account: { isActive: true } },
+    where: {
+      isActive: true,
+      account: { isActive: true },
+      ...(requestedPartyName ? { partyName: { contains: requestedPartyName, mode: "insensitive" } } : {}),
+    },
     select: { id: true, partyName: true, account: { select: { id: true } } },
     orderBy: { partyName: "asc" },
   });
+
+  if (requestedPartyName && parties.length === 0) {
+    console.log(`No active party matching "${requestedPartyName}" found.`);
+    return;
+  }
 
   for (const party of parties) {
     if (!party.account) continue;
 
     const openingBreakdown = await getOpeningBalanceBreakdown(prisma, party.id);
-    if (openingBreakdown && openingBreakdown.direction) {
+    if (openingBreakdown) {
       console.log(
-        `${party.partyName}: Opening Balance Rs. ${openingBreakdown.totalDue.toLocaleString()} (${openingBreakdown.direction})` +
-          ` - tagged entry Rs. ${openingBreakdown.taggedAmount.toLocaleString()}, untagged manual JE Rs. ${openingBreakdown.untaggedAmount.toLocaleString()}`
+        `${party.partyName}: Opening Balance raw Rs. ${openingBreakdown.rawTotalDue.toLocaleString()}` +
+          ` -> capped remaining Rs. ${openingBreakdown.totalDue.toLocaleString()}${openingBreakdown.direction ? ` (${openingBreakdown.direction})` : " (CLEARED)"}` +
+          ` [current net balance Rs. ${openingBreakdown.currentNetBalance.toLocaleString()}, tagged Rs. ${openingBreakdown.taggedAmount.toLocaleString()}, untagged Rs. ${openingBreakdown.untaggedAmount.toLocaleString()}]`
       );
     }
 
     for (const direction of ["RECEIVABLE", "PAYABLE"] as const) {
-      const preview = await previewFifoForParty(party.account.id, party.partyName, direction);
+      const preview = await previewFifoForParty(party.account.id, direction);
       if (!preview) continue;
 
       console.log(
@@ -186,23 +352,33 @@ async function runFifoPass(actorId: string | null) {
         await prisma.$transaction((tx) => rerunFifoForParty(tx, party.account!.id, direction, actorId));
       }
     }
+
+    if (verbose) {
+      await runVerboseDiagnostic({ id: party.id, partyName: party.partyName, account: party.account });
+    }
   }
 }
 
 async function main() {
-  await reportLegacyBackfillStatus();
+  if (!verbose) {
+    await reportLegacyBackfillStatus();
+  }
 
   let actorId: string | null = null;
   if (apply) {
-    const actorUser = await resolveActor();
-    actorId = actorUser.id;
-    console.log(`Applying, attributed to user "${actorUser.username}".`);
+    if (verbose) {
+      console.log("--verbose is read-only diagnostics - ignoring --apply for this run.");
+    } else {
+      const actorUser = await resolveActor();
+      actorId = actorUser.id;
+      console.log(`Applying, attributed to user "${actorUser.username}".`);
+    }
   }
 
   await runFifoPass(actorId);
 
-  if (!apply) {
-    console.log("\nDry-run only - no writes made. Re-run with --apply to commit.\n");
+  if (!apply || verbose) {
+    console.log("\nDry-run only - no writes made. Re-run with --apply (without --verbose) to commit.\n");
   } else {
     console.log("\nFIFO backfill applied.\n");
   }
