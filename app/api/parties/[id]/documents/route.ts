@@ -54,9 +54,16 @@ export async function GET(
       return NextResponse.json({ success: false, message: "This party does not have an account yet." }, { status: 404 });
     }
 
-    const states = await getPartyDocumentStates(prisma, party.account.id, {
-      onlyWithRemainingBalance: onlyOutstanding,
-    });
+    // This view only ever rendered BILTY/CHALLAN rows (see DocumentRow
+    // below) - merge both directions so existing behavior is
+    // unchanged; any newer target type (BILTY_PAID/BILL/PRIVATE_PHONCH_*/
+    // OPENING_BALANCE) is simply not one of the two switch branches
+    // below and is silently skipped, exactly like an unrecognized
+    // target already was before this feature extended the type union.
+    const states = [
+      ...(await getPartyDocumentStates(prisma, party.account.id, "RECEIVABLE", { onlyWithRemainingBalance: onlyOutstanding })),
+      ...(await getPartyDocumentStates(prisma, party.account.id, "PAYABLE", { onlyWithRemainingBalance: onlyOutstanding })),
+    ];
 
     const biltyIds = states.filter((s) => s.targetSourceType === "BILTY").map((s) => s.targetSourceId);
     const challanIdsFromBiltyTargets = new Set<string>();

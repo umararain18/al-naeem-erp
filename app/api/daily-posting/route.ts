@@ -24,6 +24,8 @@ import { assertPrivatePhonchPaymentNotExceeded, PrivatePhonchAccountingError } f
 import { assertBillReceiptNotExceeded, BillAccountingError } from "@/lib/bill-accounting";
 import { postExpenseOfficeLine, CarrierTripError } from "@/lib/carrier-trip";
 import { auditPost, actorFromUser, requestContext } from "@/lib/audit-log";
+import type { AllocationDirection } from "@/lib/payment-allocation";
+import { rerunFifoForParty } from "@/lib/party-payment-fifo";
 
 const lineSchema = z.object({
   // Required for non-document-linked entries; optional for a
@@ -1589,6 +1591,30 @@ export async function POST(request: NextRequest) {
             },
             ...requestContext(request),
           });
+        }
+
+        // AUTO FIFO ALLOCATION - any PARTY-category line not already
+        // tagged to a specific Challan/Bilty at posting time (see
+        // lib/payment-allocation.ts's isEligibleForAllocation) is a
+        // lumpsum party payment/receipt - rerun that party's own FIFO
+        // allocation (in the matching direction only) so it is
+        // immediately attributed against their oldest open documents.
+        // Deduped per (account, direction) pair since several lines in
+        // one submission can touch the same party.
+        const fifoPartiesToRerun = new Map<string, { accountId: string; direction: AllocationDirection }>();
+        for (const entry of created) {
+          for (const line of entry.lines) {
+            if (line.account.category !== "PARTY" || !line.account.party) continue;
+            if (line.sourceType === "CHALLAN" || line.sourceType === "BILTY") continue;
+            const debit = Number(line.debit);
+            const credit = Number(line.credit);
+            if (debit <= 0 && credit <= 0) continue;
+            const direction: AllocationDirection = credit > 0 ? "RECEIVABLE" : "PAYABLE";
+            fifoPartiesToRerun.set(`${line.account.id}:${direction}`, { accountId: line.account.id, direction });
+          }
+        }
+        for (const { accountId, direction } of fifoPartiesToRerun.values()) {
+          await rerunFifoForParty(tx, accountId, direction, currentUser.userId);
         }
 
         return created;

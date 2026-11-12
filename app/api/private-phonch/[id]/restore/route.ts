@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { auditRestore, actorFromUser, requestContext } from "@/lib/audit-log";
+import { rerunFifoForPrivatePhonchParties } from "@/lib/party-payment-fifo";
 
 // Mirrors app/api/phonch/[id]/restore/route.ts exactly.
 export async function POST(
@@ -61,6 +62,10 @@ export async function POST(
         description: `Restored Private Phonch ${current.phonchNo} from Bin`,
         ...requestContext(request),
       });
+
+      // AUTO FIFO ALLOCATION - this Private Phonch's own targets are
+      // resolvable again.
+      await rerunFifoForPrivatePhonchParties(tx, id, currentUser.userId);
 
       return restored;
     });

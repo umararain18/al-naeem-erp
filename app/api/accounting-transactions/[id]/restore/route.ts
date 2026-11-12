@@ -9,6 +9,7 @@ import { PhonchAccountingError } from "@/lib/phonch-accounting";
 import { PrivatePhonchAccountingError } from "@/lib/private-phonch-accounting";
 import { BillAccountingError } from "@/lib/bill-accounting";
 import { auditRestore, actorFromUser, requestContext } from "@/lib/audit-log";
+import { rerunFifoForEntryLines } from "@/lib/party-payment-fifo";
 
 export async function POST(
   request: NextRequest,
@@ -78,7 +79,14 @@ export async function POST(
             deletedAt: null,
             deletedById: null,
           },
+          include: { lines: { select: { accountId: true, debit: true, credit: true, account: { select: { category: true } } } } },
         });
+
+        // AUTO FIFO ALLOCATION - a restored payment is newly eligible
+        // again (see assertRestoreDoesNotExceedCeilings's own comment
+        // above re: document-linked lines un-excluding) - rerun FIFO
+        // for whichever party its own PARTY-category lines touch.
+        await rerunFifoForEntryLines(tx, restored.lines, currentUser.userId);
 
         await auditRestore(tx, {
           actor: actorFromUser(currentUser),

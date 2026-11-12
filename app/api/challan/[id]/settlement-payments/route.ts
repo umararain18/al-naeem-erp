@@ -10,6 +10,7 @@ import {
 import { getUnclaimedGrossBiltyReceivableAmountForCollection } from "@/lib/gross-accounts";
 import { prisma } from "@/lib/prisma";
 import { auditSettlementPayment, actorFromUser, requestContext } from "@/lib/audit-log";
+import { rerunFifoForChallanParties } from "@/lib/party-payment-fifo";
 
 function round2(value: number): number {
   return Math.round((value + Number.EPSILON) * 100) / 100;
@@ -204,6 +205,10 @@ export async function POST(
         newValues: { component: data.component, biltyId: data.biltyId || null, payerAccountId: data.payerAccountId, amount: outcome.row.amount },
         ...requestContext(request),
       });
+    }
+
+    if (!outcome.idempotentReplay) {
+      await prisma.$transaction((tx) => rerunFifoForChallanParties(tx, challanId, currentUser.userId));
     }
 
     return NextResponse.json({

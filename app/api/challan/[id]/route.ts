@@ -21,6 +21,7 @@ import { auditUpdate, auditDelete, auditRestore, actorFromUser, requestContext, 
 import { assertSuperAdmin, biltyHasPhonchOrBillReference, ChallanLifecycleError } from "@/lib/challan-lifecycle";
 import { isCarrierTripChallanIncomeRecognized, autoLinkOwnCarrierChallan } from "@/lib/carrier-trip";
 import { computeConversionImpact, reverseLegacyCarrierRentDispatchEntries } from "@/lib/challan-own-carrier-conversion";
+import { rerunFifoForChallanParties, rerunFifoForParty, clearAndRerunForDocument } from "@/lib/party-payment-fifo";
 
 function round2(value: number): number {
   return Math.round(value * 100) / 100;
@@ -1206,6 +1207,21 @@ export async function PATCH(
           changedFields,
           ...requestContext(request),
         });
+      }
+
+      // AUTO FIFO ALLOCATION - a Carrier Rent correction (or Bilty
+      // add/remove) above can reassign CHALLAN's own responsible
+      // party. clearAndRerunForDocument re-resolves it fresh and
+      // orphans any stale allocation still pointing at the old one;
+      // rerunFifoForChallanParties then covers every other party
+      // genuinely associated with this Challan (Transporter + every
+      // linked Bilty's own parties) as a safety net. A genuinely
+      // unrelated third-party override (explicitCarrierRentPartyAccountId)
+      // is rerun explicitly too, since it may not be any of those.
+      await clearAndRerunForDocument(tx, "CHALLAN", id, currentUser.userId);
+      await rerunFifoForChallanParties(tx, id, currentUser.userId);
+      if (explicitCarrierRentPartyAccountId) {
+        await rerunFifoForParty(tx, explicitCarrierRentPartyAccountId, "PAYABLE", currentUser.userId);
       }
 
       return updatedChallanRow;

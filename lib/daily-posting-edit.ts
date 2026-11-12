@@ -9,7 +9,8 @@ import { assertPaidVerificationNotExceeded } from "@/lib/bilty-paid-verification
 import { assertPhonchReceiptNotExceeded } from "@/lib/phonch-accounting";
 import { assertPrivatePhonchPaymentNotExceeded } from "@/lib/private-phonch-accounting";
 import { assertBillReceiptNotExceeded } from "@/lib/bill-accounting";
-import { getAllocatedAmountForPayment } from "@/lib/payment-allocation";
+import { getAllocatedAmountForPayment, type AllocationDirection } from "@/lib/payment-allocation";
+import { rerunFifoForParty } from "@/lib/party-payment-fifo";
 import { auditUpdate, auditDelete, actorFromUser, diffFields, type AuditActor } from "@/lib/audit-log";
 import type { Permission } from "@/lib/permissions";
 
@@ -424,6 +425,34 @@ export async function updateDailyPostingEntry({
     },
     include: { lines: { include: { account: true } } },
   });
+
+  // AUTO FIFO ALLOCATION - rerun every party account+direction touched
+  // by this edit, both its state BEFORE (existingCounterLines, which
+  // already includes every removed line) and AFTER (resolvedLines) -
+  // a Counter Account/amount/direction change, or a line's removal,
+  // can each free up or newly consume FIFO capacity, and the rebuild
+  // itself is idempotent, so re-running an untouched party here is
+  // harmless.
+  const fifoPartiesToRerun = new Map<string, { accountId: string; direction: AllocationDirection }>();
+  for (const existing of existingCounterLines) {
+    if (existing.account.category !== "PARTY") continue;
+    const direction: AllocationDirection = Number(existing.debit) > 0 ? "PAYABLE" : "RECEIVABLE";
+    fifoPartiesToRerun.set(`${existing.accountId}:${direction}`, { accountId: existing.accountId, direction });
+  }
+  const resolvedCounterAccountIds = [...new Set(resolvedLines.map((l) => l.counterAccountId))];
+  const resolvedAccounts = await tx.account.findMany({
+    where: { id: { in: resolvedCounterAccountIds } },
+    select: { id: true, category: true },
+  });
+  const categoryByAccountId = new Map(resolvedAccounts.map((a) => [a.id, a.category]));
+  for (const line of resolvedLines) {
+    if (categoryByAccountId.get(line.counterAccountId) !== "PARTY") continue;
+    const direction: AllocationDirection = line.direction === "DEBIT" ? "RECEIVABLE" : "PAYABLE";
+    fifoPartiesToRerun.set(`${line.counterAccountId}:${direction}`, { accountId: line.counterAccountId, direction });
+  }
+  for (const { accountId, direction } of fifoPartiesToRerun.values()) {
+    await rerunFifoForParty(tx, accountId, direction, currentUser.userId);
+  }
 
   const changedFields = diffFields(
     { date: entry.entryDate, lineCount: entry.lines.length },

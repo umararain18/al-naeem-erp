@@ -21,6 +21,7 @@ import {
 } from "@/lib/gross-accounts";
 import { getBillPaymentState, resolveBillClientAccountId } from "@/lib/bill-accounting";
 import { auditUpdate, auditDelete, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
+import { rerunFifoForPrivatePhonchParties, rerunFifoForParty } from "@/lib/party-payment-fifo";
 
 type Tx = Prisma.TransactionClient | typeof prisma;
 
@@ -806,6 +807,27 @@ export async function PATCH(
               ...requestContext(request),
             });
           }
+
+          // AUTO FIFO ALLOCATION - rerun every party this Private
+          // Phonch now touches, PLUS any Clearing Agent it used to
+          // touch but no longer does (removed/reassigned above) -
+          // the helper only sees the CURRENT state, so a departed
+          // party needs its own explicit rerun here.
+          await rerunFifoForPrivatePhonchParties(tx, id, currentUser.userId);
+          if (caChanges.length > 0) {
+            const oldCaAccountPartyIds = [...new Set(caChanges.map((c) => c.oldPartyId).filter((pid): pid is string => !!pid))];
+            if (oldCaAccountPartyIds.length > 0) {
+              const oldCaAccounts = await tx.party.findMany({
+                where: { id: { in: oldCaAccountPartyIds } },
+                select: { account: { select: { id: true } } },
+              });
+              for (const p of oldCaAccounts) {
+                if (!p.account) continue;
+                await rerunFifoForParty(tx, p.account.id, "RECEIVABLE", currentUser.userId);
+                await rerunFifoForParty(tx, p.account.id, "PAYABLE", currentUser.userId);
+              }
+            }
+          }
         },
         { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
       );
@@ -958,6 +980,10 @@ export async function DELETE(
         description: `Moved Private Phonch ${phonch.phonchNo} to Bin`,
         ...requestContext(request),
       });
+
+      // AUTO FIFO ALLOCATION - this Private Phonch's own targets no
+      // longer exist.
+      await rerunFifoForPrivatePhonchParties(tx, id, currentUser.userId);
     });
 
     return NextResponse.json({ success: true, message: "Private Phonch moved to Bin successfully." });

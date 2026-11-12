@@ -23,6 +23,7 @@ import {
 } from "@/lib/bilty-revenue-recognition";
 import { auditUpdate, auditDelete, auditRestore, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 import { parseISODateStart } from "@/lib/date-range";
+import { rerunFifoForParty, clearAndRerunForDocument } from "@/lib/party-payment-fifo";
 
 const updateBiltySchema = z.object({
   biltyNo: z.string().trim().min(1, "Bilty number is required").optional(),
@@ -1298,6 +1299,37 @@ export async function PATCH(
         });
       }
 
+      // AUTO FIFO ALLOCATION - a Bilty edit can change Collection/
+      // Commission's own responsible party (via the settlement
+      // correction calls above) and/or the Paid-responsible party -
+      // rerun FIFO (RECEIVABLE only - BILTY/BILTY_PAID are always
+      // RECEIVABLE) for every distinct party touched, before AND
+      // after this edit, so newly freed/consumed capacity is picked
+      // up immediately.
+      const touchedPartyIds = [...new Set(
+        [
+          existingBilty.consignorPartyId,
+          existingBilty.consigneePartyId,
+          existingBilty.clearingAgentPartyId,
+          existingBilty.agentPartyId,
+          existingBilty.paidResponsiblePartyId,
+          consignorPartyId,
+          consigneePartyId,
+          clearingAgentPartyId,
+          agentPartyId,
+          paidResponsiblePartyId,
+        ].filter((p): p is string => Boolean(p))
+      )];
+      if (touchedPartyIds.length > 0) {
+        const touchedAccounts = await tx.party.findMany({
+          where: { id: { in: touchedPartyIds } },
+          select: { account: { select: { id: true } } },
+        });
+        for (const p of touchedAccounts) {
+          if (p.account) await rerunFifoForParty(tx, p.account.id, "RECEIVABLE", currentUser.userId);
+        }
+      }
+
       return updatedBiltyRow;
     }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable });
     } catch (correctionError) {
@@ -1540,6 +1572,15 @@ export async function DELETE(
         description: `Moved Bilty ${existingBilty.biltyNo} to Bin`,
         ...requestContext(request),
       });
+
+      // AUTO FIFO ALLOCATION - this Bilty's own BILTY_PAID target
+      // (independent of Settlement/Challan - see resolveBiltyPaidTarget's
+      // own doc comment) no longer exists; clear any allocation against
+      // it and rebuild its party's FIFO from a clean slate. BILTY itself
+      // requires an active settled Challan, already excluded above by
+      // the pre-transaction guard, so this is a defensive no-op there.
+      await clearAndRerunForDocument(tx, "BILTY_PAID", id, currentUser.userId);
+      await clearAndRerunForDocument(tx, "BILTY", id, currentUser.userId);
     });
 
     return NextResponse.json({

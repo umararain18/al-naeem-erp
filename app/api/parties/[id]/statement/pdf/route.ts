@@ -71,7 +71,13 @@ export async function GET(
 
     // Same document set the Summary/Statement view already shows -
     // via the same lib/payment-allocation.ts helper.
-    const states = await getPartyDocumentStates(prisma, party.account.id);
+    // Only BILTY rows are rendered below - merge both directions so
+    // existing behavior is unchanged (see the identical note in
+    // app/api/parties/[id]/documents/route.ts).
+    const states = [
+      ...(await getPartyDocumentStates(prisma, party.account.id, "RECEIVABLE")),
+      ...(await getPartyDocumentStates(prisma, party.account.id, "PAYABLE")),
+    ];
     const biltyIds = states.filter((s) => s.targetSourceType === "BILTY").map((s) => s.targetSourceId);
     const bilties = biltyIds.length
       ? await prisma.bilty.findMany({

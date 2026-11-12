@@ -15,6 +15,7 @@ import {
 import { getBillIncomeAccountId, getBillWalkInReceivableAccountId } from "@/lib/gross-accounts";
 import { syncPrivatePhonchVehicleAmountsFromBill, PrivatePhonchValidationError } from "@/lib/private-phonch-accounting";
 import { auditUpdate, auditDelete, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
+import { clearAndRerunForDocument } from "@/lib/party-payment-fifo";
 
 export async function GET(
   _request: NextRequest,
@@ -389,6 +390,11 @@ export async function PATCH(
               ...requestContext(request),
             });
           }
+
+          // AUTO FIFO ALLOCATION - this Bill's own totalDue/Client may
+          // have just changed - clear its own allocations and rebuild
+          // its (possibly new) party's FIFO from a clean slate.
+          await clearAndRerunForDocument(tx, "BILL", id, currentUser.userId);
         },
         { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
       );
@@ -528,6 +534,9 @@ export async function DELETE(
         description: `Moved Bill ${bill.billNo} to Bin`,
         ...requestContext(request),
       });
+
+      // AUTO FIFO ALLOCATION - this Bill's own target no longer exists.
+      await clearAndRerunForDocument(tx, "BILL", id, currentUser.userId);
     });
 
     return NextResponse.json({ success: true, message: "Bill moved to Bin successfully." });

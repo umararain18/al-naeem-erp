@@ -13,6 +13,8 @@ import {
   BIN_REASON_TOO_OLD,
   isOlderThanBinThreshold,
 } from "@/lib/cash-bank-bin-policy";
+import type { AllocationDirection } from "@/lib/payment-allocation";
+import { rerunFifoForParty } from "@/lib/party-payment-fifo";
 
 // ============================================================
 // MANUAL JOURNAL ENTRY - LIST + CREATE
@@ -252,6 +254,24 @@ export async function POST(request: NextRequest) {
 
           void totalDebit;
           void totalCredit;
+
+          // AUTO FIFO ALLOCATION - any PARTY-category line on this
+          // Manual Journal Entry is a lumpsum party payment/receipt
+          // (never document-linked - decision #12 above), so rerun
+          // that party's own FIFO allocation in the matching
+          // direction, exactly like Daily Posting's own hook.
+          const fifoPartiesToRerun = new Map<string, { accountId: string; direction: AllocationDirection }>();
+          for (const line of entry.lines) {
+            if (line.account.category !== "PARTY") continue;
+            const debit = Number(line.debit);
+            const credit = Number(line.credit);
+            if (debit <= 0 && credit <= 0) continue;
+            const direction: AllocationDirection = credit > 0 ? "RECEIVABLE" : "PAYABLE";
+            fifoPartiesToRerun.set(`${line.accountId}:${direction}`, { accountId: line.accountId, direction });
+          }
+          for (const { accountId, direction } of fifoPartiesToRerun.values()) {
+            await rerunFifoForParty(tx, accountId, direction, currentUser.userId);
+          }
 
           return entry;
         },

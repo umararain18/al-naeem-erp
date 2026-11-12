@@ -5,14 +5,15 @@ import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import {
   AllocationError,
+  type AllocationDirection,
   assertPaymentBelongsToParty,
-  autoAllocateOldestFirst,
   createAllocations,
   getAllocatedAmountForPayment,
   getAllocationStatusForPayment,
   getUnallocatedAmountForPayment,
   isEligibleForAllocation,
 } from "@/lib/payment-allocation";
+import { rerunFifoForParty } from "@/lib/party-payment-fifo";
 
 function errorStatus(code: string): number {
   switch (code) {
@@ -105,7 +106,15 @@ const manualAllocationSchema = z.object({
   allocations: z
     .array(
       z.object({
-        targetSourceType: z.enum(["BILTY", "CHALLAN"]),
+        targetSourceType: z.enum([
+          "OPENING_BALANCE",
+          "BILTY",
+          "BILTY_PAID",
+          "BILL",
+          "PRIVATE_PHONCH_RECOVERY",
+          "CHALLAN",
+          "PRIVATE_PHONCH_PAYABLE",
+        ]),
         targetSourceId: z.string().min(1),
         amount: z.number().positive(),
       })
@@ -163,10 +172,39 @@ export async function POST(
     await assertPaymentBelongsToParty(prisma, data.journalLineId, partyId);
 
     if (data.mode === "AUTO") {
-      const outcome = await autoAllocateOldestFirst({
-        journalLineId: data.journalLineId,
-        createdById: currentUser.userId,
-        idempotencyKey: data.idempotencyKey,
+      const outcome = await prisma.$transaction(async (tx) => {
+        const payment = await assertPaymentBelongsToParty(tx, data.journalLineId, partyId);
+        if (payment.isDeleted) {
+          throw new AllocationError("PAYMENT_DELETED", "This payment has been moved to Bin and cannot be allocated.");
+        }
+        if (!isEligibleForAllocation(payment)) {
+          throw new AllocationError(
+            "PAYMENT_ALREADY_DOCUMENT_LINKED",
+            "This payment was already posted against a specific Challan/Bilty and is already fully attributed."
+          );
+        }
+
+        const direction: AllocationDirection = payment.direction === "CREDIT" ? "RECEIVABLE" : "PAYABLE";
+        await rerunFifoForParty(tx, payment.partyAccountId, direction, currentUser.userId);
+
+        const totalAllocated = await getAllocatedAmountForPayment(tx, data.journalLineId);
+        const remainingUnallocated = await getUnallocatedAmountForPayment(tx, data.journalLineId);
+        const rows = await tx.paymentAllocation.findMany({
+          where: { journalLineId: data.journalLineId },
+          orderBy: { createdAt: "asc" },
+          select: { id: true, targetSourceType: true, targetSourceId: true, allocatedAmount: true },
+        });
+
+        return {
+          allocations: rows.map((r) => ({
+            id: r.id,
+            targetSourceType: r.targetSourceType,
+            targetSourceId: r.targetSourceId,
+            allocatedAmount: Number(r.allocatedAmount),
+          })),
+          totalAllocated,
+          remainingUnallocated,
+        };
       });
 
       return NextResponse.json({

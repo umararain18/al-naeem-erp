@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { auditRestore, actorFromUser, requestContext } from "@/lib/audit-log";
+import { clearAndRerunForDocument } from "@/lib/party-payment-fifo";
 
 export async function POST(
   request: NextRequest,
@@ -78,6 +79,12 @@ export async function POST(
         description: `Restored Bilty ${currentBilty.biltyNo} from Bin`,
         ...requestContext(request),
       });
+
+      // AUTO FIFO ALLOCATION - this Bilty's BILTY_PAID/BILTY targets
+      // are resolvable again now that it is back - rerun FIFO for
+      // whichever party they resolve to.
+      await clearAndRerunForDocument(tx, "BILTY_PAID", id, currentUser.userId);
+      await clearAndRerunForDocument(tx, "BILTY", id, currentUser.userId);
 
       return restored;
     });

@@ -5,6 +5,7 @@ import { getCurrentUser } from "@/lib/auth";
 import { auditUpdate, actorFromUser, requestContext } from "@/lib/audit-log";
 import { assertSuperAdmin, ChallanLifecycleError, reverseChallanSettlementEntries } from "@/lib/challan-lifecycle";
 import { getAllocatedAmountForDocument } from "@/lib/payment-allocation";
+import { rerunFifoForChallanParties } from "@/lib/party-payment-fifo";
 
 // ============================================================
 // POST /api/challan/[id]/unsettle - EXACTLY reverses whatever
@@ -163,6 +164,8 @@ export async function POST(
           changedFields: { isSettled: { old: true, new: false } },
           ...requestContext(request),
         });
+
+        await rerunFifoForChallanParties(tx, id, currentUser.userId);
       },
       { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
     );

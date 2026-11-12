@@ -539,6 +539,120 @@ export async function getPrivatePhonchDeliveryRecoveryState(
 }
 
 // ------------------------------------------------------------
+// EVERY DISTINCT PARTY BALANCE ON ONE PRIVATE PHONCH, AT ONCE
+//
+// Consolidates the exact per-vehicle PAYABLE (Transporter's own
+// carrierPayable, each distinct Clearing Agent's own
+// totalRent-deliveryCharges-carrierPayable) and RECEIVABLE/Recovery
+// (a fully-paid vehicle's own deliveryCharges, attributed to whichever
+// party deliveryRecoveryParty names) math app/api/private-phonch/[id]/
+// route.ts's own GET handler already computes inline - reused here
+// (never re-derived a second, independent way) so lib/payment-
+// allocation.ts's own PRIVATE_PHONCH_PAYABLE/PRIVATE_PHONCH_RECOVERY
+// targets read the SAME numbers the detail page itself shows. One row
+// per distinct (accountId, direction) pair - a Clearing Agent can
+// legitimately appear twice (once PAYABLE, once RECEIVABLE) only if
+// different vehicles name them for each (the existing mutual-
+// exclusivity guard already prevents the SAME vehicle contributing to
+// both for the SAME party).
+// ------------------------------------------------------------
+
+export interface PrivatePhonchPartyBalance {
+  accountId: string;
+  partyId: string | null;
+  partyName: string;
+  direction: "PAYABLE" | "RECEIVABLE";
+  totalDue: number;
+  settledAmount: number;
+  remainingDue: number;
+}
+
+export async function getPrivatePhonchPartyBalances(tx: Tx, phonchId: string): Promise<PrivatePhonchPartyBalance[]> {
+  const phonch = await tx.privatePhonch.findUnique({
+    where: { id: phonchId },
+    select: {
+      transporterParty: { select: { id: true, partyName: true, account: { select: { id: true } } } },
+      vehicles: {
+        select: {
+          totalRent: true,
+          deliveryCharges: true,
+          carrierPayable: true,
+          deliveryRecoveryParty: true,
+          clearingAgentPartyId: true,
+          clearingAgentParty: { select: { id: true, partyName: true, account: { select: { id: true } } } },
+        },
+      },
+    },
+  });
+  if (!phonch) return [];
+
+  const results: PrivatePhonchPartyBalance[] = [];
+
+  const totalCarrierPayable = round2(phonch.vehicles.reduce((s, v) => s + Number(v.carrierPayable), 0));
+  const totalTransporterRecovery = round2(
+    phonch.vehicles.reduce((s, v) => s + (Number(v.totalRent) <= EPS && v.deliveryRecoveryParty !== "CLEARING_AGENT" ? Number(v.deliveryCharges) : 0), 0)
+  );
+  const transporterAccountId = phonch.transporterParty.account?.id;
+  if (transporterAccountId && totalCarrierPayable > EPS) {
+    const state = await getPrivatePhonchPaymentState(tx, phonchId, transporterAccountId, totalCarrierPayable, undefined, true);
+    results.push({
+      accountId: transporterAccountId,
+      partyId: phonch.transporterParty.id,
+      partyName: phonch.transporterParty.partyName,
+      direction: "PAYABLE",
+      totalDue: totalCarrierPayable,
+      settledAmount: round2(totalCarrierPayable - state.remainingDue),
+      remainingDue: state.remainingDue,
+    });
+  }
+  if (transporterAccountId && totalTransporterRecovery > EPS) {
+    const state = await getPrivatePhonchDeliveryRecoveryState(tx, phonchId, transporterAccountId, totalTransporterRecovery);
+    results.push({
+      accountId: transporterAccountId,
+      partyId: phonch.transporterParty.id,
+      partyName: phonch.transporterParty.partyName,
+      direction: "RECEIVABLE",
+      totalDue: totalTransporterRecovery,
+      settledAmount: round2(totalTransporterRecovery - state.remainingDue),
+      remainingDue: state.remainingDue,
+    });
+  }
+
+  const caPayableByPartyId = new Map<string, number>();
+  const caRecoveryByPartyId = new Map<string, number>();
+  const caById = new Map<string, { id: string; partyName: string; account: { id: string } | null }>();
+  for (const v of phonch.vehicles) {
+    if (!v.clearingAgentPartyId) continue;
+    if (v.clearingAgentParty) caById.set(v.clearingAgentPartyId, v.clearingAgentParty);
+    if (Number(v.totalRent) <= EPS && v.deliveryRecoveryParty === "CLEARING_AGENT") {
+      caRecoveryByPartyId.set(v.clearingAgentPartyId, round2((caRecoveryByPartyId.get(v.clearingAgentPartyId) || 0) + Number(v.deliveryCharges)));
+      continue;
+    }
+    const caPayable = Math.max(0, Number(v.totalRent) - Number(v.deliveryCharges) - Number(v.carrierPayable));
+    caPayableByPartyId.set(v.clearingAgentPartyId, round2((caPayableByPartyId.get(v.clearingAgentPartyId) || 0) + caPayable));
+  }
+
+  for (const [partyId, amount] of caPayableByPartyId) {
+    if (amount <= EPS) continue;
+    const ca = caById.get(partyId);
+    const accountId = ca?.account?.id;
+    if (!accountId) continue;
+    const state = await getPrivatePhonchPaymentState(tx, phonchId, accountId, amount);
+    results.push({ accountId, partyId, partyName: ca!.partyName, direction: "PAYABLE", totalDue: amount, settledAmount: round2(amount - state.remainingDue), remainingDue: state.remainingDue });
+  }
+  for (const [partyId, amount] of caRecoveryByPartyId) {
+    if (amount <= EPS) continue;
+    const ca = caById.get(partyId);
+    const accountId = ca?.account?.id;
+    if (!accountId) continue;
+    const state = await getPrivatePhonchDeliveryRecoveryState(tx, phonchId, accountId, amount);
+    results.push({ accountId, partyId, partyName: ca!.partyName, direction: "RECEIVABLE", totalDue: amount, settledAmount: round2(amount - state.remainingDue), remainingDue: state.remainingDue });
+  }
+
+  return results;
+}
+
+// ------------------------------------------------------------
 // OVERALL STATUS - the single authoritative rule for "what is this
 // Private Phonch's current outstanding position", used identically by
 // the list and the detail page (never re-derived independently in the

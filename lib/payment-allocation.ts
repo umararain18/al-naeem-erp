@@ -6,6 +6,9 @@ import {
   type SettlementComponent,
 } from "@/lib/settlement-correction";
 import { getActiveSettlementPayers } from "@/lib/settlement-payments";
+import { resolveBiltyPaidResponsibleParty } from "@/lib/document-party-resolution";
+import { resolveBillClientAccountId } from "@/lib/bill-accounting";
+import { getPrivatePhonchPartyBalances } from "@/lib/private-phonch-accounting";
 
 // ============================================================
 // PAYMENT ALLOCATION (Party Ledger 2.0, Step 2A)
@@ -31,8 +34,29 @@ import { getActiveSettlementPayers } from "@/lib/settlement-payments";
 
 type Tx = PrismaClient | Prisma.TransactionClient;
 
-export type AllocationTargetType = "BILTY" | "CHALLAN";
+export type AllocationTargetType =
+  | "OPENING_BALANCE"
+  | "BILTY"
+  | "BILTY_PAID"
+  | "BILL"
+  | "PRIVATE_PHONCH_RECOVERY"
+  | "CHALLAN"
+  | "PRIVATE_PHONCH_PAYABLE";
+export type AllocationDirection = "RECEIVABLE" | "PAYABLE";
 export type AllocationStatus = "UNALLOCATED" | "PARTIALLY_ALLOCATED" | "FULLY_ALLOCATED";
+
+// RECEIVABLE targets (party owes ANC) vs PAYABLE targets (ANC owes
+// party) - see lib/party-payment-fifo.ts's own header comment for the
+// direction-matching rule this drives ("a receipt only clears
+// RECEIVABLE targets, a payment only clears PAYABLE ones").
+const RECEIVABLE_TARGET_TYPES: AllocationTargetType[] = ["BILTY", "BILTY_PAID", "BILL", "PRIVATE_PHONCH_RECOVERY"];
+const PAYABLE_TARGET_TYPES: AllocationTargetType[] = ["CHALLAN", "PRIVATE_PHONCH_PAYABLE"];
+
+export function directionForTargetType(targetSourceType: AllocationTargetType): AllocationDirection | null {
+  if (RECEIVABLE_TARGET_TYPES.includes(targetSourceType)) return "RECEIVABLE";
+  if (PAYABLE_TARGET_TYPES.includes(targetSourceType)) return "PAYABLE";
+  return null; // OPENING_BALANCE - direction depends on which way its own net balance runs, resolved per-party.
+}
 
 export class AllocationError extends Error {
   code: string;
@@ -232,6 +256,8 @@ interface ResolvedTarget {
   totalDue: number;
   /** Already received/paid via EXISTING sourceType/sourceId-tagged Daily Postings (lib/challan-financials.ts's own figures - never recomputed here). */
   existingReceivedOrPaid: number;
+  /** RECEIVABLE (party owes ANC) or PAYABLE (ANC owes party) - see directionForTargetType(). */
+  direction: AllocationDirection;
 }
 
 const BOOKING_INCOME_CACHE = { id: null as string | null };
@@ -371,6 +397,7 @@ async function resolveChallanTarget(tx: Tx, challanId: string): Promise<Resolved
     responsiblePartyAccountId: partyAccountId,
     totalDue: carrierRent,
     existingReceivedOrPaid: receivedOrPaid,
+    direction: "PAYABLE",
   };
 }
 
@@ -505,6 +532,339 @@ async function resolveBiltyTarget(tx: Tx, biltyId: string): Promise<ResolvedTarg
     responsiblePartyAccountId: partyAccountId,
     totalDue,
     existingReceivedOrPaid: receivedOrPaid,
+    direction: "RECEIVABLE",
+  };
+}
+
+/**
+ * Resolves a BILTY_PAID allocation target - the Bilty's own Paid
+ * (advance) component, independent of Settlement/Challan dispatch
+ * entirely (see resolveBiltyPaidResponsibleParty's own module-level
+ * reasoning in lib/document-party-resolution.ts) - a genuinely
+ * separate pool of money from BILTY's own Collection+Commission
+ * above, never summed into the same ceiling (see this module's own
+ * "Settlement interplay" guard, enforced by keeping these two target
+ * types structurally disjoint, exactly like CHALLAN vs BILTY already
+ * are for the same reason).
+ */
+async function resolveBiltyPaidTarget(tx: Tx, biltyId: string): Promise<ResolvedTarget> {
+  // Same multi-payer guard as resolveChallanTarget/resolveBiltyTarget -
+  // the "PAID" component of lib/settlement-payments.ts's own
+  // MultiPayerComponent union is this exact same money.
+  const paidPayers = await getActiveSettlementPayers(tx, "PAID", { biltyId });
+  if (paidPayers.length > 0) {
+    throw new AllocationError(
+      "MULTI_PAYER_NOT_ALLOCATABLE",
+      "This Bilty's Paid amount has multiple settlement payment rows recorded against it and cannot currently be targeted by Payment Allocation."
+    );
+  }
+
+  const bilty = await tx.bilty.findUnique({
+    where: { id: biltyId },
+    select: { id: true, biltyNo: true, date: true, isDeleted: true, advance: true },
+  });
+  if (!bilty || bilty.isDeleted) {
+    throw new AllocationError("DOCUMENT_NOT_FOUND", "Target Bilty not found.");
+  }
+
+  const advance = Number(bilty.advance);
+  if (advance <= 0) {
+    throw new AllocationError("DOCUMENT_NOT_ALLOCATABLE", "This Bilty has no Paid amount due.");
+  }
+
+  const responsible = await resolveBiltyPaidResponsibleParty(biltyId, tx);
+  if (!responsible) {
+    throw new AllocationError("DOCUMENT_NOT_ALLOCATABLE", "No responsible party is established for this Bilty's Paid amount yet.");
+  }
+
+  const taggedLines = await tx.journalLine.findMany({
+    where: {
+      sourceType: "BILTY",
+      sourceId: bilty.id,
+      journalEntry: { referenceType: "DAILY_POSTING", isDeleted: false },
+      account: { category: "PARTY", id: responsible.accountId },
+    },
+    select: { debit: true, credit: true },
+  });
+  const receivedOrPaid = taggedLines.reduce((s, l) => s + Number(l.debit) + Number(l.credit), 0);
+
+  return {
+    targetSourceType: "BILTY_PAID",
+    targetSourceId: bilty.id,
+    documentNo: bilty.biltyNo,
+    documentDate: bilty.date,
+    responsiblePartyAccountId: responsible.accountId,
+    totalDue: advance,
+    existingReceivedOrPaid: receivedOrPaid,
+    direction: "RECEIVABLE",
+  };
+}
+
+/**
+ * Resolves a BILL allocation target. A Bill always resolves to
+ * exactly one party (the real Client, or the shared walk-in system
+ * account - excluded below, since "the walk-in party" isn't a real
+ * Party with other payments of its own to allocate against).
+ */
+async function resolveBillTarget(tx: Tx, billId: string): Promise<ResolvedTarget> {
+  const bill = await tx.bill.findUnique({
+    where: { id: billId },
+    select: {
+      id: true,
+      billNo: true,
+      date: true,
+      isDeleted: true,
+      clientPartyId: true,
+      clientParty: { select: { account: { select: { id: true } } } },
+      items: { select: { rent: true, delivery: true, otherExpense: true } },
+    },
+  });
+  if (!bill || bill.isDeleted) {
+    throw new AllocationError("DOCUMENT_NOT_FOUND", "Target Bill not found.");
+  }
+  if (!bill.clientPartyId) {
+    throw new AllocationError("DOCUMENT_NOT_ALLOCATABLE", "This Bill has no real Client Party (walk-in) and cannot be targeted by Payment Allocation.");
+  }
+
+  const partyAccountId = await resolveBillClientAccountId(tx, bill.clientParty);
+  if (!partyAccountId) {
+    throw new AllocationError("DOCUMENT_NOT_ALLOCATABLE", "This Bill's Client has no active account.");
+  }
+
+  const total = round2(bill.items.reduce((s, i) => s + Number(i.rent) + Number(i.delivery) + Number(i.otherExpense), 0));
+  if (total <= 0) {
+    throw new AllocationError("DOCUMENT_NOT_ALLOCATABLE", "This Bill has no amount due (record only).");
+  }
+
+  const taggedLines = await tx.journalLine.findMany({
+    where: {
+      sourceType: "BILL",
+      sourceId: bill.id,
+      journalEntry: { referenceType: "DAILY_POSTING", isDeleted: false },
+      account: { category: "PARTY", id: partyAccountId },
+    },
+    select: { debit: true, credit: true },
+  });
+  const receivedOrPaid = taggedLines.reduce((s, l) => s + Number(l.debit) + Number(l.credit), 0);
+
+  return {
+    targetSourceType: "BILL",
+    targetSourceId: bill.id,
+    documentNo: bill.billNo,
+    documentDate: bill.date,
+    responsiblePartyAccountId: partyAccountId,
+    totalDue: total,
+    existingReceivedOrPaid: receivedOrPaid,
+    direction: "RECEIVABLE",
+  };
+}
+
+/**
+ * Resolves a PRIVATE_PHONCH_PAYABLE/PRIVATE_PHONCH_RECOVERY target.
+ * targetSourceId is a composite "<phonchId>:<accountId>" string - a
+ * Private Phonch is NEVER a single-party document (see
+ * lib/private-phonch-accounting.ts's own module header: up to several
+ * distinct payable/receivable parties at once), so (unlike every
+ * other target type) one Phonch alone cannot identify a row; the
+ * payer/payee account must be part of the id itself.
+ */
+async function resolvePrivatePhonchTarget(
+  tx: Tx,
+  targetSourceId: string,
+  direction: "PAYABLE" | "RECEIVABLE"
+): Promise<ResolvedTarget> {
+  const [phonchId, accountId] = targetSourceId.split(":");
+  if (!phonchId || !accountId) {
+    throw new AllocationError("INVALID_TARGET_TYPE", "Malformed Private Phonch target id - expected \"<phonchId>:<accountId>\".");
+  }
+
+  const phonch = await tx.privatePhonch.findUnique({
+    where: { id: phonchId },
+    select: { id: true, phonchNo: true, date: true, isDeleted: true },
+  });
+  if (!phonch || phonch.isDeleted) {
+    throw new AllocationError("DOCUMENT_NOT_FOUND", "Target Private Phonch not found.");
+  }
+
+  const balances = await getPrivatePhonchPartyBalances(tx, phonchId);
+  const match = balances.find((b) => b.accountId === accountId && b.direction === direction);
+  if (!match || match.totalDue <= 0) {
+    throw new AllocationError("DOCUMENT_NOT_ALLOCATABLE", "This Private Phonch has no such outstanding amount for this account.");
+  }
+
+  return {
+    targetSourceType: direction === "PAYABLE" ? "PRIVATE_PHONCH_PAYABLE" : "PRIVATE_PHONCH_RECOVERY",
+    targetSourceId,
+    documentNo: phonch.phonchNo,
+    documentDate: phonch.date,
+    responsiblePartyAccountId: accountId,
+    totalDue: match.totalDue,
+    existingReceivedOrPaid: match.settledAmount,
+    direction: direction === "PAYABLE" ? "PAYABLE" : "RECEIVABLE",
+  };
+}
+
+const OPENING_BALANCE_EQUITY_CACHE = { id: null as string | null };
+
+async function getOpeningBalanceEquityAccountId(tx: Tx): Promise<string | null> {
+  if (OPENING_BALANCE_EQUITY_CACHE.id) return OPENING_BALANCE_EQUITY_CACHE.id;
+  const account = await tx.account.findFirst({ where: { accountCode: "OPENING-BALANCE" }, select: { id: true } });
+  if (!account) return null;
+  OPENING_BALANCE_EQUITY_CACHE.id = account.id;
+  return account.id;
+}
+
+/**
+ * Resolves the OPENING_BALANCE virtual target - a party's own pre-ERP
+ * opening position, which FIFO must always clear before every real
+ * document (it is, by definition, older than anything else). Summed
+ * from TWO sources (never just one, so a historical manual entry is
+ * never silently missed):
+ *  1. The official OPENING_BALANCE-tagged JournalEntry
+ *     (referenceId = partyId) app/api/parties/route.ts's own Party
+ *     creation flow posts, dated the party's own real creation date.
+ *  2. Any OTHER live JournalLine on this party's own account whose
+ *     sibling line in the same JournalEntry targets the shared
+ *     "Opening Balance Equity" system account (accountCode
+ *     "OPENING-BALANCE") - an untagged manual Journal Entry someone
+ *     used historically to record an opening position outside the
+ *     official flow.
+ * targetSourceId for this target type is the party's own id (never an
+ * account id), matching the OPENING_BALANCE entry's own referenceId
+ * convention.
+ */
+export interface OpeningBalanceQualifyingLine {
+  debit: number;
+  credit: number;
+  entryDate: Date;
+  /** Either the official OPENING_BALANCE-tagged entry, OR an entry
+   * with a sibling line on the Opening Balance Equity account - the
+   * caller filters to only lines meeting one of these two conditions
+   * (addition B's dual-source rule) before calling this function. */
+}
+
+/**
+ * Pure derivation step of resolveOpeningBalanceTarget (DB I/O lives
+ * only in the caller) - sums net debit-credit across every ALREADY-
+ * FILTERED qualifying line (see OpeningBalanceQualifyingLine's own
+ * doc comment: the caller decides which lines qualify, by EITHER the
+ * official OPENING_BALANCE tag OR an Opening-Balance-Equity contra -
+ * addition B's dual-source rule) and the earliest contributing date.
+ * A net of ~0 (every source cancels out) or no qualifying lines at
+ * all both correctly mean "no opening balance" - returns null.
+ */
+export function deriveOpeningBalanceFromLines(
+  lines: OpeningBalanceQualifyingLine[]
+): { totalDue: number; direction: AllocationDirection; earliestDate: Date } | null {
+  let net = 0;
+  let earliestDate: Date | null = null;
+  for (const line of lines) {
+    net += line.debit - line.credit;
+    if (!earliestDate || line.entryDate < earliestDate) earliestDate = line.entryDate;
+  }
+
+  if (!earliestDate || Math.abs(round2(net)) <= 0.009) return null;
+
+  return {
+    totalDue: round2(Math.abs(net)),
+    direction: net > 0 ? "RECEIVABLE" : "PAYABLE",
+    earliestDate,
+  };
+}
+
+async function resolveOpeningBalanceTarget(tx: Tx, partyId: string): Promise<ResolvedTarget | null> {
+  const party = await tx.party.findUnique({ where: { id: partyId }, select: { id: true, partyName: true, account: { select: { id: true } } } });
+  if (!party?.account) return null;
+
+  const openingEquityAccountId = await getOpeningBalanceEquityAccountId(tx);
+
+  const partyLines = await tx.journalLine.findMany({
+    where: { accountId: party.account.id, journalEntry: { isDeleted: false } },
+    select: {
+      debit: true,
+      credit: true,
+      journalEntry: {
+        select: { entryDate: true, referenceType: true, lines: { select: { accountId: true } } },
+      },
+    },
+  });
+
+  const qualifyingLines: OpeningBalanceQualifyingLine[] = [];
+  for (const line of partyLines) {
+    const isOfficiallyTagged = line.journalEntry.referenceType === "OPENING_BALANCE";
+    const hasOpeningEquityContra = openingEquityAccountId != null && line.journalEntry.lines.some((l) => l.accountId === openingEquityAccountId);
+    if (!isOfficiallyTagged && !hasOpeningEquityContra) continue;
+    qualifyingLines.push({ debit: Number(line.debit), credit: Number(line.credit), entryDate: line.journalEntry.entryDate });
+  }
+
+  const derived = deriveOpeningBalanceFromLines(qualifyingLines);
+  if (!derived) return null;
+
+  return {
+    targetSourceType: "OPENING_BALANCE",
+    targetSourceId: partyId,
+    documentNo: "Opening Balance",
+    documentDate: derived.earliestDate,
+    responsiblePartyAccountId: party.account.id,
+    totalDue: derived.totalDue,
+    existingReceivedOrPaid: 0,
+    direction: derived.direction,
+  };
+}
+
+export interface OpeningBalanceBreakdown {
+  taggedAmount: number;
+  untaggedAmount: number;
+  totalDue: number;
+  direction: AllocationDirection | null;
+  earliestDate: Date | null;
+}
+
+/**
+ * Reporting-only variant of resolveOpeningBalanceTarget - same dual-
+ * source qualifying-line gathering, but keeps the OPENING_BALANCE-
+ * tagged contribution and the untagged-OBE-contra contribution
+ * separate (never merged until the final net) so
+ * scripts/backfill-fifo-allocation.ts's own dry-run report can show
+ * each party's opening amount broken down by source, per the plan.
+ */
+export async function getOpeningBalanceBreakdown(tx: Tx, partyId: string): Promise<OpeningBalanceBreakdown | null> {
+  const party = await tx.party.findUnique({ where: { id: partyId }, select: { account: { select: { id: true } } } });
+  if (!party?.account) return null;
+
+  const openingEquityAccountId = await getOpeningBalanceEquityAccountId(tx);
+
+  const partyLines = await tx.journalLine.findMany({
+    where: { accountId: party.account.id, journalEntry: { isDeleted: false } },
+    select: {
+      debit: true,
+      credit: true,
+      journalEntry: { select: { entryDate: true, referenceType: true, lines: { select: { accountId: true } } } },
+    },
+  });
+
+  const taggedLines: OpeningBalanceQualifyingLine[] = [];
+  const untaggedLines: OpeningBalanceQualifyingLine[] = [];
+  for (const line of partyLines) {
+    const isOfficiallyTagged = line.journalEntry.referenceType === "OPENING_BALANCE";
+    const hasOpeningEquityContra = openingEquityAccountId != null && line.journalEntry.lines.some((l) => l.accountId === openingEquityAccountId);
+    const entry: OpeningBalanceQualifyingLine = { debit: Number(line.debit), credit: Number(line.credit), entryDate: line.journalEntry.entryDate };
+    if (isOfficiallyTagged) taggedLines.push(entry);
+    else if (hasOpeningEquityContra) untaggedLines.push(entry);
+  }
+
+  if (taggedLines.length === 0 && untaggedLines.length === 0) return null;
+
+  const taggedNet = taggedLines.reduce((s, l) => s + l.debit - l.credit, 0);
+  const untaggedNet = untaggedLines.reduce((s, l) => s + l.debit - l.credit, 0);
+  const derived = deriveOpeningBalanceFromLines([...taggedLines, ...untaggedLines]);
+
+  return {
+    taggedAmount: round2(Math.abs(taggedNet)),
+    untaggedAmount: round2(Math.abs(untaggedNet)),
+    totalDue: derived?.totalDue ?? 0,
+    direction: derived?.direction ?? null,
+    earliestDate: derived?.earliestDate ?? null,
   };
 }
 
@@ -515,6 +875,15 @@ export async function resolveAllocationTarget(
 ): Promise<ResolvedTarget> {
   if (targetSourceType === "CHALLAN") return resolveChallanTarget(tx, targetSourceId);
   if (targetSourceType === "BILTY") return resolveBiltyTarget(tx, targetSourceId);
+  if (targetSourceType === "BILTY_PAID") return resolveBiltyPaidTarget(tx, targetSourceId);
+  if (targetSourceType === "BILL") return resolveBillTarget(tx, targetSourceId);
+  if (targetSourceType === "PRIVATE_PHONCH_PAYABLE") return resolvePrivatePhonchTarget(tx, targetSourceId, "PAYABLE");
+  if (targetSourceType === "PRIVATE_PHONCH_RECOVERY") return resolvePrivatePhonchTarget(tx, targetSourceId, "RECEIVABLE");
+  if (targetSourceType === "OPENING_BALANCE") {
+    const target = await resolveOpeningBalanceTarget(tx, targetSourceId);
+    if (!target) throw new AllocationError("DOCUMENT_NOT_ALLOCATABLE", "This Party has no opening balance to allocate against.");
+    return target;
+  }
   throw new AllocationError("INVALID_TARGET_TYPE", `Unsupported allocation target type: ${targetSourceType}`);
 }
 
@@ -576,6 +945,8 @@ async function validateSingleAllocation(
 // WRITE: MANUAL ALLOCATION (atomic, all-or-nothing)
 // ============================================================
 
+export type AllocationOrigin = "FIFO" | "SETTLEMENT" | "MANUAL" | "LEGACY";
+
 export interface CreateAllocationsInput {
   journalLineId: string;
   allocations: AllocationRequestItem[];
@@ -585,6 +956,17 @@ export interface CreateAllocationsInput {
    * resubmission of the same request cannot create duplicate rows,
    * without any new schema/column. */
   idempotencyKey?: string;
+  /** Which mechanism is writing these rows - see schema.prisma's own
+   * doc comment on PaymentAllocation.origin. Defaults to "MANUAL":
+   * this function is the manual-picker's own write path (the FIFO
+   * rebuild engine in lib/party-payment-fifo.ts writes directly,
+   * reusing its own already-open transaction instead). */
+  origin?: AllocationOrigin;
+  /** When true (the default for a MANUAL write), stamps this
+   * payment's own JournalLine.allocationMode = "MANUAL" in the same
+   * transaction, exempting it from every future auto-FIFO rebuild
+   * until the user picks "Back to Auto". */
+  markPaymentManual?: boolean;
 }
 
 export interface AllocationRowResult {
@@ -612,7 +994,7 @@ export interface CreateAllocationsResult {
  * target document's remaining allocatable amount.
  */
 export async function createAllocations(input: CreateAllocationsInput): Promise<CreateAllocationsResult> {
-  const { journalLineId, allocations, createdById, idempotencyKey } = input;
+  const { journalLineId, allocations, createdById, idempotencyKey, origin = "MANUAL", markPaymentManual = origin === "MANUAL" } = input;
 
   if (allocations.length === 0) {
     throw new AllocationError("NO_ALLOCATIONS", "At least one allocation is required.");
@@ -666,6 +1048,7 @@ export async function createAllocations(input: CreateAllocationsInput): Promise<
               targetSourceId: item.targetSourceId,
               allocatedAmount: round2(item.amount),
               createdById,
+              origin,
             },
           });
           created.push({
@@ -674,6 +1057,10 @@ export async function createAllocations(input: CreateAllocationsInput): Promise<
             targetSourceId: row.targetSourceId,
             allocatedAmount: Number(row.allocatedAmount),
           });
+        }
+
+        if (markPaymentManual) {
+          await tx.journalLine.update({ where: { id: journalLineId }, data: { allocationMode: "MANUAL" } });
         }
 
         const totalAllocated = await getAllocatedAmountForPayment(tx, journalLineId);
@@ -747,8 +1134,12 @@ export async function createAllocations(input: CreateAllocationsInput): Promise<
 export async function getPartyDocumentStates(
   tx: Tx,
   partyAccountId: string,
+  direction: AllocationDirection,
   options: { onlyWithRemainingBalance?: boolean } = {}
 ): Promise<DocumentAllocationState[]> {
+  const account = await tx.account.findUnique({ where: { id: partyAccountId }, select: { partyId: true } });
+  const partyId = account?.partyId ?? null;
+
   const partyLines = await tx.journalLine.findMany({
     where: {
       accountId: partyAccountId,
@@ -766,106 +1157,145 @@ export async function getPartyDocumentStates(
     if (line.sourceType === "BILTY" && line.sourceId) candidateBiltyIds.add(line.sourceId);
   }
 
+  // BILTY_PAID candidates - any Bilty where this party is explicitly
+  // or implicitly the Paid-responsible party (resolveBiltyPaidTarget
+  // re-validates the exact responsibility chain below; this query is
+  // deliberately a superset).
+  if (partyId && direction === "RECEIVABLE") {
+    const paidBilties = await tx.bilty.findMany({
+      where: {
+        isDeleted: false,
+        advance: { gt: 0 },
+        OR: [{ paidResponsiblePartyId: partyId }, { consignorPartyId: partyId }, { consigneePartyId: partyId }],
+      },
+      select: { id: true },
+    });
+    for (const b of paidBilties) candidateBiltyIds.add(b.id);
+  }
+
+  const candidateBillIds = new Set<string>();
+  if (partyId && direction === "RECEIVABLE") {
+    const bills = await tx.bill.findMany({ where: { isDeleted: false, clientPartyId: partyId }, select: { id: true } });
+    for (const b of bills) candidateBillIds.add(b.id);
+  }
+
+  const candidatePhonchIds = new Set<string>();
+  if (partyId) {
+    const phonches = await tx.privatePhonch.findMany({
+      where: {
+        isDeleted: false,
+        OR: [{ transporterPartyId: partyId }, { vehicles: { some: { clearingAgentPartyId: partyId } } }],
+      },
+      select: { id: true },
+    });
+    for (const p of phonches) candidatePhonchIds.add(p.id);
+  }
+
   const results: DocumentAllocationState[] = [];
 
-  for (const challanId of candidateChallanIds) {
+  if (direction === "RECEIVABLE" || direction === "PAYABLE") {
     try {
-      const state = await getRemainingAllocatableAmountForDocument(tx, "CHALLAN", challanId);
-      if (
-        state.responsiblePartyAccountId === partyAccountId &&
-        (!options.onlyWithRemainingBalance || state.remainingAllocatable > 0.009)
-      ) {
-        results.push(state);
+      const openingState = await resolveOpeningBalanceTarget(tx, partyId ?? "");
+      if (openingState && openingState.direction === direction) {
+        const allocatedViaTable = await getAllocatedAmountForDocument(tx, "OPENING_BALANCE", openingState.targetSourceId);
+        const remaining = Math.max(0, round2(openingState.totalDue - openingState.existingReceivedOrPaid - allocatedViaTable));
+        if (!options.onlyWithRemainingBalance || remaining > 0.009) {
+          results.push({ ...openingState, allocatedViaTable, remainingAllocatable: remaining });
+        }
       }
     } catch {
-      // Ambiguous / not settled / not found - simply not eligible.
+      // No opening balance established - simply not eligible.
     }
   }
 
-  for (const biltyId of candidateBiltyIds) {
+  if (direction === "PAYABLE") {
+    for (const challanId of candidateChallanIds) {
+      try {
+        const state = await getRemainingAllocatableAmountForDocument(tx, "CHALLAN", challanId);
+        if (
+          state.responsiblePartyAccountId === partyAccountId &&
+          state.direction === direction &&
+          (!options.onlyWithRemainingBalance || state.remainingAllocatable > 0.009)
+        ) {
+          results.push(state);
+        }
+      } catch {
+        // Ambiguous / not settled / not found - simply not eligible.
+      }
+    }
+  }
+
+  if (direction === "RECEIVABLE") {
+    for (const biltyId of candidateBiltyIds) {
+      try {
+        const state = await getRemainingAllocatableAmountForDocument(tx, "BILTY", biltyId);
+        if (
+          state.responsiblePartyAccountId === partyAccountId &&
+          state.direction === direction &&
+          (!options.onlyWithRemainingBalance || state.remainingAllocatable > 0.009)
+        ) {
+          results.push(state);
+        }
+      } catch {
+        // Ambiguous / not settled / not found - simply not eligible.
+      }
+
+      try {
+        const state = await getRemainingAllocatableAmountForDocument(tx, "BILTY_PAID", biltyId);
+        if (
+          state.responsiblePartyAccountId === partyAccountId &&
+          state.direction === direction &&
+          (!options.onlyWithRemainingBalance || state.remainingAllocatable > 0.009)
+        ) {
+          results.push(state);
+        }
+      } catch {
+        // Multi-payer / no advance / not found - simply not eligible.
+      }
+    }
+
+    for (const billId of candidateBillIds) {
+      try {
+        const state = await getRemainingAllocatableAmountForDocument(tx, "BILL", billId);
+        if (
+          state.responsiblePartyAccountId === partyAccountId &&
+          state.direction === direction &&
+          (!options.onlyWithRemainingBalance || state.remainingAllocatable > 0.009)
+        ) {
+          results.push(state);
+        }
+      } catch {
+        // Walk-in / record-only - simply not eligible.
+      }
+    }
+  }
+
+  for (const phonchId of candidatePhonchIds) {
     try {
-      const state = await getRemainingAllocatableAmountForDocument(tx, "BILTY", biltyId);
+      const state = await getRemainingAllocatableAmountForDocument(
+        tx,
+        direction === "PAYABLE" ? "PRIVATE_PHONCH_PAYABLE" : "PRIVATE_PHONCH_RECOVERY",
+        `${phonchId}:${partyAccountId}`
+      );
       if (
         state.responsiblePartyAccountId === partyAccountId &&
+        state.direction === direction &&
         (!options.onlyWithRemainingBalance || state.remainingAllocatable > 0.009)
       ) {
         results.push(state);
       }
     } catch {
-      // Ambiguous / not settled / not found - simply not eligible.
+      // No such outstanding amount for this account on this Phonch.
     }
   }
 
   results.sort((a, b) => {
     const dateDiff = a.documentDate.getTime() - b.documentDate.getTime();
     if (dateDiff !== 0) return dateDiff;
-    return a.targetSourceId.localeCompare(b.targetSourceId);
+    return a.documentNo.localeCompare(b.documentNo);
   });
 
   return results;
-}
-
-export interface AutoAllocateInput {
-  journalLineId: string;
-  createdById: string;
-  idempotencyKey?: string;
-}
-
-export interface AutoAllocateResult {
-  allocations: AllocationRowResult[];
-  totalAllocated: number;
-  remainingUnallocated: number;
-  documentsAffected: { targetSourceType: AllocationTargetType; targetSourceId: string; amount: number }[];
-  idempotentReplay?: boolean;
-}
-
-export async function autoAllocateOldestFirst(input: AutoAllocateInput): Promise<AutoAllocateResult> {
-  const { journalLineId, createdById, idempotencyKey } = input;
-
-  const payment = await getPaymentLine(prisma, journalLineId);
-  if (payment.isDeleted) {
-    throw new AllocationError("PAYMENT_DELETED", "This payment has been moved to Bin and cannot be allocated.");
-  }
-  if (!isEligibleForAllocation(payment)) {
-    throw new AllocationError(
-      "PAYMENT_ALREADY_DOCUMENT_LINKED",
-      "This payment was already posted against a specific Challan/Bilty and is already fully attributed."
-    );
-  }
-
-  let unallocated = await getUnallocatedAmountForPayment(prisma, journalLineId);
-  if (unallocated <= 0.009) {
-    return { allocations: [], totalAllocated: await getAllocatedAmountForPayment(prisma, journalLineId), remainingUnallocated: 0, documentsAffected: [] };
-  }
-
-  const documents = await getPartyDocumentStates(prisma, payment.partyAccountId, { onlyWithRemainingBalance: true });
-
-  // getPartyDocumentStates() already returned each document's fresh
-  // remainingAllocatable; the actual write below (createAllocations)
-  // re-validates everything again inside its own SERIALIZABLE
-  // transaction regardless, so this plan is just a proposal.
-  const plan: AllocationRequestItem[] = [];
-  for (const doc of documents) {
-    if (unallocated <= 0.009) break;
-    const take = Math.min(unallocated, doc.remainingAllocatable);
-    if (take <= 0.009) continue;
-    plan.push({ targetSourceType: doc.targetSourceType, targetSourceId: doc.targetSourceId, amount: round2(take) });
-    unallocated = round2(unallocated - take);
-  }
-
-  if (plan.length === 0) {
-    return { allocations: [], totalAllocated: await getAllocatedAmountForPayment(prisma, journalLineId), remainingUnallocated: await getUnallocatedAmountForPayment(prisma, journalLineId), documentsAffected: [] };
-  }
-
-  const result = await createAllocations({ journalLineId, allocations: plan, createdById, idempotencyKey });
-
-  return {
-    allocations: result.created,
-    totalAllocated: result.totalAllocated,
-    remainingUnallocated: result.remainingUnallocated,
-    documentsAffected: result.created.map((c) => ({ targetSourceType: c.targetSourceType, targetSourceId: c.targetSourceId, amount: c.allocatedAmount })),
-    idempotentReplay: result.idempotentReplay,
-  };
 }
 
 // ============================================================

@@ -21,6 +21,7 @@ import { createSettlementPayment, SettlementPaymentError } from "@/lib/settlemen
 import { getLedgerTruePaidAttributedAmount } from "@/lib/paid-attribution";
 import { resolveBiltyPaidResponsibleParty } from "@/lib/document-party-resolution";
 import { auditSettlement, auditUpdate, actorFromUser, requestContext } from "@/lib/audit-log";
+import { rerunFifoForChallanParties } from "@/lib/party-payment-fifo";
 
 // ============================================================
 // POST /api/challan/[id]/finalize-settlement
@@ -641,6 +642,8 @@ export async function POST(
               ...requestContext(request),
             });
 
+            await rerunFifoForChallanParties(tx, id, currentUser.userId);
+
             return settled;
           },
           { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
@@ -946,6 +949,8 @@ export async function POST(
             },
             ...requestContext(request),
           });
+
+          await rerunFifoForChallanParties(tx, id, currentUser.userId);
 
           return {
             ...settled,

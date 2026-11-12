@@ -412,6 +412,15 @@ model JournalLine {
   // has no CarrierTripLine of its own).
   liters             Decimal?            @db.Decimal(10, 2)
   ratePerLiter       Decimal?            @db.Decimal(10, 2)
+  // Only meaningful on a qualifying PARTY-side payment line (the same
+  // shape lib/payment-allocation.ts's own getPaymentLine() requires) -
+  // null (default/"AUTO") means lib/party-payment-fifo.ts's own
+  // rerunFifoForParty() keeps rebuilding this payment's own allocations
+  // automatically; "MANUAL" means the user explicitly picked its
+  // documents themselves (via the Allocation picker) and every auto
+  // rebuild skips it until they choose "Back to Auto" (which clears this
+  // back to null and triggers one rebuild for its own party).
+  allocationMode     String?
   account            Account             @relation(fields: [accountId], references: [id])
   journalEntry       JournalEntry        @relation(fields: [journalEntryId], references: [id], onDelete: Cascade)
   paymentAllocations PaymentAllocation[]
@@ -456,12 +465,25 @@ model PaymentAllocation {
   id               String      @id @default(cuid())
   journalLineId    String
   journalLine      JournalLine @relation(fields: [journalLineId], references: [id], onDelete: Cascade)
-  // "BILTY" | "CHALLAN" - the same sourceType vocabulary
-  // JournalLine already uses; not modeled as an enum here for the
-  // same reason JournalLine.sourceType isn't (see that field).
+  // "BILTY" | "BILTY_PAID" | "BILL" | "PRIVATE_PHONCH_RECOVERY" | "CHALLAN" |
+  // "PRIVATE_PHONCH_PAYABLE" | "OPENING_BALANCE" - the same sourceType-like
+  // vocabulary JournalLine already uses; not modeled as an enum here for the
+  // same reason JournalLine.sourceType isn't (see that field). See
+  // lib/payment-allocation.ts's own AllocationTargetType.
   targetSourceType String
   targetSourceId   String
   allocatedAmount  Decimal     @db.Decimal(15, 2)
+  // Which mechanism wrote THIS row - "FIFO" (lib/party-payment-fifo.ts's
+  // own rerunFifoForParty, the only writer going forward - every trigger,
+  // payment-side or document-side or settlement-side, writes this same
+  // tag), "MANUAL" (a user's own explicit document pick), "LEGACY" (every
+  // row that existed before this column did - the migration itself stamps
+  // these, see its own migration.sql), or "SETTLEMENT" (RESERVED - no
+  // current write site; see lib/party-payment-fifo.ts's own header comment).
+  // rerunFifoForParty only ever deletes/rebuilds origin="FIFO" rows - every
+  // other origin is permanently frozen, its own amount still counted
+  // against a document's capacity via the ordinary allocatedAmount sum.
+  origin           String      @default("FIFO")
   createdAt        DateTime    @default(now())
   createdById      String?
 

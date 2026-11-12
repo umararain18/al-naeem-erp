@@ -13,6 +13,7 @@ import {
   BIN_REASON_TOO_OLD,
   isOlderThanBinThreshold,
 } from "@/lib/cash-bank-bin-policy";
+import { rerunFifoForEntryLines } from "@/lib/party-payment-fifo";
 
 // GET reuses the existing, unmodified GET /api/accounting-transactions/[id]
 // for both View and Edit's initial data load - no duplicate endpoint here.
@@ -99,6 +100,11 @@ export async function PATCH(
         async (tx) => {
           const { resolvedLines } = await resolveManualJournalEntry(tx, data.lines);
 
+          const oldLines = await tx.journalLine.findMany({
+            where: { journalEntryId: id },
+            select: { accountId: true, debit: true, credit: true, account: { select: { category: true } } },
+          });
+
           await tx.journalLine.deleteMany({ where: { journalEntryId: id } });
 
           const entry = await tx.journalEntry.update({
@@ -121,6 +127,12 @@ export async function PATCH(
               lines: { include: { account: { select: { accountName: true, category: true } } } },
             },
           });
+
+          // AUTO FIFO ALLOCATION - rerun every party account+direction
+          // touched by this edit, both before (oldLines) and after
+          // (entry.lines) - idempotent, so an untouched party is a no-op.
+          await rerunFifoForEntryLines(tx, oldLines, currentUser.userId);
+          await rerunFifoForEntryLines(tx, entry.lines, currentUser.userId);
 
           return entry;
         },
@@ -180,7 +192,10 @@ export async function DELETE(
     }
 
     const { id } = await context.params;
-    const current = await prisma.journalEntry.findUnique({ where: { id } });
+    const current = await prisma.journalEntry.findUnique({
+      where: { id },
+      include: { lines: { select: { accountId: true, debit: true, credit: true, account: { select: { category: true } } } } },
+    });
 
     if (!current) {
       return NextResponse.json({ success: false, message: "Journal entry not found" }, { status: 404 });
@@ -201,9 +216,13 @@ export async function DELETE(
       return NextResponse.json({ success: false, message: BIN_REASON_TOO_OLD }, { status: 403 });
     }
 
-    const deleted = await prisma.journalEntry.update({
-      where: { id },
-      data: { isDeleted: true, deletedAt: new Date(), deletedById: currentUser.userId },
+    const deleted = await prisma.$transaction(async (tx) => {
+      const updated = await tx.journalEntry.update({
+        where: { id },
+        data: { isDeleted: true, deletedAt: new Date(), deletedById: currentUser.userId },
+      });
+      await rerunFifoForEntryLines(tx, current.lines, currentUser.userId);
+      return updated;
     });
 
     return NextResponse.json({

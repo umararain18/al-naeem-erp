@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { auditRestore, actorFromUser, requestContext } from "@/lib/audit-log";
+import { clearAndRerunForDocument } from "@/lib/party-payment-fifo";
 
 // Mirrors app/api/phonch/[id]/restore/route.ts exactly.
 export async function POST(
@@ -59,6 +60,9 @@ export async function POST(
         description: `Restored Bill ${bill.billNo} from Bin`,
         ...requestContext(request),
       });
+
+      // AUTO FIFO ALLOCATION - this Bill's own target is resolvable again.
+      await clearAndRerunForDocument(tx, "BILL", id, currentUser.userId);
 
       return restoredBill;
     });

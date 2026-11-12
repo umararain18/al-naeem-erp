@@ -9,6 +9,7 @@ import {
 } from "@/lib/settlement-payments";
 import { prisma } from "@/lib/prisma";
 import { auditSettlementPayment, auditDelete, actorFromUser, requestContext } from "@/lib/audit-log";
+import { rerunFifoForChallanParties } from "@/lib/party-payment-fifo";
 
 function errorStatus(code: string): number {
   switch (code) {
@@ -95,6 +96,8 @@ export async function PATCH(
       ...requestContext(request),
     });
 
+    await prisma.$transaction((tx) => rerunFifoForChallanParties(tx, challanId, currentUser.userId));
+
     return NextResponse.json({ success: true, message: "Settlement payment updated successfully.", ...outcome });
   } catch (error) {
     if (error instanceof SettlementPaymentError) {
@@ -141,6 +144,8 @@ export async function DELETE(
       oldValues: { component: existingRow.component, biltyId: existingRow.biltyId, payerAccountId: existingRow.payerAccountId, amount: Number(existingRow.amount) },
       ...requestContext(request),
     });
+
+    await prisma.$transaction((tx) => rerunFifoForChallanParties(tx, challanId, currentUser.userId));
 
     return NextResponse.json({ success: true, message: "Settlement payment removed successfully.", ...outcome });
   } catch (error) {

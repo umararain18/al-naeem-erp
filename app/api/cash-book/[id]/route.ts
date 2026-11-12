@@ -30,7 +30,8 @@ import {
   PrivatePhonchAccountingError,
 } from "@/lib/private-phonch-accounting";
 import { BillAccountingError } from "@/lib/bill-accounting";
-import { getAllocatedAmountForPayment } from "@/lib/payment-allocation";
+import { getAllocatedAmountForPayment, type AllocationDirection } from "@/lib/payment-allocation";
+import { rerunFifoForParty, rerunFifoForEntryLines } from "@/lib/party-payment-fifo";
 import { auditUpdate, auditDelete, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 import { updateDailyPostingEntry, type DailyPostingLineInput } from "@/lib/daily-posting-edit";
 import { toISODate } from "@/lib/date-range";
@@ -523,6 +524,30 @@ export async function PATCH(
                 sourceNumber: finalSourceNumber,
               },
             });
+
+            // AUTO FIFO ALLOCATION - rerun FIFO for whichever party
+            // account(s) this line touched BEFORE and AFTER the edit
+            // (old counterLine.accountId and finalCounterAccountId,
+            // which can genuinely differ for a CHALLAN/BILTY
+            // re-resolution) - a no-op for a non-PARTY account, and
+            // idempotent if both happen to be the same party.
+            const oldCounterAccount = await tx.account.findUnique({ where: { id: counterLine.accountId }, select: { category: true } });
+            const fifoParties = new Map<string, { accountId: string; direction: AllocationDirection }>();
+            if (oldCounterAccount?.category === "PARTY") {
+              const oldDirection: AllocationDirection = Number(counterLine.debit) > 0 ? "PAYABLE" : "RECEIVABLE";
+              fifoParties.set(`${counterLine.accountId}:${oldDirection}`, { accountId: counterLine.accountId, direction: oldDirection });
+            }
+            const newCounterAccount =
+              finalCounterAccountId === counterLine.accountId
+                ? oldCounterAccount
+                : await tx.account.findUnique({ where: { id: finalCounterAccountId }, select: { category: true } });
+            if (newCounterAccount?.category === "PARTY") {
+              const newDirection: AllocationDirection = counterDebit > 0 ? "PAYABLE" : "RECEIVABLE";
+              fifoParties.set(`${finalCounterAccountId}:${newDirection}`, { accountId: finalCounterAccountId, direction: newDirection });
+            }
+            for (const { accountId, direction } of fifoParties.values()) {
+              await rerunFifoForParty(tx, accountId, direction, currentUser.userId);
+            }
 
             const changedFields = diffFields(
               { amount: Number(currentLine.debit) || Number(currentLine.credit), date: currentLine.journalEntry.entryDate, description: currentLine.description },
@@ -1033,8 +1058,8 @@ export async function DELETE(
     // Only mark the JournalEntry as deleted.
     // ============================================================
 
-    const deletedEntry =
-      await prisma.journalEntry.update({
+    const deletedEntry = await prisma.$transaction(async (tx) => {
+      const updated = await tx.journalEntry.update({
         where: {
           id: currentLine.journalEntryId,
         },
@@ -1045,6 +1070,19 @@ export async function DELETE(
           deletedById: currentUser.userId,
         },
       });
+
+      // AUTO FIFO ALLOCATION - this entry's own PARTY-category line(s)
+      // (if any) are no longer live - rerun FIFO for whichever party
+      // they touched so the freed-up money is released back to the
+      // unallocated pool.
+      const linesWithCategory = await tx.journalLine.findMany({
+        where: { journalEntryId: currentLine.journalEntryId },
+        select: { accountId: true, debit: true, credit: true, account: { select: { category: true } } },
+      });
+      await rerunFifoForEntryLines(tx, linesWithCategory, currentUser.userId);
+
+      return updated;
+    });
 
     await auditDelete(prisma, {
       actor: actorFromUser(currentUser),
