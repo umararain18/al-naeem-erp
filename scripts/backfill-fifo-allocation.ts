@@ -34,7 +34,15 @@
 // --apply): prints, for the one matched party, (1) every JournalLine
 // on its account since opening with ELIGIBLE yes/no + a reason when
 // not, (2) every candidate document per direction with INCLUDED
-// yes/no + a reason when not, (3) the planned allocations.
+// yes/no + a reason when not (plus a one-line "alreadyPaid rule"
+// explaining exactly which tagged lines that figure counts, so a
+// same-party receipt tagged to a DIFFERENT document/component is
+// immediately traceable instead of looking like a bug), (3) the
+// planned allocations. A party with zero open FIFO-scope documents at
+// all for a direction (e.g. a fuel pump only ever paid via Trip
+// expense, never a real Bilty/Challan/Bill/Private Phonch/Opening
+// Balance) reports "N/A - no FIFO documents" instead of a misleading
+// "advance left unallocated" total.
 //
 // Usage:
 //   npx tsx scripts/backfill-fifo-allocation.ts                              (dry-run, every party)
@@ -127,6 +135,15 @@ async function reportLegacyBackfillStatus() {
 
 interface PartyFifoReport {
   direction: AllocationDirection;
+  /** True when this party has ZERO open FIFO-scope documents at all
+   * for this direction (e.g. a fuel pump that only ever receives
+   * Trip-expense payments, never a Bilty/Challan/Bill/Private Phonch/
+   * Opening Balance) - FIFO is simply not applicable here, which is
+   * a different situation from "everything is already allocated" or
+   * "there's a genuine advance" and must be reported as such rather
+   * than a misleading "advance left unallocated" for the party's
+   * entire payment history. */
+  noFifoDocuments: boolean;
   docsCleared: number;
   docsPartial: number;
   advanceLeft: number;
@@ -137,6 +154,9 @@ async function previewFifoForParty(accountId: string, direction: AllocationDirec
   if (payments.length === 0) return null;
 
   const documents = await getPartyDocumentStates(prisma, accountId, direction, { onlyWithRemainingBalance: true });
+  if (documents.length === 0) {
+    return { direction, noFifoDocuments: true, docsCleared: 0, docsPartial: 0, advanceLeft: 0 };
+  }
 
   const candidatePayments = [];
   for (const payment of payments) {
@@ -169,12 +189,41 @@ async function previewFifoForParty(accountId: string, direction: AllocationDirec
   const totalAllocated = plan.reduce((s, p) => s + p.amount, 0);
   const advanceLeft = Math.round((totalPaymentAmount - totalAllocated) * 100) / 100;
 
-  return { direction, docsCleared, docsPartial, advanceLeft };
+  return { direction, noFifoDocuments: false, docsCleared, docsPartial, advanceLeft };
 }
 
 function reasonFromError(error: unknown): string {
   if (error instanceof AllocationError) return `${error.code}: ${error.message}`;
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Explains, in plain terms, exactly which Daily Posting lines
+ * "alreadyPaid" counts for a given target type - so a verbose report
+ * showing alreadyPaid=0 next to an obviously-nonzero receipt
+ * elsewhere on the SAME party's ledger (section (1)) is immediately
+ * traceable instead of looking like a bug: that other receipt is
+ * tagged to a DIFFERENT document/component and was never eligible to
+ * count here in the first place.
+ */
+function explainAlreadyPaidRule(targetSourceType: string, targetSourceId: string): string {
+  switch (targetSourceType) {
+    case "BILTY":
+      return `counts only Daily Posting lines tagged sourceType=BILTY sourceId=${targetSourceId} on the Collection/Commission-responsible account (established via Settlement) - a CHALLAN-tagged receipt on this same account belongs to that Challan's own Carrier Rent, a separate pool, and never counts here`;
+    case "BILTY_PAID":
+      return `counts only Daily Posting lines tagged sourceType=BILTY sourceId=${targetSourceId} on the Paid-responsible account (independent of Settlement/Challan) - a CHALLAN- or BILTY-Collection-tagged receipt belongs to a different component and never counts here`;
+    case "CHALLAN":
+      return `counts only Daily Posting lines tagged sourceType=CHALLAN sourceId=${targetSourceId} on the Carrier-Rent-responsible account - a BILTY-tagged receipt on this same account belongs to that Bilty's own Collection/Commission/Paid, a separate pool, and never counts here`;
+    case "BILL":
+      return `counts only Daily Posting lines tagged sourceType=BILL sourceId=${targetSourceId} on the Client account`;
+    case "PRIVATE_PHONCH_PAYABLE":
+    case "PRIVATE_PHONCH_RECOVERY":
+      return "derived from getPrivatePhonchPartyBalances's own live, vehicle-based recomputation (settledAmount) - never a direct tagged-Daily-Posting-line sum";
+    case "OPENING_BALANCE":
+      return "always 0 by definition - the opening figure is reduced only via FIFO allocation and the current-live-balance cap, never via a tagged Daily Posting line";
+    default:
+      return "no rule on file for this target type";
+  }
 }
 
 // ============================================================
@@ -251,6 +300,7 @@ async function reportCandidateDocuments(accountId: string) {
             ` totalDue=${state.totalDue} alreadyPaid=${alreadyPaid} remaining=${state.remainingAllocatable}` +
             ` INCLUDED=${included ? "yes" : "no"}${reason ? ` (${reason})` : ""}`
         );
+        console.log(`      alreadyPaid rule: ${explainAlreadyPaidRule(candidate.targetSourceType, candidate.targetSourceId)}`);
       } catch (error) {
         console.log(`  [${direction}] ${candidate.targetSourceType} ${candidate.targetSourceId} INCLUDED=no (${reasonFromError(error)})`);
       }
@@ -344,11 +394,15 @@ async function runFifoPass(actorId: string | null) {
       const preview = await previewFifoForParty(party.account.id, direction);
       if (!preview) continue;
 
-      console.log(
-        `  [${direction}] docs fully cleared: ${preview.docsCleared}, partially covered: ${preview.docsPartial}, advance left unallocated: Rs. ${preview.advanceLeft.toLocaleString()}`
-      );
+      if (preview.noFifoDocuments) {
+        console.log(`  [${direction}] N/A - no FIFO documents`);
+      } else {
+        console.log(
+          `  [${direction}] docs fully cleared: ${preview.docsCleared}, partially covered: ${preview.docsPartial}, advance left unallocated: Rs. ${preview.advanceLeft.toLocaleString()}`
+        );
+      }
 
-      if (apply && actorId) {
+      if (apply && actorId && !preview.noFifoDocuments) {
         await prisma.$transaction((tx) => rerunFifoForParty(tx, party.account!.id, direction, actorId));
       }
     }

@@ -9,6 +9,7 @@ import { getActiveSettlementPayers } from "@/lib/settlement-payments";
 import { resolveBiltyPaidResponsibleParty } from "@/lib/document-party-resolution";
 import { resolveBillClientAccountId } from "@/lib/bill-accounting";
 import { getPrivatePhonchPartyBalances } from "@/lib/private-phonch-accounting";
+import { OPENING_BALANCE_SENTINEL_DATE } from "@/lib/account-opening-balance";
 
 // ============================================================
 // PAYMENT ALLOCATION (Party Ledger 2.0, Step 2A)
@@ -935,7 +936,19 @@ async function resolveOpeningBalanceTarget(tx: Tx, partyId: string): Promise<Res
     targetSourceType: "OPENING_BALANCE",
     targetSourceId: partyId,
     documentNo: "Opening Balance",
-    documentDate: capped.earliestDate,
+    // ALWAYS the sentinel, never the real earliest contributing
+    // line's date - a Party's own OPENING_BALANCE entry is dated its
+    // real creation date (app/api/parties/route.ts), which can easily
+    // fall AFTER a real document already on file (e.g. a backfilled
+    // party created today with Bilties dated weeks ago) - FIFO must
+    // still clear the opening balance FIRST, regardless of its own
+    // recorded date, since it represents money owed from before
+    // every other transaction by definition. sortFifoDocuments sorts
+    // purely on this field, so the sentinel (2000-01-01, earlier than
+    // any real document) is what guarantees that. The TRUE earliest
+    // date is still shown separately for reporting - see
+    // getOpeningBalanceBreakdown's own earliestDate field.
+    documentDate: OPENING_BALANCE_SENTINEL_DATE,
     responsiblePartyAccountId: party.account.id,
     totalDue: capped.totalDue,
     existingReceivedOrPaid: 0,
@@ -1353,6 +1366,8 @@ export async function getPartyDocumentCandidateRefs(
   }
 
   if (partyId) {
+    const candidatePhonchIds = new Set<string>();
+
     const phonches = await tx.privatePhonch.findMany({
       where: {
         isDeleted: false,
@@ -1360,8 +1375,31 @@ export async function getPartyDocumentCandidateRefs(
       },
       select: { id: true },
     });
+    for (const p of phonches) candidatePhonchIds.add(p.id);
+
+    // Ledger-truth safety net, mirroring the CHALLAN/BILTY candidate
+    // gathering above: the LIVE PrivatePhonch/PrivatePhonchVehicle
+    // table's own transporterPartyId/clearingAgentPartyId reflect
+    // only the CURRENT assignment - if a Phonch was edited and this
+    // party's role was later reassigned away, a real, still-live
+    // PRIVATE_PHONCH-tagged Daily Posting line already sitting on
+    // this account would otherwise never surface as a candidate at
+    // all (confirmed missing on production for a party whose
+    // ledger plainly carried such lines). Any live JournalLine on
+    // this account tagged sourceType="PRIVATE_PHONCH" names its own
+    // Phonch directly via sourceId - added here regardless of what
+    // the live table currently says; resolvePrivatePhonchTarget
+    // re-validates the real, current balance either way.
+    const privatePhonchLedgerLines = await tx.journalLine.findMany({
+      where: { accountId: partyAccountId, sourceType: "PRIVATE_PHONCH", sourceId: { not: null } },
+      select: { sourceId: true },
+    });
+    for (const line of privatePhonchLedgerLines) {
+      if (line.sourceId) candidatePhonchIds.add(line.sourceId);
+    }
+
     const phonchTargetType = direction === "PAYABLE" ? "PRIVATE_PHONCH_PAYABLE" : "PRIVATE_PHONCH_RECOVERY";
-    for (const p of phonches) refs.push({ targetSourceType: phonchTargetType, targetSourceId: `${p.id}:${partyAccountId}` });
+    for (const phonchId of candidatePhonchIds) refs.push({ targetSourceType: phonchTargetType, targetSourceId: `${phonchId}:${partyAccountId}` });
   }
 
   return refs;
