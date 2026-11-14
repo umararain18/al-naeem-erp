@@ -68,6 +68,10 @@
 //   npx tsx scripts/backfill-fifo-allocation.ts --apply --skip-mismatch      (writes ONLY for parties whose combined reconciliation is OK; every
 //                                                                              party with a MISMATCH is left entirely untouched - neither direction
 //                                                                              applied - and printed in a "skipped" list at the end, by diff)
+//   npx tsx scripts/backfill-fifo-allocation.ts --rollback-fifo              (dry-run: reports every origin=FIFO PaymentAllocation row that
+//                                                                              would be deleted, grouped by party - never MANUAL/LEGACY/SETTLEMENT)
+//   npx tsx scripts/backfill-fifo-allocation.ts --rollback-fifo --apply      (deletes them for real)
+//   npx tsx scripts/backfill-fifo-allocation.ts --rollback-fifo --party="NKB" --apply   (scoped to one party)
 
 import { PrismaClient } from "@prisma/client";
 import {
@@ -99,6 +103,7 @@ const prisma = new PrismaClient();
 const apply = process.argv.includes("--apply");
 const verbose = process.argv.includes("--verbose");
 const skipMismatch = process.argv.includes("--skip-mismatch");
+const rollbackFifo = process.argv.includes("--rollback-fifo");
 const userArg = process.argv.find((a) => a.startsWith("--user="));
 const requestedUsername = userArg ? userArg.slice("--user=".length) : null;
 const partyArg = process.argv.find((a) => a.startsWith("--party="));
@@ -445,21 +450,29 @@ async function runFifoPass(actorId: string | null) {
     // receivable and a payable at once.
     // Only check reconciliation when this party is actually within
     // FIFO's own conceptual scope at all (an Opening Balance, or at
-    // least one eligible payment for some direction) - a party with
-    // NEITHER (e.g. a fuel pump whose only activity is Trip expense
-    // postings on OTHER accounts entirely) is correctly already
-    // reported as out of scope elsewhere ("N/A - no FIFO documents"
-    // or no header at all) and checking it here would just manufacture
-    // noise from activity this feature was never meant to explain.
+    // least one eligible payment for some direction - i.e. ANY entry
+    // in directionReports, UNFILTERED: a noFifoDocuments preview still
+    // carries a real, possibly nonzero advanceLeft now - see
+    // computePartyFifoPreview's own doc comment - so it is NEVER
+    // filtered out here. Confirmed production bug: filtering it out
+    // used to silently drop a party ENTIRELY from the OK/MISMATCH
+    // totals the moment its only open document got fully drained by a
+    // real apply, even though it still had a real, unaccounted-for
+    // advance sitting on its account - New Al Hamra Goods, Rs. 20,000).
+    // A party with NEITHER an opening balance NOR any eligible payment
+    // at all (e.g. a fuel pump whose only activity is Trip-expense
+    // postings, a referenceType listEligibleFifoPayments never even
+    // queries) has an EMPTY directionReports (computePartyFifoPreview
+    // itself returned null for both directions) and is correctly
+    // excluded - there is categorically nothing to reconcile.
     //
     // Computed BEFORE the apply step below (not after) so --skip-mismatch
     // can gate on it - reconciliation is inherently a per-PARTY (both
     // directions combined) verdict, never per-direction, so a MISMATCH
     // skips applying BOTH of this party's directions, not just one.
-    const nonSkippedReports = directionReports.filter((r) => !r.preview.noFifoDocuments);
     let reconciliation: ReconciliationResult | null = null;
-    if (openingBreakdown || nonSkippedReports.length > 0) {
-      reconciliation = await checkPartyReconciliation(prisma, party.account.id, nonSkippedReports);
+    if (openingBreakdown || directionReports.length > 0) {
+      reconciliation = await checkPartyReconciliation(prisma, party.account.id, directionReports);
       if (reconciliation.isMatch) {
         okCount++;
         console.log(`  reconciliation: OK (expected ${reconciliation.expectedSignedNet} vs adjusted actual ${reconciliation.adjustedActualSignedNet})`);
@@ -502,7 +515,72 @@ async function runFifoPass(actorId: string | null) {
   }
 }
 
+// ============================================================
+// ROLLBACK (--rollback-fifo [--party=X]) - deletes ONLY origin=FIFO
+// rows (never MANUAL/LEGACY/SETTLEMENT), the exact set rerunFifoForParty
+// itself is ever allowed to touch. Dry-run by default (reports what
+// WOULD be deleted, grouped by party); --rollback-fifo --apply deletes
+// for real. Intended as the undo step before re-applying with fixed
+// code: a party's FIFO rows written under a since-fixed bug (e.g. an
+// advance silently dropped once its only document got fully drained -
+// see computePartyFifoPreview/checkPartyReconciliation) are exactly
+// origin=FIFO, so rolling them back and then re-running --apply
+// --skip-mismatch with the fix in place reconstructs them correctly -
+// never deletes a MANUAL pick or a LEGACY pre-migration row.
+// ============================================================
+
+async function runRollbackFifo() {
+  console.log(`\n=== ROLLBACK FIFO ${apply ? "APPLY" : "dry-run"} ===\n`);
+
+  const where = {
+    origin: "FIFO",
+    ...(requestedPartyName
+      ? { journalLine: { account: { party: { partyName: { contains: requestedPartyName, mode: "insensitive" as const } } } } }
+      : {}),
+  };
+
+  const rows = await prisma.paymentAllocation.findMany({
+    where,
+    select: {
+      allocatedAmount: true,
+      journalLine: { select: { account: { select: { party: { select: { partyName: true } } } } } },
+    },
+  });
+
+  if (rows.length === 0) {
+    console.log(requestedPartyName ? `No origin=FIFO rows found for party matching "${requestedPartyName}".` : "No origin=FIFO rows found.");
+    return;
+  }
+
+  const byParty = new Map<string, { count: number; amount: number }>();
+  for (const row of rows) {
+    const partyName = row.journalLine.account.party?.partyName || "(no party)";
+    const existing = byParty.get(partyName) || { count: 0, amount: 0 };
+    existing.count += 1;
+    existing.amount = round2(existing.amount + Number(row.allocatedAmount));
+    byParty.set(partyName, existing);
+  }
+
+  console.log(`${rows.length} origin=FIFO row(s) across ${byParty.size} part${byParty.size === 1 ? "y" : "ies"}${apply ? " - DELETING:" : " (would be deleted with --apply):"}`);
+  for (const [partyName, { count, amount }] of byParty) {
+    console.log(`  - ${partyName}: ${count} row(s), Rs. ${amount.toLocaleString()}`);
+  }
+
+  if (apply) {
+    const { count } = await prisma.paymentAllocation.deleteMany({ where });
+    console.log(`\nDeleted ${count} row(s).`);
+  } else {
+    console.log(`\nDry-run only - no writes made. Re-run with --rollback-fifo --apply to delete.`);
+  }
+}
+
 async function main() {
+  if (rollbackFifo) {
+    await runRollbackFifo();
+    await prisma.$disconnect();
+    return;
+  }
+
   if (!verbose) {
     await reportLegacyBackfillStatus();
   }

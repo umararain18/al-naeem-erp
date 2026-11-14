@@ -212,10 +212,9 @@ async function main() {
       directionReports.push({ direction, preview });
     }
 
-    const nonSkippedReports = directionReports.filter((r) => !r.preview.noFifoDocuments);
-    if (!openingBreakdown && nonSkippedReports.length === 0) continue; // out of FIFO's own scope entirely.
+    if (!openingBreakdown && directionReports.length === 0) continue; // out of FIFO's own scope entirely.
 
-    const reconciliation = await checkPartyReconciliation(prisma, party.account.id, nonSkippedReports);
+    const reconciliation = await checkPartyReconciliation(prisma, party.account.id, directionReports);
     if (reconciliation.isMatch) continue;
 
     mismatchParties.push({ partyName: party.partyName, diff: reconciliation.diff });

@@ -232,11 +232,17 @@ export async function computePartyFifoPreview(tx: Tx, accountId: string, directi
   const payments = await listEligibleFifoPayments(tx, accountId, direction);
   if (payments.length === 0) return null;
 
-  const documents = await getPartyDocumentStates(tx, accountId, direction, { onlyWithRemainingBalance: true });
-  if (documents.length === 0) {
-    return { direction, noFifoDocuments: true, documents: [], plan: [], advanceLeft: 0, docsCleared: 0, docsPartial: 0, invariantViolation: null };
-  }
-
+  // Computed BEFORE the documents check below, and never skipped: a
+  // payment's own remaining (post-allocation) amount is a real,
+  // standing advance the moment it exceeds every open document's own
+  // capacity, whether or not any open document capacity remains AT
+  // ALL right now. Confirmed production bug: once a FIFO rebuild
+  // fully drains the one document a payment was partially matched
+  // against, documents.length drops to 0 on the NEXT preview call and
+  // this used to hard-code advanceLeft to 0 here - silently discarding
+  // a genuine, still-unallocated advance (Super Life Goods Lahore: Rs.
+  // 31,500) the instant there was nothing left to match it against,
+  // breaking reconciliation's own idempotency across an apply.
   const candidatePayments: FifoCandidatePayment[] = [];
   for (const payment of payments) {
     const alreadyAllocated = await getAllocatedAmountForPayment(tx, payment.journalLineId);
@@ -245,6 +251,21 @@ export async function computePartyFifoPreview(tx: Tx, accountId: string, directi
       remainingAmount: round2(payment.amount - alreadyAllocated),
       entryDate: payment.entryDate,
     });
+  }
+  const totalPaymentAmount = round2(candidatePayments.reduce((s, p) => s + p.remainingAmount, 0));
+
+  const documents = await getPartyDocumentStates(tx, accountId, direction, { onlyWithRemainingBalance: true });
+  if (documents.length === 0) {
+    return {
+      direction,
+      noFifoDocuments: true,
+      documents: [],
+      plan: [],
+      advanceLeft: round2(Math.max(0, totalPaymentAmount)),
+      docsCleared: 0,
+      docsPartial: 0,
+      invariantViolation: null,
+    };
   }
 
   const sortedPayments = sortFifoPayments(candidatePayments);
@@ -267,7 +288,6 @@ export async function computePartyFifoPreview(tx: Tx, accountId: string, directi
     else docsPartial++;
   }
 
-  const totalPaymentAmount = round2(candidatePayments.reduce((s, p) => s + p.remainingAmount, 0));
   const totalAllocated = round2(plan.reduce((s, p) => s + p.amount, 0));
   const advanceLeft = round2(totalPaymentAmount - totalAllocated);
 
@@ -383,7 +403,17 @@ export async function checkPartyReconciliation(
     }
 
     const preview = previewByDirection.get(direction);
-    if (preview && !preview.noFifoDocuments) {
+    // Use the plan-math branch whenever a preview was computed at all -
+    // NOT gated on preview.noFifoDocuments. A noFifoDocuments preview
+    // still carries an accurate advanceLeft (see computePartyFifoPreview's
+    // own doc comment on why it is never hard-coded to 0 there) and this
+    // branch is a strict generalization of the fallback sum below: when
+    // plan=[] and advanceLeft=0 (a party with genuinely nothing left to
+    // allocate and nothing left over), it reduces to the exact same sum.
+    // Only skip straight to the fallback when there is NO preview at all
+    // for this direction (listEligibleFifoPayments found zero candidates -
+    // categorically no payment, so categorically no possible advance).
+    if (preview) {
       const allocatedByDoc = new Map<string, number>();
       for (const item of preview.plan) {
         const key = `${item.targetSourceType}:${item.targetSourceId}`;
