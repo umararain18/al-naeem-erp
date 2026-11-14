@@ -1037,6 +1037,35 @@ async function getOpeningBalanceEquityAccountId(tx: Tx): Promise<string | null> 
 }
 
 /**
+ * True only when this JournalEntry is a genuine, UNAMBIGUOUS party-
+ * vs-Opening-Balance-Equity pair (exactly 2 lines total) - never for
+ * a bundled, multi-line entry that merely happens to ALSO contain an
+ * unrelated Opening-Balance-Equity line for a completely different
+ * purpose/party in the same submission. A naive "does ANY sibling
+ * line in this entry touch the Opening Balance Equity account" check
+ * (the original addition-B implementation) produced exactly that
+ * false positive in production: a bundled Daily Posting entry with
+ * dozens of unrelated lines (the same DIRECT_GROUP bundling
+ * findPairedCashBankLine's own doc comment describes) happened to
+ * also include someone else's Opening-Balance-Equity line, making
+ * Niazi Cargo Tarnol's own, completely unrelated Daily Posting
+ * payment lines look like untagged opening-balance postings and
+ * fabricating a Rs. 31,500 opening balance that doesn't exist. A
+ * real untagged manual opening-balance JE is always a simple Dr/Cr
+ * pair (the party's own account + the Opening Balance Equity
+ * account, nothing else) - requiring exactly 2 lines mirrors
+ * findPairedCashBankLine's own "never guess when ambiguous" rule.
+ */
+function isGenuineOpeningEquityContraPair(
+  journalEntry: { lines: { accountId: string }[] },
+  openingEquityAccountId: string | null
+): boolean {
+  if (openingEquityAccountId == null) return false;
+  if (journalEntry.lines.length !== 2) return false;
+  return journalEntry.lines.some((l) => l.accountId === openingEquityAccountId);
+}
+
+/**
  * Resolves the OPENING_BALANCE virtual target - a party's own pre-ERP
  * opening position, which FIFO must always clear before every real
  * document (it is, by definition, older than anything else). Summed
@@ -1157,7 +1186,7 @@ async function resolveOpeningBalanceTarget(tx: Tx, partyId: string): Promise<Res
   const qualifyingLines: OpeningBalanceQualifyingLine[] = [];
   for (const line of partyLines) {
     const isOfficiallyTagged = line.journalEntry.referenceType === "OPENING_BALANCE";
-    const hasOpeningEquityContra = openingEquityAccountId != null && line.journalEntry.lines.some((l) => l.accountId === openingEquityAccountId);
+    const hasOpeningEquityContra = isGenuineOpeningEquityContraPair(line.journalEntry, openingEquityAccountId);
     if (!isOfficiallyTagged && !hasOpeningEquityContra) continue;
     qualifyingLines.push({ debit: Number(line.debit), credit: Number(line.credit), entryDate: line.journalEntry.entryDate });
   }
@@ -1251,7 +1280,7 @@ export async function getOpeningBalanceBreakdown(tx: Tx, partyId: string): Promi
     currentNetBalance += debit - credit;
 
     const isOfficiallyTagged = line.journalEntry.referenceType === "OPENING_BALANCE";
-    const hasOpeningEquityContra = openingEquityAccountId != null && line.journalEntry.lines.some((l) => l.accountId === openingEquityAccountId);
+    const hasOpeningEquityContra = isGenuineOpeningEquityContraPair(line.journalEntry, openingEquityAccountId);
     const entry: OpeningBalanceQualifyingLine = { debit, credit, entryDate: line.journalEntry.entryDate };
     if (isOfficiallyTagged) taggedLines.push(entry);
     else if (hasOpeningEquityContra) untaggedLines.push(entry);
@@ -1566,10 +1595,32 @@ export async function getPartyDocumentCandidateRefs(
 
   const refs: AllocationCandidateRef[] = [];
 
+  // Every referenceType the Settlement/multi-payer system can tag a
+  // party's own account with, establishing their responsibility for a
+  // Challan's Carrier Rent or a Bilty's Collection: the original
+  // single-payer flow ("SETTLEMENT", its own "SETTLEMENT_CORRECTION"),
+  // AND the newer multi-payer engine's own entries ("SETTLEMENT_PAYMENT",
+  // its own "SETTLEMENT_PAYMENT_CORRECTION", and
+  // "CARRIER_RENT_MULTI_PAYER_TRANSITION") - confirmed missing on
+  // production: a party whose ENTIRE responsibility for a Challan/
+  // Bilty was established solely through the multi-payer engine
+  // (never through the original flow's own marker entry, which can be
+  // a zero-line entry with no party-account effect at all - see
+  // finalize-settlement's own comment) never surfaced as a candidate
+  // at all under the old, narrower filter (e.g. Shoib Niazi cargo,
+  // Nawab Broker). Every one of these entries uses the SAME
+  // referenceId convention the original flow already does (the
+  // Challan's own id, whether the specific line is CHALLAN- or
+  // BILTY-sourced - see the extraction below, unchanged).
   const settlementLines = await tx.journalLine.findMany({
     where: {
       accountId: partyAccountId,
-      journalEntry: { referenceType: { in: ["SETTLEMENT", "SETTLEMENT_CORRECTION"] }, isDeleted: false },
+      journalEntry: {
+        referenceType: {
+          in: ["SETTLEMENT", "SETTLEMENT_CORRECTION", "SETTLEMENT_PAYMENT", "SETTLEMENT_PAYMENT_CORRECTION", "CARRIER_RENT_MULTI_PAYER_TRANSITION"],
+        },
+        isDeleted: false,
+      },
     },
     select: { journalEntry: { select: { referenceId: true } }, sourceType: true, sourceId: true },
   });
