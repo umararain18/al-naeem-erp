@@ -17,14 +17,29 @@
 //   both directions (RECEIVABLE/PAYABLE), reports what
 //   rerunFifoForParty() would do - documents cleared, partially
 //   covered, and any advance (unallocated leftover) - without
-//   writing, plus each party's own Opening Balance figure (capped to
-//   the account's CURRENT live balance - see
-//   capOpeningBalanceByCurrentBalance in lib/payment-allocation.ts)
-//   and its source breakdown (official OPENING_BALANCE-tagged entry
-//   vs. an untagged manual JE contra-ing the Opening Balance Equity
+//   writing, plus each party's own Opening Balance figure (the RAW,
+//   uncapped figure - see lib/payment-allocation.ts's own
+//   resolveOpeningBalanceTarget doc comment on why it is NEVER capped
+//   to the account's current balance before FIFO runs) and its
+//   source breakdown (official OPENING_BALANCE-tagged entry vs. an
+//   untagged manual JE contra-ing the Opening Balance Equity
 //   account). --apply commits it by calling the SAME rerunFifoForParty
 //   the live app uses for every other trigger - never a second,
 //   parallel write path.
+//
+//   RECONCILIATION (printed for every party+direction, read-only):
+//   opening_remaining + sum(other doc remaining) - advance is
+//   compared against the account's own current net ledger balance -
+//   OK when they match, MISMATCH with the diff otherwise. A mismatch
+//   means some ledger activity is moving the balance without being
+//   accounted for by a recognized open document or a FIFO-tracked
+//   payment; --verbose lists exactly which lines those are.
+//
+//   HARD INVARIANT (checkNoAdvanceWithOpenCapacity, shared with the
+//   real rerunFifoForParty): a genuine advance can never coexist with
+//   an open document that still has capacity - this pass checks it
+//   read-only and flags any violation loudly; the live write path
+//   throws on it outright rather than silently misallocating.
 //
 // A payment already stamped allocationMode: "MANUAL" is skipped by
 // listEligibleFifoPayments() itself (same as every other FIFO
@@ -69,6 +84,9 @@ import {
   sortFifoPayments,
   sortFifoDocuments,
   computeFifoAllocationPlan,
+  checkNoAdvanceWithOpenCapacity,
+  type FifoCandidateDocument,
+  type FifoAllocationPlanItem,
 } from "../lib/party-payment-fifo";
 
 const prisma = new PrismaClient();
@@ -147,6 +165,11 @@ interface PartyFifoReport {
   docsCleared: number;
   docsPartial: number;
   advanceLeft: number;
+  /** Carried through so the reconciliation check (B3/B4) can reuse
+   * the EXACT same documents/plan this preview computed, rather than
+   * recomputing a second time and risking the two disagreeing. */
+  documents: FifoCandidateDocument[];
+  plan: FifoAllocationPlanItem[];
 }
 
 async function previewFifoForParty(accountId: string, direction: AllocationDirection): Promise<PartyFifoReport | null> {
@@ -155,7 +178,7 @@ async function previewFifoForParty(accountId: string, direction: AllocationDirec
 
   const documents = await getPartyDocumentStates(prisma, accountId, direction, { onlyWithRemainingBalance: true });
   if (documents.length === 0) {
-    return { direction, noFifoDocuments: true, docsCleared: 0, docsPartial: 0, advanceLeft: 0 };
+    return { direction, noFifoDocuments: true, docsCleared: 0, docsPartial: 0, advanceLeft: 0, documents: [], plan: [] };
   }
 
   const candidatePayments = [];
@@ -168,7 +191,23 @@ async function previewFifoForParty(accountId: string, direction: AllocationDirec
     });
   }
 
-  const plan = computeFifoAllocationPlan(sortFifoPayments(candidatePayments), sortFifoDocuments(documents));
+  const sortedPayments = sortFifoPayments(candidatePayments);
+  const sortedDocuments = sortFifoDocuments(documents);
+  const plan = computeFifoAllocationPlan(sortedPayments, sortedDocuments);
+
+  // B4 - same hard invariant rerunFifoForParty() itself asserts
+  // before ever writing: leftover advance while an open document
+  // still has capacity can only mean candidate discovery missed
+  // something. The dry-run preview checks it too, read-only, so a
+  // violation surfaces here before anyone runs --apply.
+  const violation = checkNoAdvanceWithOpenCapacity(sortedPayments, sortedDocuments, plan);
+  if (violation) {
+    console.log(
+      `  [${direction}] *** FIFO INVARIANT VIOLATION *** Rs. ${violation.totalAdvance} left as advance while ` +
+        `${violation.openDocumentsWithCapacity.length} document(s) still have open capacity: ` +
+        violation.openDocumentsWithCapacity.map((d) => `${d.targetSourceType} ${d.targetSourceId} (Rs. ${d.remaining})`).join(", ")
+    );
+  }
 
   const allocatedByDoc = new Map<string, number>();
   for (const item of plan) {
@@ -178,7 +217,7 @@ async function previewFifoForParty(accountId: string, direction: AllocationDirec
 
   let docsCleared = 0;
   let docsPartial = 0;
-  for (const doc of documents) {
+  for (const doc of sortedDocuments) {
     const allocated = allocatedByDoc.get(`${doc.targetSourceType}:${doc.targetSourceId}`) || 0;
     if (allocated <= 0.009) continue;
     if (allocated >= doc.remainingAllocatable - 0.009) docsCleared++;
@@ -189,12 +228,131 @@ async function previewFifoForParty(accountId: string, direction: AllocationDirec
   const totalAllocated = plan.reduce((s, p) => s + p.amount, 0);
   const advanceLeft = Math.round((totalPaymentAmount - totalAllocated) * 100) / 100;
 
-  return { direction, noFifoDocuments: false, docsCleared, docsPartial, advanceLeft };
+  return { direction, noFifoDocuments: false, docsCleared, docsPartial, advanceLeft, documents: sortedDocuments, plan };
 }
 
 function reasonFromError(error: unknown): string {
   if (error instanceof AllocationError) return `${error.code}: ${error.message}`;
   return error instanceof Error ? error.message : String(error);
+}
+
+// ============================================================
+// B3 - RECONCILIATION: opening_remaining + sum(other doc remaining)
+// - advance  vs  the account's own current net balance.
+//
+// Every document's own remainingAllocatable (including Opening
+// Balance, now RAW per the B1/B2 fix) already reflects the FIFO
+// ceiling minus what FIFO itself has attributed. If the plan's own
+// bookkeeping is complete and correct, "what's left open across every
+// document, minus any genuine advance sitting unapplied" must equal
+// the account's own real ledger balance - any gap means SOME ledger
+// activity (an ambiguous/bundled Daily Posting line, a direct JE, a
+// Settlement entry, etc.) is moving the account's balance without
+// being accounted for by either a recognized open document or a
+// FIFO-tracked payment. --verbose lists exactly which lines those are
+// for any mismatch.
+// ============================================================
+
+async function computeCurrentNetBalanceInDirection(accountId: string, direction: AllocationDirection): Promise<number> {
+  const lines = await prisma.journalLine.findMany({
+    where: { accountId, journalEntry: { isDeleted: false } },
+    select: { debit: true, credit: true },
+  });
+  const net = lines.reduce((s, l) => s + Number(l.debit) - Number(l.credit), 0);
+  const magnitude = direction === "RECEIVABLE" ? Math.max(0, net) : Math.max(0, -net);
+  return Math.round(magnitude * 100) / 100;
+}
+
+interface ReconciliationResult {
+  lhs: number;
+  currentNetBalance: number;
+  diff: number;
+  isMatch: boolean;
+}
+
+async function checkReconciliation(accountId: string, direction: AllocationDirection, preview: PartyFifoReport): Promise<ReconciliationResult> {
+  const allocatedByDoc = new Map<string, number>();
+  for (const item of preview.plan) {
+    const key = `${item.targetSourceType}:${item.targetSourceId}`;
+    allocatedByDoc.set(key, Math.round(((allocatedByDoc.get(key) || 0) + item.amount) * 100) / 100);
+  }
+
+  const totalDocsRemainingAfterPlan = preview.documents.reduce((s, doc) => {
+    const allocated = allocatedByDoc.get(`${doc.targetSourceType}:${doc.targetSourceId}`) || 0;
+    return s + Math.max(0, Math.round((doc.remainingAllocatable - allocated) * 100) / 100);
+  }, 0);
+
+  const lhs = Math.round((totalDocsRemainingAfterPlan - preview.advanceLeft) * 100) / 100;
+  const currentNetBalance = await computeCurrentNetBalanceInDirection(accountId, direction);
+  const diff = Math.round((lhs - currentNetBalance) * 100) / 100;
+
+  return { lhs, currentNetBalance, diff, isMatch: Math.abs(diff) <= 0.01 };
+}
+
+/**
+ * --verbose-only, for a MISMATCH: lists every live JournalLine on the
+ * account that is NOT accounted for by either (a) the Opening
+ * Balance's own qualifying lines, (b) a tagged line belonging to one
+ * of this party's own recognized open/candidate documents, or (c) a
+ * FIFO-eligible payment line - i.e. exactly the ledger activity the
+ * reconciliation diff is attributing the gap to.
+ */
+async function reportUnexplainedLedgerLines(accountId: string, direction: AllocationDirection, preview: PartyFifoReport) {
+  const openingEquityAccount = await prisma.account.findFirst({ where: { accountCode: "OPENING-BALANCE" }, select: { id: true } });
+
+  const candidateRefs = await getPartyDocumentCandidateRefs(prisma, accountId, direction);
+  const explainedSourceKeys = new Set<string>();
+  for (const ref of candidateRefs) {
+    if (ref.targetSourceType === "PRIVATE_PHONCH_PAYABLE" || ref.targetSourceType === "PRIVATE_PHONCH_RECOVERY") {
+      explainedSourceKeys.add(`PRIVATE_PHONCH:${ref.targetSourceId.split(":")[0]}`);
+    } else if (ref.targetSourceType !== "OPENING_BALANCE") {
+      explainedSourceKeys.add(`${ref.targetSourceType}:${ref.targetSourceId}`);
+    }
+  }
+
+  const explainedPaymentLineIds = new Set(preview.plan.map((p) => p.journalLineId));
+  const eligiblePayments = await listEligibleFifoPayments(prisma, accountId, direction);
+  for (const p of eligiblePayments) explainedPaymentLineIds.add(p.journalLineId);
+
+  const lines = await prisma.journalLine.findMany({
+    where: { accountId, journalEntry: { isDeleted: false } },
+    select: {
+      id: true,
+      debit: true,
+      credit: true,
+      sourceType: true,
+      sourceId: true,
+      journalEntry: { select: { id: true, entryDate: true, referenceType: true, referenceId: true, lines: { select: { accountId: true } } } },
+    },
+    orderBy: { journalEntry: { entryDate: "asc" } },
+  });
+
+  const unexplained = lines.filter((line) => {
+    const isOfficiallyTaggedOpening = line.journalEntry.referenceType === "OPENING_BALANCE";
+    const hasOpeningEquityContra = openingEquityAccount != null && line.journalEntry.lines.some((l) => l.accountId === openingEquityAccount.id);
+    if (isOfficiallyTaggedOpening || hasOpeningEquityContra) return false;
+
+    if (line.sourceType && line.sourceId && explainedSourceKeys.has(`${line.sourceType}:${line.sourceId}`)) return false;
+    if (explainedPaymentLineIds.has(line.id)) return false;
+
+    return true;
+  });
+
+  if (unexplained.length === 0) {
+    console.log(`      no unexplained lines found - the gap may be from a document resolution that failed silently; re-check with --verbose section (2) above.`);
+    return;
+  }
+
+  console.log(`      unexplained ledger line(s) (contribute to the account's balance but match no recognized open document or FIFO-eligible payment):`);
+  for (const line of unexplained) {
+    const debit = Number(line.debit);
+    const credit = Number(line.credit);
+    const drCr = debit > 0 ? `Dr ${debit}` : `Cr ${credit}`;
+    const date = line.journalEntry.entryDate.toISOString().slice(0, 10);
+    console.log(
+      `        ${date}  entry=${line.journalEntry.id}  ${drCr}  sourceType=${line.sourceType ?? "-"}  sourceId=${line.sourceId ?? "-"}  referenceType=${line.journalEntry.referenceType ?? "-"}  referenceId=${line.journalEntry.referenceId ?? "-"}`
+    );
+  }
 }
 
 /**
@@ -219,8 +377,10 @@ function explainAlreadyPaidRule(targetSourceType: string, targetSourceId: string
     case "PRIVATE_PHONCH_PAYABLE":
     case "PRIVATE_PHONCH_RECOVERY":
       return "derived from getPrivatePhonchPartyBalances's own live, vehicle-based recomputation (settledAmount) - never a direct tagged-Daily-Posting-line sum";
+    case "PHONCH_RECOVERY":
+      return `counts only Daily Posting lines tagged sourceType=PHONCH sourceId=${targetSourceId} on the Transporter's own account (this is a Showroom Phonch, NOT a Private Phonch - a separate target type)`;
     case "OPENING_BALANCE":
-      return "always 0 by definition - the opening figure is reduced only via FIFO allocation and the current-live-balance cap, never via a tagged Daily Posting line";
+      return "always 0 by definition - the RAW opening figure is reduced only via real FIFO allocation (never pre-capped to the account's current balance before FIFO runs - see the reconciliation report below for how much of it other, non-FIFO ledger activity has already offset)";
     default:
       return "no rule on file for this target type";
   }
@@ -400,6 +560,19 @@ async function runFifoPass(actorId: string | null) {
         console.log(
           `  [${direction}] docs fully cleared: ${preview.docsCleared}, partially covered: ${preview.docsPartial}, advance left unallocated: Rs. ${preview.advanceLeft.toLocaleString()}`
         );
+
+        const reconciliation = await checkReconciliation(party.account.id, direction, preview);
+        if (reconciliation.isMatch) {
+          console.log(`  [${direction}] reconciliation: OK (${reconciliation.lhs} vs current net balance ${reconciliation.currentNetBalance})`);
+        } else {
+          console.log(
+            `  [${direction}] reconciliation: MISMATCH diff=${reconciliation.diff} ` +
+              `(opening_remaining + sum(doc remaining) - advance = ${reconciliation.lhs}, current net balance = ${reconciliation.currentNetBalance})`
+          );
+          if (verbose) {
+            await reportUnexplainedLedgerLines(party.account.id, direction, preview);
+          }
+        }
       }
 
       if (apply && actorId && !preview.noFifoDocuments) {

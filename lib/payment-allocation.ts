@@ -41,6 +41,7 @@ export type AllocationTargetType =
   | "BILTY_PAID"
   | "BILL"
   | "PRIVATE_PHONCH_RECOVERY"
+  | "PHONCH_RECOVERY"
   | "CHALLAN"
   | "PRIVATE_PHONCH_PAYABLE";
 export type AllocationDirection = "RECEIVABLE" | "PAYABLE";
@@ -50,7 +51,14 @@ export type AllocationStatus = "UNALLOCATED" | "PARTIALLY_ALLOCATED" | "FULLY_AL
 // party) - see lib/party-payment-fifo.ts's own header comment for the
 // direction-matching rule this drives ("a receipt only clears
 // RECEIVABLE targets, a payment only clears PAYABLE ones").
-const RECEIVABLE_TARGET_TYPES: AllocationTargetType[] = ["BILTY", "BILTY_PAID", "BILL", "PRIVATE_PHONCH_RECOVERY"];
+//
+// PHONCH_PAYABLE deliberately does not exist: a Showroom Phonch
+// (app/api/phonch/route.ts) only ever posts ONE party line - the
+// Transporter's own account, always a DEBIT (RECEIVABLE) for its
+// Total Amount - there is no code path that posts a CREDIT to any
+// party for a Showroom Phonch, so a payable counterpart would have
+// no document that could ever resolve to it.
+const RECEIVABLE_TARGET_TYPES: AllocationTargetType[] = ["BILTY", "BILTY_PAID", "BILL", "PRIVATE_PHONCH_RECOVERY", "PHONCH_RECOVERY"];
 const PAYABLE_TARGET_TYPES: AllocationTargetType[] = ["CHALLAN", "PRIVATE_PHONCH_PAYABLE"];
 
 export function directionForTargetType(targetSourceType: AllocationTargetType): AllocationDirection | null {
@@ -907,6 +915,73 @@ async function resolveBillTarget(tx: Tx, billId: string): Promise<ResolvedTarget
 }
 
 /**
+ * Resolves a PHONCH_RECOVERY target - a Showroom Phonch (app/api/
+ * phonch/route.ts), NOT a Private Phonch (a separate, already-scoped
+ * target type above). Always single-party (the Transporter alone -
+ * resolvePhonchParty's own doc comment in lib/document-party-
+ * resolution.ts confirms "unambiguous"), always RECEIVABLE - a
+ * Phonch's own creation/edit posting is always `debit: totalAmount`
+ * on the Transporter's account (see app/api/phonch/route.ts), never
+ * a credit, so there is no payable counterpart to resolve (see
+ * RECEIVABLE_TARGET_TYPES's own doc comment above on why
+ * PHONCH_PAYABLE does not exist).
+ */
+async function resolvePhonchTarget(tx: Tx, phonchId: string): Promise<ResolvedTarget> {
+  const phonch = await tx.phonch.findUnique({
+    where: { id: phonchId },
+    select: {
+      id: true,
+      phonchNo: true,
+      date: true,
+      isDeleted: true,
+      transporterParty: { select: { account: { select: { id: true } } } },
+      vehicles: { select: { deliveryCharges: true, otherExpenseAmount: true, claimAmount: true } },
+    },
+  });
+  if (!phonch || phonch.isDeleted) {
+    throw new AllocationError("DOCUMENT_NOT_FOUND", "Target Phonch not found.");
+  }
+
+  const partyAccountId = phonch.transporterParty.account?.id;
+  if (!partyAccountId) {
+    throw new AllocationError("DOCUMENT_NOT_ALLOCATABLE", "This Phonch's Transporter has no active account.");
+  }
+
+  const totalAmount = round2(
+    phonch.vehicles.reduce((s, v) => s + Number(v.deliveryCharges) + Number(v.otherExpenseAmount) + Number(v.claimAmount), 0)
+  );
+  if (totalAmount <= 0) {
+    throw new AllocationError("DOCUMENT_NOT_ALLOCATABLE", "This Phonch has no amount due (record only).");
+  }
+
+  // Same tagged-lines convention every other target type uses - see
+  // lib/phonch-accounting.ts's own getPhonchPaymentState() for the
+  // equivalent read this mirrors (never a second, separately-derived
+  // "received" figure).
+  const taggedLines = await tx.journalLine.findMany({
+    where: {
+      sourceType: "PHONCH",
+      sourceId: phonch.id,
+      journalEntry: { referenceType: "DAILY_POSTING", isDeleted: false },
+      account: { category: "PARTY", id: partyAccountId },
+    },
+    select: { debit: true, credit: true },
+  });
+  const receivedOrPaid = taggedLines.reduce((s, l) => s + Number(l.debit) + Number(l.credit), 0);
+
+  return {
+    targetSourceType: "PHONCH_RECOVERY",
+    targetSourceId: phonch.id,
+    documentNo: phonch.phonchNo,
+    documentDate: phonch.date,
+    responsiblePartyAccountId: partyAccountId,
+    totalDue: totalAmount,
+    existingReceivedOrPaid: receivedOrPaid,
+    direction: "RECEIVABLE",
+  };
+}
+
+/**
  * Resolves a PRIVATE_PHONCH_PAYABLE/PRIVATE_PHONCH_RECOVERY target.
  * targetSourceId is a composite "<phonchId>:<accountId>" string - a
  * Private Phonch is NEVER a single-party document (see
@@ -1080,26 +1155,33 @@ async function resolveOpeningBalanceTarget(tx: Tx, partyId: string): Promise<Res
   });
 
   const qualifyingLines: OpeningBalanceQualifyingLine[] = [];
-  let currentNetBalance = 0;
   for (const line of partyLines) {
-    const debit = Number(line.debit);
-    const credit = Number(line.credit);
-    currentNetBalance += debit - credit;
-
     const isOfficiallyTagged = line.journalEntry.referenceType === "OPENING_BALANCE";
     const hasOpeningEquityContra = openingEquityAccountId != null && line.journalEntry.lines.some((l) => l.accountId === openingEquityAccountId);
     if (!isOfficiallyTagged && !hasOpeningEquityContra) continue;
-    qualifyingLines.push({ debit, credit, entryDate: line.journalEntry.entryDate });
+    qualifyingLines.push({ debit: Number(line.debit), credit: Number(line.credit), entryDate: line.journalEntry.entryDate });
   }
 
   const derived = deriveOpeningBalanceFromLines(qualifyingLines);
   if (!derived) return null;
 
-  // Cap to the account's CURRENT total net balance - see
-  // capOpeningBalanceByCurrentBalance's own doc comment.
-  const capped = capOpeningBalanceByCurrentBalance(derived, currentNetBalance);
-  if (!capped) return null;
-
+  // RAW, never capped to the account's current live balance here -
+  // this is the FIFO CEILING (what rerunFifoForParty may allocate
+  // real, tracked payments against), and capping it before FIFO ever
+  // runs was itself a bug: the account's "current balance" already
+  // reflects the very same unallocated Daily Posting payments FIFO
+  // is about to apply, so pre-capping on that figure silently zeroed
+  // out the opening target before FIFO could ever consume it,
+  // stranding the payment as "advance" instead (confirmed in
+  // production: Zafar Niazi Cargo Karachi, ABT, Khalid Goods - advance
+  // sitting unapplied while Opening Balance showed as already
+  // "cleared"). The current-live-balance comparison still has a
+  // genuine use - reconciling how much of the RAW opening a party's
+  // OTHER, non-FIFO-tracked ledger activity has already offset - but
+  // that is a POST-FIFO reporting concern now (see
+  // capOpeningBalanceByCurrentBalance's own doc comment and
+  // scripts/backfill-fifo-allocation.ts's reconciliation report),
+  // never a pre-FIFO ceiling reduction.
   return {
     targetSourceType: "OPENING_BALANCE",
     targetSourceId: partyId,
@@ -1118,9 +1200,9 @@ async function resolveOpeningBalanceTarget(tx: Tx, partyId: string): Promise<Res
     // getOpeningBalanceBreakdown's own earliestDate field.
     documentDate: OPENING_BALANCE_SENTINEL_DATE,
     responsiblePartyAccountId: party.account.id,
-    totalDue: capped.totalDue,
+    totalDue: derived.totalDue,
     existingReceivedOrPaid: 0,
-    direction: capped.direction,
+    direction: derived.direction,
   };
 }
 
@@ -1204,6 +1286,7 @@ export async function resolveAllocationTarget(
   if (targetSourceType === "BILL") return resolveBillTarget(tx, targetSourceId);
   if (targetSourceType === "PRIVATE_PHONCH_PAYABLE") return resolvePrivatePhonchTarget(tx, targetSourceId, "PAYABLE");
   if (targetSourceType === "PRIVATE_PHONCH_RECOVERY") return resolvePrivatePhonchTarget(tx, targetSourceId, "RECEIVABLE");
+  if (targetSourceType === "PHONCH_RECOVERY") return resolvePhonchTarget(tx, targetSourceId);
   if (targetSourceType === "OPENING_BALANCE") {
     const target = await resolveOpeningBalanceTarget(tx, targetSourceId);
     if (!target) throw new AllocationError("DOCUMENT_NOT_ALLOCATABLE", "This Party has no opening balance to allocate against.");
@@ -1530,6 +1613,16 @@ export async function getPartyDocumentCandidateRefs(
     if (partyId) {
       const bills = await tx.bill.findMany({ where: { isDeleted: false, clientPartyId: partyId }, select: { id: true } });
       for (const b of bills) refs.push({ targetSourceType: "BILL", targetSourceId: b.id });
+
+      // Showroom Phonch - always single-party (the Transporter), and
+      // (unlike Private Phonch) that Transporter can never be
+      // reassigned once any receipt has been recorded against the
+      // old one (app/api/phonch/[id]/route.ts's own edit guard) - so,
+      // unlike Private Phonch's own candidate gathering above, no
+      // separate ledger-truth safety net is needed here; the live
+      // table's transporterPartyId is always consistent with history.
+      const phonches = await tx.phonch.findMany({ where: { isDeleted: false, transporterPartyId: partyId }, select: { id: true } });
+      for (const p of phonches) refs.push({ targetSourceType: "PHONCH_RECOVERY", targetSourceId: p.id });
     }
   }
 

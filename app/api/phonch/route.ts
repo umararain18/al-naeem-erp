@@ -12,6 +12,7 @@ import {
 import { getShowroomDeliveryIncomeAccountId, getClaimRecoveryAccountId } from "@/lib/gross-accounts";
 import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
 import { phonchListSearchOr } from "@/lib/search-helpers";
+import { rerunFifoForParty } from "@/lib/party-payment-fifo";
 
 // ============================================================
 // GET /api/phonch - list (search/filter)
@@ -355,6 +356,11 @@ export async function POST(request: NextRequest) {
             },
             ...requestContext(request),
           });
+
+          // AUTO FIFO ALLOCATION - this Phonch's own PHONCH_RECOVERY
+          // target is newly resolvable, so any of this Transporter's
+          // own eligible, unallocated payments can apply to it.
+          await rerunFifoForParty(tx, transporterParty.account.id, "RECEIVABLE", currentUser.userId);
 
           return createdPhonch;
         },

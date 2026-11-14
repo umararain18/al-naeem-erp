@@ -14,6 +14,7 @@ import {
 import { getShowroomDeliveryIncomeAccountId, getClaimRecoveryAccountId } from "@/lib/gross-accounts";
 import { getBillPaymentState, resolveBillClientAccountId } from "@/lib/bill-accounting";
 import { auditUpdate, auditDelete, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
+import { clearAndRerunForDocument } from "@/lib/party-payment-fifo";
 
 export async function GET(
   _request: NextRequest,
@@ -398,6 +399,10 @@ export async function PATCH(
               ...requestContext(request),
             });
           }
+
+          // AUTO FIFO ALLOCATION - this Phonch's own totalDue/
+          // Transporter may have just changed.
+          await clearAndRerunForDocument(tx, "PHONCH_RECOVERY", id, currentUser.userId);
         },
         { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
       );
@@ -536,6 +541,9 @@ export async function DELETE(
         description: `Moved Showroom Phonch ${phonch.phonchNo} to Bin`,
         ...requestContext(request),
       });
+
+      // AUTO FIFO ALLOCATION - this Phonch's own target no longer exists.
+      await clearAndRerunForDocument(tx, "PHONCH_RECOVERY", id, currentUser.userId);
     });
 
     return NextResponse.json({ success: true, message: "Phonch moved to Bin successfully." });

@@ -144,6 +144,55 @@ export function computeFifoAllocationPlan(
   return plan;
 }
 
+export interface FifoInvariantViolation {
+  totalAdvance: number;
+  openDocumentsWithCapacity: { targetSourceType: string; targetSourceId: string; remaining: number }[];
+}
+
+/**
+ * Hard correctness invariant on the greedy walk's own OUTPUT: if any
+ * payment amount is left over as "advance" (unallocated) after a
+ * rebuild, EVERY candidate document passed in must have been filled
+ * to its own full remainingAllocatable - computeFifoAllocationPlan's
+ * algorithm walks every document for every payment before moving on,
+ * so this should hold by construction given a correct candidate
+ * list. A violation here means candidate discovery itself missed
+ * something (a real open document that should have been in
+ * `documents` but wasn't) - exactly the class of bug this feature has
+ * repeatedly hit on production data. Returns the violation (never
+ * throws itself - the caller decides whether to hard-fail) so it can
+ * be asserted in both rerunFifoForParty and a pure unit test.
+ */
+export function checkNoAdvanceWithOpenCapacity(
+  payments: FifoCandidatePayment[],
+  documents: FifoCandidateDocument[],
+  plan: FifoAllocationPlanItem[]
+): FifoInvariantViolation | null {
+  const totalPayments = round2(payments.reduce((s, p) => s + p.remainingAmount, 0));
+  const totalAllocated = round2(plan.reduce((s, p) => s + p.amount, 0));
+  const advance = round2(totalPayments - totalAllocated);
+  if (advance <= 0.009) return null;
+
+  const allocatedByDoc = new Map<string, number>();
+  for (const item of plan) {
+    const key = `${item.targetSourceType}:${item.targetSourceId}`;
+    allocatedByDoc.set(key, round2((allocatedByDoc.get(key) ?? 0) + item.amount));
+  }
+
+  const openDocumentsWithCapacity: FifoInvariantViolation["openDocumentsWithCapacity"] = [];
+  for (const doc of documents) {
+    const key = `${doc.targetSourceType}:${doc.targetSourceId}`;
+    const allocated = allocatedByDoc.get(key) ?? 0;
+    const remaining = round2(doc.remainingAllocatable - allocated);
+    if (remaining > 0.009) {
+      openDocumentsWithCapacity.push({ targetSourceType: doc.targetSourceType, targetSourceId: doc.targetSourceId, remaining });
+    }
+  }
+
+  if (openDocumentsWithCapacity.length === 0) return null;
+  return { totalAdvance: advance, openDocumentsWithCapacity };
+}
+
 async function getPartyPaymentLineIdsByDirection(
   tx: Tx,
   partyAccountId: string,
@@ -237,7 +286,19 @@ export async function rerunFifoForParty(
     });
   }
 
-  const plan = computeFifoAllocationPlan(sortFifoPayments(candidatePayments), sortFifoDocuments(documents));
+  const sortedPayments = sortFifoPayments(candidatePayments);
+  const sortedDocuments = sortFifoDocuments(documents);
+  const plan = computeFifoAllocationPlan(sortedPayments, sortedDocuments);
+
+  const violation = checkNoAdvanceWithOpenCapacity(sortedPayments, sortedDocuments, plan);
+  if (violation) {
+    throw new AllocationError(
+      "FIFO_INVARIANT_VIOLATION",
+      `Rs. ${violation.totalAdvance} left unallocated as advance while ${violation.openDocumentsWithCapacity.length} document(s) still have open capacity (${violation.openDocumentsWithCapacity
+        .map((d) => `${d.targetSourceType} ${d.targetSourceId}: Rs. ${d.remaining}`)
+        .join(", ")}) - this should never happen; candidate discovery likely missed something.`
+    );
+  }
 
   for (const item of plan) {
     await tx.paymentAllocation.create({

@@ -4,6 +4,7 @@ import {
   sortFifoPayments,
   sortFifoDocuments,
   computeFifoAllocationPlan,
+  checkNoAdvanceWithOpenCapacity,
   type FifoCandidatePayment,
   type FifoCandidateDocument,
 } from "./party-payment-fifo";
@@ -329,4 +330,57 @@ test("Post-migration no-op: only origin=FIFO rows are ever deletion candidates -
   const mixedRows = [...preExistingRows, { id: "r4", origin: "FIFO" }];
   const deletableMixed = mixedRows.filter((r) => r.origin === "FIFO");
   assert.deepEqual(deletableMixed, [{ id: "r4", origin: "FIFO" }]);
+});
+
+// ------------------------------------------------------------
+// checkNoAdvanceWithOpenCapacity() - production bug fix: Opening
+// Balance (and, by the same mechanism, any other document) was being
+// pre-capped before FIFO ever ran, so a real advance sat unapplied
+// while the document that should have absorbed it showed as already
+// "cleared" (Zafar Niazi Cargo Karachi, ABT, Khalid Goods). This hard
+// invariant check catches exactly that class of bug going forward:
+// leftover advance while an open document still has capacity can
+// only mean candidate discovery missed something.
+// ------------------------------------------------------------
+
+test("checkNoAdvanceWithOpenCapacity: no advance at all - never a violation", () => {
+  const payments = [payment({ journalLineId: "p1", remainingAmount: 500 })];
+  const documents = [doc({ targetSourceId: "d1", remainingAllocatable: 500 })];
+  const plan = computeFifoAllocationPlan(payments, documents);
+  assert.equal(checkNoAdvanceWithOpenCapacity(payments, documents, plan), null);
+});
+
+test("checkNoAdvanceWithOpenCapacity: genuine advance with every document fully filled - not a violation", () => {
+  const payments = [payment({ journalLineId: "p1", remainingAmount: 1000 })];
+  const documents = [doc({ targetSourceId: "d1", remainingAllocatable: 500 })];
+  const plan = computeFifoAllocationPlan(payments, documents);
+  // 500 allocated, 500 genuinely left over as advance - d1 has 0 remaining capacity.
+  assert.equal(checkNoAdvanceWithOpenCapacity(payments, documents, plan), null);
+});
+
+test("checkNoAdvanceWithOpenCapacity: advance left while a document still has open capacity - violation", () => {
+  const payments = [payment({ journalLineId: "p1", remainingAmount: 1000 })];
+  const documents = [doc({ targetSourceId: "d1", remainingAllocatable: 500 })];
+  // Simulate the exact bug: candidate discovery dropped a document
+  // from the plan's own inputs, but it's still passed to the checker
+  // as a "real" open document (e.g. a pre-capped Opening Balance that
+  // should have absorbed the leftover 500 but never got the chance).
+  const emptyPlan: ReturnType<typeof computeFifoAllocationPlan> = [];
+  const violation = checkNoAdvanceWithOpenCapacity(payments, documents, emptyPlan);
+  assert.ok(violation);
+  assert.equal(violation!.totalAdvance, 1000);
+  assert.equal(violation!.openDocumentsWithCapacity.length, 1);
+  assert.equal(violation!.openDocumentsWithCapacity[0].targetSourceId, "d1");
+  assert.equal(violation!.openDocumentsWithCapacity[0].remaining, 500);
+});
+
+test("checkNoAdvanceWithOpenCapacity: the normal greedy plan never violates this invariant by construction", () => {
+  const payments = [payment({ journalLineId: "p1", remainingAmount: 300 })];
+  const documents = [
+    doc({ targetSourceId: "a", documentDate: new Date("2026-01-01"), documentNo: "A", remainingAllocatable: 200 }),
+    doc({ targetSourceId: "b", documentDate: new Date("2026-02-01"), documentNo: "B", remainingAllocatable: 200 }),
+  ];
+  const plan = computeFifoAllocationPlan(sortFifoPayments(payments), sortFifoDocuments(documents));
+  // 300 fully allocated (200 to a, 100 to b) - no advance, so trivially no violation.
+  assert.equal(checkNoAdvanceWithOpenCapacity(payments, documents, plan), null);
 });

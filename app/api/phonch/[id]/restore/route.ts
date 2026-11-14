@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { auditRestore, actorFromUser, requestContext } from "@/lib/audit-log";
+import { clearAndRerunForDocument } from "@/lib/party-payment-fifo";
 
 export async function POST(
   request: NextRequest,
@@ -59,6 +60,9 @@ export async function POST(
         description: `Restored Showroom Phonch ${current.phonchNo} from Bin`,
         ...requestContext(request),
       });
+
+      // AUTO FIFO ALLOCATION - this Phonch's own target is resolvable again.
+      await clearAndRerunForDocument(tx, "PHONCH_RECOVERY", id, currentUser.userId);
 
       return restored;
     });
