@@ -480,20 +480,22 @@ async function resolveChallanTarget(tx: Tx, challanId: string): Promise<Resolved
   };
 }
 
+interface BiltyCollectionResponsibility {
+  bilty: { id: string; biltyNo: string; date: Date };
+  activeChallan: { id: string; challanNo: string; isSettled: boolean; settlementJournalEntryId: string | null };
+  partyAccountId: string;
+  totalDue: number;
+}
+
 /**
- * Resolves a BILTY allocation target. A Bilty can have up to two
- * independent components - Collection (Bilty.total) and Commission
- * (Bilty.agentCommission) - each with its OWN responsible party
- * (see the multi-party Settlement tests). Reuses
- * findSettledPartyAccountId() (the same per-component lookup
- * Settlement corrections/reassignments already rely on) rather than
- * a new resolution formula. If the two components resolve to
- * DIFFERENT parties, rejects as ambiguous rather than guessing which
- * portion of a blended "received" figure belongs to which party -
- * the same principle the Daily Posting P0 fix already established
- * at the Challan level.
+ * Resolves ONE Bilty's own Collection+Commission responsible party
+ * and combined totalDue - extracted out of resolveBiltyTarget so
+ * getChallanTaggedCollectionShareForBilty() below can reuse the EXACT
+ * same resolution for every sibling Bilty on a Challan (never a
+ * second, parallel formula) while walking that Challan's own
+ * CHALLAN-tagged receipt pool across them.
  */
-async function resolveBiltyTarget(tx: Tx, biltyId: string): Promise<ResolvedTarget> {
+async function resolveBiltyCollectionResponsibility(tx: Tx, biltyId: string): Promise<BiltyCollectionResponsibility> {
   // Same reasoning as resolveChallanTarget()'s Carrier Rent guard
   // above, for this Bilty's Collection (Remaining To-Pay) component.
   // Need the owning Challan first to scope the lookup correctly.
@@ -586,11 +588,175 @@ async function resolveBiltyTarget(tx: Tx, biltyId: string): Promise<ResolvedTarg
   const partyAccountId = [...distinctParties][0]!;
   const totalDue = resolved.filter((r) => r.partyAccountId === partyAccountId).reduce((s, r) => s + r.amount, 0);
 
+  return {
+    bilty: { id: bilty.id, biltyNo: bilty.biltyNo, date: bilty.date },
+    activeChallan,
+    partyAccountId,
+    totalDue,
+  };
+}
+
+export interface ChallanPoolBiltyCandidate {
+  biltyId: string;
+  biltyNo: string;
+  date: Date;
+  /** This Bilty's own totalDue minus whatever is ALREADY tagged
+   * directly to it (sourceType=BILTY) - the capacity left for the
+   * shared CHALLAN-tagged pool to fill. */
+  remaining: number;
+}
+
+/**
+ * Pure distribution step of getChallanTaggedCollectionShareForBilty
+ * (DB I/O lives only in the caller) - walks a Challan's own CHALLAN-
+ * tagged receipt pool across every qualifying sibling Bilty, oldest
+ * date first (tie-break by biltyNo, same convention as
+ * sortFifoDocuments), greedily filling each one's own remaining
+ * capacity before moving to the next. Pure and deterministic -
+ * extracted so this allocation rule can be unit tested directly, the
+ * same way lib/party-payment-fifo.ts's own computeFifoAllocationPlan
+ * is.
+ */
+export function distributeChallanTaggedPoolOldestBiltyFirst(
+  pool: number,
+  candidates: ChallanPoolBiltyCandidate[]
+): Map<string, number> {
+  const sorted = [...candidates].sort((a, b) => {
+    const dateDiff = a.date.getTime() - b.date.getTime();
+    if (dateDiff !== 0) return dateDiff;
+    return a.biltyNo.localeCompare(b.biltyNo);
+  });
+
+  const assigned = new Map<string, number>();
+  let remainingPool = round2(pool);
+
+  for (const candidate of sorted) {
+    if (remainingPool <= 0.009) break;
+    const take = round2(Math.min(remainingPool, candidate.remaining));
+    if (take <= 0.009) continue;
+    assigned.set(candidate.biltyId, take);
+    remainingPool = round2(remainingPool - take);
+  }
+
+  return assigned;
+}
+
+/**
+ * A Daily Posting receipt tagged sourceType=CHALLAN (never a specific
+ * Bilty) counted toward nothing in Payment Allocation until now - but
+ * when the SAME party is the Collection/Commission-responsible party
+ * for one or more of this Challan's own Bilties, and this party has
+ * NO Carrier Rent due from/to them on this Challan (so the receipt
+ * cannot plausibly be "about" Carrier Rent instead), there is no
+ * other real-world explanation for why they'd have a CHALLAN-tagged
+ * receipt at all - it is their own Collection/Commission payment,
+ * just recorded against the Challan number rather than a specific
+ * Bilty line (common when a Challan carries only one Bilty, or as a
+ * historical shorthand). Shared across every Bilty on the Challan
+ * this same party is solely responsible for, applied oldest-Bilty-
+ * first - exactly the same greedy FIFO walk the rest of this feature
+ * already uses, just scoped to one Challan's own pool instead of a
+ * party's entire ledger.
+ *
+ * Confirmed in production: Ansari And Sons, a Cr 2000 CHALLAN-tagged
+ * receipt on Challan X (no Carrier Rent due from them on that
+ * Challan) - Bilty 475 (the oldest/only qualifying Bilty) must show
+ * this as alreadyPaid, not a stranded, uncounted receipt.
+ */
+async function getChallanTaggedCollectionShareForBilty(
+  tx: Tx,
+  activeChallan: { id: string; challanNo: string; isSettled: boolean; settlementJournalEntryId: string | null },
+  partyAccountId: string,
+  biltyId: string
+): Promise<number> {
+  // Ambiguity guard: if this SAME party is also the Carrier-Rent-
+  // responsible party for this Challan, a CHALLAN-tagged receipt
+  // could genuinely be for either component - never auto-attributed
+  // to Collection in that case. Resolving to a DIFFERENT party, or
+  // throwing (not settled for Carrier Rent / zero Carrier Rent /
+  // multi-payer), both mean there is no such ambiguity.
+  try {
+    const carrierRentTarget = await resolveChallanTarget(tx, activeChallan.id);
+    if (carrierRentTarget.responsiblePartyAccountId === partyAccountId) return 0;
+  } catch {
+    // No Carrier Rent due from/to this party on this Challan at all.
+  }
+
+  const challanTaggedLines = await tx.journalLine.findMany({
+    where: {
+      sourceType: "CHALLAN",
+      sourceId: activeChallan.id,
+      journalEntry: { referenceType: "DAILY_POSTING", isDeleted: false },
+      account: { category: "PARTY", id: partyAccountId },
+    },
+    select: { debit: true, credit: true },
+  });
+  let pool = round2(challanTaggedLines.reduce((s, l) => s + Number(l.debit) + Number(l.credit), 0));
+  if (pool <= 0.009) return 0;
+
+  const siblingLinks = await tx.challanBilty.findMany({
+    where: { challanId: activeChallan.id },
+    select: { bilty: { select: { id: true, isDeleted: true } } },
+  });
+
+  const group: ChallanPoolBiltyCandidate[] = [];
+
+  for (const link of siblingLinks) {
+    if (link.bilty.isDeleted) continue;
+
+    let responsibility: BiltyCollectionResponsibility;
+    try {
+      responsibility = await resolveBiltyCollectionResponsibility(tx, link.bilty.id);
+    } catch {
+      // Not settled / multi-payer / ambiguous / no responsible party
+      // yet - excluded from this shared pool, same as it would be
+      // excluded as its own standalone BILTY target.
+      continue;
+    }
+    if (responsibility.partyAccountId !== partyAccountId) continue;
+
+    const ownTaggedLines = await tx.journalLine.findMany({
+      where: {
+        sourceType: "BILTY",
+        sourceId: responsibility.bilty.id,
+        journalEntry: { referenceType: "DAILY_POSTING", isDeleted: false },
+        account: { category: "PARTY", id: partyAccountId },
+      },
+      select: { debit: true, credit: true },
+    });
+    const ownTagged = ownTaggedLines.reduce((s, l) => s + Number(l.debit) + Number(l.credit), 0);
+    const remaining = Math.max(0, round2(responsibility.totalDue - ownTagged));
+
+    group.push({ biltyId: responsibility.bilty.id, biltyNo: responsibility.bilty.biltyNo, date: responsibility.bilty.date, remaining });
+  }
+
+  const assigned = distributeChallanTaggedPoolOldestBiltyFirst(pool, group);
+  return assigned.get(biltyId) ?? 0;
+}
+
+/**
+ * Resolves a BILTY allocation target. A Bilty can have up to two
+ * independent components - Collection (Bilty.total) and Commission
+ * (Bilty.agentCommission) - each with its OWN responsible party
+ * (see the multi-party Settlement tests). Reuses
+ * findSettledPartyAccountId() (the same per-component lookup
+ * Settlement corrections/reassignments already rely on) rather than
+ * a new resolution formula. If the two components resolve to
+ * DIFFERENT parties, rejects as ambiguous rather than guessing which
+ * portion of a blended "received" figure belongs to which party -
+ * the same principle the Daily Posting P0 fix already established
+ * at the Challan level.
+ */
+async function resolveBiltyTarget(tx: Tx, biltyId: string): Promise<ResolvedTarget> {
+  const { bilty, activeChallan, partyAccountId, totalDue } = await resolveBiltyCollectionResponsibility(tx, biltyId);
+
   // Existing received/paid tagged specifically to this Bilty (same
   // matching convention lib/challan-financials.ts already uses for
   // its own Challan-level aggregate - just scoped to one Bilty here,
   // since a payment eligible for allocation is, by construction,
-  // never already tagged this way; see isEligibleForAllocation).
+  // never already tagged this way; see isEligibleForAllocation) -
+  // PLUS this party's own share of this Challan's CHALLAN-tagged
+  // receipt pool, if any (see getChallanTaggedCollectionShareForBilty).
   const taggedLines = await tx.journalLine.findMany({
     where: {
       sourceType: "BILTY",
@@ -601,7 +767,9 @@ async function resolveBiltyTarget(tx: Tx, biltyId: string): Promise<ResolvedTarg
     select: { debit: true, credit: true },
   });
 
-  const receivedOrPaid = taggedLines.reduce((s, l) => s + Number(l.debit) + Number(l.credit), 0);
+  const biltyTaggedAmount = taggedLines.reduce((s, l) => s + Number(l.debit) + Number(l.credit), 0);
+  const challanPoolShare = await getChallanTaggedCollectionShareForBilty(tx, activeChallan, partyAccountId, bilty.id);
+  const receivedOrPaid = round2(biltyTaggedAmount + challanPoolShare);
 
   return {
     targetSourceType: "BILTY",

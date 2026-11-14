@@ -4,7 +4,9 @@ import {
   findPairedCashBankLine,
   capOpeningBalanceByCurrentBalance,
   isEligibleForAllocation,
+  distributeChallanTaggedPoolOldestBiltyFirst,
   type PaymentLineInfo,
+  type ChallanPoolBiltyCandidate,
 } from "./payment-allocation";
 
 // ------------------------------------------------------------
@@ -202,4 +204,75 @@ test("isEligibleForAllocation: a lumpsum payment with no document (null/DIRECT/P
   for (const sourceType of [null, "DIRECT", "PARTY", "ACCOUNT"]) {
     assert.equal(isEligibleForAllocation(payment(sourceType)), true, `${sourceType} should be eligible`);
   }
+});
+
+// ------------------------------------------------------------
+// distributeChallanTaggedPoolOldestBiltyFirst() - production bug fix:
+// a Daily Posting receipt tagged sourceType=CHALLAN (never a specific
+// Bilty) counted toward nothing in Payment Allocation at all, even
+// when the receiving party is plainly the Collection/Commission-
+// responsible party for that Challan's own Bilty(s) and has no
+// Carrier Rent due on that Challan - the only real-world explanation
+// for such a receipt. Confirmed in production: Ansari And Sons, a
+// Cr 2000 CHALLAN-tagged receipt - Bilty 475 (the oldest/only
+// qualifying Bilty on that Challan) must show it as alreadyPaid.
+// ------------------------------------------------------------
+
+function biltyCandidate(overrides: Partial<ChallanPoolBiltyCandidate> & { biltyId: string }): ChallanPoolBiltyCandidate {
+  return {
+    biltyNo: overrides.biltyId,
+    date: new Date("2026-01-01"),
+    remaining: 0,
+    ...overrides,
+  };
+}
+
+test("distributeChallanTaggedPoolOldestBiltyFirst: single qualifying Bilty receives the full pool (Ansari And Sons / Bilty 475 scenario)", () => {
+  const assigned = distributeChallanTaggedPoolOldestBiltyFirst(2000, [
+    biltyCandidate({ biltyId: "bilty-475", date: new Date("2026-10-25"), remaining: 2000 }),
+  ]);
+  assert.equal(assigned.get("bilty-475"), 2000);
+});
+
+test("distributeChallanTaggedPoolOldestBiltyFirst: pool smaller than the Bilty's remaining only partially covers it", () => {
+  const assigned = distributeChallanTaggedPoolOldestBiltyFirst(500, [biltyCandidate({ biltyId: "bilty-1", remaining: 2000 })]);
+  assert.equal(assigned.get("bilty-1"), 500);
+});
+
+test("distributeChallanTaggedPoolOldestBiltyFirst: oldest Bilty is filled first, leftover carries to the next", () => {
+  const assigned = distributeChallanTaggedPoolOldestBiltyFirst(3000, [
+    biltyCandidate({ biltyId: "newer", date: new Date("2026-02-01"), remaining: 1000 }),
+    biltyCandidate({ biltyId: "oldest", date: new Date("2026-01-01"), remaining: 2000 }),
+  ]);
+  assert.equal(assigned.get("oldest"), 2000);
+  assert.equal(assigned.get("newer"), 1000);
+});
+
+test("distributeChallanTaggedPoolOldestBiltyFirst: tie-break by biltyNo when dates are identical", () => {
+  const sameDate = new Date("2026-05-01");
+  const assigned = distributeChallanTaggedPoolOldestBiltyFirst(1000, [
+    biltyCandidate({ biltyId: "z", biltyNo: "6402", date: sameDate, remaining: 1000 }),
+    biltyCandidate({ biltyId: "a", biltyNo: "6300", date: sameDate, remaining: 1000 }),
+  ]);
+  assert.equal(assigned.get("a"), 1000);
+  assert.equal(assigned.has("z"), false);
+});
+
+test("distributeChallanTaggedPoolOldestBiltyFirst: never exceeds a Bilty's own remaining capacity", () => {
+  const assigned = distributeChallanTaggedPoolOldestBiltyFirst(5000, [biltyCandidate({ biltyId: "bilty-1", remaining: 500 })]);
+  assert.equal(assigned.get("bilty-1"), 500);
+});
+
+test("distributeChallanTaggedPoolOldestBiltyFirst: a Bilty with zero remaining capacity is skipped entirely", () => {
+  const assigned = distributeChallanTaggedPoolOldestBiltyFirst(1000, [
+    biltyCandidate({ biltyId: "already-covered", date: new Date("2026-01-01"), remaining: 0 }),
+    biltyCandidate({ biltyId: "still-open", date: new Date("2026-02-01"), remaining: 1000 }),
+  ]);
+  assert.equal(assigned.has("already-covered"), false);
+  assert.equal(assigned.get("still-open"), 1000);
+});
+
+test("distributeChallanTaggedPoolOldestBiltyFirst: empty candidate list assigns nothing", () => {
+  const assigned = distributeChallanTaggedPoolOldestBiltyFirst(2000, []);
+  assert.equal(assigned.size, 0);
 });

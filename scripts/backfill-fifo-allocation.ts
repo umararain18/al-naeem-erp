@@ -209,11 +209,11 @@ function reasonFromError(error: unknown): string {
 function explainAlreadyPaidRule(targetSourceType: string, targetSourceId: string): string {
   switch (targetSourceType) {
     case "BILTY":
-      return `counts only Daily Posting lines tagged sourceType=BILTY sourceId=${targetSourceId} on the Collection/Commission-responsible account (established via Settlement) - a CHALLAN-tagged receipt on this same account belongs to that Challan's own Carrier Rent, a separate pool, and never counts here`;
+      return `counts Daily Posting lines tagged sourceType=BILTY sourceId=${targetSourceId} on the Collection/Commission-responsible account, PLUS this party's own oldest-Bilty-first share of any sourceType=CHALLAN-tagged receipt on the same Challan - but only when this party has NO Carrier Rent due on that Challan (otherwise the CHALLAN-tagged receipt is ambiguous and never auto-attributed)`;
     case "BILTY_PAID":
-      return `counts only Daily Posting lines tagged sourceType=BILTY sourceId=${targetSourceId} on the Paid-responsible account (independent of Settlement/Challan) - a CHALLAN- or BILTY-Collection-tagged receipt belongs to a different component and never counts here`;
+      return `counts only Daily Posting lines tagged sourceType=BILTY sourceId=${targetSourceId} on the Paid-responsible account (independent of Settlement/Challan) - a CHALLAN-tagged receipt belongs to BILTY's own Collection/Commission share rule instead, never here`;
     case "CHALLAN":
-      return `counts only Daily Posting lines tagged sourceType=CHALLAN sourceId=${targetSourceId} on the Carrier-Rent-responsible account - a BILTY-tagged receipt on this same account belongs to that Bilty's own Collection/Commission/Paid, a separate pool, and never counts here`;
+      return `counts only Daily Posting lines tagged sourceType=CHALLAN sourceId=${targetSourceId} on the Carrier-Rent-responsible account - a BILTY-tagged receipt on this same account belongs to that Bilty's own Collection/Commission/Paid, a separate pool, and never counts here (the reverse direction - a CHALLAN-tagged receipt counting toward a Bilty's own Collection - is handled by BILTY's own rule above, not this one)`;
     case "BILL":
       return `counts only Daily Posting lines tagged sourceType=BILL sourceId=${targetSourceId} on the Client account`;
     case "PRIVATE_PHONCH_PAYABLE":
