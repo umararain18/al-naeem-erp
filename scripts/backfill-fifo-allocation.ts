@@ -65,6 +65,9 @@
 //   npx tsx scripts/backfill-fifo-allocation.ts --apply --user=umar          (attribute to a specific username; defaults to the first active SUPER_ADMIN)
 //   npx tsx scripts/backfill-fifo-allocation.ts --party="Ansari And Sons"    (restrict the FIFO pass to one party, case-insensitive substring match)
 //   npx tsx scripts/backfill-fifo-allocation.ts --party="NKB" --verbose      (full line-by-line/document-by-document diagnostic for that party - read-only)
+//   npx tsx scripts/backfill-fifo-allocation.ts --apply --skip-mismatch      (writes ONLY for parties whose combined reconciliation is OK; every
+//                                                                              party with a MISMATCH is left entirely untouched - neither direction
+//                                                                              applied - and printed in a "skipped" list at the end, by diff)
 
 import { PrismaClient } from "@prisma/client";
 import {
@@ -84,15 +87,18 @@ import {
   sortFifoPayments,
   sortFifoDocuments,
   computeFifoAllocationPlan,
-  checkNoAdvanceWithOpenCapacity,
-  type FifoCandidateDocument,
-  type FifoAllocationPlanItem,
+  computePartyFifoPreview,
+  checkPartyReconciliation,
+  type PartyFifoPreview,
+  type ReconciliationResult,
+  type LedgerLineClassification,
 } from "../lib/party-payment-fifo";
 
 const prisma = new PrismaClient();
 
 const apply = process.argv.includes("--apply");
 const verbose = process.argv.includes("--verbose");
+const skipMismatch = process.argv.includes("--skip-mismatch");
 const userArg = process.argv.find((a) => a.startsWith("--user="));
 const requestedUsername = userArg ? userArg.slice("--user=".length) : null;
 const partyArg = process.argv.find((a) => a.startsWith("--party="));
@@ -151,323 +157,24 @@ async function reportLegacyBackfillStatus() {
   console.log("");
 }
 
-interface PartyFifoReport {
-  direction: AllocationDirection;
-  /** True when this party has ZERO open FIFO-scope documents at all
-   * for this direction (e.g. a fuel pump that only ever receives
-   * Trip-expense payments, never a Bilty/Challan/Bill/Private Phonch/
-   * Opening Balance) - FIFO is simply not applicable here, which is
-   * a different situation from "everything is already allocated" or
-   * "there's a genuine advance" and must be reported as such rather
-   * than a misleading "advance left unallocated" for the party's
-   * entire payment history. */
-  noFifoDocuments: boolean;
-  docsCleared: number;
-  docsPartial: number;
-  advanceLeft: number;
-  /** Carried through so the reconciliation check (B3/B4) can reuse
-   * the EXACT same documents/plan this preview computed, rather than
-   * recomputing a second time and risking the two disagreeing. */
-  documents: FifoCandidateDocument[];
-  plan: FifoAllocationPlanItem[];
-  /** Non-null when checkNoAdvanceWithOpenCapacity (B4) found a
-   * violation - returned rather than printed here, so the CALLER can
-   * attribute it under the correct party header (see runFifoPass's
-   * own comment on why every line must be attributed explicitly). */
-  invariantViolation: ReturnType<typeof checkNoAdvanceWithOpenCapacity>;
-}
-
-async function previewFifoForParty(accountId: string, direction: AllocationDirection): Promise<PartyFifoReport | null> {
-  const payments = await listEligibleFifoPayments(prisma, accountId, direction);
-  if (payments.length === 0) return null;
-
-  const documents = await getPartyDocumentStates(prisma, accountId, direction, { onlyWithRemainingBalance: true });
-  if (documents.length === 0) {
-    return { direction, noFifoDocuments: true, docsCleared: 0, docsPartial: 0, advanceLeft: 0, documents: [], plan: [], invariantViolation: null };
-  }
-
-  const candidatePayments = [];
-  for (const payment of payments) {
-    const alreadyAllocated = await getAllocatedAmountForPayment(prisma, payment.journalLineId);
-    candidatePayments.push({
-      journalLineId: payment.journalLineId,
-      remainingAmount: Math.round((payment.amount - alreadyAllocated) * 100) / 100,
-      entryDate: payment.entryDate,
-    });
-  }
-
-  const sortedPayments = sortFifoPayments(candidatePayments);
-  const sortedDocuments = sortFifoDocuments(documents);
-  const plan = computeFifoAllocationPlan(sortedPayments, sortedDocuments);
-
-  // B4 - same hard invariant rerunFifoForParty() itself asserts
-  // before ever writing: leftover advance while an open document
-  // still has capacity can only mean candidate discovery missed
-  // something. The dry-run preview checks it too, read-only - the
-  // CALLER prints it (see runFifoPass), never here, so it is always
-  // correctly attributed under this party's own header.
-  const invariantViolation = checkNoAdvanceWithOpenCapacity(sortedPayments, sortedDocuments, plan);
-
-  const allocatedByDoc = new Map<string, number>();
-  for (const item of plan) {
-    const key = `${item.targetSourceType}:${item.targetSourceId}`;
-    allocatedByDoc.set(key, Math.round(((allocatedByDoc.get(key) || 0) + item.amount) * 100) / 100);
-  }
-
-  let docsCleared = 0;
-  let docsPartial = 0;
-  for (const doc of sortedDocuments) {
-    const allocated = allocatedByDoc.get(`${doc.targetSourceType}:${doc.targetSourceId}`) || 0;
-    if (allocated <= 0.009) continue;
-    if (allocated >= doc.remainingAllocatable - 0.009) docsCleared++;
-    else docsPartial++;
-  }
-
-  const totalPaymentAmount = candidatePayments.reduce((s, p) => s + p.remainingAmount, 0);
-  const totalAllocated = plan.reduce((s, p) => s + p.amount, 0);
-  const advanceLeft = Math.round((totalPaymentAmount - totalAllocated) * 100) / 100;
-
-  return { direction, noFifoDocuments: false, docsCleared, docsPartial, advanceLeft, documents: sortedDocuments, plan, invariantViolation };
-}
+// previewFifoForParty is now just computePartyFifoPreview from
+// lib/party-payment-fifo.ts - the SAME function rerunFifoForParty
+// itself plans from (and, in turn, the same one checkPartyReconciliation
+// reads) - see that function's own doc comment on why this used to be
+// a separately re-implemented pipeline here.
+const previewFifoForParty = (accountId: string, direction: AllocationDirection) => computePartyFifoPreview(prisma, accountId, direction);
 
 function reasonFromError(error: unknown): string {
   if (error instanceof AllocationError) return `${error.code}: ${error.message}`;
   return error instanceof Error ? error.message : String(error);
 }
 
-// ============================================================
-// B3 - RECONCILIATION - ONE combined check per PARTY (both
-// directions together), never per-direction.
-//
-// An account that carries BOTH a receivable and a payable at once
-// (e.g. a Transporter/Clearing Agent who is both Collection-
-// responsible for some Bilties AND Carrier-Rent-responsible for a
-// Challan - confirmed on production: Nawab Broker) cannot be
-// reconciled one direction at a time: the account's own signed net
-// balance is a single number blending both, so checking only
-// "RECEIVABLE documents vs. the RECEIVABLE-filtered balance" makes
-// every genuinely-explained PAYABLE-side line look "unexplained",
-// and vice versa. This checks the FULL signed net instead:
-//
-//   expectedSignedNet = lhs(RECEIVABLE) - lhs(PAYABLE)
-//   (each lhs = sum of that direction's own doc-remaining-after-plan,
-//    minus that direction's own advance - see previewFifoForParty)
-//
-// compared against the account's REAL signed net balance (every live
-// line, debit - credit), AFTER subtracting out every line that is
-// explained by a mechanism OTHER than FIFO's own document/payment
-// model but still legitimately moves the balance:
-//   - a Settlement-family entry (SETTLEMENT/SETTLEMENT_CORRECTION/
-//     SETTLEMENT_PAYMENT/SETTLEMENT_PAYMENT_CORRECTION/
-//     CARRIER_RENT_MULTI_PAYER_TRANSITION) for a document that did
-//     NOT resolve as one of this party's own current documents - the
-//     protected Settlement/multi-payer engine has already decided
-//     this money's true disposition independently of FIFO (it may
-//     have been reassigned since), so FIFO is right to stay out of it.
-//   - a Manual Journal line (referenceType=MANUAL_JOURNAL) - never
-//     document-linked by design (decision #12), always non-FIFO.
-// Any OTHER unexplained line is a genuine gap - exactly what
-// --verbose lists for a MISMATCH.
-// ============================================================
-
-/** Every sourceType that ALWAYS means "already tagged to a specific
- * document at posting time" (same set isEligibleForAllocation excludes
- * in lib/payment-allocation.ts) - a line carrying one of these is, by
- * definition, never a generic unattributed payment FIFO should have
- * an opinion about. When its OWN document happens to resolve right
- * now, that's already captured via bucket 3 (resolvedDocumentKeys,
- * checked first); when it does NOT (MULTI_PAYER_NOT_ALLOCATABLE, no
- * responsible party established yet, a historical reassignment, etc.
- * - confirmed on production: Jaecco Hyderabad, Al furqan), the
- * PROTECTED Settlement/Phonch/Bill/Private-Phonch systems still own
- * this money's true disposition, independently of FIFO - so it is
- * never "unexplained" either way. Plus SETTLEMENT_PAYMENT (the
- * multi-payer engine's own correction tag, never itself a document)
- * and MANUAL_JOURNAL (never document-linked by design, decision #12). */
-const DOCUMENT_LINKED_SOURCE_TYPES = new Set(["CHALLAN", "BILTY", "BILL", "PRIVATE_PHONCH", "PHONCH"]);
-
-/** Maps an AllocationTargetType to the LITERAL JournalLine.sourceType
- * tag its own document-linked lines actually carry - these are NOT
- * always the same string (BILTY_PAID's own lines are still tagged
- * sourceType="BILTY"; PHONCH_RECOVERY's are tagged "PHONCH", not
- * "PHONCH_RECOVERY"; PRIVATE_PHONCH_PAYABLE/RECOVERY's are tagged
- * "PRIVATE_PHONCH") - a classifier that assumes identity between the
- * two silently fails to recognize a document's own lines as
- * explained (confirmed bug: MRK Faisalabad's PHONCH-tagged lines). */
-function sourceTypeTagForTarget(targetSourceType: string): string | null {
-  switch (targetSourceType) {
-    case "BILTY":
-    case "BILTY_PAID":
-      return "BILTY";
-    case "BILL":
-      return "BILL";
-    case "CHALLAN":
-      return "CHALLAN";
-    case "PRIVATE_PHONCH_PAYABLE":
-    case "PRIVATE_PHONCH_RECOVERY":
-      return "PRIVATE_PHONCH";
-    case "PHONCH_RECOVERY":
-      return "PHONCH";
-    default:
-      return null; // OPENING_BALANCE - no sourceType tag at all.
-  }
-}
-
-interface LedgerLineClassification {
-  id: string;
-  debit: number;
-  credit: number;
-  sourceType: string | null;
-  sourceId: string | null;
-  entryId: string;
-  entryDate: Date;
-  referenceType: string | null;
-  referenceId: string | null;
-}
-
-interface ReconciliationResult {
-  expectedSignedNet: number;
-  adjustedActualSignedNet: number;
-  diff: number;
-  isMatch: boolean;
-  unexplainedLines: LedgerLineClassification[];
-}
-
-async function checkPartyReconciliation(
-  accountId: string,
-  directionReports: { direction: AllocationDirection; preview: PartyFifoReport }[]
-): Promise<ReconciliationResult> {
-  const previewByDirection = new Map(directionReports.map((r) => [r.direction, r.preview]));
-
-  const lhsByDirection = new Map<AllocationDirection, number>();
-  const resolvedDocumentKeys = new Set<string>();
-  const fifoPaymentLineIds = new Set<string>();
-
-  for (const direction of ["RECEIVABLE", "PAYABLE"] as const) {
-    // ALWAYS fetch this direction's FULL (unfiltered) document list,
-    // regardless of whether there happens to be any FIFO-eligible
-    // payment to plan against - a document can be tagged-received
-    // (existingReceivedOrPaid, or getPrivatePhonchPartyBalances's own
-    // settledAmount) with no OTHER FIFO-eligible payment on the
-    // account at all (confirmed: Khalid Goods has a CHALLAN- and a
-    // PRIVATE_PHONCH-tagged receipt/payment but ZERO eligible PAYABLE
-    // payments, so previewFifoForParty(..., "PAYABLE") returns null -
-    // the document itself, and its own tagged lines, still need to be
-    // recognized here independently of that).
-    const documents = await getPartyDocumentStates(prisma, accountId, direction, { onlyWithRemainingBalance: false });
-    for (const doc of documents) {
-      const tag = sourceTypeTagForTarget(doc.targetSourceType);
-      if (!tag) continue; // OPENING_BALANCE has no sourceType tag to match against.
-      const rawId = doc.targetSourceType === "PRIVATE_PHONCH_PAYABLE" || doc.targetSourceType === "PRIVATE_PHONCH_RECOVERY"
-        ? doc.targetSourceId.split(":")[0]
-        : doc.targetSourceId;
-      resolvedDocumentKeys.add(`${tag}:${rawId}`);
-    }
-
-    const preview = previewByDirection.get(direction);
-    if (preview && !preview.noFifoDocuments) {
-      const allocatedByDoc = new Map<string, number>();
-      for (const item of preview.plan) {
-        const key = `${item.targetSourceType}:${item.targetSourceId}`;
-        allocatedByDoc.set(key, round2((allocatedByDoc.get(key) || 0) + item.amount));
-        fifoPaymentLineIds.add(item.journalLineId);
-      }
-      const totalDocsRemainingAfterPlan = documents.reduce((s, doc) => {
-        const allocated = allocatedByDoc.get(`${doc.targetSourceType}:${doc.targetSourceId}`) || 0;
-        return s + Math.max(0, round2(doc.remainingAllocatable - allocated));
-      }, 0);
-      lhsByDirection.set(direction, round2(totalDocsRemainingAfterPlan - preview.advanceLeft));
-    } else {
-      // No eligible payments at all for this direction (or none of
-      // the documents have remaining capacity) - nothing new to
-      // allocate, so lhs is simply every document's own current
-      // remaining amount.
-      lhsByDirection.set(direction, round2(documents.reduce((s, doc) => s + doc.remainingAllocatable, 0)));
-    }
-
-    // EVERY FIFO-eligible payment line for this direction, not just
-    // the ones THIS fresh plan has something left to allocate - a
-    // line already fully consumed by a PRIOR real allocation (the 17
-    // pre-existing PaymentAllocation rows on this production copy,
-    // for instance) has remainingAmount=0 and so never appears in
-    // `preview.plan` at all, but its own JournalLine is still real,
-    // still FIFO-eligible, and still explains the ledger.
-    const eligiblePayments = await listEligibleFifoPayments(prisma, accountId, direction);
-    for (const p of eligiblePayments) fifoPaymentLineIds.add(p.journalLineId);
-  }
-
-  const expectedSignedNet = round2((lhsByDirection.get("RECEIVABLE") || 0) - (lhsByDirection.get("PAYABLE") || 0));
-
-  const openingEquityAccount = await prisma.account.findFirst({ where: { accountCode: "OPENING-BALANCE" }, select: { id: true } });
-
-  const lines = await prisma.journalLine.findMany({
-    where: { accountId, journalEntry: { isDeleted: false } },
-    select: {
-      id: true,
-      debit: true,
-      credit: true,
-      sourceType: true,
-      sourceId: true,
-      journalEntry: { select: { id: true, entryDate: true, referenceType: true, referenceId: true, lines: { select: { accountId: true } } } },
-    },
-    orderBy: { journalEntry: { entryDate: "asc" } },
-  });
-
-  let trueSignedNet = 0;
-  let adjustmentNet = 0;
-  const unexplainedLines: LedgerLineClassification[] = [];
-
-  for (const line of lines) {
-    const debit = Number(line.debit);
-    const credit = Number(line.credit);
-    trueSignedNet += debit - credit;
-
-    const isOfficiallyTaggedOpening = line.journalEntry.referenceType === "OPENING_BALANCE";
-    // Mirrors lib/payment-allocation.ts's isGenuineOpeningEquityContraPair: only a
-    // genuine, unambiguous 2-line party-vs-Opening-Balance-Equity JE counts - never a
-    // bundled multi-line entry that merely happens to also contain an unrelated
-    // Opening-Balance-Equity line for a different party/purpose in the same submission.
-    const hasOpeningEquityContra =
-      openingEquityAccount != null &&
-      line.journalEntry.lines.length === 2 &&
-      line.journalEntry.lines.some((l) => l.accountId === openingEquityAccount.id);
-    if (isOfficiallyTaggedOpening || hasOpeningEquityContra) continue; // bucket 1 - captured via lhs's own OPENING_BALANCE document.
-
-    if (fifoPaymentLineIds.has(line.id)) continue; // bucket 2 - captured via lhs's own advance/allocated math.
-
-    if (line.sourceType && line.sourceId && resolvedDocumentKeys.has(`${line.sourceType}:${line.sourceId}`)) continue; // bucket 3.
-
-    const isDocumentLinkedButUnresolved = line.sourceType != null && DOCUMENT_LINKED_SOURCE_TYPES.has(line.sourceType);
-    const isSettlementPaymentCorrection = line.sourceType === "SETTLEMENT_PAYMENT";
-    const isManualJournal = line.journalEntry.referenceType === "MANUAL_JOURNAL";
-    // Own-Carrier trip fuel/other-expense postings (lib/carrier-trip.ts) - a party-account
-    // charge unrelated to any Bilty/Challan/Phonch/Bill document and never FIFO-eligible
-    // (not a Daily Posting payment), the exact "non-FIFO line like fuel/expense" case.
-    const isCarrierTripExpense =
-      line.journalEntry.referenceType === "CARRIER_TRIP_LINE" || line.journalEntry.referenceType === "CARRIER_TRIP_LINE_REVERSAL";
-    if (isDocumentLinkedButUnresolved || isSettlementPaymentCorrection || isManualJournal || isCarrierTripExpense) {
-      adjustmentNet += debit - credit; // bucket 4 - explained by a different, protected mechanism.
-      continue;
-    }
-
-    unexplainedLines.push({
-      id: line.id,
-      debit,
-      credit,
-      sourceType: line.sourceType,
-      sourceId: line.sourceId,
-      entryId: line.journalEntry.id,
-      entryDate: line.journalEntry.entryDate,
-      referenceType: line.journalEntry.referenceType,
-      referenceId: line.journalEntry.referenceId,
-    }); // bucket 5 - genuinely unexplained.
-  }
-
-  const adjustedActualSignedNet = round2(trueSignedNet - adjustmentNet);
-  const diff = round2(expectedSignedNet - adjustedActualSignedNet);
-
-  return { expectedSignedNet, adjustedActualSignedNet, diff, isMatch: Math.abs(diff) <= 0.01, unexplainedLines };
-}
+// checkPartyReconciliation itself now lives in lib/party-payment-fifo.ts,
+// shared with rerunFifoForParty's own live reconciliation warning and
+// scripts/report-document-ledger-drift.ts - see its own doc comment
+// there for the full reconciliation design (why it is ONE combined
+// check per party across both directions, and the 5-bucket line
+// classification).
 
 function round2(value: number): number {
   return Math.round(value * 100) / 100;
@@ -674,6 +381,7 @@ async function runFifoPass(actorId: string | null) {
   let mismatchCount = 0;
   let okCount = 0;
   let invariantViolationCount = 0;
+  const skippedParties: { partyName: string; diff: number }[] = [];
 
   for (const party of parties) {
     if (!party.account) continue;
@@ -691,7 +399,7 @@ async function runFifoPass(actorId: string | null) {
     // and was misread as belonging to "Zafar Niazi Cargo Karachi" -
     // the previous party that DID have a header - even though that
     // party's own isolated --verbose run correctly showed nothing).
-    const directionReports: { direction: AllocationDirection; preview: PartyFifoReport }[] = [];
+    const directionReports: { direction: AllocationDirection; preview: PartyFifoPreview }[] = [];
     for (const direction of ["RECEIVABLE", "PAYABLE"] as const) {
       const preview = await previewFifoForParty(party.account.id, direction);
       if (!preview) continue;
@@ -729,10 +437,6 @@ async function runFifoPass(actorId: string | null) {
           );
         }
       }
-
-      if (apply && actorId && !preview.noFifoDocuments) {
-        await prisma.$transaction((tx) => rerunFifoForParty(tx, party.account!.id, direction, actorId));
-      }
     }
 
     // ONE combined reconciliation per party (both directions together)
@@ -747,9 +451,15 @@ async function runFifoPass(actorId: string | null) {
     // reported as out of scope elsewhere ("N/A - no FIFO documents"
     // or no header at all) and checking it here would just manufacture
     // noise from activity this feature was never meant to explain.
+    //
+    // Computed BEFORE the apply step below (not after) so --skip-mismatch
+    // can gate on it - reconciliation is inherently a per-PARTY (both
+    // directions combined) verdict, never per-direction, so a MISMATCH
+    // skips applying BOTH of this party's directions, not just one.
     const nonSkippedReports = directionReports.filter((r) => !r.preview.noFifoDocuments);
+    let reconciliation: ReconciliationResult | null = null;
     if (openingBreakdown || nonSkippedReports.length > 0) {
-      const reconciliation = await checkPartyReconciliation(party.account.id, nonSkippedReports);
+      reconciliation = await checkPartyReconciliation(prisma, party.account.id, nonSkippedReports);
       if (reconciliation.isMatch) {
         okCount++;
         console.log(`  reconciliation: OK (expected ${reconciliation.expectedSignedNet} vs adjusted actual ${reconciliation.adjustedActualSignedNet})`);
@@ -765,12 +475,31 @@ async function runFifoPass(actorId: string | null) {
       }
     }
 
+    const skipThisParty = skipMismatch && reconciliation != null && !reconciliation.isMatch;
+    if (skipThisParty) {
+      skippedParties.push({ partyName: party.partyName, diff: reconciliation!.diff });
+      console.log(`  --skip-mismatch: NOT applying either direction for this party (reconciliation MISMATCH).`);
+    } else if (apply && actorId) {
+      for (const { direction, preview } of directionReports) {
+        if (!preview.noFifoDocuments) {
+          await prisma.$transaction((tx) => rerunFifoForParty(tx, party.account!.id, direction, actorId));
+        }
+      }
+    }
+
     if (verbose) {
       await runVerboseDiagnostic({ id: party.id, partyName: party.partyName, account: party.account });
     }
   }
 
   console.log(`\n=== RECONCILIATION TOTALS: ${okCount} OK, ${mismatchCount} MISMATCH, ${invariantViolationCount} invariant violation(s) ===`);
+
+  if (skipMismatch) {
+    console.log(`\n=== --skip-mismatch: ${skippedParties.length} part${skippedParties.length === 1 ? "y" : "ies"} skipped (reconciliation MISMATCH, not applied) ===`);
+    for (const s of skippedParties) {
+      console.log(`  - ${s.partyName} (diff=${s.diff})`);
+    }
+  }
 }
 
 async function main() {
