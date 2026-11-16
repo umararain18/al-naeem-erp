@@ -5,6 +5,7 @@ import { DocumentSearchSelect } from "./DocumentSearchSelect";
 import { SearchableSelect, sourceOptions } from "./SearchableSelect";
 import { toBusinessDateInputValue } from "@/lib/date-range";
 import { getSavedListFilters, saveListFilters, useListScrollRestore } from "@/components/useListScrollRestore";
+import AllocationPanel from "@/app/parties/[id]/ledger/AllocationPanel";
 
 // No "open record + highlight on return" wiring here - unlike every
 // other list page, Daily Posting has no outbound navigation of its
@@ -302,6 +303,11 @@ type ExistingCounterLine = {
   // Engine Oil Stock lines only - see PostingLine.liters's own comment.
   liters: number | null;
   ratePerLiter: number | null;
+  // Opens the Allocation picker only for an untagged PARTY-category
+  // line (the FIFO-eligible shape) - counterPartyId is null for a
+  // non-Party account.
+  counterAccountCategory: string;
+  counterPartyId: string | null;
 };
 
 // ONE row = ONE Daily Posting JournalEntry (one logical transaction),
@@ -403,6 +409,8 @@ function buildExistingRow(entry: ExistingJournalEntry): ExistingRow {
     sourceNumber: l.sourceNumber || "",
     liters: l.liters != null ? Number(l.liters) : null,
     ratePerLiter: l.ratePerLiter != null ? Number(l.ratePerLiter) : null,
+    counterAccountCategory: l.account.category,
+    counterPartyId: l.account.party?.id ?? null,
   }));
 
   return {
@@ -798,6 +806,7 @@ export default function DailyPostingPage() {
   const [drafts, setDrafts] = useState<Map<string, ExistingDraft>>(new Map());
   const [savingDay, setSavingDay] = useState(false);
   const [dayError, setDayError] = useState("");
+  const [allocationTarget, setAllocationTarget] = useState<{ partyId: string; journalLineId: string } | null>(null);
 
   async function loadAccounts() {
     try {
@@ -1882,6 +1891,7 @@ export default function DailyPostingPage() {
                             <th className="px-4 py-2">Description</th>
                             <th className="px-4 py-2 text-right">Debit</th>
                             <th className="px-4 py-2 text-right">Credit</th>
+                            {!isEditing && <th className="px-4 py-2">Allocation</th>}
                             {isEditing && <th className="px-4 py-2">Action</th>}
                           </tr>
                         </thead>
@@ -1915,7 +1925,7 @@ export default function DailyPostingPage() {
                             ))
                           ) : row.counterLines.length === 0 ? (
                             <tr>
-                              <td colSpan={6} className="px-4 py-4 text-center text-xs text-gray-500">
+                              <td colSpan={7} className="px-4 py-4 text-center text-xs text-gray-500">
                                 No counter lines left on this transaction.
                               </td>
                             </tr>
@@ -1928,6 +1938,17 @@ export default function DailyPostingPage() {
                                 <td className="px-4 py-3 text-gray-600">{cl.description || "—"}</td>
                                 <td className="px-4 py-3 text-right text-gray-900">{cl.debit > 0 ? `Rs. ${formatMoney(cl.debit)}` : "—"}</td>
                                 <td className="px-4 py-3 text-right text-gray-900">{cl.credit > 0 ? `Rs. ${formatMoney(cl.credit)}` : "—"}</td>
+                                <td className="px-4 py-3">
+                                  {cl.counterAccountCategory === "PARTY" && cl.counterPartyId && (
+                                    <button
+                                      type="button"
+                                      onClick={() => setAllocationTarget({ partyId: cl.counterPartyId!, journalLineId: cl.id })}
+                                      className="rounded-lg border border-blue-200 px-2 py-1 text-xs text-blue-600 hover:bg-blue-50"
+                                    >
+                                      Allocation
+                                    </button>
+                                  )}
+                                </td>
                               </tr>
                             ))
                           )}
@@ -2030,6 +2051,16 @@ export default function DailyPostingPage() {
             </div>
           </div>
         </div>
+      )}
+
+      {allocationTarget && (
+        <AllocationPanel
+          partyId={allocationTarget.partyId}
+          journalLineId={allocationTarget.journalLineId}
+          lang="en"
+          onClose={() => setAllocationTarget(null)}
+          onChanged={() => void loadExisting(postingDate)}
+        />
       )}
     </div>
   );

@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { formatBusinessDate } from "@/lib/date-range";
 import { useReturnToSuffix, withReturnTo } from "@/components/useListScrollRestore";
+import AllocationPanel from "@/app/parties/[id]/ledger/AllocationPanel";
 
 type Account = {
   id: string;
@@ -11,6 +12,7 @@ type Account = {
   accountCode: string | null;
   accountType: string;
   category: string;
+  party?: { id: string; partyName: string } | null;
 };
 
 type JournalLine = {
@@ -52,30 +54,33 @@ export default function AccountingTransactionDetailPage({
   const [entry, setEntry] = useState<JournalEntry | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [allocationTarget, setAllocationTarget] = useState<{ partyId: string; journalLineId: string } | null>(null);
+
+  async function load() {
+    try {
+      setError("");
+      const { id } = await params;
+      const response = await fetch(`/api/accounting-transactions/${id}`);
+      const data = await response.json();
+      if (!response.ok || !data.success) {
+        setError(
+          response.status === 404
+            ? "Source record is no longer available."
+            : data.message || "Unable to load transaction"
+        );
+        return;
+      }
+      setEntry(data.entry);
+    } catch {
+      setError("Unable to connect to the server");
+    } finally {
+      setLoading(false);
+    }
+  }
 
   useEffect(() => {
-    async function load() {
-      try {
-        setError("");
-        const { id } = await params;
-        const response = await fetch(`/api/accounting-transactions/${id}`);
-        const data = await response.json();
-        if (!response.ok || !data.success) {
-          setError(
-            response.status === 404
-              ? "Source record is no longer available."
-              : data.message || "Unable to load transaction"
-          );
-          return;
-        }
-        setEntry(data.entry);
-      } catch {
-        setError("Unable to connect to the server");
-      } finally {
-        setLoading(false);
-      }
-    }
     load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [params]);
 
   function formatCurrency(value: number) {
@@ -224,6 +229,7 @@ export default function AccountingTransactionDetailPage({
                   <th className="px-4 py-3 text-right">Credit</th>
                   <th className="px-4 py-3">Description</th>
                   <th className="px-4 py-3">Source</th>
+                  <th className="px-4 py-3">Allocation</th>
                 </tr>
               </thead>
               <tbody className="divide-y">
@@ -255,6 +261,17 @@ export default function AccountingTransactionDetailPage({
                         );
                       })()}
                     </td>
+                    <td className="px-4 py-3">
+                      {line.account.category === "PARTY" && line.account.party && (
+                        <button
+                          type="button"
+                          onClick={() => setAllocationTarget({ partyId: line.account.party!.id, journalLineId: line.id })}
+                          className="rounded-lg border border-blue-200 px-2 py-1 text-xs text-blue-600 hover:bg-blue-50"
+                        >
+                          Allocation
+                        </button>
+                      )}
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -283,6 +300,16 @@ export default function AccountingTransactionDetailPage({
           </div>
         </div>
       </div>
+
+      {allocationTarget && (
+        <AllocationPanel
+          partyId={allocationTarget.partyId}
+          journalLineId={allocationTarget.journalLineId}
+          lang="en"
+          onClose={() => setAllocationTarget(null)}
+          onChanged={() => void load()}
+        />
+      )}
     </main>
   );
 }

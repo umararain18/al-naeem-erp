@@ -45,6 +45,7 @@ export async function GET(
                 accountCode: true,
                 accountType: true,
                 category: true,
+                party: { select: { id: true, partyName: true } },
               },
             },
           },

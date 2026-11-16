@@ -1,6 +1,8 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { formatBusinessDate } from "@/lib/date-range";
+import AllocationPanel from "@/app/parties/[id]/ledger/AllocationPanel";
 
 type TransactionEntry = {
   id: string;
@@ -33,6 +35,38 @@ export default function TransactionViewModal({
   entry,
   onClose,
 }: TransactionViewModalProps) {
+  const [partyLine, setPartyLine] = useState<{ partyId: string; journalLineId: string } | null>(null);
+  const [showAllocation, setShowAllocation] = useState(false);
+
+  // This row IS the Cash/Bank account's own leg of the JournalEntry -
+  // the PARTY-category line (the actual Allocation anchor) lives on a
+  // sibling line of the SAME entry, never in `entry` itself. One fetch
+  // of the full entry, same route the Journal Entry detail page already
+  // uses, to find it.
+  useEffect(() => {
+    setPartyLine(null);
+    if (!entry) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const response = await fetch(`/api/accounting-transactions/${entry.journalEntryId}`);
+        const data = await response.json();
+        if (cancelled || !response.ok || !data.success) return;
+        const partyLineRaw = data.entry.lines.find(
+          (l: { account: { category: string; party?: { id: string } | null } }) => l.account.category === "PARTY" && l.account.party
+        );
+        if (partyLineRaw) {
+          setPartyLine({ partyId: partyLineRaw.account.party.id, journalLineId: partyLineRaw.id });
+        }
+      } catch {
+        // No Allocation button if this fails - never blocks viewing the transaction.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [entry]);
+
   if (!entry) {
     return null;
   }
@@ -184,7 +218,17 @@ export default function TransactionViewModal({
         </div>
 
         {/* Footer */}
-        <div className="flex justify-end border-t px-6 py-4">
+        <div className="flex justify-end gap-3 border-t px-6 py-4">
+
+          {partyLine && (
+            <button
+              type="button"
+              onClick={() => setShowAllocation(true)}
+              className="rounded-lg border border-blue-200 px-5 py-2.5 text-sm font-medium text-blue-600 hover:bg-blue-50"
+            >
+              Allocation
+            </button>
+          )}
 
           <button
             type="button"
@@ -197,6 +241,16 @@ export default function TransactionViewModal({
         </div>
 
       </div>
+
+      {showAllocation && partyLine && (
+        <AllocationPanel
+          partyId={partyLine.partyId}
+          journalLineId={partyLine.journalLineId}
+          lang="en"
+          onClose={() => setShowAllocation(false)}
+          onChanged={() => setShowAllocation(false)}
+        />
+      )}
     </div>
   );
 }
