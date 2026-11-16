@@ -184,6 +184,14 @@ export async function POST(
           );
         }
 
+        // "Back to Auto" - clear any MANUAL stamp FIRST, in the same
+        // transaction: rerunFifoForParty's own candidate discovery
+        // (listEligibleFifoPayments) explicitly skips a payment still
+        // stamped allocationMode="MANUAL", so without this reset the
+        // rebuild below would silently skip the very payment this
+        // request is trying to hand back to auto-allocation.
+        await tx.journalLine.update({ where: { id: data.journalLineId }, data: { allocationMode: null } });
+
         const direction: AllocationDirection = payment.direction === "CREDIT" ? "RECEIVABLE" : "PAYABLE";
         await rerunFifoForParty(tx, payment.partyAccountId, direction, currentUser.userId);
 
