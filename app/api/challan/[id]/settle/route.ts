@@ -17,6 +17,7 @@ import {
 } from "@/lib/gross-accounts";
 import { applySettlementReassignment } from "@/lib/settlement-correction";
 import { auditSettlement, actorFromUser, requestContext } from "@/lib/audit-log";
+import { rerunFifoForChallanParties } from "@/lib/party-payment-fifo";
 
 const responsibilitySelectionSchema = z.object({
   responsibility: z.enum(["CLEARING_AGENT", "TRANSPORTER", "THIRD_PARTY"]),
@@ -498,6 +499,8 @@ export async function POST(
         ...requestContext(request),
       });
 
+      await rerunFifoForChallanParties(tx, id, currentUser.userId);
+
       return settledChallan;
     });
 
@@ -921,6 +924,8 @@ export async function PATCH(
           ...requestContext(request),
         });
       }
+
+      await rerunFifoForChallanParties(tx, challan.id, currentUser.userId);
     });
 
     return NextResponse.json({

@@ -12,6 +12,7 @@ import {
   type BillInput,
 } from "@/lib/bill-accounting";
 import { getBillIncomeAccountId, getBillWalkInReceivableAccountId } from "@/lib/gross-accounts";
+import { rerunFifoForParty } from "@/lib/party-payment-fifo";
 import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
 import { billListSearchOr } from "@/lib/search-helpers";
 
@@ -319,6 +320,14 @@ export async function POST(request: NextRequest) {
                 },
               },
             });
+
+            // BILL is always resolvable (never gated behind Settlement) -
+            // this Bill is a brand-new FIFO candidate for a real Client
+            // the instant it posts. Walk-in clients (no clientPartyId) have
+            // no Party account of their own, so there is nothing to rebuild.
+            if (clientPartyId) {
+              await rerunFifoForParty(tx, clientAccountId, "RECEIVABLE", currentUser.userId);
+            }
           }
 
           await auditCreate(tx, {

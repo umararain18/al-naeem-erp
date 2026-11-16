@@ -7,6 +7,7 @@ import { PartyType, Prisma, BiltyStatus } from "@prisma/client";
 import { getGrossBiltyReceivableAccountId, getUnearnedRevenueAccountId } from "@/lib/gross-accounts";
 import { resolveBiltyPaidResponsibleParty } from "@/lib/document-party-resolution";
 import { createSettlementPayment, SettlementPaymentError } from "@/lib/settlement-payments";
+import { rerunFifoForParty } from "@/lib/party-payment-fifo";
 import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
 import { biltyListSearchOr } from "@/lib/search-helpers";
 import { parseISODateStart } from "@/lib/date-range";
@@ -1192,6 +1193,11 @@ export async function POST(
             },
             tx
           );
+          // BILTY_PAID is newly resolvable on this party's account the
+          // moment the above PAID component exists - rebuild its FIFO
+          // allocations now rather than waiting for its own next, unrelated
+          // trigger.
+          await rerunFifoForParty(tx, paidResponsible.accountId, "RECEIVABLE", currentUser.userId);
         }
       }
 

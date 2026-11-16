@@ -18,6 +18,7 @@ import {
   getPrivatePhonchDeliveryIncomeAccountId,
 } from "@/lib/gross-accounts";
 import { getBillPaymentState, resolveBillClientAccountId } from "@/lib/bill-accounting";
+import { rerunFifoForPrivatePhonchParties } from "@/lib/party-payment-fifo";
 import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
 import { privatePhonchListSearchOr } from "@/lib/search-helpers";
 
@@ -557,6 +558,13 @@ export async function POST(request: NextRequest) {
               },
             });
           }
+
+          // PRIVATE_PHONCH_PAYABLE/RECOVERY targets are always resolvable
+          // (never Settlement-gated) - this Phonch is a brand-new FIFO
+          // candidate for its Transporter and every named Clearing Agent
+          // the instant it posts. Safe to call unconditionally even for a
+          // record-only Phonch (lines.length === 0) - a no-op there.
+          await rerunFifoForPrivatePhonchParties(tx, createdPhonch.id, currentUser.userId);
 
           await auditCreate(tx, {
             actor: actorFromUser(currentUser),
