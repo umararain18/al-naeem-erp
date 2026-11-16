@@ -54,12 +54,6 @@ export async function GET(
       return NextResponse.json({ success: false, message: "This party does not have an account yet." }, { status: 404 });
     }
 
-    // This view only ever rendered BILTY/CHALLAN rows (see DocumentRow
-    // below) - merge both directions so existing behavior is
-    // unchanged; any newer target type (BILTY_PAID/BILL/PRIVATE_PHONCH_*/
-    // OPENING_BALANCE) is simply not one of the two switch branches
-    // below and is silently skipped, exactly like an unrecognized
-    // target already was before this feature extended the type union.
     const states = [
       ...(await getPartyDocumentStates(prisma, party.account.id, "RECEIVABLE", { onlyWithRemainingBalance: onlyOutstanding })),
       ...(await getPartyDocumentStates(prisma, party.account.id, "PAYABLE", { onlyWithRemainingBalance: onlyOutstanding })),
@@ -106,7 +100,15 @@ export async function GET(
     const challanById = new Map(challans.map((c) => [c.id, c]));
 
     interface DocumentRow {
-      targetSourceType: "BILTY" | "CHALLAN";
+      targetSourceType:
+        | "BILTY"
+        | "BILTY_PAID"
+        | "BILL"
+        | "PRIVATE_PHONCH_RECOVERY"
+        | "CHALLAN"
+        | "PRIVATE_PHONCH_PAYABLE"
+        | "PHONCH_RECOVERY"
+        | "OPENING_BALANCE";
       targetSourceId: string;
       documentNo: string;
       documentDate: string;
@@ -127,7 +129,7 @@ export async function GET(
       biltyRent: number | null;
       carrierRent: number | null;
       commission: number | null;
-      billNo: null;
+      billNo: string | null;
       sequenceIndex: number;
     }
 
@@ -175,7 +177,7 @@ export async function GET(
           billNo: null,
           sequenceIndex: activeLink ? activeLink.addedAt.getTime() : 0,
         });
-      } else {
+      } else if (state.targetSourceType === "CHALLAN") {
         const challan = challanById.get(state.targetSourceId);
         if (!challan) continue;
         if (challanNoFilter && !challan.challanNo.toLowerCase().includes(challanNoFilter)) continue;
@@ -212,6 +214,45 @@ export async function GET(
           carrierRent: Number(challan.carrierRent),
           commission: null,
           billNo: null,
+          sequenceIndex: 0,
+        });
+      } else {
+        // Every other target type (BILTY_PAID/BILL/PRIVATE_PHONCH_RECOVERY/
+        // PRIVATE_PHONCH_PAYABLE/PHONCH_RECOVERY/OPENING_BALANCE) - none of
+        // these have a single Bilty/vehicle of their own, so the Bilty/
+        // Challan-specific filters above never match them, by design (same
+        // "never guess a vehicle" rule the CHALLAN branch already follows).
+        // documentNo/documentDate/totalDue/etc. all come straight from the
+        // resolver (ResolvedTarget) - no extra per-type DB join needed.
+        if (registrationFilter || chassisFilter || biltyNoFilter || challanNoFilter) continue;
+
+        const remaining = state.remainingAllocatable;
+        const status: DocumentRow["status"] =
+          remaining <= 0.009 ? "FULLY_PAID" : state.existingReceivedOrPaid > 0.009 ? "PARTIALLY_PAID" : "UNPAID";
+
+        rows.push({
+          targetSourceType: state.targetSourceType,
+          targetSourceId: state.targetSourceId,
+          documentNo: state.documentNo,
+          documentDate: state.documentDate.toISOString(),
+          totalDue: state.totalDue,
+          receivedOrPaid: state.existingReceivedOrPaid,
+          allocatedViaTable: state.allocatedViaTable,
+          remainingAllocatable: remaining,
+          status,
+          challanId: null,
+          challanNo: null,
+          biltyId: null,
+          biltyNo: null,
+          vehicleRegistrationNumber: null,
+          chassisNumber: null,
+          vehicleType: null,
+          fromLocation: null,
+          toLocation: null,
+          biltyRent: null,
+          carrierRent: null,
+          commission: null,
+          billNo: state.targetSourceType === "BILL" ? state.documentNo : null,
           sequenceIndex: 0,
         });
       }

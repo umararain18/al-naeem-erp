@@ -6,10 +6,21 @@ import { t, type Lang } from "@/lib/i18n/party-ledger";
 import { formatBusinessDate } from "@/lib/date-range";
 import { useReturnToSuffix, withReturnTo } from "@/components/useListScrollRestore";
 
+type AllocationTargetType =
+  | "BILTY"
+  | "BILTY_PAID"
+  | "BILL"
+  | "PRIVATE_PHONCH_RECOVERY"
+  | "CHALLAN"
+  | "PRIVATE_PHONCH_PAYABLE"
+  | "PHONCH_RECOVERY"
+  | "OPENING_BALANCE";
+
 type AllocationRow = {
   id: string;
-  targetSourceType: "BILTY" | "CHALLAN";
+  targetSourceType: AllocationTargetType;
   targetSourceId: string;
+  documentNo: string | null;
   allocatedAmount: number;
   createdAt: string;
 };
@@ -23,7 +34,7 @@ type PaymentState = {
 };
 
 type OutstandingDocument = {
-  targetSourceType: "BILTY" | "CHALLAN";
+  targetSourceType: AllocationTargetType;
   targetSourceId: string;
   documentNo: string;
   documentDate: string;
@@ -231,9 +242,35 @@ export default function AllocationPanel({
     }
   }
 
-  function targetHref(row: { targetSourceType: string; targetSourceId: string }) {
-    const base = row.targetSourceType === "BILTY" ? `/bilty/${row.targetSourceId}` : `/challan/${row.targetSourceId}`;
-    return withReturnTo(base, returnToSuffix);
+  /** Returns null for a target type with no detail page of its own
+   * (OPENING_BALANCE - targetSourceId is the party's own id, not a
+   * document) - the caller renders plain text instead of a link then. */
+  function targetHref(row: { targetSourceType: AllocationTargetType; targetSourceId: string }): string | null {
+    switch (row.targetSourceType) {
+      case "BILTY":
+      case "BILTY_PAID":
+        return withReturnTo(`/bilty/${row.targetSourceId}`, returnToSuffix);
+      case "CHALLAN":
+        return withReturnTo(`/challan/${row.targetSourceId}`, returnToSuffix);
+      case "BILL":
+        return withReturnTo(`/bill/${row.targetSourceId}`, returnToSuffix);
+      case "PHONCH_RECOVERY":
+        return withReturnTo(`/phonch/${row.targetSourceId}`, returnToSuffix);
+      case "PRIVATE_PHONCH_RECOVERY":
+      case "PRIVATE_PHONCH_PAYABLE": {
+        // Composite id ("<phonchId>:<accountId>") - the detail page only
+        // ever needs the Phonch's own id.
+        const phonchId = row.targetSourceId.split(":")[0];
+        return withReturnTo(`/private-phonch/${phonchId}`, returnToSuffix);
+      }
+      case "OPENING_BALANCE":
+        return null;
+    }
+  }
+
+  function targetLabel(row: { targetSourceType: AllocationTargetType; targetSourceId: string; documentNo?: string | null }): string {
+    if (row.documentNo) return row.documentNo;
+    return `${row.targetSourceType} ${row.targetSourceId}`;
   }
 
   return (
@@ -281,11 +318,17 @@ export default function AllocationPanel({
               <div className="mb-6">
                 <h3 className="text-sm font-medium mb-2">{t("allocatedTo", lang)}</h3>
                 <div className="space-y-1">
-                  {state.allocations.map((row) => (
+                  {state.allocations.map((row) => {
+                    const href = targetHref(row);
+                    return (
                     <div key={row.id} className="flex items-center justify-between text-sm border-b py-1.5 gap-3">
-                      <Link href={targetHref(row)} className="text-blue-600 hover:underline">
-                        {row.targetSourceType} {row.targetSourceId}
-                      </Link>
+                      {href ? (
+                        <Link href={href} className="text-blue-600 hover:underline">
+                          {targetLabel(row)}
+                        </Link>
+                      ) : (
+                        <span>{targetLabel(row)}</span>
+                      )}
 
                       {editingId === row.id ? (
                         <div className="flex items-center gap-2">
@@ -341,7 +384,8 @@ export default function AllocationPanel({
                         </div>
                       )}
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             )}

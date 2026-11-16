@@ -66,6 +66,10 @@ type Bilty = {
   agentDescription: string | null;
   notes: string | null;
   status: BiltyStatus;
+  /** Paid/advance collection status (lib/bilty-paid-verification.ts,
+   * batched server-side) - null when there is no advance to collect
+   * at all (nothing to show a chip for). */
+  paidStatus: "UNPAID" | "PARTIALLY_PAID" | "FULLY_PAID" | null;
 };
 
 type SearchOption = {
@@ -1393,6 +1397,19 @@ export default function BiltyPage() {
                         <td className="py-3 pr-4 text-right">
                           <div>Rs. {Number(bilty.advance || 0).toLocaleString()} Paid</div>
                           <div className="text-xs text-gray-500">Rs. {Number(bilty.toPay || 0).toLocaleString()} To Pay</div>
+                          {bilty.paidStatus && (
+                            <div
+                              className={`text-xs mt-0.5 ${
+                                bilty.paidStatus === "FULLY_PAID"
+                                  ? "text-green-600"
+                                  : bilty.paidStatus === "PARTIALLY_PAID"
+                                    ? "text-yellow-600"
+                                    : "text-red-600"
+                              }`}
+                            >
+                              {bilty.paidStatus === "FULLY_PAID" ? "Paid" : bilty.paidStatus === "PARTIALLY_PAID" ? "Partial" : "Unpaid"}
+                            </div>
+                          )}
                         </td>
 
                         <td className="py-3 pr-4">

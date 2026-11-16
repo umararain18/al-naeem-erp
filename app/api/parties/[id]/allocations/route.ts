@@ -6,10 +6,12 @@ import { hasPermission } from "@/lib/permissions";
 import {
   AllocationError,
   type AllocationDirection,
+  type AllocationTargetType,
   assertPaymentBelongsToParty,
   createAllocations,
   getAllocatedAmountForPayment,
   getAllocationStatusForPayment,
+  getRemainingAllocatableAmountForDocument,
   getUnallocatedAmountForPayment,
   isEligibleForAllocation,
 } from "@/lib/payment-allocation";
@@ -70,6 +72,36 @@ export async function GET(
       },
     });
 
+    // Resolved fresh per row for a friendly document number (never
+    // stored) - a document can become unresolvable after the fact
+    // (deleted, zeroed, reassigned via Settlement), in which case this
+    // falls back to null and the UI shows the raw type/id instead of
+    // guessing.
+    const allocations = await Promise.all(
+      rows.map(async (r) => {
+        let documentNo: string | null = null;
+        try {
+          const target = await getRemainingAllocatableAmountForDocument(
+            prisma,
+            r.targetSourceType as AllocationTargetType,
+            r.targetSourceId
+          );
+          documentNo = target.documentNo;
+        } catch {
+          // Document no longer resolvable - leave documentNo null.
+        }
+        return {
+          id: r.id,
+          targetSourceType: r.targetSourceType,
+          targetSourceId: r.targetSourceId,
+          documentNo,
+          allocatedAmount: Number(r.allocatedAmount),
+          createdAt: r.createdAt,
+          createdById: r.createdById,
+        };
+      })
+    );
+
     return NextResponse.json({
       success: true,
       payment: {
@@ -82,14 +114,7 @@ export async function GET(
       allocated,
       unallocated,
       status,
-      allocations: rows.map((r) => ({
-        id: r.id,
-        targetSourceType: r.targetSourceType,
-        targetSourceId: r.targetSourceId,
-        allocatedAmount: Number(r.allocatedAmount),
-        createdAt: r.createdAt,
-        createdById: r.createdById,
-      })),
+      allocations,
     });
   } catch (error) {
     if (error instanceof AllocationError) {

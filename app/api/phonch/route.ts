@@ -86,6 +86,24 @@ export async function GET(request: NextRequest) {
       receivedByKey.set(key, prev + Number(line.credit) - Number(line.debit));
     }
 
+    // PHONCH_RECOVERY's own FIFO-table allocations (an auto- or manually-
+    // allocated lumpsum party payment, untagged by design - see
+    // lib/payment-allocation.ts's own AllocationTargetType) never show up
+    // in the tagged-line scan above, which would otherwise make this
+    // list's Received/Remaining/status go stale the moment a payment was
+    // allocated to this Phonch via FIFO rather than a direct tagged
+    // Daily Posting. One batched sum, same shape as the tagged-line scan.
+    const allocationRows = phonchIds.length
+      ? await prisma.paymentAllocation.findMany({
+          where: { targetSourceType: "PHONCH_RECOVERY", targetSourceId: { in: phonchIds } },
+          select: { targetSourceId: true, allocatedAmount: true },
+        })
+      : [];
+    const allocatedByPhonchId = new Map<string, number>();
+    for (const row of allocationRows) {
+      allocatedByPhonchId.set(row.targetSourceId, (allocatedByPhonchId.get(row.targetSourceId) || 0) + Number(row.allocatedAmount));
+    }
+
     const items = phonches.map((p) => {
       const totalDeliveryCharges = p.vehicles.reduce((s, v) => s + Number(v.deliveryCharges), 0);
       const totalOtherExpense = p.vehicles.reduce((s, v) => s + Number(v.otherExpenseAmount), 0);
@@ -93,7 +111,8 @@ export async function GET(request: NextRequest) {
       const totalAmount = totalDeliveryCharges + totalOtherExpense + totalClaim;
       const transporterAccountId = p.transporterParty.account?.id;
       const receivedRaw = transporterAccountId ? receivedByKey.get(`${p.id}:${transporterAccountId}`) || 0 : 0;
-      const receivedAmount = Math.max(0, Math.round(receivedRaw * 100) / 100);
+      const allocatedViaTable = allocatedByPhonchId.get(p.id) || 0;
+      const receivedAmount = Math.max(0, Math.round((receivedRaw + allocatedViaTable) * 100) / 100);
       const remainingDue = Math.max(0, Math.round((totalAmount - receivedAmount) * 100) / 100);
 
       // Compact per-vehicle Bill reference for the List (Section 20) -

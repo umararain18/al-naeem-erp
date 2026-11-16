@@ -6,6 +6,7 @@ import { hasPermission } from "@/lib/permissions";
 import { PartyType, Prisma, BiltyStatus } from "@prisma/client";
 import { getGrossBiltyReceivableAccountId, getUnearnedRevenueAccountId } from "@/lib/gross-accounts";
 import { resolveBiltyPaidResponsibleParty } from "@/lib/document-party-resolution";
+import { getBiltyPaidVerificationBatch } from "@/lib/bilty-paid-verification";
 import { createSettlementPayment, SettlementPaymentError } from "@/lib/settlement-payments";
 import { rerunFifoForParty } from "@/lib/party-payment-fifo";
 import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
@@ -355,9 +356,26 @@ export async function GET(request: NextRequest) {
         prisma.bilty.count({ where }),
       ]);
 
+    // Paid/advance verification status - one batched query set for the
+    // whole page (lib/bilty-paid-verification.ts's own doc comment on
+    // why this must never be looped per-row) rather than N+1 per Bilty.
+    const paidVerificationById = await getBiltyPaidVerificationBatch(prisma, bilties.map((b) => b.id));
+    const biltiesWithPaidStatus = bilties.map((bilty) => {
+      const verification = paidVerificationById.get(bilty.id);
+      const paidStatus: "UNPAID" | "PARTIALLY_PAID" | "FULLY_PAID" | null =
+        !verification || verification.paidAmount <= 0.009
+          ? null
+          : verification.unverifiedAmount <= 0.009
+            ? "FULLY_PAID"
+            : verification.verifiedReceivedAmount > 0.009
+              ? "PARTIALLY_PAID"
+              : "UNPAID";
+      return { ...bilty, paidStatus };
+    });
+
     return NextResponse.json({
       success: true,
-      bilties,
+      bilties: biltiesWithPaidStatus,
       pagination: {
         page,
         pageSize,
