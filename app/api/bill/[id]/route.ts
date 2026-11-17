@@ -16,6 +16,8 @@ import { getBillIncomeAccountId, getBillWalkInReceivableAccountId } from "@/lib/
 import { syncPrivatePhonchVehicleAmountsFromBill, PrivatePhonchValidationError } from "@/lib/private-phonch-accounting";
 import { auditUpdate, auditDelete, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 import { clearAndRerunForDocument } from "@/lib/party-payment-fifo";
+import { toLocalMobile } from "@/lib/phone";
+import { refreshMarketingContacts } from "@/lib/marketing/contact-refresh";
 
 export async function GET(
   _request: NextRequest,
@@ -398,6 +400,16 @@ export async function PATCH(
         },
         { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
       );
+
+      // MARKETING CONTACT REFRESH - post-commit, try/catch, warn-only.
+      try {
+        const touchedPhones = [toLocalMobile(current.clientPhone), toLocalMobile(resolved.clientPhone)].filter(
+          (p): p is string => p !== null
+        );
+        if (touchedPhones.length > 0) await refreshMarketingContacts(prisma, { phones: touchedPhones });
+      } catch (marketingError) {
+        console.warn("[Marketing] refresh failed for bill", id, marketingError);
+      }
 
       return NextResponse.json({ success: true, message: "Bill updated successfully." });
     } catch (error) {

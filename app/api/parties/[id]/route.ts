@@ -5,6 +5,8 @@ import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { BalanceType, PartyType } from "@prisma/client";
 import { auditUpdate, auditDelete, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
+import { toLocalMobile } from "@/lib/phone";
+import { refreshMarketingContacts } from "@/lib/marketing/contact-refresh";
 
 const updatePartySchema = z.object({
   partyName: z.string().min(2).optional(),
@@ -440,6 +442,19 @@ export async function PATCH(
         return party;
       }
     );
+
+    // MARKETING CONTACT REFRESH - post-commit, try/catch, warn-only.
+    try {
+      const touchedPhones = [
+        toLocalMobile(existingParty.phone),
+        toLocalMobile(existingParty.whatsapp),
+        toLocalMobile(updatedParty.phone),
+        toLocalMobile(updatedParty.whatsapp),
+      ].filter((p): p is string => p !== null);
+      if (touchedPhones.length > 0) await refreshMarketingContacts(prisma, { phones: touchedPhones });
+    } catch (marketingError) {
+      console.warn("[Marketing] refresh failed for party", id, marketingError);
+    }
 
     return NextResponse.json({
       success: true,

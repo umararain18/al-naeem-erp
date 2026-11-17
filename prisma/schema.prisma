@@ -56,6 +56,12 @@ model User {
   createdCarrierTripLines      CarrierTripLine[]     @relation("CarrierTripLineCreatedBy")
   deletedCarrierTripLines      CarrierTripLine[]     @relation("CarrierTripLineDeletedBy")
   updatedNotebooks             Notebook[]            @relation("NotebookUpdatedBy")
+
+  optedOutMarketingContacts    MarketingContact[]      @relation("MarketingContactOptOutBy")
+  updatedMarketingSettings     MarketingSettings[]     @relation("MarketingSettingsUpdatedBy")
+  createdMarketingSavedSegments MarketingSavedSegment[] @relation("MarketingSavedSegmentCreatedBy")
+  createdMarketingCampaigns    MarketingCampaign[]     @relation("MarketingCampaignCreatedBy")
+  createdMarketingLeads        MarketingLead[]         @relation("MarketingLeadCreatedBy")
 }
 
 model Party {
@@ -91,6 +97,8 @@ model Party {
   carrierTripVendorLines   CarrierTripLine[] @relation("CarrierTripLineVendor")
   carrierTripPumpLines     CarrierTripLine[] @relation("CarrierTripLinePump")
   ownCarrierDefaultPumpFor OwnCarrier[]      @relation("OwnCarrierDefaultPump")
+
+  linkedMarketingContacts MarketingContact[]
 }
 
 // ============================================================
@@ -1912,4 +1920,231 @@ model NotebookVehicle {
   note          String?
 
   @@index([notebookId])
+}
+
+// ============================================================
+// MARKETING / LEAD GENERATION MODULE
+//
+// Fully additive module: a Contact's own derived fields (role, revenue,
+// bilty count, etc.) are mined read-only from Bilty/Bill/Party - this
+// module never writes back to or alters any of those existing models.
+// Contact aggregates are ALWAYS fully recomputed from source documents
+// (never incrementally patched) by the single lib/marketing/contact-
+// refresh.ts rebuild - same "one shared rebuild, full recompute every
+// time" philosophy lib/party-payment-fifo.ts already established - but
+// unlike that module's PaymentAllocation rows, a MarketingContact row is
+// NEVER deleted by any rebuild (MarketingCampaignRecipient/MarketingLead
+// cascade from it, and deleting would silently wipe campaign/lead
+// history) - a phone with no remaining source document is kept with
+// `sourceless: true` instead. See lib/marketing/contact-refresh.ts.
+// ============================================================
+
+enum MarketingContactRole {
+  SENDER
+  RECEIVER
+  BILL_CLIENT
+  PARTY
+}
+
+model MarketingContact {
+  id    String @id @default(cuid())
+  phone String @unique // canonical 03XXXXXXXXX key - see lib/phone.ts's toLocalMobile()
+  name  String // latest known name across every source document
+
+  roles   MarketingContactRole[] // a phone can hold several roles at once
+  aliases String[]               @default([]) // every other distinct name seen for this phone
+
+  city  String? // latest, role-dependent (sender's own fromLocation / receiver's own toLocation of the latest matching Bilty)
+  route String? // latest "<from> -> <to>"
+
+  firstDate DateTime
+  lastDate  DateTime
+
+  biltyCount Int     @default(0) // Bilty rows only, per spec
+  revenue    Decimal @default(0) @db.Decimal(15, 2) // Bilty.total + Bill item totals, each document counted once
+
+  lastVehicle String?
+
+  linkedPartyId String?
+  linkedParty   Party?  @relation(fields: [linkedPartyId], references: [id], onDelete: SetNull)
+
+  isBroker     Boolean @default(false)
+  brokerReason String? // "MANY_NAMES" | "CLEARING_AGENT_MATCH"
+
+  optedOut     Boolean   @default(false)
+  optOutReason String?
+  optOutAt     DateTime?
+  optOutById   String?
+  optOutBy     User?     @relation("MarketingContactOptOutBy", fields: [optOutById], references: [id], onDelete: SetNull)
+
+  // Manual merge: this phone is the SAME real contact as mergedIntoId -
+  // its own documents still roll up into the root's aggregate on the next
+  // refresh, but it is hidden from every list/segment in favor of the
+  // root. "Unmerge" clears this back to null.
+  mergedIntoId String?
+  mergedInto   MarketingContact?  @relation("MarketingContactMerge", fields: [mergedIntoId], references: [id], onDelete: SetNull)
+  mergedFrom   MarketingContact[] @relation("MarketingContactMerge")
+
+  // true once a refresh finds NO source document left for this phone at
+  // all (e.g. its only Bilty was later binned/deleted) - the row is KEPT
+  // (never deleted, see module doc comment above), just excluded from
+  // every segment until a document reappears.
+  sourceless Boolean @default(false)
+
+  campaignRecipients MarketingCampaignRecipient[]
+  leads              MarketingLead[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isBroker])
+  @@index([optedOut])
+  @@index([lastDate])
+  @@index([mergedIntoId])
+  @@index([linkedPartyId])
+  @@index([sourceless])
+}
+
+// Singleton settings row, same race-safe pattern as BusinessSettings
+// (lib/business-settings.ts) - segment day-thresholds and campaign
+// defaults, read via lib/marketing/settings.ts's getMarketingSettings().
+model MarketingSettings {
+  id        String @id @default(cuid())
+  singleton String @unique @default("SINGLETON")
+
+  activeDays           Int @default(30)
+  sleepingMinDays      Int @default(60)
+  sleepingMaxDays      Int @default(180)
+  lostDays             Int @default(180)
+  vipPercentile        Int @default(20)
+  defaultDailyLimit    Int @default(50)
+  conversionWindowDays Int @default(30)
+
+  updatedAt   DateTime @updatedAt
+  updatedById String?
+  updatedBy   User?    @relation("MarketingSettingsUpdatedBy", fields: [updatedById], references: [id], onDelete: SetNull)
+}
+
+// A named, reusable custom filter ("custom saved filters" per spec) - see
+// lib/marketing/segments.ts's SavedSegmentFilter type for filterJson's shape.
+model MarketingSavedSegment {
+  id         String @id @default(cuid())
+  name       String
+  filterJson Json
+
+  createdById String?
+  createdBy   User?    @relation("MarketingSavedSegmentCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt   DateTime @default(now())
+}
+
+enum MarketingSegmentType {
+  ACTIVE
+  SLEEPING
+  LOST
+  ONE_TIME
+  VIP
+  ROUTE
+  BROKER
+  PARTY
+  SAVED
+  ALL
+}
+
+model MarketingCampaign {
+  id           String  @id @default(cuid())
+  name         String
+  templateText String // {name} {city} {vehicle} {lastDate} {role} {direction}
+  dailyLimit   Int     @default(50)
+
+  segmentType   MarketingSegmentType
+  segmentParams Json? // {fromLocationId,toLocationId} for ROUTE, {savedSegmentId} for SAVED
+
+  isActive Boolean @default(true) // simple archive flag - this module does not integrate with the existing Bin system
+
+  createdById String?
+  createdBy   User?    @relation("MarketingCampaignCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt   DateTime @default(now())
+
+  recipients MarketingCampaignRecipient[]
+  leads      MarketingLead[]
+
+  @@index([isActive])
+}
+
+enum MarketingRecipientStatus {
+  QUEUED
+  SENT
+  REPLIED
+  LEAD
+  NOT_INTERESTED
+  OPTED_OUT
+}
+
+// Recipients are resolved ONCE at campaign-create time (see
+// lib/marketing/campaign.ts's resolveSegmentContactIds) and never
+// re-resolved - the unique constraint below is what makes "one message
+// per contact per campaign" a real guarantee, not just a convention.
+model MarketingCampaignRecipient {
+  id         String           @id @default(cuid())
+  campaignId String
+  campaign   MarketingCampaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  contactId  String
+  contact    MarketingContact  @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  status          MarketingRecipientStatus @default(QUEUED)
+  sentAt          DateTime?
+  statusUpdatedAt DateTime?
+
+  leadId String?        @unique
+  lead   MarketingLead? @relation(fields: [leadId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+
+  @@unique([campaignId, contactId])
+  @@index([campaignId, status])
+}
+
+enum MarketingLeadStage {
+  NEW
+  CONTACTED
+  QUOTED
+  BOOKED
+  LOST
+}
+
+enum MarketingLeadSource {
+  CAMPAIGN
+  WEBSITE
+  REFERRAL
+  CALL
+}
+
+model MarketingLead {
+  id        String              @id @default(cuid())
+  contactId String
+  contact   MarketingContact    @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  stage     MarketingLeadStage  @default(NEW)
+  source    MarketingLeadSource
+
+  campaignId String?
+  campaign   MarketingCampaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+
+  followUpDate DateTime?
+  notes        String?
+
+  // Set only by lib/marketing/conversion.ts's autoConvertLeadForBilty() -
+  // never user-editable.
+  convertedBiltyId String?
+  convertedAt      DateTime?
+
+  createdById String?
+  createdBy   User?    @relation("MarketingLeadCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  recipient MarketingCampaignRecipient? // back-relation of the unique leadId FK above
+
+  @@index([stage])
+  @@index([followUpDate])
+  @@index([contactId])
 }

@@ -4,6 +4,7 @@ import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { formatBusinessDate, toBusinessDateInputValue } from "@/lib/date-range";
 import { getSavedListFilters, saveListFilters, useListScrollRestore, LIST_HIGHLIGHT_CLASS } from "@/components/useListScrollRestore";
+import { toLocalMobile } from "@/lib/phone";
 
 const BILTY_LIST_KEY = "bilty-list";
 interface BiltyListFilters {
@@ -931,11 +932,18 @@ export default function BiltyPage() {
 
                 <input
                   type="text"
-                  placeholder="Consignor Phone"
+                  placeholder="Consignor Phone (e.g. 03XXXXXXXXX)"
                   value={consignorPhone}
                   onChange={(e) => setConsignorPhone(e.target.value)}
+                  required={!editingBilty}
                   className="w-full border rounded-lg px-4 py-3 mt-2"
                 />
+                {!editingBilty && consignorPhone.trim() !== "" && toLocalMobile(consignorPhone) === null && (
+                  <p className="text-xs text-red-600 mt-1">Enter a valid mobile number (e.g. 03XXXXXXXXX)</p>
+                )}
+                {editingBilty && toLocalMobile(consignorPhone) === null && (
+                  <p className="text-xs text-amber-600 mt-1">⚠ Sender mobile missing</p>
+                )}
               </div>
 
               <div>

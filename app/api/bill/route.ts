@@ -15,6 +15,8 @@ import { getBillIncomeAccountId, getBillWalkInReceivableAccountId } from "@/lib/
 import { rerunFifoForParty } from "@/lib/party-payment-fifo";
 import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
 import { billListSearchOr } from "@/lib/search-helpers";
+import { toLocalMobile } from "@/lib/phone";
+import { refreshMarketingContacts } from "@/lib/marketing/contact-refresh";
 
 // ============================================================
 // GET /api/bill - list (search)
@@ -352,6 +354,16 @@ export async function POST(request: NextRequest) {
         },
         { isolationLevel: Prisma.TransactionIsolationLevel.Serializable }
       );
+
+      // MARKETING CONTACT REFRESH - post-commit, try/catch, warn-only
+      // (never blocks or rolls back the Bill save). See the Bilty
+      // routes' identical comment for the full reasoning.
+      try {
+        const phone = toLocalMobile(resolved.clientPhone);
+        if (phone) await refreshMarketingContacts(prisma, { phones: [phone] });
+      } catch (marketingError) {
+        console.warn("[Marketing] refresh failed for bill", bill.id, marketingError);
+      }
 
       return NextResponse.json(
         { success: true, message: "Bill created successfully.", bill: { id: bill.id, billNo: bill.billNo } },

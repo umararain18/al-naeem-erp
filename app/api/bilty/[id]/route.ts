@@ -24,6 +24,9 @@ import {
 import { auditUpdate, auditDelete, auditRestore, actorFromUser, requestContext, diffFields } from "@/lib/audit-log";
 import { parseISODateStart } from "@/lib/date-range";
 import { rerunFifoForParty, clearAndRerunForDocument } from "@/lib/party-payment-fifo";
+import { toLocalMobile } from "@/lib/phone";
+import { refreshMarketingContacts } from "@/lib/marketing/contact-refresh";
+import { autoConvertLeadForBilty } from "@/lib/marketing/conversion";
 
 const updateBiltySchema = z.object({
   biltyNo: z.string().trim().min(1, "Bilty number is required").optional(),
@@ -1362,6 +1365,30 @@ export async function PATCH(
         );
       }
       throw correctionError;
+    }
+
+    // MARKETING CONTACT REFRESH + AUTO-CONVERSION - same post-commit,
+    // try/catch, warn-only pattern as the create route (see its own
+    // comment) - never blocks or rolls back the Bilty edit.
+    try {
+      const touchedPhones = [
+        toLocalMobile(updatedBilty.consignorPhone),
+        toLocalMobile(updatedBilty.consigneePhone),
+        toLocalMobile(existingBilty.consignorPhone),
+        toLocalMobile(existingBilty.consigneePhone),
+      ].filter((p): p is string => p !== null);
+      await refreshMarketingContacts(prisma, { phones: touchedPhones });
+      const contacts = await prisma.marketingContact.findMany({
+        where: { phone: { in: touchedPhones } },
+        select: { id: true },
+      });
+      await autoConvertLeadForBilty(prisma, {
+        contactIds: contacts.map((c) => c.id),
+        biltyId: updatedBilty.id,
+        createdById: currentUser.userId,
+      });
+    } catch (marketingError) {
+      console.warn("[Marketing] refresh/conversion failed for bilty", updatedBilty.id, marketingError);
     }
 
     return NextResponse.json({

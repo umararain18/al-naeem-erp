@@ -12,6 +12,9 @@ import { rerunFifoForParty } from "@/lib/party-payment-fifo";
 import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
 import { biltyListSearchOr } from "@/lib/search-helpers";
 import { parseISODateStart } from "@/lib/date-range";
+import { toLocalMobile } from "@/lib/phone";
+import { refreshMarketingContacts } from "@/lib/marketing/contact-refresh";
+import { autoConvertLeadForBilty } from "@/lib/marketing/conversion";
 
 // Comma-separated, fully business-readable description for the Bilty
 // Commission/Referral expense JournalLine pair - stored verbatim at
@@ -63,10 +66,18 @@ const createBiltySchema = z.object({
     .trim()
     .min(1, "Consignor name is required"),
 
+  // Required (even for a walk-in with no Party selected) + must
+  // normalize to a real Pakistani mobile number - the Marketing module's
+  // Contact engine depends on a usable sender phone for every NEW Bilty.
+  // Editing an OLD Bilty that already lacks one is never blocked by this
+  // (app/api/bilty/[id]/route.ts's own schema is untouched) - the edit
+  // form shows a non-blocking warning instead. See lib/phone.ts's
+  // toLocalMobile() for the exact normalization rule.
   consignorPhone: z
     .string()
-    .optional()
-    .or(z.literal("")),
+    .trim()
+    .min(1, "Sender mobile number is required")
+    .refine((v) => toLocalMobile(v) !== null, "Enter a valid mobile number (e.g. 03XXXXXXXXX)"),
 
   // Consignee
   consigneePartyId: z
@@ -1258,6 +1269,32 @@ export async function POST(
         );
       }
       throw paidError;
+    }
+
+    // ------------------------------------------------
+    // MARKETING CONTACT REFRESH + AUTO-CONVERSION - deliberately AFTER
+    // the Bilty's own transaction has already committed, wrapped in
+    // try/catch, warn-only on failure. A Marketing-side failure must
+    // NEVER block or roll back a Bilty save - the next nightly/manual
+    // full refresh (scripts/refresh-marketing-contacts.ts /
+    // POST /api/marketing/contacts/refresh) always catches a missed one.
+    // ------------------------------------------------
+    try {
+      const touchedPhones = [toLocalMobile(data.consignorPhone), toLocalMobile(data.consigneePhone)].filter(
+        (p): p is string => p !== null
+      );
+      await refreshMarketingContacts(prisma, { phones: touchedPhones });
+      const contacts = await prisma.marketingContact.findMany({
+        where: { phone: { in: touchedPhones } },
+        select: { id: true },
+      });
+      await autoConvertLeadForBilty(prisma, {
+        contactIds: contacts.map((c) => c.id),
+        biltyId: bilty.id,
+        createdById: currentUser.userId,
+      });
+    } catch (marketingError) {
+      console.warn("[Marketing] refresh/conversion failed for bilty", bilty.id, marketingError);
     }
 
     return NextResponse.json(

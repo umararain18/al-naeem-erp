@@ -6,6 +6,8 @@ import { hasPermission } from "@/lib/permissions";
 import { BalanceType, PartyType, Prisma } from "@prisma/client";
 import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
 import { partySearchOr, extractPhoneSearchDigits, findIdsByPhoneDigits } from "@/lib/search-helpers";
+import { toLocalMobile } from "@/lib/phone";
+import { refreshMarketingContacts } from "@/lib/marketing/contact-refresh";
 
 const createPartySchema = z.object({
   partyName: z
@@ -419,6 +421,18 @@ export async function POST(
           };
         }
       );
+
+    // MARKETING CONTACT REFRESH - post-commit, try/catch, warn-only
+    // (never blocks or rolls back the Party save). Keeps linkedPartyId
+    // and the PARTY role current for any Contact sharing this phone.
+    try {
+      const touchedPhones = [toLocalMobile(transaction.party.phone), toLocalMobile(transaction.party.whatsapp)].filter(
+        (p): p is string => p !== null
+      );
+      if (touchedPhones.length > 0) await refreshMarketingContacts(prisma, { phones: touchedPhones });
+    } catch (marketingError) {
+      console.warn("[Marketing] refresh failed for party", transaction.party.id, marketingError);
+    }
 
     return NextResponse.json(
       {

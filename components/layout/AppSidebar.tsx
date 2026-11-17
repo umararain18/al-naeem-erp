@@ -29,6 +29,7 @@ import {
   History,
   Car,
   NotebookPen,
+  Megaphone,
 } from "lucide-react";
 import GlobalSearch from "@/components/layout/GlobalSearch";
 import ThemeToggle from "@/components/theme/ThemeToggle";
@@ -175,6 +176,18 @@ const navigation: { section: string; items: NavItem[] }[] = [
         icon: Briefcase,
         permission: "employees.view",
         match: (pathname) => pathname === "/employees" || pathname.startsWith("/employees/"),
+      },
+    ],
+  },
+  {
+    section: "MARKETING",
+    items: [
+      {
+        label: "Marketing",
+        href: "/marketing",
+        icon: Megaphone,
+        permission: "marketing.view",
+        match: (pathname) => pathname === "/marketing" || pathname.startsWith("/marketing/"),
       },
     ],
   },

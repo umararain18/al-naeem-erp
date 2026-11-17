@@ -72,7 +72,9 @@ export type Permission =
   | "ownCarrier.permanentlyDelete"
   | "audit.view"
   | "notebook.view"
-  | "notebook.edit";
+  | "notebook.edit"
+  | "marketing.view"
+  | "marketing.manage";
 
 const permissions: Record<AuthUser["role"], Permission[]> = {
   SUPER_ADMIN: [
@@ -163,6 +165,9 @@ const permissions: Record<AuthUser["role"], Permission[]> = {
 
     "notebook.view",
     "notebook.edit",
+
+    "marketing.view",
+    "marketing.manage",
   ],
 
   MANAGER: [
@@ -235,6 +240,9 @@ const permissions: Record<AuthUser["role"], Permission[]> = {
 
     "notebook.view",
     "notebook.edit",
+
+    "marketing.view",
+    "marketing.manage",
   ],
 
   VIEWER: [
