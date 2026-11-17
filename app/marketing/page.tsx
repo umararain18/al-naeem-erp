@@ -14,9 +14,16 @@ type CampaignStat = {
   conversionRate: number;
 };
 
+type NoPhoneProvidedStat = {
+  total: number;
+  byUser: { userId: string; userName: string; count: number }[];
+  byDate: { date: string; count: number }[];
+};
+
 type DashboardData = {
   totals: { totalContacts: number; activeLeads: number; followUpsDue: number };
   campaigns: CampaignStat[];
+  noPhoneProvided: NoPhoneProvidedStat;
 };
 
 function formatCurrency(value: number) {
@@ -119,6 +126,47 @@ export default function MarketingDashboardPage() {
                   </table>
                 </div>
               )}
+            </div>
+
+            <div className="bg-white rounded-xl shadow-sm p-6 mt-6">
+              <h2 className="text-lg font-semibold mb-1">&quot;Customer ne number nahi diya&quot;</h2>
+              <p className="text-sm text-gray-500 mb-4">Bilties saved without a sender phone, by user and by date ({data.noPhoneProvided.total} total)</p>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <div>
+                  <p className="text-xs uppercase text-gray-500 mb-2">By User</p>
+                  {data.noPhoneProvided.byUser.length === 0 ? (
+                    <p className="text-sm text-gray-400">None</p>
+                  ) : (
+                    <table className="w-full text-sm">
+                      <tbody className="divide-y">
+                        {data.noPhoneProvided.byUser.map((u) => (
+                          <tr key={u.userId}>
+                            <td className="py-1.5">{u.userName}</td>
+                            <td className="py-1.5 text-right font-medium">{u.count}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+                <div>
+                  <p className="text-xs uppercase text-gray-500 mb-2">By Date</p>
+                  {data.noPhoneProvided.byDate.length === 0 ? (
+                    <p className="text-sm text-gray-400">None</p>
+                  ) : (
+                    <table className="w-full text-sm">
+                      <tbody className="divide-y">
+                        {data.noPhoneProvided.byDate.map((d) => (
+                          <tr key={d.date}>
+                            <td className="py-1.5">{d.date}</td>
+                            <td className="py-1.5 text-right font-medium">{d.count}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  )}
+                </div>
+              </div>
             </div>
           </>
         )}

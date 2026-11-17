@@ -13,6 +13,7 @@ import { auditCreate, actorFromUser, requestContext } from "@/lib/audit-log";
 import { biltyListSearchOr } from "@/lib/search-helpers";
 import { parseISODateStart } from "@/lib/date-range";
 import { toLocalMobile } from "@/lib/phone";
+import { resolveBiltySenderPhone } from "@/lib/bilty-sender-phone";
 import { refreshMarketingContacts } from "@/lib/marketing/contact-refresh";
 import { autoConvertLeadForBilty } from "@/lib/marketing/conversion";
 
@@ -66,18 +67,27 @@ const createBiltySchema = z.object({
     .trim()
     .min(1, "Consignor name is required"),
 
-  // Required (even for a walk-in with no Party selected) + must
-  // normalize to a real Pakistani mobile number - the Marketing module's
-  // Contact engine depends on a usable sender phone for every NEW Bilty.
-  // Editing an OLD Bilty that already lacks one is never blocked by this
-  // (app/api/bilty/[id]/route.ts's own schema is untouched) - the edit
+  // Required UNLESS it can be auto-filled from a selected Party's own
+  // phone/whatsapp, or the walk-in "customer didn't give a number"
+  // checkbox (noPhoneProvided) is ticked - that fuller rule needs the
+  // Party lookup below (step 4b), so this schema only validates FORMAT
+  // when something was actually typed; presence/fallback is enforced
+  // there, not here. Editing an OLD Bilty is untouched by any of this
+  // (app/api/bilty/[id]/route.ts's own schema stays optional) - the edit
   // form shows a non-blocking warning instead. See lib/phone.ts's
   // toLocalMobile() for the exact normalization rule.
   consignorPhone: z
     .string()
-    .trim()
-    .min(1, "Sender mobile number is required")
-    .refine((v) => toLocalMobile(v) !== null, "Enter a valid mobile number (e.g. 03XXXXXXXXX)"),
+    .optional()
+    .or(z.literal("")),
+
+  // Walk-in escape hatch for step 4b above - explicit, never inferred.
+  // Stored on the Bilty itself (additive column, default false) so the
+  // Marketing dashboard can report how often it's used, by user/date.
+  noPhoneProvided: z
+    .boolean()
+    .optional()
+    .default(false),
 
   // Consignee
   consigneePartyId: z
@@ -576,6 +586,8 @@ export async function POST(
 
     let consignorPartyId:
       string | null = null;
+    let consignorPartyRecord:
+      { phone: string | null; whatsapp: string | null } | null = null;
 
     if (data.consignorPartyId) {
       const consignorParty =
@@ -609,7 +621,35 @@ export async function POST(
 
       consignorPartyId =
         consignorParty.id;
+      consignorPartyRecord =
+        consignorParty;
     }
+
+    // ------------------------------------------------
+    // 4b. RESOLVE EFFECTIVE SENDER PHONE
+    //
+    // Priority: (1) an explicitly-typed phone, validated as a real
+    // 03XXXXXXXXX mobile number - garbage here is always rejected,
+    // never silently overridden. (2) if left blank and a Party is
+    // selected, auto-fill from that Party's own phone, then whatsapp
+    // (first one that normalizes). (3) if still nothing usable, the
+    // walk-in "customer didn't give a number" escape hatch
+    // (noPhoneProvided) - explicit, stored on the Bilty itself, never
+    // inferred. Editing an existing Bilty is untouched by any of this
+    // (app/api/bilty/[id]/route.ts's own schema stays optional).
+    // ------------------------------------------------
+
+    const phoneResolution = resolveBiltySenderPhone({
+      typedPhone: data.consignorPhone || "",
+      partyPhone: consignorPartyRecord?.phone ?? null,
+      partyWhatsapp: consignorPartyRecord?.whatsapp ?? null,
+      noPhoneProvided: data.noPhoneProvided,
+    });
+    if (!phoneResolution.ok) {
+      return NextResponse.json({ success: false, message: phoneResolution.message }, { status: 400 });
+    }
+    const effectiveConsignorPhone = phoneResolution.phone;
+    const effectiveNoPhoneProvided = phoneResolution.noPhoneProvided;
 
     // ------------------------------------------------
     // 5. VALIDATE CONSIGNEE PARTY
@@ -943,8 +983,10 @@ export async function POST(
             data.consignorName,
 
           consignorPhone:
-            data.consignorPhone ||
-            null,
+            effectiveConsignorPhone,
+
+          noPhoneProvided:
+            effectiveNoPhoneProvided,
 
           consigneePartyId:
             consigneePartyId,
@@ -1280,7 +1322,7 @@ export async function POST(
     // POST /api/marketing/contacts/refresh) always catches a missed one.
     // ------------------------------------------------
     try {
-      const touchedPhones = [toLocalMobile(data.consignorPhone), toLocalMobile(data.consigneePhone)].filter(
+      const touchedPhones = [toLocalMobile(bilty.consignorPhone), toLocalMobile(bilty.consigneePhone)].filter(
         (p): p is string => p !== null
       );
       await refreshMarketingContacts(prisma, { phones: touchedPhones });

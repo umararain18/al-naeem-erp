@@ -49,10 +49,37 @@ export async function GET() {
       prisma.marketingLead.count({ where: { stage: { notIn: ["BOOKED", "LOST"] }, followUpDate: { lte: new Date() } } }),
     ]);
 
+    // "Customer ne number nahi diya" usage (Bilty create's walk-in
+    // escape hatch) - grouped in memory (small volume, same convention
+    // as lib/marketing/contact-refresh.ts's own full-table scans) rather
+    // than a raw-SQL date-trunc groupBy.
+    const noPhoneBilties = await prisma.bilty.findMany({
+      where: { isDeleted: false, noPhoneProvided: true },
+      select: { date: true, createdById: true, createdBy: { select: { fullName: true, username: true } } },
+    });
+    const byUserMap = new Map<string, { userId: string; userName: string; count: number }>();
+    const byDateMap = new Map<string, number>();
+    for (const b of noPhoneBilties) {
+      const userId = b.createdById || "unknown";
+      const userName = b.createdBy?.fullName || b.createdBy?.username || "Unknown";
+      const userEntry = byUserMap.get(userId) ?? { userId, userName, count: 0 };
+      userEntry.count += 1;
+      byUserMap.set(userId, userEntry);
+
+      const dateKey = b.date.toISOString().slice(0, 10);
+      byDateMap.set(dateKey, (byDateMap.get(dateKey) ?? 0) + 1);
+    }
+    const noPhoneProvided = {
+      total: noPhoneBilties.length,
+      byUser: [...byUserMap.values()].sort((a, b) => b.count - a.count),
+      byDate: [...byDateMap.entries()].map(([date, count]) => ({ date, count })).sort((a, b) => (a.date < b.date ? 1 : -1)),
+    };
+
     return NextResponse.json({
       success: true,
       totals: { totalContacts, activeLeads: totalLeads, followUpsDue },
       campaigns: campaignStats,
+      noPhoneProvided,
     });
   } catch (error) {
     console.error("Marketing dashboard error:", error);

@@ -272,6 +272,14 @@ model Bilty {
   consignorName    String
   consignorPhone   String?
 
+  // Walk-in escape hatch for the Bilty create form's sender-mobile
+  // requirement (app/api/bilty/route.ts's own "RESOLVE EFFECTIVE SENDER
+  // PHONE" step) - explicit, user-ticked "customer didn't give a number",
+  // never inferred from a merely-blank consignorPhone. Always false on
+  // every pre-existing row (default) and on every Bilty edited through
+  // app/api/bilty/[id]/route.ts, which never touches this column.
+  noPhoneProvided Boolean @default(false)
+
   // Consignee
   consigneePartyId String?
   consigneeParty   Party?  @relation("BiltyConsigneeParty", fields: [consigneePartyId], references: [id], onDelete: SetNull)

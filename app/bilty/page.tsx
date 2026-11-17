@@ -223,6 +223,8 @@ export default function BiltyPage() {
 
   const [consignorPhone, setConsignorPhone] = useState("");
 
+  const [noPhoneProvided, setNoPhoneProvided] = useState(false);
+
   const [consigneePartyId, setConsigneePartyId] = useState("");
 
   const [consigneeName, setConsigneeName] = useState("");
@@ -387,6 +389,7 @@ export default function BiltyPage() {
     setConsignorPartyId("");
     setConsignorName("");
     setConsignorPhone("");
+    setNoPhoneProvided(false);
     setConsigneePartyId("");
     setConsigneeName("");
     setConsigneePhone("");
@@ -604,6 +607,7 @@ export default function BiltyPage() {
           consignorPartyId: consignorPartyId || undefined,
           consignorName,
           consignorPhone: consignorPhone || undefined,
+          noPhoneProvided,
           consigneePartyId: consigneePartyId || undefined,
           consigneeName,
           consigneePhone: consigneePhone || undefined,
@@ -935,14 +939,28 @@ export default function BiltyPage() {
                   placeholder="Consignor Phone (e.g. 03XXXXXXXXX)"
                   value={consignorPhone}
                   onChange={(e) => setConsignorPhone(e.target.value)}
-                  required={!editingBilty}
-                  className="w-full border rounded-lg px-4 py-3 mt-2"
+                  required={!editingBilty && !noPhoneProvided}
+                  disabled={!editingBilty && noPhoneProvided}
+                  className="w-full border rounded-lg px-4 py-3 mt-2 disabled:bg-gray-100"
                 />
                 {!editingBilty && consignorPhone.trim() !== "" && toLocalMobile(consignorPhone) === null && (
                   <p className="text-xs text-red-600 mt-1">Enter a valid mobile number (e.g. 03XXXXXXXXX)</p>
                 )}
                 {editingBilty && toLocalMobile(consignorPhone) === null && (
                   <p className="text-xs text-amber-600 mt-1">⚠ Sender mobile missing</p>
+                )}
+                {!editingBilty && (
+                  <label className="flex items-center gap-2 mt-2 text-xs text-gray-600">
+                    <input
+                      type="checkbox"
+                      checked={noPhoneProvided}
+                      onChange={(e) => {
+                        setNoPhoneProvided(e.target.checked);
+                        if (e.target.checked) setConsignorPhone("");
+                      }}
+                    />
+                    Customer ne number nahi diya
+                  </label>
                 )}
               </div>
 
