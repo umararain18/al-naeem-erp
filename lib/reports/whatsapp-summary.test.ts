@@ -59,7 +59,7 @@ test("buildWhatsAppSummaryText - no wasooli, no alerts omits those lines cleanly
 
 test("buildWhatsAppSummaryText - only shows top 3 of a longer wasooli list", () => {
   const summary = baseSummary();
-  summary.wasooli.push({ partyId: "p4", name: "Fourth Party", phone: null, amount: 1000, days: 32 });
+  summary.wasooli!.push({ partyId: "p4", name: "Fourth Party", phone: null, amount: 1000, days: 32 });
   const text = buildWhatsAppSummaryText(summary);
   assert.doesNotMatch(text, /Fourth Party/);
 });

@@ -13,27 +13,38 @@ function formatRs(n: number): string {
   return `Rs ${Math.round(n).toLocaleString("en-US")}`;
 }
 
+/**
+ * Requires `reports.view` (profit/wasooli are null without it, see
+ * lib/reports/daily-summary-permissions.ts) - the caller (Whatsapp
+ * SummaryButton) only ever offers this when that permission is
+ * present, but this returns a plain no-access line instead of
+ * crashing if it's ever called without it.
+ */
 export function buildWhatsAppSummaryText(summary: DailySummaryResponse, businessName = "AL NAEEM CARGO"): string {
   const { today, profit, wasooli, alerts, meta } = summary;
+
+  if (!profit || !wasooli) {
+    return "Is report ke liye 'reports.view' permission chahiye.";
+  }
 
   const lines: string[] = [];
   lines.push(`*${businessName} – Aaj ki report*`);
   lines.push(meta.todayISO.split("-").reverse().join("-"));
   lines.push("");
 
-  lines.push(`Bilty: ${today.biltyCount} (${formatRs(today.biltyBookingAmount)})`);
-  lines.push(`Challan: ${today.challanCount}`);
-  lines.push(`Bill: ${today.billCount} (${formatRs(today.billAmount)})`);
-  lines.push(`Showroom Phonch: ${today.showroomPhonchVehicleCount} gaariyan`);
-  lines.push(`Private Phonch: ${today.privatePhonchVehicleCount} gaariyan`);
+  lines.push(`Bilty: ${today.biltyCount ?? "-"} (${formatRs(today.biltyBookingAmount ?? 0)})`);
+  lines.push(`Challan: ${today.challanCount ?? "-"}`);
+  lines.push(`Bill: ${today.billCount ?? "-"} (${formatRs(today.billAmount ?? 0)})`);
+  lines.push(`Showroom Phonch: ${today.showroomPhonchVehicleCount ?? "-"} gaariyan`);
+  lines.push(`Private Phonch: ${today.privatePhonchVehicleCount ?? "-"} gaariyan`);
   lines.push("");
 
-  lines.push(`Paise aaye: ${formatRs(today.cashIn)}`);
-  lines.push(`Paise gaye: ${formatRs(today.cashOut)}`);
-  for (const acc of today.cashByAccount) {
+  lines.push(`Paise aaye: ${formatRs(today.cashIn ?? 0)}`);
+  lines.push(`Paise gaye: ${formatRs(today.cashOut ?? 0)}`);
+  for (const acc of today.cashByAccount ?? []) {
     lines.push(`${acc.accountName}: ${formatRs(acc.balance)}`);
   }
-  lines.push(`*Kul cash: ${formatRs(today.totalCash)}*`);
+  lines.push(`*Kul cash: ${formatRs(today.totalCash ?? 0)}*`);
   lines.push("");
 
   lines.push(`Is period: Income ${formatRs(profit.totalIncome)} − Kharcha ${formatRs(profit.totalExpense)} = *Profit ${formatRs(profit.profit)}*`);

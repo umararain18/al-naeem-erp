@@ -8,6 +8,13 @@ export default function WhatsAppSummaryButton({ summary }: { summary: DailySumma
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
 
+  // The summary itself is financial (profit, cash, wasooli) - requires
+  // reports.view, same as the Profit/Cash/Receivable cards it reads
+  // from. Those fields are null (not just hidden) when the requesting
+  // user lacks that permission - see lib/reports/daily-summary-
+  // permissions.ts - so there is nothing to build a report from here.
+  if (summary.profit === null) return null;
+
   const text = buildWhatsAppSummaryText(summary);
   const waLink = summary.ownerWhatsapp ? buildWaMeLink(summary.ownerWhatsapp, text) : null;
 

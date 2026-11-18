@@ -20,8 +20,22 @@ function Delta({ pct }: { pct: number | null }) {
   );
 }
 
-function Tile({ label, value, sub, onClick, tone }: { label: string; value: string; sub?: string; onClick?: () => void; tone?: "in" | "out" }) {
+function NoAccessNote({ label }: { label?: string }) {
+  return (
+    <div className="text-xs text-[var(--anc-muted)] italic py-2">{label ? `${label}: ` : ""}No access - permission chahiye</div>
+  );
+}
+
+function Tile({ label, value, sub, onClick, tone, locked }: { label: string; value?: string; sub?: string; onClick?: () => void; tone?: "in" | "out"; locked?: boolean }) {
   const valueColor = tone === "in" ? "text-[var(--anc-good)]" : tone === "out" ? "text-[var(--anc-bad)]" : "text-[var(--anc-ink)]";
+  if (locked || value === undefined) {
+    return (
+      <div className="block bg-[var(--anc-soft)] rounded-lg p-3 border border-transparent opacity-70">
+        <div className="text-[11px] text-[var(--anc-muted)] font-semibold">{label}</div>
+        <div className="text-xs text-[var(--anc-muted)] italic mt-1.5">No access</div>
+      </div>
+    );
+  }
   const Comp = onClick ? "button" : "div";
   return (
     <Comp
@@ -84,7 +98,7 @@ export default function DashboardPage() {
     })();
   }, [period]);
 
-  const drilldown = useMemo(() => (summary && drilldownKey ? summary.drilldowns[drilldownKey] : null), [summary, drilldownKey]);
+  const drilldown = useMemo(() => (summary && drilldownKey ? summary.drilldowns[drilldownKey] ?? null : null), [summary, drilldownKey]);
 
   if (loading && !summary) {
     return (
@@ -104,9 +118,9 @@ export default function DashboardPage() {
 
   const { today, profit, wasooli, denaHai, operations, alerts, topCustomers, topClearingAgents, topShowroomTransporters, topChallanTransporters, routes, emptyReturnCities, ownCarriers, marketing, charts } = summary;
 
-  const maxMonthValue = Math.max(1, ...charts.incomeExpense6mo.flatMap((m) => [m.income, m.expense]));
-  const maxExpense = Math.max(1, ...charts.expenseBreakdown.map((e) => e.amount));
-  const totalAgeing = charts.receivableAgeing.reduce((s, b) => s + b.amount, 0) || 1;
+  const maxMonthValue = charts ? Math.max(1, ...charts.incomeExpense6mo.flatMap((m) => [m.income, m.expense])) : 1;
+  const maxExpense = charts ? Math.max(1, ...charts.expenseBreakdown.map((e) => e.amount)) : 1;
+  const totalAgeing = charts ? charts.receivableAgeing.reduce((s, b) => s + b.amount, 0) || 1 : 1;
   const ageingColors: Record<string, string> = { Current: "var(--anc-green-2)", "1-30 Days": "var(--anc-green-2)", "31-60 Days": "var(--anc-gold)", "61-90 Days": "var(--anc-warn)", "90+ Days": "var(--anc-crimson)" };
 
   return (
@@ -152,27 +166,31 @@ export default function DashboardPage() {
             <small className="text-[11px] font-semibold text-[var(--anc-muted)]">sirf aaj - {summary.meta.todayISO}</small>
           </h2>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-2.5">
-            <Tile label="Bilty bani" value={String(today.biltyCount)} sub={`Booking ${fmt(today.biltyBookingAmount)}`} onClick={() => setDrilldownKey("tb")} />
-            <Tile label="Challan bane" value={String(today.challanCount)} sub={`${today.challanDispatchedCount} dispatch`} onClick={() => setDrilldownKey("tc")} />
-            <Tile label="Bill bane" value={String(today.billCount)} sub={fmt(today.billAmount)} onClick={() => setDrilldownKey("tbill")} />
-            <Tile label="Showroom Phonch gaariyan" value={String(today.showroomPhonchVehicleCount)} sub={fmt(today.showroomPhonchDeliveryCharges)} onClick={() => setDrilldownKey("tsr")} />
-            <Tile label="Private Phonch gaariyan" value={String(today.privatePhonchVehicleCount)} sub={fmt(today.privatePhonchRent)} onClick={() => setDrilldownKey("tpp")} />
-            <Tile label="Paise aaye (In)" value={fmt(today.cashIn)} sub="Cash + Bank, aaj" tone="in" onClick={() => setDrilldownKey("tin")} />
-            <Tile label="Paise gaye (Out)" value={fmt(today.cashOut)} sub="Cash + Bank, aaj" tone="out" onClick={() => setDrilldownKey("tout")} />
-            <Tile label="Farq (In - Out)" value={`${today.netCash >= 0 ? "+" : ""}${fmt(today.netCash)}`} sub="aaj ka net cash" />
+            <Tile label="Bilty bani" locked={today.biltyCount === null} value={today.biltyCount !== null ? String(today.biltyCount) : undefined} sub={today.biltyBookingAmount !== null ? `Booking ${fmt(today.biltyBookingAmount)}` : undefined} onClick={today.biltyCount !== null ? () => setDrilldownKey("tb") : undefined} />
+            <Tile label="Challan bane" locked={today.challanCount === null} value={today.challanCount !== null ? String(today.challanCount) : undefined} sub={today.challanDispatchedCount !== null ? `${today.challanDispatchedCount} dispatch` : undefined} onClick={today.challanCount !== null ? () => setDrilldownKey("tc") : undefined} />
+            <Tile label="Bill bane" locked={today.billCount === null} value={today.billCount !== null ? String(today.billCount) : undefined} sub={today.billAmount !== null ? fmt(today.billAmount) : undefined} onClick={today.billCount !== null ? () => setDrilldownKey("tbill") : undefined} />
+            <Tile label="Showroom Phonch gaariyan" locked={today.showroomPhonchVehicleCount === null} value={today.showroomPhonchVehicleCount !== null ? String(today.showroomPhonchVehicleCount) : undefined} sub={today.showroomPhonchDeliveryCharges !== null ? fmt(today.showroomPhonchDeliveryCharges) : undefined} onClick={today.showroomPhonchVehicleCount !== null ? () => setDrilldownKey("tsr") : undefined} />
+            <Tile label="Private Phonch gaariyan" locked={today.privatePhonchVehicleCount === null} value={today.privatePhonchVehicleCount !== null ? String(today.privatePhonchVehicleCount) : undefined} sub={today.privatePhonchRent !== null ? fmt(today.privatePhonchRent) : undefined} onClick={today.privatePhonchVehicleCount !== null ? () => setDrilldownKey("tpp") : undefined} />
+            <Tile label="Paise aaye (In)" locked={today.cashIn === null} value={today.cashIn !== null ? fmt(today.cashIn) : undefined} sub="Cash + Bank, aaj" tone="in" onClick={today.cashIn !== null ? () => setDrilldownKey("tin") : undefined} />
+            <Tile label="Paise gaye (Out)" locked={today.cashOut === null} value={today.cashOut !== null ? fmt(today.cashOut) : undefined} sub="Cash + Bank, aaj" tone="out" onClick={today.cashOut !== null ? () => setDrilldownKey("tout") : undefined} />
+            <Tile label="Farq (In - Out)" locked={today.netCash === null} value={today.netCash !== null ? `${today.netCash >= 0 ? "+" : ""}${fmt(today.netCash)}` : undefined} sub="aaj ka net cash" />
           </div>
-          <div className="flex flex-wrap gap-2.5 mt-3">
-            {today.cashByAccount.map((acc) => (
-              <div key={acc.accountId} className="flex-1 min-w-[150px] border border-dashed border-[var(--anc-line)] rounded-lg px-3 py-2 flex justify-between items-center text-sm">
-                <span>{acc.accountName}</span>
-                <b className="anc-num">{fmt(acc.balance)}</b>
+          {today.cashByAccount === null ? (
+            <NoAccessNote label="Cash balances" />
+          ) : (
+            <div className="flex flex-wrap gap-2.5 mt-3">
+              {today.cashByAccount.map((acc) => (
+                <div key={acc.accountId} className="flex-1 min-w-[150px] border border-dashed border-[var(--anc-line)] rounded-lg px-3 py-2 flex justify-between items-center text-sm">
+                  <span>{acc.accountName}</span>
+                  <b className="anc-num">{fmt(acc.balance)}</b>
+                </div>
+              ))}
+              <div className="flex-1 min-w-[150px] rounded-lg px-3 py-2 flex justify-between items-center text-sm bg-[var(--anc-green)] text-white">
+                <span>Kul Cash + Bank</span>
+                <b className="anc-num">{today.totalCash !== null ? fmt(today.totalCash) : "—"}</b>
               </div>
-            ))}
-            <div className="flex-1 min-w-[150px] rounded-lg px-3 py-2 flex justify-between items-center text-sm bg-[var(--anc-green)] text-white">
-              <span>Kul Cash + Bank</span>
-              <b className="anc-num">{fmt(today.totalCash)}</b>
             </div>
-          </div>
+          )}
         </section>
 
         {/* 2. PROFIT */}
@@ -184,95 +202,109 @@ export default function DashboardPage() {
             </span>
             <small className="text-[11px] font-semibold text-[var(--anc-muted)]">{summary.meta.comparisonLabel ? `${summary.meta.comparisonLabel} ke muqable` : ""}</small>
           </h2>
-          <div className="grid grid-cols-1 md:grid-cols-[1fr_auto_1fr_auto_1.3fr] gap-2.5 items-center mb-3">
-            <button type="button" onClick={() => setDrilldownKey("inc")} className="text-left border border-[var(--anc-line)] rounded-lg p-3">
-              <div className="text-[11px] text-[var(--anc-muted)] font-semibold">Kul Income</div>
-              <div className="text-xl font-extrabold anc-num">{fmt(profit.totalIncome)}</div>
-              <Delta pct={profit.incomeDeltaPct} />
-            </button>
-            <span className="hidden md:block text-2xl font-extrabold text-[var(--anc-muted)] text-center">−</span>
-            <button type="button" onClick={() => setDrilldownKey("exp")} className="text-left border border-[var(--anc-line)] rounded-lg p-3">
-              <div className="text-[11px] text-[var(--anc-muted)] font-semibold">Kul Kharcha</div>
-              <div className="text-xl font-extrabold anc-num">{fmt(profit.totalExpense)}</div>
-              <Delta pct={profit.expenseDeltaPct} />
-            </button>
-            <span className="hidden md:block text-2xl font-extrabold text-[var(--anc-muted)] text-center">=</span>
-            <div className="border border-transparent rounded-lg p-3 bg-[var(--anc-good-bg)]">
-              <div className="text-[11px] text-[var(--anc-muted)] font-semibold">Profit</div>
-              <div className="text-2xl font-extrabold anc-num">{fmt(profit.profit)}</div>
-              <Delta pct={profit.profitDeltaPct} />
-            </div>
-          </div>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-2.5">
-            <div className="border border-[var(--anc-line)] rounded-lg p-3">
-              <div className="text-[11px] text-[var(--anc-muted)] font-semibold">Booking Income</div>
-              <div className="text-base font-extrabold anc-num">{fmt(profit.bookingIncome)}</div>
-            </div>
-            <div className="border border-[var(--anc-line)] rounded-lg p-3">
-              <div className="text-[11px] text-[var(--anc-muted)] font-semibold">Carrier Rent</div>
-              <div className="text-base font-extrabold anc-num">{fmt(profit.carrierRent)}</div>
-            </div>
-            <div className="border border-transparent rounded-lg p-3 bg-[var(--anc-good-bg)]">
-              <div className="text-[11px] text-[var(--anc-muted)] font-semibold">Gross Margin</div>
-              <div className="text-base font-extrabold anc-num">{fmt(profit.grossMargin)} · {profit.grossMarginPct}%</div>
-              <span className="block h-1.5 bg-[var(--anc-soft)] rounded-full mt-1.5 overflow-hidden">
-                <span className="block h-full bg-[var(--anc-green-2)]" style={{ width: `${Math.min(100, Math.max(0, profit.grossMarginPct))}%` }} />
-              </span>
-            </div>
-            <div className="border border-[var(--anc-line)] rounded-lg p-3">
-              <div className="text-[11px] text-[var(--anc-muted)] font-semibold">Doosri Income</div>
-              <div className="text-base font-extrabold anc-num">{fmt(profit.otherIncome)}</div>
-            </div>
-          </div>
+          {profit === null ? (
+            <NoAccessNote label="Profit / Income / Kharcha" />
+          ) : (
+            <>
+              <div className="grid grid-cols-1 md:grid-cols-[1fr_auto_1fr_auto_1.3fr] gap-2.5 items-center mb-3">
+                <button type="button" onClick={() => setDrilldownKey("inc")} className="text-left border border-[var(--anc-line)] rounded-lg p-3">
+                  <div className="text-[11px] text-[var(--anc-muted)] font-semibold">Kul Income</div>
+                  <div className="text-xl font-extrabold anc-num">{fmt(profit.totalIncome)}</div>
+                  <Delta pct={profit.incomeDeltaPct} />
+                </button>
+                <span className="hidden md:block text-2xl font-extrabold text-[var(--anc-muted)] text-center">−</span>
+                <button type="button" onClick={() => setDrilldownKey("exp")} className="text-left border border-[var(--anc-line)] rounded-lg p-3">
+                  <div className="text-[11px] text-[var(--anc-muted)] font-semibold">Kul Kharcha</div>
+                  <div className="text-xl font-extrabold anc-num">{fmt(profit.totalExpense)}</div>
+                  <Delta pct={profit.expenseDeltaPct} />
+                </button>
+                <span className="hidden md:block text-2xl font-extrabold text-[var(--anc-muted)] text-center">=</span>
+                <div className="border border-transparent rounded-lg p-3 bg-[var(--anc-good-bg)]">
+                  <div className="text-[11px] text-[var(--anc-muted)] font-semibold">Profit</div>
+                  <div className="text-2xl font-extrabold anc-num">{fmt(profit.profit)}</div>
+                  <Delta pct={profit.profitDeltaPct} />
+                </div>
+              </div>
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-2.5">
+                <div className="border border-[var(--anc-line)] rounded-lg p-3">
+                  <div className="text-[11px] text-[var(--anc-muted)] font-semibold">Booking Income</div>
+                  <div className="text-base font-extrabold anc-num">{fmt(profit.bookingIncome)}</div>
+                </div>
+                <div className="border border-[var(--anc-line)] rounded-lg p-3">
+                  <div className="text-[11px] text-[var(--anc-muted)] font-semibold">Carrier Rent</div>
+                  <div className="text-base font-extrabold anc-num">{fmt(profit.carrierRent)}</div>
+                </div>
+                <div className="border border-transparent rounded-lg p-3 bg-[var(--anc-good-bg)]">
+                  <div className="text-[11px] text-[var(--anc-muted)] font-semibold">Gross Margin</div>
+                  <div className="text-base font-extrabold anc-num">{fmt(profit.grossMargin)} · {profit.grossMarginPct}%</div>
+                  <span className="block h-1.5 bg-[var(--anc-soft)] rounded-full mt-1.5 overflow-hidden">
+                    <span className="block h-full bg-[var(--anc-green-2)]" style={{ width: `${Math.min(100, Math.max(0, profit.grossMarginPct))}%` }} />
+                  </span>
+                </div>
+                <div className="border border-[var(--anc-line)] rounded-lg p-3">
+                  <div className="text-[11px] text-[var(--anc-muted)] font-semibold">Doosri Income</div>
+                  <div className="text-base font-extrabold anc-num">{fmt(profit.otherIncome)}</div>
+                </div>
+              </div>
+            </>
+          )}
         </section>
 
         {/* 3. WASOOLI | DENA HAI */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-          <Card title="Wasooli karni hai" subtitle={`30 din se purana - ${fmt(summary.wasooliTotal)} kul`} onTitleClick={() => setDrilldownKey("rec")}>
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="text-left text-[10px] uppercase text-[var(--anc-muted)]">
-                  <th className="py-1">Party</th>
-                  <th className="py-1 text-right">Baaqi</th>
-                  <th className="py-1 text-right">Din</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-[var(--anc-line)]">
-                {wasooli.map((w) => (
-                  <tr key={w.partyId ?? w.name}>
-                    <td className="py-1.5">{w.partyId ? <Link href={`/parties/${w.partyId}/ledger`} className="text-[var(--anc-blue)] hover:underline">{w.name}</Link> : w.name}</td>
-                    <td className="py-1.5 text-right anc-num">{fmt(w.amount)}</td>
-                    <td className="py-1.5 text-right">
-                      <span className={`text-[11px] font-bold px-2 py-0.5 rounded-full ${w.days > 45 ? "bg-[var(--anc-bad-bg)] text-[var(--anc-bad)]" : "bg-[var(--anc-warn-bg)] text-[var(--anc-warn)]"}`}>
-                        {w.days === Infinity ? "—" : `${w.days} din`}
-                      </span>
-                    </td>
+          <Card title="Wasooli karni hai" subtitle={wasooli !== null ? `30 din se purana - ${fmt(summary.wasooliTotal!)} kul` : undefined} onTitleClick={wasooli !== null ? () => setDrilldownKey("rec") : undefined}>
+            {wasooli === null ? (
+              <NoAccessNote />
+            ) : (
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-left text-[10px] uppercase text-[var(--anc-muted)]">
+                    <th className="py-1">Party</th>
+                    <th className="py-1 text-right">Baaqi</th>
+                    <th className="py-1 text-right">Din</th>
                   </tr>
-                ))}
-                {wasooli.length === 0 && <tr><td colSpan={3} className="py-4 text-center text-[var(--anc-muted)]">Kuch baaqi nahi</td></tr>}
-              </tbody>
-            </table>
+                </thead>
+                <tbody className="divide-y divide-[var(--anc-line)]">
+                  {wasooli.map((w) => (
+                    <tr key={w.partyId ?? w.name}>
+                      <td className="py-1.5">{w.partyId ? <Link href={`/parties/${w.partyId}/ledger`} className="text-[var(--anc-blue)] hover:underline">{w.name}</Link> : w.name}</td>
+                      <td className="py-1.5 text-right anc-num">{fmt(w.amount)}</td>
+                      <td className="py-1.5 text-right">
+                        <span className={`text-[11px] font-bold px-2 py-0.5 rounded-full ${w.days > 45 ? "bg-[var(--anc-bad-bg)] text-[var(--anc-bad)]" : "bg-[var(--anc-warn-bg)] text-[var(--anc-warn)]"}`}>
+                          {w.days === Infinity ? "—" : `${w.days} din`}
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
+                  {wasooli.length === 0 && <tr><td colSpan={3} className="py-4 text-center text-[var(--anc-muted)]">Kuch baaqi nahi</td></tr>}
+                </tbody>
+              </table>
+            )}
           </Card>
-          <Card title="Dena hai" subtitle={`carriers / transporters - ${fmt(summary.denaHaiTotal)} kul`} onTitleClick={() => setDrilldownKey("pay")}>
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="text-left text-[10px] uppercase text-[var(--anc-muted)]">
-                  <th className="py-1">Party</th>
-                  <th className="py-1 text-right">Dena</th>
-                  <th className="py-1 text-right">Sab se purana</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-[var(--anc-line)]">
-                {denaHai.map((d) => (
-                  <tr key={d.partyId}>
-                    <td className="py-1.5"><Link href={`/parties/${d.partyId}/ledger`} className="text-[var(--anc-blue)] hover:underline">{d.name}</Link></td>
-                    <td className="py-1.5 text-right anc-num">{fmt(d.amount)}</td>
-                    <td className="py-1.5 text-right text-[11px] text-[var(--anc-muted)]">{d.oldestDocNo ? `${d.oldestDocNo} · ${d.oldestDocDays} din` : "—"}</td>
+          <Card title="Dena hai" subtitle={denaHai !== null ? `carriers / transporters - ${fmt(summary.denaHaiTotal!)} kul` : undefined} onTitleClick={denaHai !== null ? () => setDrilldownKey("pay") : undefined}>
+            {denaHai === null ? (
+              <NoAccessNote />
+            ) : (
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-left text-[10px] uppercase text-[var(--anc-muted)]">
+                    <th className="py-1">Party</th>
+                    <th className="py-1 text-right">Dena</th>
+                    <th className="py-1 text-right">Sab se purana</th>
                   </tr>
-                ))}
-                {denaHai.length === 0 && <tr><td colSpan={3} className="py-4 text-center text-[var(--anc-muted)]">Kuch dena nahi</td></tr>}
-              </tbody>
-            </table>
+                </thead>
+                <tbody className="divide-y divide-[var(--anc-line)]">
+                  {denaHai.map((d) => (
+                    <tr key={d.partyId}>
+                      <td className="py-1.5"><Link href={`/parties/${d.partyId}/ledger`} className="text-[var(--anc-blue)] hover:underline">{d.name}</Link></td>
+                      <td className="py-1.5 text-right anc-num">{fmt(d.amount)}</td>
+                      <td className="py-1.5 text-right text-[11px] text-[var(--anc-muted)]">{d.oldestDocNo ? `${d.oldestDocNo} · ${d.oldestDocDays} din` : "—"}</td>
+                    </tr>
+                  ))}
+                  {denaHai.length === 0 && <tr><td colSpan={3} className="py-4 text-center text-[var(--anc-muted)]">Kuch dena nahi</td></tr>}
+                </tbody>
+              </table>
+            )}
           </Card>
         </div>
 
@@ -280,21 +312,42 @@ export default function DashboardPage() {
         <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
           <Card title="Operations pipeline" subtitle="abhi ki halat">
             <div className="grid grid-cols-3 gap-2.5">
-              <div className="rounded-lg p-3 bg-[var(--anc-soft)] shadow-[inset_3px_0_0_var(--anc-warn)]">
-                <div className="text-2xl font-extrabold anc-num">{operations.notDispatchedCount}</div>
-                <div className="text-xs font-bold">Dispatch baaqi</div>
-                <div className="text-[11px] text-[var(--anc-muted)]">{operations.notDispatchedOldestDays !== null ? `oldest ${operations.notDispatchedOldestDays} din` : "—"}</div>
-              </div>
-              <div className="rounded-lg p-3 bg-[var(--anc-soft)] shadow-[inset_3px_0_0_var(--anc-blue)]">
-                <div className="text-2xl font-extrabold anc-num">{operations.inTransitCount}</div>
-                <div className="text-xs font-bold">Raaste mein</div>
-                <div className="text-[11px] text-[var(--anc-muted)]">active challan</div>
-              </div>
-              <div className="rounded-lg p-3 bg-[var(--anc-soft)] shadow-[inset_3px_0_0_var(--anc-good)]">
-                <div className="text-2xl font-extrabold anc-num">{operations.deliveredNotCollectedCount}</div>
-                <div className="text-xs font-bold">Deliver, wasooli baaqi</div>
-                <div className="text-[11px] text-[var(--anc-muted)] anc-num">{fmt(operations.deliveredNotCollectedAmount)}</div>
-              </div>
+              {operations.notDispatchedCount === null ? (
+                <div className="rounded-lg p-3 bg-[var(--anc-soft)] opacity-70">
+                  <div className="text-xs font-bold">Dispatch baaqi</div>
+                  <NoAccessNote />
+                </div>
+              ) : (
+                <div className="rounded-lg p-3 bg-[var(--anc-soft)] shadow-[inset_3px_0_0_var(--anc-warn)]">
+                  <div className="text-2xl font-extrabold anc-num">{operations.notDispatchedCount}</div>
+                  <div className="text-xs font-bold">Dispatch baaqi</div>
+                  <div className="text-[11px] text-[var(--anc-muted)]">{operations.notDispatchedOldestDays !== null ? `oldest ${operations.notDispatchedOldestDays} din` : "—"}</div>
+                </div>
+              )}
+              {operations.inTransitCount === null ? (
+                <div className="rounded-lg p-3 bg-[var(--anc-soft)] opacity-70">
+                  <div className="text-xs font-bold">Raaste mein</div>
+                  <NoAccessNote />
+                </div>
+              ) : (
+                <div className="rounded-lg p-3 bg-[var(--anc-soft)] shadow-[inset_3px_0_0_var(--anc-blue)]">
+                  <div className="text-2xl font-extrabold anc-num">{operations.inTransitCount}</div>
+                  <div className="text-xs font-bold">Raaste mein</div>
+                  <div className="text-[11px] text-[var(--anc-muted)]">active challan</div>
+                </div>
+              )}
+              {operations.deliveredNotCollectedCount === null ? (
+                <div className="rounded-lg p-3 bg-[var(--anc-soft)] opacity-70">
+                  <div className="text-xs font-bold">Deliver, wasooli baaqi</div>
+                  <NoAccessNote />
+                </div>
+              ) : (
+                <div className="rounded-lg p-3 bg-[var(--anc-soft)] shadow-[inset_3px_0_0_var(--anc-good)]">
+                  <div className="text-2xl font-extrabold anc-num">{operations.deliveredNotCollectedCount}</div>
+                  <div className="text-xs font-bold">Deliver, wasooli baaqi</div>
+                  <div className="text-[11px] text-[var(--anc-muted)] anc-num">{fmt(operations.deliveredNotCollectedAmount ?? 0)}</div>
+                </div>
+              )}
             </div>
           </Card>
           <Card title="Dhyan dein" subtitle={`${[alerts.lossChallanCount > 0, alerts.settlementPendingCount > 0, alerts.unearnedRevenueBalance > 0, alerts.fifoMismatchCount > 0, alerts.noPhoneBiltyCount > 0].filter(Boolean).length} alerts`}>
@@ -325,12 +378,16 @@ export default function DashboardPage() {
 
         {/* 5. TOP PARTIES */}
         <Card title="Top parties" subtitle="is period - sab se zyada kaam dene wale">
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-            <TopList title="Top Customers" subtitle="sab se zyada bilties banwayin" unit="bilty" rows={topCustomers} onOpen={() => setDrilldownKey("cust")} />
-            <TopList title="Top Clearing Agents" subtitle="Private Phonch par gaariyan" unit="gaari" rows={topClearingAgents} onOpen={() => setDrilldownKey("ca")} />
-            <TopList title="Top Transporters - Showroom" subtitle="Showroom Phonch par gaariyan" unit="gaari" rows={topShowroomTransporters} onOpen={() => setDrilldownKey("sr")} />
-            <TopList title="Top Transporters - Challan" subtitle="hamari gaariyan load kin" unit="challan" rows={topChallanTransporters} onOpen={() => setDrilldownKey("ch")} />
-          </div>
+          {topCustomers === null || topClearingAgents === null || topShowroomTransporters === null || topChallanTransporters === null ? (
+            <NoAccessNote label="Top parties" />
+          ) : (
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+              <TopList title="Top Customers" subtitle="sab se zyada bilties banwayin" unit="bilty" rows={topCustomers} onOpen={() => setDrilldownKey("cust")} />
+              <TopList title="Top Clearing Agents" subtitle="Private Phonch par gaariyan" unit="gaari" rows={topClearingAgents} onOpen={() => setDrilldownKey("ca")} />
+              <TopList title="Top Transporters - Showroom" subtitle="Showroom Phonch par gaariyan" unit="gaari" rows={topShowroomTransporters} onOpen={() => setDrilldownKey("sr")} />
+              <TopList title="Top Transporters - Challan" subtitle="hamari gaariyan load kin" unit="challan" rows={topChallanTransporters} onOpen={() => setDrilldownKey("ch")} />
+            </div>
+          )}
         </Card>
 
         {/* 6. ROUTES | OWN CARRIER | MARKETING */}
@@ -400,56 +457,74 @@ export default function DashboardPage() {
         {/* 7. CHARTS */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
           <Card title="Income vs Kharcha" subtitle="6 mahine">
-            <div className="flex items-end gap-3 h-40">
-              {charts.incomeExpense6mo.map((m) => (
-                <div key={m.month} className="flex-1 flex flex-col items-center gap-1">
-                  <div className="flex items-end gap-0.5 h-32 w-full justify-center">
-                    <div className="w-2.5 bg-[var(--anc-green-2)] rounded-t-sm" style={{ height: `${Math.max(2, (m.income / maxMonthValue) * 100)}%` }} title={fmt(m.income)} />
-                    <div className="w-2.5 bg-[var(--anc-gold)] rounded-t-sm" style={{ height: `${Math.max(2, (m.expense / maxMonthValue) * 100)}%` }} title={fmt(m.expense)} />
-                  </div>
-                  <span className="text-[10px] text-[var(--anc-muted)]">{m.month}</span>
+            {charts === null ? (
+              <NoAccessNote />
+            ) : (
+              <>
+                <div className="flex items-end gap-3 h-40">
+                  {charts.incomeExpense6mo.map((m) => (
+                    <div key={m.month} className="flex-1 flex flex-col items-center gap-1">
+                      <div className="flex items-end gap-0.5 h-32 w-full justify-center">
+                        <div className="w-2.5 bg-[var(--anc-green-2)] rounded-t-sm" style={{ height: `${Math.max(2, (m.income / maxMonthValue) * 100)}%` }} title={fmt(m.income)} />
+                        <div className="w-2.5 bg-[var(--anc-gold)] rounded-t-sm" style={{ height: `${Math.max(2, (m.expense / maxMonthValue) * 100)}%` }} title={fmt(m.expense)} />
+                      </div>
+                      <span className="text-[10px] text-[var(--anc-muted)]">{m.month}</span>
+                    </div>
+                  ))}
                 </div>
-              ))}
-            </div>
-            <div className="flex gap-3.5 text-xs text-[var(--anc-muted)] mt-2">
-              <span><i className="inline-block w-2.5 h-2.5 rounded-sm mr-1 bg-[var(--anc-green-2)]" />Kul Income</span>
-              <span><i className="inline-block w-2.5 h-2.5 rounded-sm mr-1 bg-[var(--anc-gold)]" />Kharcha</span>
-            </div>
+                <div className="flex gap-3.5 text-xs text-[var(--anc-muted)] mt-2">
+                  <span><i className="inline-block w-2.5 h-2.5 rounded-sm mr-1 bg-[var(--anc-green-2)]" />Kul Income</span>
+                  <span><i className="inline-block w-2.5 h-2.5 rounded-sm mr-1 bg-[var(--anc-gold)]" />Kharcha</span>
+                </div>
+              </>
+            )}
           </Card>
 
-          <Card title="Kharcha kahan gaya" subtitle={summary.meta.periodLabel} onTitleClick={() => setDrilldownKey("exp")}>
-            {charts.expenseBreakdown.map((e) => (
-              <div key={e.account} className="grid grid-cols-[110px_1fr_90px] gap-2 items-center text-xs my-1.5">
-                <span className="truncate">{e.account}</span>
-                <span className="h-2.5 bg-[var(--anc-soft)] rounded-full overflow-hidden">
-                  <span className="block h-full bg-[var(--anc-green-2)] rounded-full" style={{ width: `${Math.max(2, (e.amount / maxExpense) * 100)}%` }} />
-                </span>
-                <span className="text-right anc-num">{fmt(e.amount)}</span>
-              </div>
-            ))}
-            {charts.expenseBreakdown.length === 0 && <p className="text-sm text-[var(--anc-muted)]">Is period koi kharcha nahi</p>}
-          </Card>
-
-          <Card title="Receivable ageing" subtitle={fmt(summary.wasooliTotal)} onTitleClick={() => setDrilldownKey("rec")}>
-            <div className="flex h-5.5 rounded-md overflow-hidden my-1.5" style={{ height: "22px" }}>
-              {charts.receivableAgeing.filter((b) => b.amount > 0).map((b) => (
-                <span key={b.bucket} style={{ width: `${(b.amount / totalAgeing) * 100}%`, background: ageingColors[b.bucket] ?? "var(--anc-muted)" }} title={`${b.bucket}: ${fmt(b.amount)}`} />
-              ))}
-            </div>
-            <table className="w-full text-sm mt-2">
-              <tbody className="divide-y divide-[var(--anc-line)]">
-                {charts.receivableAgeing.map((b) => (
-                  <tr key={b.bucket}>
-                    <td className="py-1">
-                      <span className="text-[11px] font-bold px-2 py-0.5 rounded-full" style={{ background: `color-mix(in srgb, ${ageingColors[b.bucket] ?? "var(--anc-muted)"} 18%, transparent)`, color: ageingColors[b.bucket] ?? "var(--anc-muted)" }}>
-                        {b.bucket}
-                      </span>
-                    </td>
-                    <td className="py-1 text-right anc-num">{fmt(b.amount)}</td>
-                  </tr>
+          <Card title="Kharcha kahan gaya" subtitle={summary.meta.periodLabel} onTitleClick={charts !== null ? () => setDrilldownKey("exp") : undefined}>
+            {charts === null ? (
+              <NoAccessNote />
+            ) : (
+              <>
+                {charts.expenseBreakdown.map((e) => (
+                  <div key={e.account} className="grid grid-cols-[110px_1fr_90px] gap-2 items-center text-xs my-1.5">
+                    <span className="truncate">{e.account}</span>
+                    <span className="h-2.5 bg-[var(--anc-soft)] rounded-full overflow-hidden">
+                      <span className="block h-full bg-[var(--anc-green-2)] rounded-full" style={{ width: `${Math.max(2, (e.amount / maxExpense) * 100)}%` }} />
+                    </span>
+                    <span className="text-right anc-num">{fmt(e.amount)}</span>
+                  </div>
                 ))}
-              </tbody>
-            </table>
+                {charts.expenseBreakdown.length === 0 && <p className="text-sm text-[var(--anc-muted)]">Is period koi kharcha nahi</p>}
+              </>
+            )}
+          </Card>
+
+          <Card title="Receivable ageing" subtitle={summary.wasooliTotal !== null ? fmt(summary.wasooliTotal) : undefined} onTitleClick={wasooli !== null ? () => setDrilldownKey("rec") : undefined}>
+            {charts === null ? (
+              <NoAccessNote />
+            ) : (
+              <>
+                <div className="flex h-5.5 rounded-md overflow-hidden my-1.5" style={{ height: "22px" }}>
+                  {charts.receivableAgeing.filter((b) => b.amount > 0).map((b) => (
+                    <span key={b.bucket} style={{ width: `${(b.amount / totalAgeing) * 100}%`, background: ageingColors[b.bucket] ?? "var(--anc-muted)" }} title={`${b.bucket}: ${fmt(b.amount)}`} />
+                  ))}
+                </div>
+                <table className="w-full text-sm mt-2">
+                  <tbody className="divide-y divide-[var(--anc-line)]">
+                    {charts.receivableAgeing.map((b) => (
+                      <tr key={b.bucket}>
+                        <td className="py-1">
+                          <span className="text-[11px] font-bold px-2 py-0.5 rounded-full" style={{ background: `color-mix(in srgb, ${ageingColors[b.bucket] ?? "var(--anc-muted)"} 18%, transparent)`, color: ageingColors[b.bucket] ?? "var(--anc-muted)" }}>
+                            {b.bucket}
+                          </span>
+                        </td>
+                        <td className="py-1 text-right anc-num">{fmt(b.amount)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </>
+            )}
           </Card>
         </div>
       </div>

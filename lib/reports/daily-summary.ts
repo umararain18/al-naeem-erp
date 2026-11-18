@@ -8,6 +8,7 @@ import { computePartyFifoPreview, checkPartyReconciliation, type PartyFifoPrevie
 import { getBusinessSettings } from "@/lib/business-settings";
 import { resolveDateRange, safePercentChange, toISODate, type DatePreset } from "@/lib/date-range";
 import { computeRouteMargins, detectEmptyReturnCities, type RouteBiltyInput, type RouteChallanInput } from "./route-margins";
+import { applyDailySummaryPermissions, type DailySummaryPermissions } from "./daily-summary-permissions";
 
 // ============================================================
 // DAILY SUMMARY - the ONE typed read-only aggregation every Dashboard
@@ -47,6 +48,12 @@ export type DrilldownKey =
   | "cust" | "ca" | "sr" | "ch" | "rec" | "pay" | "routes" | "exp" | "inc"
   | "tb" | "tc" | "tbill" | "tsr" | "tpp" | "tin" | "tout" | "loss" | "settle";
 
+// Permission gating (see lib/reports/daily-summary-permissions.ts's own
+// doc comment): every field below that can be `null` is null ONLY
+// because the requesting user lacks the permission that guards it -
+// never a legitimate "zero" value wearing a null costume. `[]` (an
+// empty array) still means "you have access, there's just nothing to
+// show" - a genuinely different, non-sensitive state from `null`.
 export interface DailySummaryResponse {
   meta: {
     todayISO: string;
@@ -58,22 +65,29 @@ export interface DailySummaryResponse {
     generatedAt: string;
   };
   today: {
-    biltyCount: number;
-    biltyBookingAmount: number;
-    challanCount: number;
-    challanDispatchedCount: number;
-    billCount: number;
-    billAmount: number;
-    showroomPhonchVehicleCount: number;
-    showroomPhonchDeliveryCharges: number;
-    privatePhonchVehicleCount: number;
-    privatePhonchRent: number;
-    cashIn: number;
-    cashOut: number;
-    netCash: number;
-    cashByAccount: { accountId: string; accountName: string; balance: number }[];
-    totalCash: number;
+    // bilty.view
+    biltyCount: number | null;
+    biltyBookingAmount: number | null;
+    // challan.view
+    challanCount: number | null;
+    challanDispatchedCount: number | null;
+    // bill.view
+    billCount: number | null;
+    billAmount: number | null;
+    // phonch.view
+    showroomPhonchVehicleCount: number | null;
+    showroomPhonchDeliveryCharges: number | null;
+    // privatePhonch.view
+    privatePhonchVehicleCount: number | null;
+    privatePhonchRent: number | null;
+    // reports.view
+    cashIn: number | null;
+    cashOut: number | null;
+    netCash: number | null;
+    cashByAccount: { accountId: string; accountName: string; balance: number }[] | null;
+    totalCash: number | null;
   };
+  // reports.view
   profit: {
     totalIncome: number;
     totalExpense: number;
@@ -86,17 +100,20 @@ export interface DailySummaryResponse {
     grossMargin: number;
     grossMarginPct: number;
     otherIncome: number;
-  };
-  wasooli: { partyId: string | null; name: string; phone: string | null; amount: number; days: number }[];
-  wasooliTotal: number;
-  denaHai: { partyId: string; name: string; amount: number; oldestDocNo: string | null; oldestDocDays: number | null }[];
-  denaHaiTotal: number;
+  } | null;
+  // reports.view
+  wasooli: { partyId: string | null; name: string; phone: string | null; amount: number; days: number }[] | null;
+  wasooliTotal: number | null;
+  denaHai: { partyId: string; name: string; amount: number; oldestDocNo: string | null; oldestDocDays: number | null }[] | null;
+  denaHaiTotal: number | null;
   operations: {
-    notDispatchedCount: number;
+    // bilty.view
+    notDispatchedCount: number | null;
     notDispatchedOldestDays: number | null;
-    inTransitCount: number;
-    deliveredNotCollectedCount: number;
-    deliveredNotCollectedAmount: number;
+    // challan.view
+    inTransitCount: number | null;
+    deliveredNotCollectedCount: number | null;
+    deliveredNotCollectedAmount: number | null;
   };
   alerts: {
     lossChallanCount: number;
@@ -105,10 +122,11 @@ export interface DailySummaryResponse {
     fifoMismatchCount: number;
     noPhoneBiltyCount: number;
   };
-  topCustomers: { partyId: string; name: string; count: number; amount: number }[];
-  topClearingAgents: { partyId: string; name: string; count: number; amount: number }[];
-  topShowroomTransporters: { partyId: string; name: string; count: number; amount: number }[];
-  topChallanTransporters: { partyId: string; name: string; count: number; amount: number }[];
+  // reports.view (all 4 - each list shows Rs amounts, not just counts)
+  topCustomers: { partyId: string; name: string; count: number; amount: number }[] | null;
+  topClearingAgents: { partyId: string; name: string; count: number; amount: number }[] | null;
+  topShowroomTransporters: { partyId: string; name: string; count: number; amount: number }[] | null;
+  topChallanTransporters: { partyId: string; name: string; count: number; amount: number }[] | null;
   routes: ReturnType<typeof computeRouteMargins>;
   emptyReturnCities: ReturnType<typeof detectEmptyReturnCities>;
   ownCarriers: {
@@ -124,18 +142,29 @@ export interface DailySummaryResponse {
     campaignBookingsCount: number;
     campaignBookingsAmount: number;
   };
+  // reports.view
   charts: {
     incomeExpense6mo: { month: string; income: number; expense: number }[];
     expenseBreakdown: { account: string; amount: number }[];
     receivableAgeing: { bucket: string; amount: number }[];
-  };
-  drilldowns: Record<DrilldownKey, DrilldownDataset>;
+  } | null;
+  // Gated keys are simply absent (never sent to the client at all) -
+  // see lib/reports/daily-summary-permissions.ts.
+  drilldowns: Partial<Record<DrilldownKey, DrilldownDataset>>;
+  // reports.view (the WhatsApp summary itself is financial)
   ownerWhatsapp: string | null;
 }
 
 export interface GetDailySummaryParams {
   date?: string | null; // YYYY-MM-DD, defaults to server-local today - "Aaj ka khulasa" is ALWAYS this date, never period-filtered
   period?: string | null; // DatePreset for everything else (Profit, Top Parties, Routes, charts) - defaults to THIS_MONTH
+  // Required - the caller (app/api/reports/daily-summary/route.ts)
+  // must compute this from the REAL requesting user's own
+  // hasPermission() checks. Every section/field this permission set
+  // doesn't allow is nulled out (never computed-then-hidden client-
+  // side) before this function returns - see
+  // lib/reports/daily-summary-permissions.ts's own doc comment.
+  permissions: DailySummaryPermissions;
 }
 
 function startOfDay(d: Date): Date {
@@ -633,7 +662,7 @@ async function computeTodaySection(todayStart: Date, todayEnd: Date) {
   };
 }
 
-export async function getDailySummary(params: GetDailySummaryParams = {}): Promise<DailySummaryResponse> {
+export async function getDailySummary(params: GetDailySummaryParams): Promise<DailySummaryResponse> {
   const now = new Date();
   const today = params.date ? new Date(`${params.date}T00:00:00`) : startOfDay(now);
   const todayStart = startOfDay(today);
@@ -800,7 +829,7 @@ export async function getDailySummary(params: GetDailySummaryParams = {}): Promi
     },
   };
 
-  return {
+  const full: DailySummaryResponse = {
     meta: {
       todayISO: toISODate(today),
       period: range.preset,
@@ -834,4 +863,6 @@ export async function getDailySummary(params: GetDailySummaryParams = {}): Promi
     drilldowns,
     ownerWhatsapp: businessSettings.ownerWhatsapp ?? null,
   };
+
+  return applyDailySummaryPermissions(full, params.permissions);
 }
