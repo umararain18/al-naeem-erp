@@ -6,6 +6,7 @@ import { SearchableSelect, sourceOptions } from "./SearchableSelect";
 import { toBusinessDateInputValue } from "@/lib/date-range";
 import { getSavedListFilters, saveListFilters, useListScrollRestore } from "@/components/useListScrollRestore";
 import AllocationPanel from "@/app/parties/[id]/ledger/AllocationPanel";
+import { Pencil, Trash2, Link2 } from "lucide-react";
 
 // No "open record + highlight on return" wiring here - unlike every
 // other list page, Daily Posting has no outbound navigation of its
@@ -244,6 +245,7 @@ type ExistingJournalLine = {
   sourceNumber: string | null;
   liters: number | null;
   ratePerLiter: number | null;
+  createdAt: string;
 };
 
 type ExistingJournalEntry = {
@@ -273,6 +275,10 @@ const DOCUMENT_LABELS: Record<string, string> = {
 function formatDocument(sourceType: string | null): string {
   if (!sourceType || sourceType === "DIRECT") return "Direct Account";
   return DOCUMENT_LABELS[sourceType] || sourceType;
+}
+
+function formatPostedTime(iso: string): string {
+  return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
 function isCashOrBank(account: ExistingAccount): boolean {
@@ -308,6 +314,7 @@ type ExistingCounterLine = {
   // non-Party account.
   counterAccountCategory: string;
   counterPartyId: string | null;
+  createdAt: string; // this JournalLine's own posted time - "posted 10:42" display + within-block chronological sort
 };
 
 // ONE row = ONE Daily Posting JournalEntry (one logical transaction),
@@ -316,6 +323,7 @@ type ExistingCounterLine = {
 type ExistingRow = {
   journalEntryId: string;
   sortKey: number; // entryDate ms, for oldest->newest ordering
+  entryCreatedAt: number; // this JournalEntry's own createdAt (ms) - groups a Main Account's many entries on one date into one merged, chronologically-sorted block (app/daily-posting/page.tsx's own "Existing Transactions" display grouping, UI-only)
   mainAccountId: string | null; // null only for a structurally unsupported entry (see below)
   mainAccountName: string;
   mainLineId: string | null; // one of the entry's own Main Cash/Bank JournalLine ids - the Bin-eligibility lookup key
@@ -345,6 +353,7 @@ type ExistingRow = {
 // in the entry at all) still yields a degraded, Edit-disabled row.
 function buildExistingRow(entry: ExistingJournalEntry): ExistingRow {
   const sortKey = new Date(entry.entryDate).getTime();
+  const entryCreatedAt = new Date(entry.createdAt).getTime();
   // Prefer a genuine Cash/Bank line (if the entry has one) as the
   // fallback/Bin target over entry.lines[0], which could just as
   // easily be a non-Cash/Bank counter line - Bin (DELETE
@@ -366,6 +375,7 @@ function buildExistingRow(entry: ExistingJournalEntry): ExistingRow {
     return {
       journalEntryId: entry.id,
       sortKey,
+      entryCreatedAt,
       mainAccountId: null,
       mainAccountName: accountNames.join(", ") || "—",
       // A real Cash/Bank line's id, when this entry has one at all -
@@ -411,11 +421,13 @@ function buildExistingRow(entry: ExistingJournalEntry): ExistingRow {
     ratePerLiter: l.ratePerLiter != null ? Number(l.ratePerLiter) : null,
     counterAccountCategory: l.account.category,
     counterPartyId: l.account.party?.id ?? null,
+    createdAt: l.createdAt,
   }));
 
   return {
     journalEntryId: entry.id,
     sortKey,
+    entryCreatedAt,
     mainAccountId: mainAccount.id,
     mainAccountName: mainAccount.accountName,
     mainLineId: cbLines[0].id,
@@ -1507,6 +1519,56 @@ export default function DailyPostingPage() {
     [existingRows]
   );
 
+  // Display-only grouping for the selected date (the underlying
+  // JournalEntries/lines stay completely separate - see the header
+  // comment on ExistingRow/buildExistingRow above, neither of which
+  // this touches). One block per Main Account, merging every one of
+  // that account's own JournalEntries on this date into a single
+  // chronologically-sorted table; a row within a block that's
+  // currently being edited (editingIds) still edits only its OWN
+  // JournalEntry via the exact same startEdit/saveEdit/cancelEdit/
+  // addDraftLine/removeDraftLine/updateDraftLine functions as before.
+  const accountBlocks = useMemo(() => {
+    const clean = existingRows.filter((r) => r.mainAccountId !== null);
+    const byAccount = new Map<string, ExistingRow[]>();
+    for (const row of clean) {
+      const list = byAccount.get(row.mainAccountId!) ?? [];
+      list.push(row);
+      byAccount.set(row.mainAccountId!, list);
+    }
+
+    const blocks = [...byAccount.entries()].map(([mainAccountId, rows]) => {
+      const sortedRows = [...rows].sort((a, b) => a.entryCreatedAt - b.entryCreatedAt || a.journalEntryId.localeCompare(b.journalEntryId));
+      const entryGroups = sortedRows.map((row) => ({
+        row,
+        lines: [...row.counterLines].sort((a, b) => a.createdAt.localeCompare(b.createdAt)),
+      }));
+      const lineCount = rows.reduce((s, r) => s + r.counterLines.length, 0);
+      // Same source values as the (unchanged) day footer below - the
+      // Main account's own JournalLine debit/credit, gross, summed
+      // across every one of its entries on this date. Debit = In
+      // (received), Credit = Out (paid) - Cash/Bank accounts are
+      // always debit-normal, see Cash Book's own identical convention
+      // (app/api/cash-book/route.ts's "Debit = money coming in" comment).
+      const totalIn = rows.reduce((s, r) => s + r.mainDebit, 0);
+      const totalOut = rows.reduce((s, r) => s + r.mainCredit, 0);
+      return {
+        mainAccountId,
+        mainAccountName: rows[0].mainAccountName,
+        entryGroups,
+        lineCount,
+        totalIn,
+        totalOut,
+        net: totalIn - totalOut,
+      };
+    });
+
+    blocks.sort((a, b) => a.mainAccountName.localeCompare(b.mainAccountName));
+    return blocks;
+  }, [existingRows]);
+
+  const ambiguousRows = useMemo(() => existingRows.filter((r) => r.mainAccountId === null), [existingRows]);
+
   return (
     <div className="min-h-screen bg-gray-50 p-6">
       <div className="mx-auto max-w-7xl">
@@ -1775,210 +1837,224 @@ export default function DailyPostingPage() {
             <div className="px-6 py-12 text-center text-sm text-gray-500">No Daily Posting transactions for this date.</div>
           ) : (
             <div className="divide-y">
-              {[...existingRows].reverse().map((row, index) => {
-                const isEditing = editingIds.has(row.journalEntryId);
-                const draft = drafts.get(row.journalEntryId);
-                const isHighlighted = !!highlightId && row.journalEntryId === highlightId;
-                const transactionNo = existingRows.length - index;
-
-                return (
-                  <div key={row.journalEntryId} className={`px-6 py-5 ${isHighlighted ? "bg-yellow-50" : ""}`}>
-                    {/* TRANSACTION HEADER */}
-                    <div className="flex flex-wrap items-start justify-between gap-4">
-                      <div>
-                        <p className="text-xs font-semibold uppercase text-gray-500">
-                          Transaction #{transactionNo}
-                          {row.counterLines.length > 1 && (
-                            <span className="ml-2 rounded-full bg-blue-100 px-2 py-0.5 text-blue-700">
-                              {row.counterLines.length} lines
-                            </span>
-                          )}
-                        </p>
-                        <p className="text-base font-semibold text-gray-900">{row.mainAccountName}</p>
-
-                        {isEditing && draft ? (
-                          <div className="mt-2 flex items-center gap-2">
-                            <label className="text-xs font-medium text-gray-600">Date</label>
-                            <input
-                              type="date"
-                              value={draft.date}
-                              onChange={(e) => updateDraftDate(row.journalEntryId, e.target.value)}
-                              className="rounded-lg border border-gray-300 px-3 py-1.5 text-sm outline-none focus:border-blue-500"
-                            />
-                            <span className="text-xs text-gray-500">Main Account cannot be reassigned.</span>
-                          </div>
-                        ) : null}
-                      </div>
-
-                      <div className="flex items-center gap-4">
-                        <div className="text-right text-sm">
-                          <p className="text-gray-500">
-                            Debit <span className="font-semibold text-gray-900">{row.mainDebit > 0 ? `Rs. ${formatMoney(row.mainDebit)}` : "—"}</span>
-                          </p>
-                          <p className="text-gray-500">
-                            Credit <span className="font-semibold text-gray-900">{row.mainCredit > 0 ? `Rs. ${formatMoney(row.mainCredit)}` : "—"}</span>
-                          </p>
-                        </div>
-
-                        <div className="flex flex-wrap gap-2">
-                          {isEditing && draft ? (
-                            <>
-                              <button
-                                type="button"
-                                onClick={() => saveEdit(row)}
-                                disabled={draft.saving || savingDay}
-                                className="rounded-md bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
-                              >
-                                {draft.saving ? "Saving..." : "Save"}
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => cancelEdit(row.journalEntryId)}
-                                disabled={draft.saving || savingDay}
-                                className="rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-gray-50 disabled:opacity-50"
-                              >
-                                Cancel
-                              </button>
-                            </>
-                          ) : (
-                            <>
-                              {row.canEdit ? (
-                                <button
-                                  type="button"
-                                  onClick={() => startEdit(row)}
-                                  disabled={savingDay}
-                                  className="rounded-md border border-blue-200 px-3 py-1.5 text-xs font-medium text-blue-600 hover:bg-blue-50 disabled:cursor-not-allowed disabled:opacity-40"
-                                >
-                                  Edit
-                                </button>
-                              ) : row.editBlockedReason ? (
-                                <span className="px-1 py-1.5 text-xs text-gray-500" title={row.editBlockedReason}>
-                                  {row.editBlockedReason}
-                                </span>
-                              ) : null}
-                              {row.canMoveToBin ? (
-                                <button
-                                  type="button"
-                                  onClick={() => handleDeleteExisting(row)}
-                                  disabled={savingDay}
-                                  className="rounded-md border border-red-200 px-3 py-1.5 text-xs font-medium text-red-600 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-40"
-                                >
-                                  Delete
-                                </button>
-                              ) : row.binProtectedReason ? (
-                                <span className="px-1 py-1.5 text-xs text-gray-500" title={row.binProtectedReason}>
-                                  {row.binProtectedReason}
-                                </span>
-                              ) : null}
-                            </>
-                          )}
-                        </div>
-                      </div>
+              {accountBlocks.map((block) => (
+                <div key={block.mainAccountId}>
+                  {/* BLOCK HEADER - account name, date, line count, Total In/Out, Net */}
+                  <div className="flex flex-wrap items-baseline justify-between gap-3 bg-gray-50 px-4 py-2.5">
+                    <div className="flex items-baseline gap-2">
+                      <span className="text-sm font-semibold text-gray-900">{block.mainAccountName}</span>
+                      <span className="text-xs text-gray-500">{postingDate}</span>
+                      <span className="text-xs text-gray-400">· {block.lineCount} line{block.lineCount === 1 ? "" : "s"}</span>
                     </div>
+                    <div className="flex items-baseline gap-4 text-xs">
+                      <span className="text-gray-500">In <span className="font-semibold text-gray-900">Rs. {formatMoney(block.totalIn)}</span></span>
+                      <span className="text-gray-500">Out <span className="font-semibold text-gray-900">Rs. {formatMoney(block.totalOut)}</span></span>
+                      <span className="text-gray-500">Net <span className={`font-semibold ${block.net >= 0 ? "text-green-700" : "text-red-700"}`}>Rs. {formatMoney(Math.abs(block.net))}</span></span>
+                    </div>
+                  </div>
 
-                    {isEditing && draft?.error && (
-                      <p className="mt-2 text-xs text-red-600">{draft.error}</p>
-                    )}
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead className="bg-white text-left text-[11px] font-semibold uppercase text-gray-500">
+                        <tr>
+                          <th className="px-3 py-1.5">Account</th>
+                          <th className="px-3 py-1.5">Doc Type</th>
+                          <th className="px-3 py-1.5">Doc No.</th>
+                          <th className="px-3 py-1.5">Description</th>
+                          <th className="px-3 py-1.5 text-right">Received (In)</th>
+                          <th className="px-3 py-1.5 text-right">Paid (Out)</th>
+                          <th className="px-3 py-1.5">Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y">
+                        {block.entryGroups.flatMap(({ row, lines }) => {
+                          const isEditing = editingIds.has(row.journalEntryId);
+                          const draft = drafts.get(row.journalEntryId);
+                          const isHighlighted = !!highlightId && row.journalEntryId === highlightId;
+                          const rowBg = isHighlighted ? "bg-yellow-50" : "";
 
-                    {/* COUNTER LINES */}
-                    <div className="mt-4 overflow-x-auto rounded-lg border">
-                      <table className="min-w-[1100px] w-full text-sm">
-                        <thead className="bg-gray-50 text-left text-xs font-semibold uppercase text-gray-500">
-                          <tr>
-                            <th className="px-4 py-2">Counter Account</th>
-                            <th className="px-4 py-2">Document</th>
-                            <th className="px-4 py-2">Document No.</th>
-                            <th className="px-4 py-2">Description</th>
-                            <th className="px-4 py-2 text-right">Debit</th>
-                            <th className="px-4 py-2 text-right">Credit</th>
-                            {!isEditing && <th className="px-4 py-2">Allocation</th>}
-                            {isEditing && <th className="px-4 py-2">Action</th>}
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y">
-                          {isEditing && draft && draft.lines.length === 0 ? (
-                            <tr>
-                              <td colSpan={7} className="px-4 py-4 text-center text-xs text-gray-500">
-                                No lines left - Save will move this whole transaction to Bin instead.
-                              </td>
-                            </tr>
-                          ) : isEditing && draft ? (
-                            draft.lines.map((line, lineIndex) => (
-                              <tr key={line.id}>
-                                <LineFieldsCells
-                                  line={line}
-                                  accounts={accounts}
-                                  mainAccountId={row.mainAccountId || ""}
-                                  onUpdate={(field, value) => updateDraftLine(row.journalEntryId, lineIndex, field, value)}
-                                  onEligibleParties={(parties) => setDraftEligibleParties(row.journalEntryId, lineIndex, parties)}
-                                />
-                                <td className="px-4 py-4">
-                                  <button
-                                    type="button"
-                                    onClick={() => removeDraftLine(row.journalEntryId, lineIndex)}
-                                    className="rounded-lg border border-red-200 px-3 py-2 text-xs text-red-600 hover:bg-red-50"
-                                  >
-                                    Remove
-                                  </button>
+                          if (isEditing && draft) {
+                            return [
+                                <tr key={`${row.journalEntryId}-toolbar`} className={rowBg}>
+                                  <td colSpan={7} className="px-3 py-2">
+                                    <div className="flex flex-wrap items-center gap-2">
+                                      <label className="text-xs font-medium text-gray-600">Date</label>
+                                      <input
+                                        type="date"
+                                        value={draft.date}
+                                        onChange={(e) => updateDraftDate(row.journalEntryId, e.target.value)}
+                                        className="rounded-lg border border-gray-300 px-2 py-1 text-xs outline-none focus:border-blue-500"
+                                      />
+                                      <span className="text-xs text-gray-400">Main Account cannot be reassigned.</span>
+                                      <div className="ml-auto flex gap-2">
+                                        <button
+                                          type="button"
+                                          onClick={() => saveEdit(row)}
+                                          disabled={draft.saving || savingDay}
+                                          className="rounded-md bg-blue-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
+                                        >
+                                          {draft.saving ? "Saving..." : "Save"}
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => cancelEdit(row.journalEntryId)}
+                                          disabled={draft.saving || savingDay}
+                                          className="rounded-md border px-2.5 py-1 text-xs font-medium hover:bg-gray-50 disabled:opacity-50"
+                                        >
+                                          Cancel
+                                        </button>
+                                      </div>
+                                    </div>
+                                    {draft.error && <p className="mt-1 text-xs text-red-600">{draft.error}</p>}
+                                  </td>
+                                </tr>,
+                                ...(draft.lines.length === 0
+                                  ? [
+                                      <tr key={`${row.journalEntryId}-empty`} className={rowBg}>
+                                        <td colSpan={7} className="px-3 py-3 text-center text-xs text-gray-500">
+                                          No lines left - Save will move this whole transaction to Bin instead.
+                                        </td>
+                                      </tr>,
+                                    ]
+                                  : draft.lines.map((line, lineIndex) => (
+                                      <tr key={line.id} className={rowBg}>
+                                        <LineFieldsCells
+                                          line={line}
+                                          accounts={accounts}
+                                          mainAccountId={row.mainAccountId || ""}
+                                          onUpdate={(field, value) => updateDraftLine(row.journalEntryId, lineIndex, field, value)}
+                                          onEligibleParties={(parties) => setDraftEligibleParties(row.journalEntryId, lineIndex, parties)}
+                                        />
+                                        <td className="px-3 py-2">
+                                          <button
+                                            type="button"
+                                            onClick={() => removeDraftLine(row.journalEntryId, lineIndex)}
+                                            className="rounded-md border border-red-200 px-2 py-1 text-xs text-red-600 hover:bg-red-50"
+                                          >
+                                            Remove
+                                          </button>
+                                        </td>
+                                      </tr>
+                                    ))),
+                                <tr key={`${row.journalEntryId}-addline`} className={rowBg}>
+                                  <td colSpan={7} className="px-3 py-2">
+                                    <button
+                                      type="button"
+                                      onClick={() => addDraftLine(row.journalEntryId)}
+                                      className="rounded-md bg-blue-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-blue-700"
+                                    >
+                                      + Add Line
+                                    </button>
+                                  </td>
+                                </tr>,
+                            ];
+                          }
+
+                          if (lines.length === 0) {
+                            return (
+                              <tr key={row.journalEntryId} className={rowBg}>
+                                <td colSpan={7} className="px-3 py-3 text-center text-xs text-gray-500">
+                                  No counter lines left on this transaction.
                                 </td>
                               </tr>
-                            ))
-                          ) : row.counterLines.length === 0 ? (
-                            <tr>
-                              <td colSpan={7} className="px-4 py-4 text-center text-xs text-gray-500">
-                                No counter lines left on this transaction.
+                            );
+                          }
+
+                          return lines.map((cl) => (
+                            <tr key={cl.id} className={rowBg}>
+                              <td className="max-w-[160px] truncate px-3 py-2 text-gray-900" title={cl.counterLabel}>
+                                {cl.counterLabel}
+                                <span className="block text-[10px] font-normal text-gray-400">posted {formatPostedTime(cl.createdAt)}</span>
                               </td>
-                            </tr>
-                          ) : (
-                            row.counterLines.map((cl) => (
-                              <tr key={cl.id}>
-                                <td className="px-4 py-3 text-gray-900">{cl.counterLabel}</td>
-                                <td className="px-4 py-3 text-gray-900">{formatDocument(cl.sourceType)}</td>
-                                <td className="px-4 py-3 text-gray-600">{cl.sourceNumber || "—"}</td>
-                                <td className="px-4 py-3 text-gray-600">{cl.description || "—"}</td>
-                                <td className="px-4 py-3 text-right text-gray-900">{cl.debit > 0 ? `Rs. ${formatMoney(cl.debit)}` : "—"}</td>
-                                <td className="px-4 py-3 text-right text-gray-900">{cl.credit > 0 ? `Rs. ${formatMoney(cl.credit)}` : "—"}</td>
-                                <td className="px-4 py-3">
+                              <td className="px-3 py-2 text-gray-700">{formatDocument(cl.sourceType)}</td>
+                              <td className="px-3 py-2 text-gray-600">{cl.sourceNumber || "—"}</td>
+                              <td className="max-w-[220px] truncate px-3 py-2 text-gray-600" title={cl.description || undefined}>
+                                {cl.description || "—"}
+                              </td>
+                              <td className="px-3 py-2 text-right text-gray-900">{cl.credit > 0 ? `Rs. ${formatMoney(cl.credit)}` : "—"}</td>
+                              <td className="px-3 py-2 text-right text-gray-900">{cl.debit > 0 ? `Rs. ${formatMoney(cl.debit)}` : "—"}</td>
+                              <td className="px-3 py-2">
+                                <div className="flex items-center gap-1.5">
+                                  {row.canEdit ? (
+                                    <button
+                                      type="button"
+                                      onClick={() => startEdit(row)}
+                                      disabled={savingDay}
+                                      title="Edit"
+                                      className="rounded-md border border-blue-200 p-1.5 text-blue-600 hover:bg-blue-50 disabled:cursor-not-allowed disabled:opacity-40"
+                                    >
+                                      <Pencil className="h-3.5 w-3.5" />
+                                    </button>
+                                  ) : row.editBlockedReason ? (
+                                    <span className="text-gray-400" title={row.editBlockedReason}>
+                                      <Pencil className="h-3.5 w-3.5" />
+                                    </span>
+                                  ) : null}
+                                  {row.canMoveToBin ? (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleDeleteExisting(row)}
+                                      disabled={savingDay}
+                                      title="Delete"
+                                      className="rounded-md border border-red-200 p-1.5 text-red-600 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-40"
+                                    >
+                                      <Trash2 className="h-3.5 w-3.5" />
+                                    </button>
+                                  ) : row.binProtectedReason ? (
+                                    <span className="text-gray-400" title={row.binProtectedReason}>
+                                      <Trash2 className="h-3.5 w-3.5" />
+                                    </span>
+                                  ) : null}
                                   {cl.counterAccountCategory === "PARTY" && cl.counterPartyId && (
                                     <button
                                       type="button"
                                       onClick={() => setAllocationTarget({ partyId: cl.counterPartyId!, journalLineId: cl.id })}
-                                      className="rounded-lg border border-blue-200 px-2 py-1 text-xs text-blue-600 hover:bg-blue-50"
+                                      title="Allocation"
+                                      className="rounded-md border border-gray-200 p-1.5 text-gray-600 hover:bg-gray-50"
                                     >
-                                      Allocation
+                                      <Link2 className="h-3.5 w-3.5" />
                                     </button>
                                   )}
-                                </td>
-                              </tr>
-                            ))
-                          )}
-                        </tbody>
-                      </table>
+                                </div>
+                              </td>
+                            </tr>
+                          ));
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              ))}
 
-                      {isEditing && (
-                        <div className="border-t bg-gray-50 px-4 py-3">
-                          <button
-                            type="button"
-                            onClick={() => addDraftLine(row.journalEntryId)}
-                            className="rounded-lg bg-blue-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-blue-700"
-                          >
-                            + Add Line
-                          </button>
-                        </div>
+              {ambiguousRows.length > 0 && (
+                <div className="px-4 py-3">
+                  <p className="mb-2 text-xs font-semibold uppercase text-gray-500">Needs Review (Main Account not reliably identified)</p>
+                  {ambiguousRows.map((row) => (
+                    <div key={row.journalEntryId} className="mb-2 flex items-center justify-between rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs">
+                      <span>{row.mainAccountName} - {row.editBlockedReason}</span>
+                      {row.canMoveToBin && (
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteExisting(row)}
+                          title="Delete"
+                          className="rounded-md border border-red-200 p-1.5 text-red-600 hover:bg-red-50"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
                       )}
                     </div>
-                  </div>
-                );
-              })}
+                  ))}
+                </div>
+              )}
             </div>
           )}
 
           {existingRows.length > 0 && (
             <div className="border-t bg-gray-50 px-6 py-5">
               <div className="ml-auto grid max-w-md grid-cols-2 gap-3 text-sm">
-                <div className="font-medium text-gray-600">Total Debit</div>
+                <div className="font-medium text-gray-600">Received (In)</div>
                 <div className="text-right font-semibold text-gray-900">Rs. {formatMoney(existingTotals.debit)}</div>
-                <div className="font-medium text-gray-600">Total Credit</div>
+                <div className="font-medium text-gray-600">Paid (Out)</div>
                 <div className="text-right font-semibold text-gray-900">Rs. {formatMoney(existingTotals.credit)}</div>
               </div>
             </div>
