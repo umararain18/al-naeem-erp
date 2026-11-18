@@ -36,6 +36,7 @@ type BusinessSettings = {
   phone1: string | null;
   phone2: string | null;
   whatsapp: string | null;
+  ownerWhatsapp: string | null;
   email: string | null;
   website: string | null;
   address: string | null;
@@ -384,6 +385,7 @@ function BusinessDetailsSection({
     phone1: settings.phone1 || "",
     phone2: settings.phone2 || "",
     whatsapp: settings.whatsapp || "",
+    ownerWhatsapp: settings.ownerWhatsapp || "",
     email: settings.email || "",
     website: settings.website || "",
     address: settings.address || "",
@@ -429,6 +431,7 @@ function BusinessDetailsSection({
         <TextField label="Phone 1" value={form.phone1} onChange={(v) => set("phone1", v)} disabled={!editable} />
         <TextField label="Phone 2" value={form.phone2} onChange={(v) => set("phone2", v)} disabled={!editable} />
         <TextField label="WhatsApp" value={form.whatsapp} onChange={(v) => set("whatsapp", v)} disabled={!editable} />
+        <TextField label="Owner WhatsApp Number" value={form.ownerWhatsapp} onChange={(v) => set("ownerWhatsapp", v)} disabled={!editable} placeholder="For the Dashboard's WhatsApp summary button" />
         <TextField label="Email" value={form.email} onChange={(v) => set("email", v)} disabled={!editable} type="email" />
         <TextField label="Website" value={form.website} onChange={(v) => set("website", v)} disabled={!editable} placeholder="https://..." />
         <TextField label="City" value={form.city} onChange={(v) => set("city", v)} disabled={!editable} />

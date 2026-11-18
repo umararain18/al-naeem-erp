@@ -1236,6 +1236,12 @@ model BusinessSettings {
   phone1             String?
   phone2             String?
   whatsapp           String?
+  // The OWNER's own WhatsApp number (distinct from `whatsapp` above,
+  // the business's general contact number shown on documents) - the
+  // Dashboard's "WhatsApp summary" button sends the daily report
+  // HERE, via a plain wa.me link. Optional, same convention as every
+  // other contact field on this model.
+  ownerWhatsapp      String?
   email              String?
   website            String?
   address            String?

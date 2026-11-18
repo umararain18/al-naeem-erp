@@ -221,3 +221,60 @@ body,
     display: none;
   }
 }
+
+/* ============================================================
+   DASHBOARD + SIDEBAR BRAND THEME (.anc-theme) - scoped on purpose.
+   Every color/font below is a NEW custom property namespaced under
+   this one class, applied ONLY to the Sidebar's own root element and
+   the Dashboard page's own root wrapper - never on :root, so no other
+   existing page's look changes. Dark mode reuses the exact same
+   `.dark` class on <html> this app's ThemeProvider already toggles
+   (components/theme/ThemeProvider.tsx) - nested here as `.dark
+   .anc-theme`, not a new mechanism.
+   ============================================================ */
+.anc-theme {
+  --anc-green: #0b4d2c;
+  --anc-green-2: #0f6b3d;
+  --anc-crimson: #b3122e;
+  --anc-gold: #c9a227;
+  --anc-blue: #1d5fd1;
+  --anc-bg: #f4f6f3;
+  --anc-card: #ffffff;
+  --anc-ink: #16201a;
+  --anc-muted: #5e6b63;
+  --anc-line: #e2e7e3;
+  --anc-soft: #eef3ef;
+  --anc-good: #127a3e;
+  --anc-good-bg: #e3f4ea;
+  --anc-warn: #b4610a;
+  --anc-warn-bg: #fdf0df;
+  --anc-bad: #b3122e;
+  --anc-bad-bg: #fbe6ea;
+  --anc-info-bg: #e7eefb;
+  --anc-font: var(--font-manrope), "Segoe UI", system-ui, sans-serif;
+}
+
+.dark .anc-theme {
+  --anc-bg: #0e1411;
+  --anc-card: #151d19;
+  --anc-ink: #e8efea;
+  --anc-muted: #9aa8a0;
+  --anc-line: #26322b;
+  --anc-soft: #1b2520;
+  --anc-green: #0a3a22;
+  --anc-green-2: #1e8a52;
+  --anc-blue: #5b8def;
+  --anc-gold: #d9b648;
+  --anc-good: #4cc584;
+  --anc-good-bg: #16301f;
+  --anc-warn: #e9a14b;
+  --anc-warn-bg: #33261a;
+  --anc-bad: #f06a80;
+  --anc-bad-bg: #3a1a21;
+  --anc-info-bg: #1a2539;
+}
+
+.anc-theme .anc-num {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}

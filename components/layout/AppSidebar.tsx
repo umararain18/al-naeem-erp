@@ -307,28 +307,27 @@ export default function AppSidebar({ user }: { user: User | null }) {
         <Menu className="h-5 w-5" />
       </button>
 
-      {/* Sidebar - deliberately theme-INVARIANT (always this same dark
-          surface in both Light and Dark mode, by existing design - see
-          app/globals.css's dark-mode token remap doc comment for why
-          this uses a fixed arbitrary value instead of the bg-gray-900
-          utility: that utility's underlying --color-gray-900 variable
-          is what gets remapped for DARK-MODE TEXT purposes elsewhere,
-          and reusing it here would otherwise flip the sidebar itself
-          to a light color under Dark Mode. */}
+      {/* Sidebar - Pakistan-green brand theme (.anc-theme, see
+          app/globals.css) - deliberately theme-INVARIANT background
+          color choice carries over (a fixed brand green in both Light
+          and Dark mode, same rationale as the previous neutral-dark
+          design: this is the ERP's own visual identity, not a
+          content surface that should flip with the viewer's theme). */}
       <aside
         className={`
-          fixed inset-y-0 left-0 z-50 bg-[oklch(21%_0.034_264.665)] text-white transition-all duration-300 flex flex-col
+          anc-theme fixed inset-y-0 left-0 z-50 bg-[var(--anc-green)] text-white transition-all duration-300 flex flex-col
           lg:sticky lg:top-0 lg:h-screen lg:z-auto
           ${collapsed ? "w-[64px]" : "w-[240px]"}
           ${mobileOpen ? "translate-x-0" : "-translate-x-full lg:translate-x-0"}
         `}
+        style={{ fontFamily: "var(--anc-font)" }}
       >
         {/* Brand */}
-        <div className="h-14 flex items-center justify-between px-4 border-b border-gray-800 flex-shrink-0">
+        <div className="h-16 flex items-center justify-between px-3 py-2.5 border-b border-white/10 flex-shrink-0">
           {!collapsed && (
-            <div className="min-w-0">
-              <p className="text-sm font-semibold truncate">AL NAEEM</p>
-              <p className="text-[10px] text-[#94A3B8] truncate">CAR CARRIERS SERVICE</p>
+            <div className="min-w-0 bg-white rounded-xl p-1.5 flex items-center justify-center">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src="/brand/anc-logo.jpg" alt="Al Naeem Cargo Services" className="h-9 w-auto object-contain" />
             </div>
           )}
           <div className="flex items-center gap-1 flex-shrink-0">
@@ -339,7 +338,7 @@ export default function AppSidebar({ user }: { user: User | null }) {
             <button
               type="button"
               onClick={() => setCollapsed(!collapsed)}
-              className="hidden lg:flex items-center justify-center w-8 h-8 rounded-md hover:bg-gray-800 text-[#94A3B8] hover:text-white"
+              className="hidden lg:flex items-center justify-center w-8 h-8 rounded-md hover:bg-white/10 text-white/70 hover:text-white"
               aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
             >
               <ChevronLeft className={`h-4 w-4 transition-transform ${collapsed ? "rotate-180" : ""}`} />
@@ -347,7 +346,7 @@ export default function AppSidebar({ user }: { user: User | null }) {
             <button
               type="button"
               onClick={() => setMobileOpen(false)}
-              className="lg:hidden flex items-center justify-center w-8 h-8 rounded-md hover:bg-gray-800 text-[#94A3B8] hover:text-white"
+              className="lg:hidden flex items-center justify-center w-8 h-8 rounded-md hover:bg-white/10 text-white/60 hover:text-white"
               aria-label="Close menu"
             >
               <X className="h-4 w-4" />
@@ -376,7 +375,7 @@ export default function AppSidebar({ user }: { user: User | null }) {
             return (
               <div key={group.section}>
                 {!collapsed && (
-                  <p className="px-2 mb-2 text-[10px] font-medium text-[#94A3B8] uppercase tracking-wider">
+                  <p className="px-2 mb-2 text-[10px] font-medium text-white/60 uppercase tracking-wider">
                     {group.section}
                   </p>
                 )}
@@ -392,10 +391,10 @@ export default function AppSidebar({ user }: { user: User | null }) {
                         onClick={handleNavigate}
                         title={collapsed ? item.label : undefined}
                         className={`
-                          flex items-center gap-3 rounded-md px-2 py-2 text-sm font-medium transition-colors
+                          flex items-center gap-3 rounded-md px-2 py-2 text-sm font-medium transition-colors border-l-[3px]
                           ${isActive
-                            ? "bg-gray-800 text-white"
-                            : "text-[#CBD5E1] hover:bg-gray-800 hover:text-white"
+                            ? "bg-white/15 text-white border-l-[var(--anc-crimson)] font-bold"
+                            : "text-white/80 hover:bg-white/10 hover:text-white border-l-transparent"
                           }
                           ${collapsed ? "justify-center" : ""}
                         `}
@@ -413,12 +412,12 @@ export default function AppSidebar({ user }: { user: User | null }) {
 
         {/* User / Logout */}
         {user && (
-          <div className="border-t border-gray-800 p-2">
+          <div className="border-t border-white/10 p-2">
             {!collapsed ? (
               <div className="space-y-2">
                 <div className="px-2 py-1">
-                  <p className="text-sm font-medium text-[#E2E8F0] truncate">{user.username}</p>
-                  <p className="text-[10px] text-[#94A3B8]">{user.role.replace("_", " ")}</p>
+                  <p className="text-sm font-medium text-white/90 truncate">{user.username}</p>
+                  <p className="text-[10px] text-white/60">{user.role.replace("_", " ")}</p>
                 </div>
                 <button
                   type="button"
@@ -426,7 +425,7 @@ export default function AppSidebar({ user }: { user: User | null }) {
                     await fetch("/api/auth/logout", { method: "POST" });
                     window.location.reload();
                   }}
-                  className="flex items-center gap-2 rounded-md px-2 py-2 text-sm text-[#CBD5E1] hover:bg-gray-800 hover:text-white w-full"
+                  className="flex items-center gap-2 rounded-md px-2 py-2 text-sm text-white/80 hover:bg-white/10 hover:text-white w-full"
                 >
                   <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="lucide lucide-log-out"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" x2="9" y2="12"/></svg>
                   <span>Logout</span>
@@ -434,7 +433,7 @@ export default function AppSidebar({ user }: { user: User | null }) {
               </div>
             ) : (
               <div className="flex flex-col items-center gap-2">
-                <div className="w-8 h-8 rounded-full bg-gray-800 flex items-center justify-center text-xs font-medium">
+                <div className="w-8 h-8 rounded-full bg-white/15 flex items-center justify-center text-xs font-medium">
                   {user.username.charAt(0).toUpperCase()}
                 </div>
                 <button
@@ -443,7 +442,7 @@ export default function AppSidebar({ user }: { user: User | null }) {
                     await fetch("/api/auth/logout", { method: "POST" });
                     window.location.reload();
                   }}
-                  className="text-[#94A3B8] hover:text-white"
+                  className="text-white/60 hover:text-white"
                   title="Logout"
                 >
                   <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="lucide lucide-log-out"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" x2="9" y2="12"/></svg>

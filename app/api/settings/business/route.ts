@@ -43,6 +43,7 @@ const updateSchema = z.object({
   phone1: optionalText(30),
   phone2: optionalText(30),
   whatsapp: optionalText(30),
+  ownerWhatsapp: optionalText(30),
   email: optionalEmail,
   website: optionalUrl,
   address: optionalText(500),
