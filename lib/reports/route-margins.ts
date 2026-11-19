@@ -39,7 +39,8 @@ export type RouteMarginRow = {
   biltyCount: number;
   booking: number;
   carrierRent: number;
-  margin: number; // booking - carrierRent
+  margin: number; // profit Rs = booking - carrierRent
+  marginPct: number; // margin / booking * 100, 0 when booking is 0
 };
 
 function routeKey(from: string, to: string): string {
@@ -66,7 +67,7 @@ export function computeRouteMargins(bilties: RouteBiltyInput[], challans: RouteC
 
   for (const b of bilties) {
     const key = routeKey(b.fromLocation, b.toLocation);
-    const row = rows.get(key) ?? { route: key, biltyCount: 0, booking: 0, carrierRent: 0, margin: 0 };
+    const row = rows.get(key) ?? { route: key, biltyCount: 0, booking: 0, carrierRent: 0, margin: 0, marginPct: 0 };
     row.biltyCount += 1;
     row.booking += b.total;
 
@@ -80,7 +81,10 @@ export function computeRouteMargins(bilties: RouteBiltyInput[], challans: RouteC
     rows.set(key, row);
   }
 
-  for (const row of rows.values()) row.margin = Math.round((row.booking - row.carrierRent) * 100) / 100;
+  for (const row of rows.values()) {
+    row.margin = Math.round((row.booking - row.carrierRent) * 100) / 100;
+    row.marginPct = row.booking > 0 ? Math.round((row.margin / row.booking) * 1000) / 10 : 0;
+  }
 
   return [...rows.values()].sort((a, b) => b.margin - a.margin);
 }

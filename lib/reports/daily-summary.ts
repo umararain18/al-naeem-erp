@@ -1,12 +1,13 @@
 import { prisma } from "@/lib/prisma";
 import { accumulateBalances, netIncome, netExpense } from "@/lib/pnl";
-import { getReceivablePayable, bucketAgeing } from "@/lib/receivable-payable";
+import { getReceivablePayable, ageingBucketForDays, AGEING_BUCKET_LABELS, type PartyBalanceRow } from "@/lib/receivable-payable";
 import { getTopTransportersByCarrierRent } from "@/lib/dashboard-analytics";
 import { getLatestOpenTrip, getTripProfitReport } from "@/lib/carrier-trip";
 import { getUnearnedRevenueAccountId } from "@/lib/gross-accounts";
+import { getPartyDocumentStates } from "@/lib/payment-allocation";
 import { computePartyFifoPreview, checkPartyReconciliation, type PartyFifoPreview } from "@/lib/party-payment-fifo";
 import { getBusinessSettings } from "@/lib/business-settings";
-import { resolveDateRange, safePercentChange, toISODate, type DatePreset } from "@/lib/date-range";
+import { resolveDateRange, safePercentChange as rawPercentChange, toISODate, type DatePreset } from "@/lib/date-range";
 import { computeRouteMargins, detectEmptyReturnCities, type RouteBiltyInput, type RouteChallanInput } from "./route-margins";
 import { applyDailySummaryPermissions, type DailySummaryPermissions } from "./daily-summary-permissions";
 
@@ -56,7 +57,16 @@ export type DrilldownKey =
 // show" - a genuinely different, non-sensitive state from `null`.
 export interface DailySummaryResponse {
   meta: {
+    // The date "Aaj ka khulasa" actually reflects - defaults to
+    // latestPostedDateISO (see below), NOT the server's own clock
+    // date, unless the caller passed an explicit `date` param (the
+    // date picker / "Kal"/"Aaj" quick buttons).
     todayISO: string;
+    // The most recent date ANY JournalEntry was posted for, server-
+    // wide - always computed, regardless of what `date` was
+    // requested, so the "Aakhri posted din" quick button always has
+    // a real target even when the picker is showing some other date.
+    latestPostedDateISO: string | null;
     period: DatePreset;
     periodLabel: string;
     periodFromISO: string | null;
@@ -106,22 +116,16 @@ export interface DailySummaryResponse {
   wasooliTotal: number | null;
   denaHai: { partyId: string; name: string; amount: number; oldestDocNo: string | null; oldestDocDays: number | null }[] | null;
   denaHaiTotal: number | null;
-  operations: {
-    // bilty.view
-    notDispatchedCount: number | null;
-    notDispatchedOldestDays: number | null;
-    // challan.view
-    inTransitCount: number | null;
-    deliveredNotCollectedCount: number | null;
-    deliveredNotCollectedAmount: number | null;
-  };
   alerts: {
     lossChallanCount: number;
     settlementPendingCount: number;
     unearnedRevenueBalance: number;
-    fifoMismatchCount: number;
     noPhoneBiltyCount: number;
   };
+  // Lazy-loaded separately (GET /api/reports/daily-summary/fifo-mismatch)
+  // - see this module's own PERFORMANCE doc comment - never computed as
+  // part of the main summary, which every FIFO-reconciliation sweep
+  // (one per Party account) made too slow to be on the hot path.
   // reports.view (all 4 - each list shows Rs amounts, not just counts)
   topCustomers: { partyId: string; name: string; count: number; amount: number }[] | null;
   topClearingAgents: { partyId: string; name: string; count: number; amount: number }[] | null;
@@ -179,6 +183,20 @@ function daysBetween(a: Date, b: Date): number {
 
 function drillRows<T>(items: T[], map: (t: T, i: number) => { name: string; link: string | null; count: number; amount: number }): DrilldownRow[] {
   return items.map((t, i) => ({ rank: i + 1, ...map(t, i) }));
+}
+
+// A "previous period" value that's zero, or negligible relative to the
+// current value (< 1% of it), produces a meaningless/explosive percent
+// change (e.g. previous=Rs 5, current=Rs 400,000 -> "+7,999,900%") -
+// not a real trend, just division by almost-nothing. Shown as "—"
+// instead of a number (see Delta's own rendering in app/dashboard/
+// page.tsx) rather than the raw lib/date-range.ts safePercentChange()
+// value, which only guards the exact previous===0 case and is left
+// unchanged for every OTHER report that already relies on it.
+function significantPercentChange(current: number, previous: number): number | null {
+  if (previous === 0) return null;
+  if (Math.abs(previous) < Math.abs(current) * 0.01) return null;
+  return rawPercentChange(current, previous);
 }
 
 type DateFilter = { gte: Date | undefined; lt: Date | undefined };
@@ -239,9 +257,9 @@ async function computeProfitSection(periodWhere: DateFilter, comparisonWhere: Da
     totalIncome: current.income,
     totalExpense: current.expense,
     profit,
-    incomeDeltaPct: safePercentChange(current.income, previous.income),
-    expenseDeltaPct: safePercentChange(current.expense, previous.expense),
-    profitDeltaPct: safePercentChange(profit, previousProfit),
+    incomeDeltaPct: significantPercentChange(current.income, previous.income),
+    expenseDeltaPct: significantPercentChange(current.expense, previous.expense),
+    profitDeltaPct: significantPercentChange(profit, previousProfit),
     bookingIncome: current.bookingIncome,
     carrierRent: current.carrierRent,
     grossMargin,
@@ -250,44 +268,93 @@ async function computeProfitSection(periodWhere: DateFilter, comparisonWhere: Da
   };
 }
 
-// Oldest unsettled Challan per payable (transporter) Party - "Dena
-// hai"'s own "sab se purana" column. Batched: one query for every
-// unsettled, external (non-own-carrier) Challan, grouped in memory by
-// transporter - never one query per party.
-async function computeDenaHaiOldestDocs(): Promise<Map<string, { docNo: string; days: number }>> {
-  const unsettled = await prisma.challan.findMany({
-    where: { isDeleted: false, isSettled: false, ownCarrierId: null, transporterPartyId: { not: null } },
-    select: { challanNo: true, loadingDate: true, transporterPartyId: true },
-    orderBy: { loadingDate: "asc" },
-  });
-
-  const now = new Date();
-  const oldestByParty = new Map<string, { docNo: string; days: number }>();
-  for (const c of unsettled) {
-    if (!c.transporterPartyId || oldestByParty.has(c.transporterPartyId)) continue;
-    oldestByParty.set(c.transporterPartyId, { docNo: c.challanNo, days: daysBetween(c.loadingDate, now) });
-  }
-  return oldestByParty;
+function round2(value: number): number {
+  return Math.round(value * 100) / 100;
 }
 
-async function computeOperationsAndAlerts(today: Date, periodWhere: DateFilter) {
-  const [pendingBilties, inTransitChallans, deliveredChallans, periodChallans, unearnedAccountId, noPhoneCount, partiesWithAccounts] = await Promise.all([
-    prisma.bilty.findMany({ where: { isDeleted: false, status: "PENDING" }, select: { date: true } }),
-    prisma.challan.count({ where: { isDeleted: false, status: "IN_TRANSIT" } }),
-    prisma.challan.findMany({
-      where: { isDeleted: false, status: "DELIVERED", outstandingReceivable: { gt: 0 } },
-      select: { id: true, outstandingReceivable: true },
-    }),
+// Real per-document ageing, NOT "days since last ledger activity"
+// (that was the bug: a party whose balance is old but who happened to
+// make SOME unrelated recent transaction looked "Current"). Reuses
+// the SAME FIFO document-resolution engine the Allocation UI/Party
+// Ledger already use (lib/payment-allocation.ts's getPartyDocumentStates)
+// - never a separate ageing-specific accounting rule. One party's own
+// open documents' remaining amounts are SCALED to sum to exactly that
+// party's own ledger balance (never the other way around) - so this
+// is always consistent with the Receivable/Payable report's own
+// totals even on the rare party where FIFO-document remaining drifts
+// slightly from the ledger balance (the same drift the FIFO-mismatch
+// alert itself flags); a party with no resolvable open document at
+// all (e.g. a pure Opening Balance never tied to a document) falls
+// back to its own last-activity date so its balance is never dropped
+// from the bucket totals.
+interface PartyOpenDocs {
+  oldestDocNo: string | null;
+  oldestDocDate: Date | null;
+  documents: { date: Date; remaining: number }[];
+}
+
+async function computePartyOpenDocuments(accountIds: string[], direction: "RECEIVABLE" | "PAYABLE"): Promise<Map<string, PartyOpenDocs>> {
+  const result = new Map<string, PartyOpenDocs>();
+  await Promise.all(
+    accountIds.map(async (accountId) => {
+      const docs = await getPartyDocumentStates(prisma, accountId, direction, { onlyWithRemainingBalance: true });
+      if (docs.length === 0) {
+        result.set(accountId, { oldestDocNo: null, oldestDocDate: null, documents: [] });
+        return;
+      }
+      const sorted = [...docs].sort((a, b) => a.documentDate.getTime() - b.documentDate.getTime());
+      result.set(accountId, {
+        oldestDocNo: sorted[0].documentNo,
+        oldestDocDate: sorted[0].documentDate,
+        documents: sorted.map((d) => ({ date: d.documentDate, remaining: d.remainingAllocatable })),
+      });
+    })
+  );
+  return result;
+}
+
+function bucketAgeingByDocument(rows: PartyBalanceRow[], docsByAccount: Map<string, PartyOpenDocs>, today: Date): { bucket: string; amount: number }[] {
+  const totals = new Map<string, number>();
+  for (const label of AGEING_BUCKET_LABELS) totals.set(label, 0);
+
+  for (const row of rows) {
+    const docState = docsByAccount.get(row.accountId);
+    if (!docState || docState.documents.length === 0) {
+      const days = row.lastActivityDate ? daysBetween(row.lastActivityDate, today) : Infinity;
+      const bucket = ageingBucketForDays(days);
+      totals.set(bucket, (totals.get(bucket) ?? 0) + row.balance);
+      continue;
+    }
+    const documentSum = docState.documents.reduce((s, d) => s + d.remaining, 0);
+    const scale = documentSum > 0 ? row.balance / documentSum : 0;
+    for (const doc of docState.documents) {
+      const days = daysBetween(doc.date, today);
+      const bucket = ageingBucketForDays(days);
+      totals.set(bucket, (totals.get(bucket) ?? 0) + doc.remaining * scale);
+    }
+  }
+
+  return AGEING_BUCKET_LABELS.map((label) => ({ bucket: label, amount: round2(totals.get(label) ?? 0) }));
+}
+
+async function computeAlerts(periodWhere: DateFilter) {
+  const [periodChallans, allUnsettledChallans, unearnedAccountId, noPhoneCount] = await Promise.all([
     prisma.challan.findMany({
       where: { isDeleted: false, loadingDate: periodWhere },
-      select: { id: true, challanNo: true, carrierRent: true, isSettled: true, status: true, ownCarrierId: true, transporterParty: { select: { partyName: true } }, bilties: { select: { bilty: { select: { total: true } } } } },
+      select: { id: true, challanNo: true, carrierRent: true, transporterParty: { select: { partyName: true } }, bilties: { select: { bilty: { select: { total: true } } } } },
+    }),
+    // "Settlement baaqi" = the Challan list's own "Before Settlement"
+    // filter (lib/challan-list-query.ts's matchesFinancialFilter:
+    // `!item.isSettled`, nothing else) - ALL-time, never period-scoped,
+    // and no status/own-carrier narrowing beyond that exact definition,
+    // so this always matches what that list itself shows.
+    prisma.challan.findMany({
+      where: { isDeleted: false, isSettled: false },
+      select: { id: true, challanNo: true, carrierRent: true, ownCarrierId: true, transporterParty: { select: { partyName: true } }, bilties: { select: { bilty: { select: { total: true } } } } },
     }),
     getUnearnedRevenueAccountId(prisma),
     prisma.bilty.count({ where: { isDeleted: false, noPhoneProvided: true, date: periodWhere } }),
-    prisma.party.findMany({ where: { isActive: true, account: { isActive: true } }, select: { id: true, account: { select: { id: true } } } }),
   ]);
-
-  const oldestPendingDays = pendingBilties.length > 0 ? Math.max(...pendingBilties.map((b) => daysBetween(b.date, today))) : null;
 
   const lossChallanRows = periodChallans
     .map((c) => {
@@ -298,45 +365,18 @@ async function computeOperationsAndAlerts(today: Date, periodWhere: DateFilter) 
     .filter((c) => c.loss > 0)
     .sort((a, b) => b.loss - a.loss);
 
-  const settlementPendingRows = periodChallans
-    .filter((c) => !c.isSettled && c.status === "DELIVERED" && !c.ownCarrierId)
-    .map((c) => ({ id: c.id, label: `${c.challanNo} - ${c.transporterParty?.partyName ?? "-"}`, biltyCount: c.bilties.length, carrierRent: Number(c.carrierRent) }));
-
-  // FIFO mismatch - reuses the exact same per-account pipeline
-  // scripts/backfill-fifo-allocation.ts's own dry-run pass uses
-  // (computePartyFifoPreview + checkPartyReconciliation), scoped to
-  // every active Party with an active Account - never a separate
-  // accounting rule, purely a read-only count for this alert.
-  let fifoMismatchCount = 0;
-  await Promise.all(
-    partiesWithAccounts.map(async (party) => {
-      if (!party.account) return;
-      const directionReports: { direction: "RECEIVABLE" | "PAYABLE"; preview: PartyFifoPreview }[] = [];
-      for (const direction of ["RECEIVABLE", "PAYABLE"] as const) {
-        const preview = await computePartyFifoPreview(prisma, party.account.id, direction);
-        if (preview) directionReports.push({ direction, preview });
-      }
-      if (directionReports.length === 0) return;
-      const reconciliation = await checkPartyReconciliation(prisma, party.account.id, directionReports);
-      if (!reconciliation.isMatch) fifoMismatchCount++;
-    })
-  );
-
-  const deliveredNotCollectedAmount = deliveredChallans.reduce((s, c) => s + Number(c.outstandingReceivable), 0);
+  const settlementPendingRows = allUnsettledChallans.map((c) => ({
+    id: c.id,
+    label: `${c.challanNo} - ${c.transporterParty?.partyName ?? (c.ownCarrierId ? "Own Carrier" : "-")}`,
+    biltyCount: c.bilties.length,
+    carrierRent: Number(c.carrierRent),
+  }));
 
   return {
-    operations: {
-      notDispatchedCount: pendingBilties.length,
-      notDispatchedOldestDays: oldestPendingDays,
-      inTransitCount: inTransitChallans,
-      deliveredNotCollectedCount: deliveredChallans.length,
-      deliveredNotCollectedAmount,
-    },
     alerts: {
       lossChallanCount: lossChallanRows.length,
       settlementPendingCount: settlementPendingRows.length,
       unearnedRevenueBalance: await getAccountCurrentBalance(unearnedAccountId, "LIABILITY"),
-      fifoMismatchCount,
       noPhoneBiltyCount: noPhoneCount,
     },
     lossChallanRows,
@@ -416,7 +456,7 @@ async function computeRoutesAndOwnCarrier(periodWhere: DateFilter) {
       where: { isDeleted: false, date: periodWhere },
       select: { id: true, total: true, fromLocation: { select: { name: true } }, toLocation: { select: { name: true } }, challanBilties: { select: { challanId: true }, take: 1 } },
     }),
-    prisma.challan.findMany({ where: { isDeleted: false, loadingDate: periodWhere }, select: { id: true, carrierRent: true } }),
+    prisma.challan.findMany({ where: { isDeleted: false, loadingDate: periodWhere }, select: { id: true, carrierRent: true, ownCarrierId: true } }),
   ]);
 
   const biltyInputs: RouteBiltyInput[] = bilties.map((b) => ({
@@ -426,7 +466,26 @@ async function computeRoutesAndOwnCarrier(periodWhere: DateFilter) {
     toLocation: b.toLocation.name,
     total: Number(b.total),
   }));
-  const challanInputs: RouteChallanInput[] = challans.map((c) => ({ challanId: c.id, carrierRent: Number(c.carrierRent) }));
+
+  // Own Carrier dispatch: Challan.carrierRent is ALWAYS kept at 0 for
+  // these (see Challan's own schema comment) - the real rent lives on
+  // CarrierTripDocument.carrierRentAmount instead. Without this, an
+  // own-carrier route's margin silently equals its full booking
+  // amount (the exact "looks like booking, not margin" bug).
+  const ownCarrierChallanIds = challans.filter((c) => c.ownCarrierId).map((c) => c.id);
+  const tripRentByChallanId = new Map<string, number>();
+  if (ownCarrierChallanIds.length > 0) {
+    const tripDocs = await prisma.carrierTripDocument.findMany({
+      where: { documentType: "CHALLAN", documentId: { in: ownCarrierChallanIds }, unlinkedAt: null },
+      select: { documentId: true, carrierRentAmount: true },
+    });
+    for (const doc of tripDocs) tripRentByChallanId.set(doc.documentId, Number(doc.carrierRentAmount));
+  }
+
+  const challanInputs: RouteChallanInput[] = challans.map((c) => ({
+    challanId: c.id,
+    carrierRent: c.ownCarrierId ? tripRentByChallanId.get(c.id) ?? 0 : Number(c.carrierRent),
+  }));
 
   return {
     routes: computeRouteMargins(biltyInputs, challanInputs),
@@ -499,12 +558,17 @@ async function computeCharts(periodWhere: DateFilter) {
     const to = new Date(now.getFullYear(), now.getMonth() - i + 1, 1);
     months.push({ label: from.toLocaleDateString("en-US", { month: "short" }), from, to });
   }
-  const incomeExpense6mo = await Promise.all(
+  const incomeExpense6moRaw = await Promise.all(
     months.map(async (m) => {
       const totals = await sumIncomeExpense({ gte: m.from, lt: m.to });
       return { month: m.label, income: totals.income, expense: totals.expense };
     })
   );
+  // Only months with actual ERP data - a month before this business
+  // started posting entries is empty, not legitimately "Rs 0 income
+  // and Rs 0 expense", so it's dropped rather than drawn as a flat
+  // zero bar.
+  const incomeExpense6mo = incomeExpense6moRaw.filter((m) => m.income !== 0 || m.expense !== 0);
 
   const expenseLines = await prisma.journalLine.findMany({
     where: { account: { accountType: "EXPENSE", isActive: true }, journalEntry: { entryDate: periodWhere, isDeleted: false } },
@@ -662,9 +726,24 @@ async function computeTodaySection(todayStart: Date, todayEnd: Date) {
   };
 }
 
+// The most recent date ANY non-deleted JournalEntry was posted for -
+// "Aaj ka khulasa"'s own default (per the user's own correction: the
+// day's data is usually posted the NEXT day, so "today" is often
+// empty and misleading as a default) and the "Aakhri posted din"
+// quick button's target.
+async function getLatestPostedDate(): Promise<Date | null> {
+  const latest = await prisma.journalEntry.findFirst({
+    where: { isDeleted: false },
+    orderBy: { entryDate: "desc" },
+    select: { entryDate: true },
+  });
+  return latest?.entryDate ?? null;
+}
+
 export async function getDailySummary(params: GetDailySummaryParams): Promise<DailySummaryResponse> {
   const now = new Date();
-  const today = params.date ? new Date(`${params.date}T00:00:00`) : startOfDay(now);
+  const latestPostedDate = await getLatestPostedDate();
+  const today = params.date ? new Date(`${params.date}T00:00:00`) : startOfDay(latestPostedDate ?? now);
   const todayStart = startOfDay(today);
   const todayEnd = endOfDayExclusive(today);
 
@@ -677,8 +756,7 @@ export async function getDailySummary(params: GetDailySummaryParams): Promise<Da
     todaySection,
     profitSection,
     receivablePayable,
-    denaHaiRaw,
-    operationsAlerts,
+    alertsResult,
     topPartiesRaw,
     routesRaw,
     ownCarriersRaw,
@@ -689,8 +767,7 @@ export async function getDailySummary(params: GetDailySummaryParams): Promise<Da
     computeTodaySection(todayStart, todayEnd),
     computeProfitSection(periodWhere, comparisonWhere),
     getReceivablePayable(),
-    computeDenaHaiOldestDocs(),
-    computeOperationsAndAlerts(todayStart, periodWhere),
+    computeAlerts(periodWhere),
     computeTopParties(periodWhere),
     computeRoutesAndOwnCarrier(periodWhere),
     computeOwnCarriers(),
@@ -699,24 +776,42 @@ export async function getDailySummary(params: GetDailySummaryParams): Promise<Da
     getBusinessSettings(prisma),
   ]);
 
+  // ALL receivable/payable parties (never a >30-day filter - that was
+  // the bug: it dropped every party into the header TOTAL too, so the
+  // card header stopped matching the Receivable/Payable report's own
+  // total). The header/total below always uses receivablePayable's own
+  // totalReceivable/totalPayable directly - the exact same figure the
+  // Receivable/Payable reports show, by construction (same shared
+  // lib/receivable-payable.ts call) - never re-summed from a filtered
+  // or sliced row subset.
+  const [receivableDocsByAccount, payableDocsByAccount] = await Promise.all([
+    computePartyOpenDocuments(receivablePayable.receivable.map((r) => r.accountId), "RECEIVABLE"),
+    computePartyOpenDocuments(receivablePayable.payable.map((p) => p.accountId), "PAYABLE"),
+  ]);
+
   const wasooliRows = receivablePayable.receivable
-    .map((r) => ({ partyId: r.partyId, name: r.partyName, phone: r.phone, amount: r.balance, days: r.lastActivityDate ? daysBetween(r.lastActivityDate, today) : Infinity }))
-    .filter((r) => r.days > 30)
+    .map((r) => {
+      const docState = receivableDocsByAccount.get(r.accountId);
+      const oldestDate = docState?.oldestDocDate ?? r.lastActivityDate;
+      return { partyId: r.partyId, name: r.partyName, phone: r.phone, amount: r.balance, days: oldestDate ? daysBetween(oldestDate, today) : Infinity };
+    })
     .sort((a, b) => b.amount - a.amount);
 
-  const denaHaiPartyIds = new Set(receivablePayable.payable.map((p) => p.partyId));
   const denaHaiRows = receivablePayable.payable
-    .map((p) => ({
-      partyId: p.partyId!,
-      name: p.partyName,
-      amount: p.balance,
-      oldestDocNo: denaHaiRaw.get(p.partyId!)?.docNo ?? null,
-      oldestDocDays: denaHaiRaw.get(p.partyId!)?.days ?? null,
-    }))
+    .map((p) => {
+      const docState = payableDocsByAccount.get(p.accountId);
+      const oldestDate = docState?.oldestDocDate ?? p.lastActivityDate;
+      return {
+        partyId: p.partyId!,
+        name: p.partyName,
+        amount: p.balance,
+        oldestDocNo: docState?.oldestDocNo ?? null,
+        oldestDocDays: oldestDate ? daysBetween(oldestDate, today) : null,
+      };
+    })
     .sort((a, b) => b.amount - a.amount);
-  void denaHaiPartyIds;
 
-  const ageingBuckets = bucketAgeing(receivablePayable.receivable, today);
+  const ageingBuckets = bucketAgeingByDocument(receivablePayable.receivable, receivableDocsByAccount, today);
 
   const drilldowns: Record<DrilldownKey, DrilldownDataset> = {
     cust: {
@@ -819,19 +914,20 @@ export async function getDailySummary(params: GetDailySummaryParams): Promise<Da
       title: "Nuqsan wale challan",
       subtitle: "Carrier rent booking se zyada",
       columns: ["Challan", "Gaariyan", "Nuqsan Rs"],
-      rows: drillRows(operationsAlerts.lossChallanRows, (c) => ({ name: c.label, link: `/challan/${c.id}`, count: c.biltyCount, amount: c.loss })),
+      rows: drillRows(alertsResult.lossChallanRows, (c) => ({ name: c.label, link: `/challan/${c.id}`, count: c.biltyCount, amount: c.loss })),
     },
     settle: {
       title: "Settlement baaqi",
       subtitle: "Delivered, settlement pending",
       columns: ["Challan", "Gaariyan", "Rent Rs"],
-      rows: drillRows(operationsAlerts.settlementPendingRows, (c) => ({ name: c.label, link: `/challan/${c.id}`, count: c.biltyCount, amount: c.carrierRent })),
+      rows: drillRows(alertsResult.settlementPendingRows, (c) => ({ name: c.label, link: `/challan/${c.id}`, count: c.biltyCount, amount: c.carrierRent })),
     },
   };
 
   const full: DailySummaryResponse = {
     meta: {
       todayISO: toISODate(today),
+      latestPostedDateISO: latestPostedDate ? toISODate(latestPostedDate) : null,
       period: range.preset,
       periodLabel: range.label,
       periodFromISO: range.fromISO,
@@ -841,12 +937,11 @@ export async function getDailySummary(params: GetDailySummaryParams): Promise<Da
     },
     today: todaySection.summary,
     profit: profitSection,
-    wasooli: wasooliRows.slice(0, 5),
-    wasooliTotal: wasooliRows.reduce((s, r) => s + r.amount, 0),
-    denaHai: denaHaiRows.slice(0, 5),
-    denaHaiTotal: denaHaiRows.reduce((s, r) => s + r.amount, 0),
-    operations: operationsAlerts.operations,
-    alerts: operationsAlerts.alerts,
+    wasooli: wasooliRows.slice(0, 10),
+    wasooliTotal: receivablePayable.totalReceivable,
+    denaHai: denaHaiRows.slice(0, 10),
+    denaHaiTotal: receivablePayable.totalPayable,
+    alerts: alertsResult.alerts,
     topCustomers: topPartiesRaw.customers.slice(0, 5),
     topClearingAgents: topPartiesRaw.clearingAgents.slice(0, 5),
     topShowroomTransporters: topPartiesRaw.showroomTransporters.slice(0, 5),
@@ -865,4 +960,37 @@ export async function getDailySummary(params: GetDailySummaryParams): Promise<Da
   };
 
   return applyDailySummaryPermissions(full, params.permissions);
+}
+
+// PERFORMANCE: lazy, NOT part of getDailySummary() above - a full FIFO
+// reconciliation sweep (lib/party-payment-fifo.ts's own
+// computePartyFifoPreview + checkPartyReconciliation, the exact same
+// pipeline scripts/backfill-fifo-allocation.ts's dry-run uses) took
+// ~5s alone on real data, which alone blew the Dashboard's <2s load
+// target. Scoped to accounts with a NONZERO current Receivable/Payable
+// balance only (a party owing/owed nothing has nothing worth alerting
+// on even if its own historical ledger has an unreconciled line) -
+// called by its own GET /api/reports/daily-summary/fifo-mismatch route,
+// fetched by the Alerts card AFTER the main dashboard has already
+// rendered, never blocking it.
+export async function getFifoMismatchCount(): Promise<number> {
+  const receivablePayable = await getReceivablePayable();
+  const accountIds = new Set<string>();
+  for (const r of receivablePayable.receivable) accountIds.add(r.accountId);
+  for (const p of receivablePayable.payable) accountIds.add(p.accountId);
+
+  let fifoMismatchCount = 0;
+  await Promise.all(
+    [...accountIds].map(async (accountId) => {
+      const directionReports: { direction: "RECEIVABLE" | "PAYABLE"; preview: PartyFifoPreview }[] = [];
+      for (const direction of ["RECEIVABLE", "PAYABLE"] as const) {
+        const preview = await computePartyFifoPreview(prisma, accountId, direction);
+        if (preview) directionReports.push({ direction, preview });
+      }
+      if (directionReports.length === 0) return;
+      const reconciliation = await checkPartyReconciliation(prisma, accountId, directionReports);
+      if (!reconciliation.isMatch) fifoMismatchCount++;
+    })
+  );
+  return fifoMismatchCount;
 }

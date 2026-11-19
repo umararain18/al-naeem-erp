@@ -760,6 +760,11 @@ model Challan {
   @@index([isDeleted, deletedAt])
   @@index([challanNo])
   @@index([ownCarrierId])
+  // Backs the Dashboard's "Settlement baaqi" alert (lib/reports/daily-
+  // summary.ts's computeAlerts) - an ALL-time, no-period scan of
+  // `{isDeleted:false, isSettled:false}`, run on every (uncached)
+  // Dashboard load.
+  @@index([isDeleted, isSettled])
 }
 
 model ChallanBilty {

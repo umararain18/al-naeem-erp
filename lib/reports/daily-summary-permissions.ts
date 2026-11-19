@@ -70,13 +70,6 @@ export function applyDailySummaryPermissions(full: DailySummaryResponse, permiss
     wasooliTotal: permissions.reports ? full.wasooliTotal : null,
     denaHai: permissions.reports ? full.denaHai : null,
     denaHaiTotal: permissions.reports ? full.denaHaiTotal : null,
-    operations: {
-      notDispatchedCount: permissions.bilty ? full.operations.notDispatchedCount : null,
-      notDispatchedOldestDays: permissions.bilty ? full.operations.notDispatchedOldestDays : null,
-      inTransitCount: permissions.challan ? full.operations.inTransitCount : null,
-      deliveredNotCollectedCount: permissions.challan ? full.operations.deliveredNotCollectedCount : null,
-      deliveredNotCollectedAmount: permissions.challan ? full.operations.deliveredNotCollectedAmount : null,
-    },
     topCustomers: permissions.reports ? full.topCustomers : null,
     topClearingAgents: permissions.reports ? full.topClearingAgents : null,
     topShowroomTransporters: permissions.reports ? full.topShowroomTransporters : null,

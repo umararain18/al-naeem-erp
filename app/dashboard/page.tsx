@@ -10,6 +10,21 @@ function fmt(n: number): string {
   return `Rs ${Math.round(n).toLocaleString("en-US")}`;
 }
 
+function localISODate(d: Date): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function formatKhulasaHeader(iso: string): string {
+  const d = new Date(`${iso}T00:00:00`);
+  const dayName = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.getDay()];
+  const dd = String(d.getDate()).padStart(2, "0");
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  return `${dayName} ${dd}-${mm}-${d.getFullYear()}`;
+}
+
 function Delta({ pct }: { pct: number | null }) {
   if (pct === null) return null;
   const isUp = pct >= 0;
@@ -76,14 +91,17 @@ export default function DashboardPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [period, setPeriod] = useState("THIS_MONTH");
+  const [khulasaDate, setKhulasaDate] = useState<string | null>(null);
   const [drilldownKey, setDrilldownKey] = useState<DrilldownKey | null>(null);
+  const [fifoMismatchCount, setFifoMismatchCount] = useState<number | null>(null);
 
   useEffect(() => {
     (async () => {
       setLoading(true);
       setError("");
       try {
-        const res = await fetch(`/api/reports/daily-summary?period=${period}`);
+        const dateParam = khulasaDate ? `&date=${khulasaDate}` : "";
+        const res = await fetch(`/api/reports/daily-summary?period=${period}${dateParam}`);
         const json = await res.json();
         if (!res.ok || !json.success) {
           setError(json.message || "Unable to load dashboard");
@@ -94,6 +112,25 @@ export default function DashboardPage() {
         setError("Unable to connect to the server");
       } finally {
         setLoading(false);
+      }
+    })();
+  }, [period, khulasaDate]);
+
+  // PERFORMANCE: fetched separately, AFTER the main dashboard has
+  // already rendered - a full FIFO reconciliation sweep is too slow
+  // to be on the main load path (see getFifoMismatchCount()'s own doc
+  // comment in lib/reports/daily-summary.ts). Shows "…" until it
+  // resolves, never blocking anything else on the page.
+  useEffect(() => {
+    setFifoMismatchCount(null);
+    (async () => {
+      try {
+        const res = await fetch("/api/reports/daily-summary/fifo-mismatch");
+        const json = await res.json();
+        if (res.ok && json.success) setFifoMismatchCount(json.fifoMismatchCount);
+      } catch {
+        // Leave as "…" - this is a secondary alert count, never worth
+        // failing the dashboard over.
       }
     })();
   }, [period]);
@@ -116,7 +153,7 @@ export default function DashboardPage() {
     );
   }
 
-  const { today, profit, wasooli, denaHai, operations, alerts, topCustomers, topClearingAgents, topShowroomTransporters, topChallanTransporters, routes, emptyReturnCities, ownCarriers, marketing, charts } = summary;
+  const { today, profit, wasooli, denaHai, alerts, topCustomers, topClearingAgents, topShowroomTransporters, topChallanTransporters, routes, emptyReturnCities, ownCarriers, marketing, charts } = summary;
 
   const maxMonthValue = charts ? Math.max(1, ...charts.incomeExpense6mo.flatMap((m) => [m.income, m.expense])) : 1;
   const maxExpense = charts ? Math.max(1, ...charts.expenseBreakdown.map((e) => e.amount)) : 1;
@@ -131,7 +168,7 @@ export default function DashboardPage() {
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h1 className="text-xl font-extrabold">ANC Dashboard</h1>
-            <p className="text-xs text-[var(--anc-muted)] mt-0.5">{summary.meta.periodLabel} · aaj: {summary.meta.todayISO}</p>
+            <p className="text-xs text-[var(--anc-muted)] mt-0.5">{summary.meta.periodLabel}</p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <select
@@ -158,12 +195,37 @@ export default function DashboardPage() {
 
         {/* 1. AAJ KA KHULASA */}
         <section className="bg-[var(--anc-card)] border border-[var(--anc-line)] border-t-[3px] border-t-[var(--anc-gold)] rounded-xl p-4">
-          <h2 className="flex items-center justify-between gap-2 mb-3">
+          <h2 className="flex flex-wrap items-center justify-between gap-2 mb-3">
             <span className="flex items-center gap-2 text-sm font-extrabold">
               <span className="inline-block w-[3px] h-3.5 bg-[var(--anc-crimson)] rounded-sm" />
-              Aaj ka khulasa
+              Khulasa: {formatKhulasaHeader(summary.meta.todayISO)}
             </span>
-            <small className="text-[11px] font-semibold text-[var(--anc-muted)]">sirf aaj - {summary.meta.todayISO}</small>
+            <div className="flex flex-wrap items-center gap-1.5">
+              {([
+                ["Kal", localISODate(new Date(Date.now() - 86400000))],
+                ["Aaj", localISODate(new Date())],
+                ...(summary.meta.latestPostedDateISO ? [["Aakhri posted din", summary.meta.latestPostedDateISO] as [string, string]] : []),
+              ] as [string, string][]).map(([label, iso]) => (
+                <button
+                  key={label}
+                  type="button"
+                  onClick={() => setKhulasaDate(iso)}
+                  className={`rounded-lg border px-2.5 py-1 text-[11px] font-semibold ${
+                    summary.meta.todayISO === iso
+                      ? "border-[var(--anc-gold)] bg-[var(--anc-gold)] text-black"
+                      : "border-[var(--anc-line)] bg-[var(--anc-card)] hover:bg-[var(--anc-soft)]"
+                  }`}
+                >
+                  {label}
+                </button>
+              ))}
+              <input
+                type="date"
+                value={summary.meta.todayISO}
+                onChange={(e) => setKhulasaDate(e.target.value)}
+                className="rounded-lg border border-[var(--anc-line)] bg-[var(--anc-card)] px-2 py-1 text-[11px] font-semibold"
+              />
+            </div>
           </h2>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-2.5">
             <Tile label="Bilty bani" locked={today.biltyCount === null} value={today.biltyCount !== null ? String(today.biltyCount) : undefined} sub={today.biltyBookingAmount !== null ? `Booking ${fmt(today.biltyBookingAmount)}` : undefined} onClick={today.biltyCount !== null ? () => setDrilldownKey("tb") : undefined} />
@@ -179,7 +241,7 @@ export default function DashboardPage() {
             <NoAccessNote label="Cash balances" />
           ) : (
             <div className="flex flex-wrap gap-2.5 mt-3">
-              {today.cashByAccount.map((acc) => (
+              {today.cashByAccount.filter((acc) => acc.balance !== 0).map((acc) => (
                 <div key={acc.accountId} className="flex-1 min-w-[150px] border border-dashed border-[var(--anc-line)] rounded-lg px-3 py-2 flex justify-between items-center text-sm">
                   <span>{acc.accountName}</span>
                   <b className="anc-num">{fmt(acc.balance)}</b>
@@ -205,48 +267,25 @@ export default function DashboardPage() {
           {profit === null ? (
             <NoAccessNote label="Profit / Income / Kharcha" />
           ) : (
-            <>
-              <div className="grid grid-cols-1 md:grid-cols-[1fr_auto_1fr_auto_1.3fr] gap-2.5 items-center mb-3">
-                <button type="button" onClick={() => setDrilldownKey("inc")} className="text-left border border-[var(--anc-line)] rounded-lg p-3">
-                  <div className="text-[11px] text-[var(--anc-muted)] font-semibold">Kul Income</div>
-                  <div className="text-xl font-extrabold anc-num">{fmt(profit.totalIncome)}</div>
-                  <Delta pct={profit.incomeDeltaPct} />
-                </button>
-                <span className="hidden md:block text-2xl font-extrabold text-[var(--anc-muted)] text-center">−</span>
-                <button type="button" onClick={() => setDrilldownKey("exp")} className="text-left border border-[var(--anc-line)] rounded-lg p-3">
-                  <div className="text-[11px] text-[var(--anc-muted)] font-semibold">Kul Kharcha</div>
-                  <div className="text-xl font-extrabold anc-num">{fmt(profit.totalExpense)}</div>
-                  <Delta pct={profit.expenseDeltaPct} />
-                </button>
-                <span className="hidden md:block text-2xl font-extrabold text-[var(--anc-muted)] text-center">=</span>
-                <div className="border border-transparent rounded-lg p-3 bg-[var(--anc-good-bg)]">
-                  <div className="text-[11px] text-[var(--anc-muted)] font-semibold">Profit</div>
-                  <div className="text-2xl font-extrabold anc-num">{fmt(profit.profit)}</div>
-                  <Delta pct={profit.profitDeltaPct} />
-                </div>
+            <div className="grid grid-cols-1 md:grid-cols-[1fr_auto_1fr_auto_1.3fr] gap-2.5 items-center">
+              <button type="button" onClick={() => setDrilldownKey("inc")} className="text-left border border-[var(--anc-line)] rounded-lg p-3">
+                <div className="text-[11px] text-[var(--anc-muted)] font-semibold">Kul Income</div>
+                <div className="text-xl font-extrabold anc-num">{fmt(profit.totalIncome)}</div>
+                <Delta pct={profit.incomeDeltaPct} />
+              </button>
+              <span className="hidden md:block text-2xl font-extrabold text-[var(--anc-muted)] text-center">−</span>
+              <button type="button" onClick={() => setDrilldownKey("exp")} className="text-left border border-[var(--anc-line)] rounded-lg p-3">
+                <div className="text-[11px] text-[var(--anc-muted)] font-semibold">Kul Kharcha</div>
+                <div className="text-xl font-extrabold anc-num">{fmt(profit.totalExpense)}</div>
+                <Delta pct={profit.expenseDeltaPct} />
+              </button>
+              <span className="hidden md:block text-2xl font-extrabold text-[var(--anc-muted)] text-center">=</span>
+              <div className="border border-transparent rounded-lg p-3 bg-[var(--anc-good-bg)]">
+                <div className="text-[11px] text-[var(--anc-muted)] font-semibold">Profit</div>
+                <div className="text-2xl font-extrabold anc-num">{fmt(profit.profit)}</div>
+                <Delta pct={profit.profitDeltaPct} />
               </div>
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-2.5">
-                <div className="border border-[var(--anc-line)] rounded-lg p-3">
-                  <div className="text-[11px] text-[var(--anc-muted)] font-semibold">Booking Income</div>
-                  <div className="text-base font-extrabold anc-num">{fmt(profit.bookingIncome)}</div>
-                </div>
-                <div className="border border-[var(--anc-line)] rounded-lg p-3">
-                  <div className="text-[11px] text-[var(--anc-muted)] font-semibold">Carrier Rent</div>
-                  <div className="text-base font-extrabold anc-num">{fmt(profit.carrierRent)}</div>
-                </div>
-                <div className="border border-transparent rounded-lg p-3 bg-[var(--anc-good-bg)]">
-                  <div className="text-[11px] text-[var(--anc-muted)] font-semibold">Gross Margin</div>
-                  <div className="text-base font-extrabold anc-num">{fmt(profit.grossMargin)} · {profit.grossMarginPct}%</div>
-                  <span className="block h-1.5 bg-[var(--anc-soft)] rounded-full mt-1.5 overflow-hidden">
-                    <span className="block h-full bg-[var(--anc-green-2)]" style={{ width: `${Math.min(100, Math.max(0, profit.grossMarginPct))}%` }} />
-                  </span>
-                </div>
-                <div className="border border-[var(--anc-line)] rounded-lg p-3">
-                  <div className="text-[11px] text-[var(--anc-muted)] font-semibold">Doosri Income</div>
-                  <div className="text-base font-extrabold anc-num">{fmt(profit.otherIncome)}</div>
-                </div>
-              </div>
-            </>
+            </div>
           )}
         </section>
 
@@ -308,73 +347,31 @@ export default function DashboardPage() {
           </Card>
         </div>
 
-        {/* 4. OPERATIONS PIPELINE | ALERTS */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-          <Card title="Operations pipeline" subtitle="abhi ki halat">
-            <div className="grid grid-cols-3 gap-2.5">
-              {operations.notDispatchedCount === null ? (
-                <div className="rounded-lg p-3 bg-[var(--anc-soft)] opacity-70">
-                  <div className="text-xs font-bold">Dispatch baaqi</div>
-                  <NoAccessNote />
-                </div>
-              ) : (
-                <div className="rounded-lg p-3 bg-[var(--anc-soft)] shadow-[inset_3px_0_0_var(--anc-warn)]">
-                  <div className="text-2xl font-extrabold anc-num">{operations.notDispatchedCount}</div>
-                  <div className="text-xs font-bold">Dispatch baaqi</div>
-                  <div className="text-[11px] text-[var(--anc-muted)]">{operations.notDispatchedOldestDays !== null ? `oldest ${operations.notDispatchedOldestDays} din` : "—"}</div>
-                </div>
-              )}
-              {operations.inTransitCount === null ? (
-                <div className="rounded-lg p-3 bg-[var(--anc-soft)] opacity-70">
-                  <div className="text-xs font-bold">Raaste mein</div>
-                  <NoAccessNote />
-                </div>
-              ) : (
-                <div className="rounded-lg p-3 bg-[var(--anc-soft)] shadow-[inset_3px_0_0_var(--anc-blue)]">
-                  <div className="text-2xl font-extrabold anc-num">{operations.inTransitCount}</div>
-                  <div className="text-xs font-bold">Raaste mein</div>
-                  <div className="text-[11px] text-[var(--anc-muted)]">active challan</div>
-                </div>
-              )}
-              {operations.deliveredNotCollectedCount === null ? (
-                <div className="rounded-lg p-3 bg-[var(--anc-soft)] opacity-70">
-                  <div className="text-xs font-bold">Deliver, wasooli baaqi</div>
-                  <NoAccessNote />
-                </div>
-              ) : (
-                <div className="rounded-lg p-3 bg-[var(--anc-soft)] shadow-[inset_3px_0_0_var(--anc-good)]">
-                  <div className="text-2xl font-extrabold anc-num">{operations.deliveredNotCollectedCount}</div>
-                  <div className="text-xs font-bold">Deliver, wasooli baaqi</div>
-                  <div className="text-[11px] text-[var(--anc-muted)] anc-num">{fmt(operations.deliveredNotCollectedAmount ?? 0)}</div>
-                </div>
-              )}
+        {/* 4. ALERTS */}
+        <Card title="Dhyan dein" subtitle={`${[alerts.lossChallanCount > 0, alerts.settlementPendingCount > 0, alerts.unearnedRevenueBalance > 0, alerts.noPhoneBiltyCount > 0].filter(Boolean).length} alerts`}>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+            <button type="button" onClick={() => setDrilldownKey("loss")} className="flex justify-between items-center gap-2 px-3 py-2 rounded-lg text-sm bg-[var(--anc-bad-bg)]">
+              <span>Nuqsan wale challan (rent &gt; booking)</span>
+              <b className="anc-num">{alerts.lossChallanCount}</b>
+            </button>
+            <button type="button" onClick={() => setDrilldownKey("settle")} className="flex justify-between items-center gap-2 px-3 py-2 rounded-lg text-sm bg-[var(--anc-warn-bg)]">
+              <span>Settlement baaqi challan</span>
+              <b className="anc-num">{alerts.settlementPendingCount}</b>
+            </button>
+            <div className="flex justify-between items-center gap-2 px-3 py-2 rounded-lg text-sm bg-[var(--anc-warn-bg)]">
+              <span>Unearned balance</span>
+              <b className="anc-num">{fmt(alerts.unearnedRevenueBalance)}</b>
             </div>
-          </Card>
-          <Card title="Dhyan dein" subtitle={`${[alerts.lossChallanCount > 0, alerts.settlementPendingCount > 0, alerts.unearnedRevenueBalance > 0, alerts.fifoMismatchCount > 0, alerts.noPhoneBiltyCount > 0].filter(Boolean).length} alerts`}>
-            <div className="flex flex-col gap-2">
-              <button type="button" onClick={() => setDrilldownKey("loss")} className="flex justify-between items-center gap-2 px-3 py-2 rounded-lg text-sm bg-[var(--anc-bad-bg)]">
-                <span>Nuqsan wale challan (rent &gt; booking)</span>
-                <b className="anc-num">{alerts.lossChallanCount}</b>
-              </button>
-              <button type="button" onClick={() => setDrilldownKey("settle")} className="flex justify-between items-center gap-2 px-3 py-2 rounded-lg text-sm bg-[var(--anc-warn-bg)]">
-                <span>Settlement baaqi challan</span>
-                <b className="anc-num">{alerts.settlementPendingCount}</b>
-              </button>
-              <div className="flex justify-between items-center gap-2 px-3 py-2 rounded-lg text-sm bg-[var(--anc-warn-bg)]">
-                <span>Unearned balance</span>
-                <b className="anc-num">{fmt(alerts.unearnedRevenueBalance)}</b>
-              </div>
-              <div className="flex justify-between items-center gap-2 px-3 py-2 rounded-lg text-sm bg-[var(--anc-info-bg)]">
-                <span>FIFO mismatch parties</span>
-                <b className="anc-num">{alerts.fifoMismatchCount}</b>
-              </div>
-              <div className="flex justify-between items-center gap-2 px-3 py-2 rounded-lg text-sm bg-[var(--anc-info-bg)]">
-                <span>Bina phone number bilties (is period)</span>
-                <b className="anc-num">{alerts.noPhoneBiltyCount}</b>
-              </div>
+            <div className="flex justify-between items-center gap-2 px-3 py-2 rounded-lg text-sm bg-[var(--anc-info-bg)]">
+              <span>FIFO mismatch parties</span>
+              <b className="anc-num">{fifoMismatchCount === null ? "…" : fifoMismatchCount}</b>
             </div>
-          </Card>
-        </div>
+            <div className="flex justify-between items-center gap-2 px-3 py-2 rounded-lg text-sm bg-[var(--anc-info-bg)]">
+              <span>Bina phone number bilties (is period)</span>
+              <b className="anc-num">{alerts.noPhoneBiltyCount}</b>
+            </div>
+          </div>
+        </Card>
 
         {/* 5. TOP PARTIES */}
         <Card title="Top parties" subtitle="is period - sab se zyada kaam dene wale">
@@ -392,16 +389,30 @@ export default function DashboardPage() {
 
         {/* 6. ROUTES | OWN CARRIER | MARKETING */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
-          <Card title="Behtareen routes" subtitle="gross margin" onTitleClick={() => setDrilldownKey("routes")}>
+          <Card title="Behtareen routes" subtitle="profit se sorted" onTitleClick={() => setDrilldownKey("routes")}>
             <table className="w-full text-sm">
+              <thead>
+                <tr className="text-left text-[10px] uppercase text-[var(--anc-muted)]">
+                  <th className="py-1">Route</th>
+                  <th className="py-1 text-right">Bilties</th>
+                  <th className="py-1 text-right">Booking</th>
+                  <th className="py-1 text-right">Carrier Rent</th>
+                  <th className="py-1 text-right">Profit</th>
+                  <th className="py-1 text-right">Margin %</th>
+                </tr>
+              </thead>
               <tbody className="divide-y divide-[var(--anc-line)]">
                 {routes.map((r) => (
                   <tr key={r.route}>
                     <td className="py-1.5">{r.route}</td>
-                    <td className="py-1.5 text-right anc-num">{fmt(r.margin)}</td>
+                    <td className="py-1.5 text-right anc-num">{r.biltyCount}</td>
+                    <td className="py-1.5 text-right anc-num">{fmt(r.booking)}</td>
+                    <td className="py-1.5 text-right anc-num">{fmt(r.carrierRent)}</td>
+                    <td className={`py-1.5 text-right anc-num ${r.margin >= 0 ? "text-[var(--anc-good)]" : "text-[var(--anc-bad)]"}`}>{fmt(r.margin)}</td>
+                    <td className="py-1.5 text-right anc-num">{r.marginPct.toFixed(1)}%</td>
                   </tr>
                 ))}
-                {routes.length === 0 && <tr><td colSpan={2} className="py-4 text-center text-[var(--anc-muted)]">Koi route nahi</td></tr>}
+                {routes.length === 0 && <tr><td colSpan={6} className="py-4 text-center text-[var(--anc-muted)]">Koi route nahi</td></tr>}
               </tbody>
             </table>
             {emptyReturnCities.length > 0 && (

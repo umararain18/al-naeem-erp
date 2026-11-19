@@ -5,7 +5,7 @@ import type { DailySummaryResponse } from "./daily-summary";
 
 function baseSummary(): DailySummaryResponse {
   return {
-    meta: { todayISO: "2026-11-18", period: "THIS_MONTH", periodLabel: "This Month", periodFromISO: "2026-11-01", periodToISO: "2026-11-30", comparisonLabel: null, generatedAt: "2026-11-18T00:00:00.000Z" },
+    meta: { todayISO: "2026-11-18", latestPostedDateISO: "2026-11-18", period: "THIS_MONTH", periodLabel: "This Month", periodFromISO: "2026-11-01", periodToISO: "2026-11-30", comparisonLabel: null, generatedAt: "2026-11-18T00:00:00.000Z" },
     today: {
       biltyCount: 7, biltyBookingAmount: 412000, challanCount: 4, challanDispatchedCount: 3, billCount: 2, billAmount: 46500,
       showroomPhonchVehicleCount: 5, showroomPhonchDeliveryCharges: 6000, privatePhonchVehicleCount: 2, privatePhonchRent: 17000,
@@ -22,8 +22,7 @@ function baseSummary(): DailySummaryResponse {
     wasooliTotal: 330500,
     denaHai: [],
     denaHaiTotal: 0,
-    operations: { notDispatchedCount: 0, notDispatchedOldestDays: null, inTransitCount: 0, deliveredNotCollectedCount: 0, deliveredNotCollectedAmount: 0 },
-    alerts: { lossChallanCount: 2, settlementPendingCount: 6, unearnedRevenueBalance: 471500, fifoMismatchCount: 17, noPhoneBiltyCount: 4 },
+    alerts: { lossChallanCount: 2, settlementPendingCount: 6, unearnedRevenueBalance: 471500, noPhoneBiltyCount: 4 },
     topCustomers: [], topClearingAgents: [], topShowroomTransporters: [], topChallanTransporters: [],
     routes: [], emptyReturnCities: [], ownCarriers: [],
     marketing: { followUpsDueToday: 0, messagesSentThisPeriod: 0, leadsThisPeriod: 0, campaignBookingsCount: 0, campaignBookingsAmount: 0 },

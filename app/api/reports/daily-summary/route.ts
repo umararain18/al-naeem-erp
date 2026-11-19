@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getCurrentUser } from "@/lib/auth";
 import { hasPermission } from "@/lib/permissions";
 import { getDailySummary } from "@/lib/reports/daily-summary";
+import { getCached } from "@/lib/reports/report-cache";
 
 // GET /api/reports/daily-summary?date=YYYY-MM-DD&period=THIS_MONTH|LAST_MONTH|THIS_YEAR
 //
@@ -38,7 +39,15 @@ export async function GET(request: NextRequest) {
       privatePhonch: hasPermission(currentUser, "privatePhonch.view"),
     };
 
-    const summary = await getDailySummary({ date, period, permissions });
+    // PERFORMANCE: 60s cache, keyed by date+period+this exact permission
+    // set - the Dashboard's own data genuinely doesn't need to be any
+    // fresher than that for an internal reporting screen, and this is
+    // what makes the expensive open-document ageing lookup (see
+    // lib/reports/daily-summary.ts's own PERFORMANCE comment, ~3s on
+    // real data) affordable: paid once per 60s shared across every
+    // viewer with the same permission set, not on every single load.
+    const cacheKey = `daily-summary:${date ?? ""}:${period ?? ""}:${JSON.stringify(permissions)}`;
+    const summary = await getCached(cacheKey, () => getDailySummary({ date, period, permissions }));
 
     return NextResponse.json({ success: true, summary });
   } catch (error) {
