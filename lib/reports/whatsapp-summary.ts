@@ -27,9 +27,10 @@ export function buildWhatsAppSummaryText(summary: DailySummaryResponse, business
     return "Is report ke liye 'reports.view' permission chahiye.";
   }
 
+  const isToday = meta.period === "TODAY";
   const lines: string[] = [];
-  lines.push(`*${businessName} – Aaj ki report*`);
-  lines.push(meta.todayISO.split("-").reverse().join("-"));
+  lines.push(`*${businessName} – ${isToday ? "Aaj ki report" : "Report"}*`);
+  lines.push(meta.rangeLabel);
   lines.push("");
 
   lines.push(`Bilty: ${today.biltyCount ?? "-"} (${formatRs(today.biltyBookingAmount ?? 0)})`);

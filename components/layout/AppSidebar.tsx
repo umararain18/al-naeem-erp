@@ -322,15 +322,21 @@ export default function AppSidebar({ user }: { user: User | null }) {
         `}
         style={{ fontFamily: "var(--anc-font)" }}
       >
-        {/* Brand */}
-        <div className="h-16 flex items-center justify-between px-3 py-2.5 border-b border-white/10 flex-shrink-0">
-          {!collapsed && (
+        {/* Brand - collapsed state keeps a small logo mark (instead of
+            nothing at all) so the sidebar never loses its identity. */}
+        <div className={`flex items-center border-b border-white/10 flex-shrink-0 px-3 py-2.5 ${collapsed ? "flex-col gap-2" : "h-16 justify-between"}`}>
+          {collapsed ? (
+            <div className="bg-white rounded-lg p-1 flex items-center justify-center flex-shrink-0">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src="/brand/anc-logo.jpg" alt="Al Naeem Cargo Services" className="h-6 w-6 object-contain rounded" />
+            </div>
+          ) : (
             <div className="min-w-0 bg-white rounded-xl p-1.5 flex items-center justify-center">
               {/* eslint-disable-next-line @next/next/no-img-element */}
               <img src="/brand/anc-logo.jpg" alt="Al Naeem Cargo Services" className="h-9 w-auto object-contain" />
             </div>
           )}
-          <div className="flex items-center gap-1 flex-shrink-0">
+          <div className={`flex items-center flex-shrink-0 gap-1 ${collapsed ? "flex-col" : ""}`}>
             {/* Global Light/Dark toggle - present here (the existing
                 global navigation area) on every page, including the
                 login screen, since this sidebar always renders. */}

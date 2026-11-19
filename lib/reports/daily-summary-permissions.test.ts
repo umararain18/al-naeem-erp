@@ -5,7 +5,7 @@ import type { DailySummaryResponse } from "./daily-summary";
 
 function fullSummary(): DailySummaryResponse {
   return {
-    meta: { todayISO: "2026-11-18", latestPostedDateISO: "2026-11-18", period: "THIS_MONTH", periodLabel: "This Month", periodFromISO: "2026-11-01", periodToISO: "2026-11-30", comparisonLabel: null, generatedAt: "2026-11-18T00:00:00.000Z" },
+    meta: { period: "THIS_MONTH", periodLabel: "This Month", periodFromISO: "2026-11-01", periodToISO: "2026-11-30", rangeLabel: "1 Nov 2026 - 30 Nov 2026", comparisonLabel: null, generatedAt: "2026-11-18T00:00:00.000Z" },
     today: {
       biltyCount: 7, biltyBookingAmount: 412000, challanCount: 4, challanDispatchedCount: 3, billCount: 2, billAmount: 46500,
       showroomPhonchVehicleCount: 5, showroomPhonchDeliveryCharges: 6000, privatePhonchVehicleCount: 2, privatePhonchRent: 17000,
@@ -14,7 +14,7 @@ function fullSummary(): DailySummaryResponse {
       totalCash: 1277017,
     },
     profit: { totalIncome: 3963581, totalExpense: 3232810, profit: 730771, incomeDeltaPct: null, expenseDeltaPct: null, profitDeltaPct: null, bookingIncome: 3612000, carrierRent: 2683500, grossMargin: 928500, grossMarginPct: 25.7, otherIncome: 351581 },
-    wasooli: [{ partyId: "p1", name: "Jaecco", phone: null, amount: 127500, days: 48 }],
+    wasooli: [{ partyId: "p1", name: "Jaecco", phone: null, amount: 127500, days: 48, oldestDocLabel: "CN 6571" }],
     wasooliTotal: 127500,
     denaHai: [{ partyId: "p2", name: "NAS", amount: 217000, oldestDocNo: "CN1", oldestDocDays: 7 }],
     denaHaiTotal: 217000,
@@ -23,7 +23,7 @@ function fullSummary(): DailySummaryResponse {
     topClearingAgents: [{ partyId: "p4", name: "Super Life", count: 12, amount: 216000 }],
     topShowroomTransporters: [{ partyId: "p5", name: "MRK", count: 15, amount: 18000 }],
     topChallanTransporters: [{ partyId: "p6", name: "Shoib", count: 13, amount: 1012000 }],
-    routes: [{ route: "Karachi -> Multan", biltyCount: 18, booking: 1000000, carrierRent: 786000, margin: 214000, marginPct: 21.4 }],
+    routes: [{ route: "Karachi -> Multan", biltyCount: 18, booking: 1000000, carrierRent: 786000, margin: 214000, marginPct: 21.4, pendingBiltyCount: 0, pendingBooking: 0 }],
     emptyReturnCities: [{ city: "D.I.Khan", inbound: 10, outbound: 0 }],
     ownCarriers: [{ carrierId: "c1", carrierNumber: "CBM-191", activeTrip: null, recentTrips: [] }],
     marketing: { followUpsDueToday: 6, messagesSentThisPeriod: 142, leadsThisPeriod: 18, campaignBookingsCount: 5, campaignBookingsAmount: 286000 },

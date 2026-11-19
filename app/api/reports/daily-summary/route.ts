@@ -27,8 +27,16 @@ export async function GET(request: NextRequest) {
     }
 
     const { searchParams } = new URL(request.url);
-    const date = searchParams.get("date");
-    const period = searchParams.get("period");
+    // ONE global period selector drives every card, Khulasa included
+    // (see lib/reports/daily-summary.ts's own header comment) -
+    // defaults to YESTERDAY, never the server's own clock date (real
+    // postings usually lag a day), when the client sends no preset at
+    // all. lib/date-range.ts's own resolveDateRange() default
+    // (THIS_MONTH, for its other, non-Dashboard callers) is
+    // deliberately never relied on here.
+    const preset = searchParams.get("preset") || "YESTERDAY";
+    const from = searchParams.get("from");
+    const to = searchParams.get("to");
 
     const permissions = {
       reports: hasPermission(currentUser, "reports.view"),
@@ -46,8 +54,11 @@ export async function GET(request: NextRequest) {
     // lib/reports/daily-summary.ts's own PERFORMANCE comment, ~3s on
     // real data) affordable: paid once per 60s shared across every
     // viewer with the same permission set, not on every single load.
-    const cacheKey = `daily-summary:${date ?? ""}:${period ?? ""}:${JSON.stringify(permissions)}`;
-    const summary = await getCached(cacheKey, () => getDailySummary({ date, period, permissions }));
+    // Reused across every viewer who shares the same period+permission
+    // set (item M: a global period change must hit cache, not recompute,
+    // on a second viewer/tab within the 60s window).
+    const cacheKey = `daily-summary:${preset}:${from ?? ""}:${to ?? ""}:${JSON.stringify(permissions)}`;
+    const summary = await getCached(cacheKey, () => getDailySummary({ preset, from, to, permissions }));
 
     return NextResponse.json({ success: true, summary });
   } catch (error) {

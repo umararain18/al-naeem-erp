@@ -10,6 +10,15 @@ function fmt(n: number): string {
   return `Rs ${Math.round(n).toLocaleString("en-US")}`;
 }
 
+// Compact Rs label for a chart value label ("412k", "1.2M") - never
+// used where an exact figure matters (those stay fmt()'s full form).
+function fmtShort(n: number): string {
+  const abs = Math.abs(n);
+  if (abs >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (abs >= 1_000) return `${Math.round(n / 1000)}k`;
+  return String(Math.round(n));
+}
+
 function localISODate(d: Date): string {
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
@@ -17,19 +26,67 @@ function localISODate(d: Date): string {
   return `${y}-${m}-${day}`;
 }
 
-function formatKhulasaHeader(iso: string): string {
-  const d = new Date(`${iso}T00:00:00`);
-  const dayName = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.getDay()];
-  const dd = String(d.getDate()).padStart(2, "0");
-  const mm = String(d.getMonth() + 1).padStart(2, "0");
-  return `${dayName} ${dd}-${mm}-${d.getFullYear()}`;
+// ============================================================
+// ONE GLOBAL PERIOD SELECTOR - Today / Yesterday / This Month /
+// Previous Month / Custom - drives every card (Khulasa included; see
+// lib/reports/daily-summary.ts's own header comment). Replaces the
+// old separate "period" dropdown + Khulasa-only date picker. Default
+// is YESTERDAY (real postings usually lag a day); the last choice is
+// remembered per-browser via localStorage.
+// ============================================================
+type PeriodChoice = { preset: string; from: string | null; to: string | null };
+const PERIOD_STORAGE_KEY = "anc-dashboard-period";
+const DEFAULT_PERIOD: PeriodChoice = { preset: "YESTERDAY", from: null, to: null };
+
+function loadStoredPeriod(): PeriodChoice {
+  try {
+    const raw = localStorage.getItem(PERIOD_STORAGE_KEY);
+    if (!raw) return DEFAULT_PERIOD;
+    const parsed = JSON.parse(raw);
+    if (typeof parsed?.preset === "string") return { preset: parsed.preset, from: parsed.from ?? null, to: parsed.to ?? null };
+  } catch {
+    // Private window / blocked storage - fall back to the default silently.
+  }
+  return DEFAULT_PERIOD;
 }
 
-function Delta({ pct }: { pct: number | null }) {
+function saveStoredPeriod(choice: PeriodChoice) {
+  try {
+    localStorage.setItem(PERIOD_STORAGE_KEY, JSON.stringify(choice));
+  } catch {
+    // Not worth failing over - just won't be remembered next visit.
+  }
+}
+
+// "Wed 18-11-2026" for a single day, "1 - 19 Nov 2026" for a range -
+// built from the exact fromISO/toISO this response already resolved
+// (never re-derived from "now"), so it always matches what the cards
+// below actually show.
+function formatRangeHeader(fromISO: string | null, toISO: string | null): string {
+  if (!fromISO || !toISO) return "—";
+  const from = new Date(`${fromISO}T00:00:00`);
+  const to = new Date(`${toISO}T00:00:00`);
+  const dayName = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][from.getDay()];
+  const dd = (d: Date) => String(d.getDate()).padStart(2, "0");
+  const mm = (d: Date) => String(d.getMonth() + 1).padStart(2, "0");
+  if (fromISO === toISO) return `${dayName} ${dd(from)}-${mm(from)}-${from.getFullYear()}`;
+  const monthsShort = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  if (from.getFullYear() === to.getFullYear() && from.getMonth() === to.getMonth()) {
+    return `${from.getDate()} - ${to.getDate()} ${monthsShort[from.getMonth()]} ${from.getFullYear()}`;
+  }
+  return `${from.getDate()} ${monthsShort[from.getMonth()]} ${from.getFullYear()} - ${to.getDate()} ${monthsShort[to.getMonth()]} ${to.getFullYear()}`;
+}
+
+function Delta({ pct, invert }: { pct: number | null; invert?: boolean }) {
   if (pct === null) return null;
   const isUp = pct >= 0;
+  // For Income/Profit, up = good (green). For Expense, up = bad (red)
+  // - `invert` flips which direction counts as "good" rather than
+  // reusing the same up=green logic for both (the exact reported
+  // color-inversion bug).
+  const isGood = invert ? !isUp : isUp;
   return (
-    <span className={`text-[11px] font-bold ${isUp ? "text-[var(--anc-good)]" : "text-[var(--anc-bad)]"}`}>
+    <span className={`text-[11px] font-bold ${isGood ? "text-[var(--anc-good)]" : "text-[var(--anc-bad)]"}`}>
       {isUp ? "↑" : "↓"} {Math.abs(pct).toFixed(1)}%
     </span>
   );
@@ -65,9 +122,9 @@ function Tile({ label, value, sub, onClick, tone, locked }: { label: string; val
   );
 }
 
-function Card({ title, subtitle, children, onTitleClick }: { title: string; subtitle?: string; children: React.ReactNode; onTitleClick?: () => void }) {
+function Card({ title, subtitle, children, onTitleClick, className }: { title: string; subtitle?: string; children: React.ReactNode; onTitleClick?: () => void; className?: string }) {
   return (
-    <section className="bg-[var(--anc-card)] border border-[var(--anc-line)] rounded-xl p-4">
+    <section className={`bg-[var(--anc-card)] border border-[var(--anc-line)] rounded-xl p-4 ${className ?? ""}`}>
       <h2 className="flex items-center justify-between gap-2 mb-3">
         <span className="flex items-center gap-2 text-sm font-extrabold">
           <span className="inline-block w-[3px] h-3.5 bg-[var(--anc-crimson)] rounded-sm" />
@@ -90,18 +147,26 @@ export default function DashboardPage() {
   const [summary, setSummary] = useState<DailySummaryResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [period, setPeriod] = useState("THIS_MONTH");
-  const [khulasaDate, setKhulasaDate] = useState<string | null>(null);
+  const [periodChoice, setPeriodChoice] = useState<PeriodChoice>(DEFAULT_PERIOD);
+  const [customDraft, setCustomDraft] = useState<{ from: string; to: string }>({ from: "", to: "" });
   const [drilldownKey, setDrilldownKey] = useState<DrilldownKey | null>(null);
   const [fifoMismatchCount, setFifoMismatchCount] = useState<number | null>(null);
+
+  // Restore the last-used period choice on mount (localStorage is
+  // per-browser, read only client-side).
+  useEffect(() => {
+    setPeriodChoice(loadStoredPeriod());
+  }, []);
 
   useEffect(() => {
     (async () => {
       setLoading(true);
       setError("");
       try {
-        const dateParam = khulasaDate ? `&date=${khulasaDate}` : "";
-        const res = await fetch(`/api/reports/daily-summary?period=${period}${dateParam}`);
+        const params = new URLSearchParams({ preset: periodChoice.preset });
+        if (periodChoice.from) params.set("from", periodChoice.from);
+        if (periodChoice.to) params.set("to", periodChoice.to);
+        const res = await fetch(`/api/reports/daily-summary?${params.toString()}`);
         const json = await res.json();
         if (!res.ok || !json.success) {
           setError(json.message || "Unable to load dashboard");
@@ -114,7 +179,12 @@ export default function DashboardPage() {
         setLoading(false);
       }
     })();
-  }, [period, khulasaDate]);
+  }, [periodChoice]);
+
+  function choosePeriod(choice: PeriodChoice) {
+    setPeriodChoice(choice);
+    saveStoredPeriod(choice);
+  }
 
   // PERFORMANCE: fetched separately, AFTER the main dashboard has
   // already rendered - a full FIFO reconciliation sweep is too slow
@@ -133,7 +203,7 @@ export default function DashboardPage() {
         // failing the dashboard over.
       }
     })();
-  }, [period]);
+  }, []);
 
   const drilldown = useMemo(() => (summary && drilldownKey ? summary.drilldowns[drilldownKey] ?? null : null), [summary, drilldownKey]);
 
@@ -155,8 +225,13 @@ export default function DashboardPage() {
 
   const { today, profit, wasooli, denaHai, alerts, topCustomers, topClearingAgents, topShowroomTransporters, topChallanTransporters, routes, emptyReturnCities, ownCarriers, marketing, charts } = summary;
 
+  const isToday = summary.meta.period === "TODAY";
+  const periodPrefix = isToday ? "Aaj" : "Is period";
+  const rangeHeader = formatRangeHeader(summary.meta.periodFromISO, summary.meta.periodToISO);
+
   const maxMonthValue = charts ? Math.max(1, ...charts.incomeExpense6mo.flatMap((m) => [m.income, m.expense])) : 1;
   const maxExpense = charts ? Math.max(1, ...charts.expenseBreakdown.map((e) => e.amount)) : 1;
+  const expenseBreakdownTotal = charts ? charts.expenseBreakdown.reduce((s, e) => s + e.amount, 0) : 0;
   const totalAgeing = charts ? charts.receivableAgeing.reduce((s, b) => s + b.amount, 0) || 1 : 1;
   const ageingColors: Record<string, string> = { Current: "var(--anc-green-2)", "1-30 Days": "var(--anc-green-2)", "31-60 Days": "var(--anc-gold)", "61-90 Days": "var(--anc-warn)", "90+ Days": "var(--anc-crimson)" };
 
@@ -164,22 +239,59 @@ export default function DashboardPage() {
     <div className="anc-theme min-h-screen bg-[var(--anc-bg)] text-[var(--anc-ink)]" style={{ fontFamily: "var(--anc-font)" }}>
       <div className="h-1 bg-[var(--anc-crimson)]" />
       <div className="max-w-[1320px] mx-auto p-5 flex flex-col gap-5">
-        {/* TOP BAR */}
+        {/* TOP BAR - ONE global period selector for the whole Dashboard */}
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h1 className="text-xl font-extrabold">ANC Dashboard</h1>
-            <p className="text-xs text-[var(--anc-muted)] mt-0.5">{summary.meta.periodLabel}</p>
+            <p className="text-xs text-[var(--anc-muted)] mt-0.5">{rangeHeader}</p>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <select
-              value={period}
-              onChange={(e) => setPeriod(e.target.value)}
+              value={periodChoice.preset}
+              onChange={(e) => {
+                const preset = e.target.value;
+                if (preset === "CUSTOM") {
+                  const from = customDraft.from || localISODate(new Date());
+                  const to = customDraft.to || localISODate(new Date());
+                  setCustomDraft({ from, to });
+                  choosePeriod({ preset: "CUSTOM", from, to });
+                } else {
+                  choosePeriod({ preset, from: null, to: null });
+                }
+              }}
               className="rounded-lg border border-[var(--anc-line)] bg-[var(--anc-card)] px-3 py-2 text-sm font-semibold"
             >
+              <option value="TODAY">Today</option>
+              <option value="YESTERDAY">Yesterday</option>
               <option value="THIS_MONTH">This Month</option>
-              <option value="LAST_MONTH">Last Month</option>
-              <option value="THIS_YEAR">This Year</option>
+              <option value="LAST_MONTH">Previous Month</option>
+              <option value="CUSTOM">Custom</option>
             </select>
+            {periodChoice.preset === "CUSTOM" && (
+              <>
+                <input
+                  type="date"
+                  value={customDraft.from}
+                  onChange={(e) => {
+                    const from = e.target.value;
+                    setCustomDraft((d) => ({ ...d, from }));
+                    if (from && customDraft.to) choosePeriod({ preset: "CUSTOM", from, to: customDraft.to });
+                  }}
+                  className="rounded-lg border border-[var(--anc-line)] bg-[var(--anc-card)] px-2 py-2 text-sm font-semibold"
+                />
+                <span className="text-[var(--anc-muted)] text-sm">-</span>
+                <input
+                  type="date"
+                  value={customDraft.to}
+                  onChange={(e) => {
+                    const to = e.target.value;
+                    setCustomDraft((d) => ({ ...d, to }));
+                    if (customDraft.from && to) choosePeriod({ preset: "CUSTOM", from: customDraft.from, to });
+                  }}
+                  className="rounded-lg border border-[var(--anc-line)] bg-[var(--anc-card)] px-2 py-2 text-sm font-semibold"
+                />
+              </>
+            )}
             <Link href="/bilty" className="rounded-lg bg-[var(--anc-blue)] text-white px-3 py-2 text-sm font-semibold">
               + New Bilty
             </Link>
@@ -193,39 +305,13 @@ export default function DashboardPage() {
           </div>
         </div>
 
-        {/* 1. AAJ KA KHULASA */}
+        {/* 1. KHULASA - whole selected period's totals; cash = closing as of the period's end */}
         <section className="bg-[var(--anc-card)] border border-[var(--anc-line)] border-t-[3px] border-t-[var(--anc-gold)] rounded-xl p-4">
           <h2 className="flex flex-wrap items-center justify-between gap-2 mb-3">
             <span className="flex items-center gap-2 text-sm font-extrabold">
               <span className="inline-block w-[3px] h-3.5 bg-[var(--anc-crimson)] rounded-sm" />
-              Khulasa: {formatKhulasaHeader(summary.meta.todayISO)}
+              Khulasa: {rangeHeader}
             </span>
-            <div className="flex flex-wrap items-center gap-1.5">
-              {([
-                ["Kal", localISODate(new Date(Date.now() - 86400000))],
-                ["Aaj", localISODate(new Date())],
-                ...(summary.meta.latestPostedDateISO ? [["Aakhri posted din", summary.meta.latestPostedDateISO] as [string, string]] : []),
-              ] as [string, string][]).map(([label, iso]) => (
-                <button
-                  key={label}
-                  type="button"
-                  onClick={() => setKhulasaDate(iso)}
-                  className={`rounded-lg border px-2.5 py-1 text-[11px] font-semibold ${
-                    summary.meta.todayISO === iso
-                      ? "border-[var(--anc-gold)] bg-[var(--anc-gold)] text-black"
-                      : "border-[var(--anc-line)] bg-[var(--anc-card)] hover:bg-[var(--anc-soft)]"
-                  }`}
-                >
-                  {label}
-                </button>
-              ))}
-              <input
-                type="date"
-                value={summary.meta.todayISO}
-                onChange={(e) => setKhulasaDate(e.target.value)}
-                className="rounded-lg border border-[var(--anc-line)] bg-[var(--anc-card)] px-2 py-1 text-[11px] font-semibold"
-              />
-            </div>
           </h2>
           <div className="grid grid-cols-2 md:grid-cols-4 gap-2.5">
             <Tile label="Bilty bani" locked={today.biltyCount === null} value={today.biltyCount !== null ? String(today.biltyCount) : undefined} sub={today.biltyBookingAmount !== null ? `Booking ${fmt(today.biltyBookingAmount)}` : undefined} onClick={today.biltyCount !== null ? () => setDrilldownKey("tb") : undefined} />
@@ -233,9 +319,9 @@ export default function DashboardPage() {
             <Tile label="Bill bane" locked={today.billCount === null} value={today.billCount !== null ? String(today.billCount) : undefined} sub={today.billAmount !== null ? fmt(today.billAmount) : undefined} onClick={today.billCount !== null ? () => setDrilldownKey("tbill") : undefined} />
             <Tile label="Showroom Phonch gaariyan" locked={today.showroomPhonchVehicleCount === null} value={today.showroomPhonchVehicleCount !== null ? String(today.showroomPhonchVehicleCount) : undefined} sub={today.showroomPhonchDeliveryCharges !== null ? fmt(today.showroomPhonchDeliveryCharges) : undefined} onClick={today.showroomPhonchVehicleCount !== null ? () => setDrilldownKey("tsr") : undefined} />
             <Tile label="Private Phonch gaariyan" locked={today.privatePhonchVehicleCount === null} value={today.privatePhonchVehicleCount !== null ? String(today.privatePhonchVehicleCount) : undefined} sub={today.privatePhonchRent !== null ? fmt(today.privatePhonchRent) : undefined} onClick={today.privatePhonchVehicleCount !== null ? () => setDrilldownKey("tpp") : undefined} />
-            <Tile label="Paise aaye (In)" locked={today.cashIn === null} value={today.cashIn !== null ? fmt(today.cashIn) : undefined} sub="Cash + Bank, aaj" tone="in" onClick={today.cashIn !== null ? () => setDrilldownKey("tin") : undefined} />
-            <Tile label="Paise gaye (Out)" locked={today.cashOut === null} value={today.cashOut !== null ? fmt(today.cashOut) : undefined} sub="Cash + Bank, aaj" tone="out" onClick={today.cashOut !== null ? () => setDrilldownKey("tout") : undefined} />
-            <Tile label="Farq (In - Out)" locked={today.netCash === null} value={today.netCash !== null ? `${today.netCash >= 0 ? "+" : ""}${fmt(today.netCash)}` : undefined} sub="aaj ka net cash" />
+            <Tile label="Paise aaye (In)" locked={today.cashIn === null} value={today.cashIn !== null ? fmt(today.cashIn) : undefined} sub={`Cash + Bank, ${periodPrefix.toLowerCase()}`} tone="in" onClick={today.cashIn !== null ? () => setDrilldownKey("tin") : undefined} />
+            <Tile label="Paise gaye (Out)" locked={today.cashOut === null} value={today.cashOut !== null ? fmt(today.cashOut) : undefined} sub={`Cash + Bank, ${periodPrefix.toLowerCase()}`} tone="out" onClick={today.cashOut !== null ? () => setDrilldownKey("tout") : undefined} />
+            <Tile label="Farq (In - Out)" locked={today.netCash === null} value={today.netCash !== null ? `${today.netCash >= 0 ? "+" : ""}${fmt(today.netCash)}` : undefined} sub="net cash" />
           </div>
           {today.cashByAccount === null ? (
             <NoAccessNote label="Cash balances" />
@@ -248,7 +334,7 @@ export default function DashboardPage() {
                 </div>
               ))}
               <div className="flex-1 min-w-[150px] rounded-lg px-3 py-2 flex justify-between items-center text-sm bg-[var(--anc-green)] text-white">
-                <span>Kul Cash + Bank</span>
+                <span>Kul Cash + Bank (closing)</span>
                 <b className="anc-num">{today.totalCash !== null ? fmt(today.totalCash) : "—"}</b>
               </div>
             </div>
@@ -277,7 +363,7 @@ export default function DashboardPage() {
               <button type="button" onClick={() => setDrilldownKey("exp")} className="text-left border border-[var(--anc-line)] rounded-lg p-3">
                 <div className="text-[11px] text-[var(--anc-muted)] font-semibold">Kul Kharcha</div>
                 <div className="text-xl font-extrabold anc-num">{fmt(profit.totalExpense)}</div>
-                <Delta pct={profit.expenseDeltaPct} />
+                <Delta pct={profit.expenseDeltaPct} invert />
               </button>
               <span className="hidden md:block text-2xl font-extrabold text-[var(--anc-muted)] text-center">=</span>
               <div className="border border-transparent rounded-lg p-3 bg-[var(--anc-good-bg)]">
@@ -291,7 +377,7 @@ export default function DashboardPage() {
 
         {/* 3. WASOOLI | DENA HAI */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
-          <Card title="Wasooli karni hai" subtitle={wasooli !== null ? `30 din se purana - ${fmt(summary.wasooliTotal!)} kul` : undefined} onTitleClick={wasooli !== null ? () => setDrilldownKey("rec") : undefined}>
+          <Card title="Wasooli karni hai" subtitle={wasooli !== null ? `Kul receivable ${fmt(summary.wasooliTotal!)}` : undefined} onTitleClick={wasooli !== null ? () => setDrilldownKey("rec") : undefined}>
             {wasooli === null ? (
               <NoAccessNote />
             ) : (
@@ -306,7 +392,10 @@ export default function DashboardPage() {
                 <tbody className="divide-y divide-[var(--anc-line)]">
                   {wasooli.map((w) => (
                     <tr key={w.partyId ?? w.name}>
-                      <td className="py-1.5">{w.partyId ? <Link href={`/parties/${w.partyId}/ledger`} className="text-[var(--anc-blue)] hover:underline">{w.name}</Link> : w.name}</td>
+                      <td className="py-1.5">
+                        {w.partyId ? <Link href={`/parties/${w.partyId}/ledger`} className="text-[var(--anc-blue)] hover:underline">{w.name}</Link> : w.name}
+                        {w.oldestDocLabel && <span className="block text-[10px] text-[var(--anc-muted)]">{w.oldestDocLabel}</span>}
+                      </td>
                       <td className="py-1.5 text-right anc-num">{fmt(w.amount)}</td>
                       <td className="py-1.5 text-right">
                         <span className={`text-[11px] font-bold px-2 py-0.5 rounded-full ${w.days > 45 ? "bg-[var(--anc-bad-bg)] text-[var(--anc-bad)]" : "bg-[var(--anc-warn-bg)] text-[var(--anc-warn)]"}`}>
@@ -389,32 +478,41 @@ export default function DashboardPage() {
 
         {/* 6. ROUTES | OWN CARRIER | MARKETING */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
-          <Card title="Behtareen routes" subtitle="profit se sorted" onTitleClick={() => setDrilldownKey("routes")}>
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="text-left text-[10px] uppercase text-[var(--anc-muted)]">
-                  <th className="py-1">Route</th>
-                  <th className="py-1 text-right">Bilties</th>
-                  <th className="py-1 text-right">Booking</th>
-                  <th className="py-1 text-right">Carrier Rent</th>
-                  <th className="py-1 text-right">Profit</th>
-                  <th className="py-1 text-right">Margin %</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-[var(--anc-line)]">
-                {routes.map((r) => (
-                  <tr key={r.route}>
-                    <td className="py-1.5">{r.route}</td>
-                    <td className="py-1.5 text-right anc-num">{r.biltyCount}</td>
-                    <td className="py-1.5 text-right anc-num">{fmt(r.booking)}</td>
-                    <td className="py-1.5 text-right anc-num">{fmt(r.carrierRent)}</td>
-                    <td className={`py-1.5 text-right anc-num ${r.margin >= 0 ? "text-[var(--anc-good)]" : "text-[var(--anc-bad)]"}`}>{fmt(r.margin)}</td>
-                    <td className="py-1.5 text-right anc-num">{r.marginPct.toFixed(1)}%</td>
+          <Card title="Behtareen routes" subtitle="profit se sorted" onTitleClick={() => setDrilldownKey("routes")} className="md:col-span-2">
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-left text-[10px] uppercase text-[var(--anc-muted)]">
+                    <th className="py-1">Route</th>
+                    <th className="py-1 text-right">Bilties</th>
+                    <th className="py-1 text-right">Booking</th>
+                    <th className="py-1 text-right">Carrier Rent</th>
+                    <th className="py-1 text-right">Profit</th>
+                    <th className="py-1 text-right">Margin %</th>
                   </tr>
-                ))}
-                {routes.length === 0 && <tr><td colSpan={6} className="py-4 text-center text-[var(--anc-muted)]">Koi route nahi</td></tr>}
-              </tbody>
-            </table>
+                </thead>
+                <tbody className="divide-y divide-[var(--anc-line)]">
+                  {routes.map((r) => (
+                    <tr key={r.route}>
+                      <td className="py-1.5 max-w-[160px] truncate" title={r.route}>{r.route}</td>
+                      <td className="py-1.5 text-right anc-num">{r.biltyCount}</td>
+                      <td className="py-1.5 text-right anc-num">{fmt(r.booking)}</td>
+                      <td className="py-1.5 text-right anc-num">{fmt(r.carrierRent)}</td>
+                      <td className={`py-1.5 text-right anc-num ${r.margin >= 0 ? "text-[var(--anc-good)]" : "text-[var(--anc-bad)]"}`}>{fmt(r.margin)}</td>
+                      <td className="py-1.5 text-right anc-num">
+                        {r.biltyCount > 0 ? `${r.marginPct.toFixed(1)}%` : "—"}
+                        {r.pendingBiltyCount > 0 && (
+                          <span className="block text-[10px] text-[var(--anc-warn)]" title={`${r.pendingBiltyCount} bilty abhi challan par nahi - rent pending`}>
+                            {r.pendingBiltyCount} rent pending
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                  {routes.length === 0 && <tr><td colSpan={6} className="py-4 text-center text-[var(--anc-muted)]">Koi route nahi</td></tr>}
+                </tbody>
+              </table>
+            </div>
             {emptyReturnCities.length > 0 && (
               <div className="mt-2.5 px-3 py-2 rounded-lg text-sm bg-[var(--anc-warn-bg)]">
                 Khali wapsi: {emptyReturnCities.slice(0, 3).map((c) => c.city).join(", ")}
@@ -428,7 +526,7 @@ export default function DashboardPage() {
               <div key={oc.carrierId} className="mb-3">
                 {oc.activeTrip ? (
                   <div className="rounded-lg p-3 bg-[var(--anc-soft)] shadow-[inset_3px_0_0_var(--anc-blue)] mb-2.5">
-                    <div className="text-xs font-bold">Chalti trip #{oc.activeTrip.tripNo}</div>
+                    <div className="text-xs font-bold">Trip {oc.activeTrip.tripNo} - Chalti</div>
                     <div className="text-[11px] text-[var(--anc-muted)]">{oc.activeTrip.route ?? "-"} · {oc.activeTrip.daysRunning} din se</div>
                     <div className="text-[11px] text-[var(--anc-muted)] anc-num">Kharcha ab tak {fmt(oc.activeTrip.expenseSoFar)}</div>
                   </div>
@@ -454,16 +552,16 @@ export default function DashboardPage() {
               </div>
             ))}
           </Card>
-
-          <Card title="Marketing" subtitle="is period">
-            <div className="grid grid-cols-2 gap-2.5">
-              <Tile label="Aaj ke follow-ups" value={String(marketing.followUpsDueToday)} />
-              <Tile label="Messages bheje" value={String(marketing.messagesSentThisPeriod)} />
-              <Tile label="Leads" value={String(marketing.leadsThisPeriod)} />
-              <Tile label="Campaign se booking" value={String(marketing.campaignBookingsCount)} sub={fmt(marketing.campaignBookingsAmount)} tone="in" />
-            </div>
-          </Card>
         </div>
+
+        <Card title="Marketing" subtitle="is period">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-2.5">
+            <Tile label="Aaj ke follow-ups" value={String(marketing.followUpsDueToday)} />
+            <Tile label="Messages bheje" value={String(marketing.messagesSentThisPeriod)} />
+            <Tile label="Leads" value={String(marketing.leadsThisPeriod)} />
+            <Tile label="Campaign se booking" value={String(marketing.campaignBookingsCount)} sub={fmt(marketing.campaignBookingsAmount)} tone="in" />
+          </div>
+        </Card>
 
         {/* 7. CHARTS */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
@@ -472,16 +570,29 @@ export default function DashboardPage() {
               <NoAccessNote />
             ) : (
               <>
-                <div className="flex items-end gap-3 h-40">
-                  {charts.incomeExpense6mo.map((m) => (
-                    <div key={m.month} className="flex-1 flex flex-col items-center gap-1">
-                      <div className="flex items-end gap-0.5 h-32 w-full justify-center">
-                        <div className="w-2.5 bg-[var(--anc-green-2)] rounded-t-sm" style={{ height: `${Math.max(2, (m.income / maxMonthValue) * 100)}%` }} title={fmt(m.income)} />
-                        <div className="w-2.5 bg-[var(--anc-gold)] rounded-t-sm" style={{ height: `${Math.max(2, (m.expense / maxMonthValue) * 100)}%` }} title={fmt(m.expense)} />
+                <div className="flex gap-2">
+                  <div className="flex flex-col justify-between h-32 text-[9px] text-[var(--anc-muted)] text-right pr-1 pb-4">
+                    <span>{fmtShort(maxMonthValue)}</span>
+                    <span>{fmtShort(maxMonthValue / 2)}</span>
+                    <span>0</span>
+                  </div>
+                  <div className="flex items-end gap-3 h-40 flex-1">
+                    {charts.incomeExpense6mo.map((m) => (
+                      <div key={m.month} className="flex-1 flex flex-col items-center gap-1">
+                        <div className="flex items-end gap-0.5 h-32 w-full justify-center relative">
+                          <div className="flex flex-col items-center justify-end h-full">
+                            <span className="text-[9px] text-[var(--anc-muted)] anc-num mb-0.5">{fmtShort(m.income)}</span>
+                            <div className="w-2.5 bg-[var(--anc-green-2)] rounded-t-sm" style={{ height: `${Math.max(2, (m.income / maxMonthValue) * 100)}%` }} title={fmt(m.income)} />
+                          </div>
+                          <div className="flex flex-col items-center justify-end h-full">
+                            <span className="text-[9px] text-[var(--anc-muted)] anc-num mb-0.5">{fmtShort(m.expense)}</span>
+                            <div className="w-2.5 bg-[var(--anc-gold)] rounded-t-sm" style={{ height: `${Math.max(2, (m.expense / maxMonthValue) * 100)}%` }} title={fmt(m.expense)} />
+                          </div>
+                        </div>
+                        <span className="text-[10px] text-[var(--anc-muted)]">{m.month}</span>
                       </div>
-                      <span className="text-[10px] text-[var(--anc-muted)]">{m.month}</span>
-                    </div>
-                  ))}
+                    ))}
+                  </div>
                 </div>
                 <div className="flex gap-3.5 text-xs text-[var(--anc-muted)] mt-2">
                   <span><i className="inline-block w-2.5 h-2.5 rounded-sm mr-1 bg-[var(--anc-green-2)]" />Kul Income</span>
@@ -497,7 +608,7 @@ export default function DashboardPage() {
             ) : (
               <>
                 {charts.expenseBreakdown.map((e) => (
-                  <div key={e.account} className="grid grid-cols-[110px_1fr_90px] gap-2 items-center text-xs my-1.5">
+                  <div key={e.account} className="grid grid-cols-[110px_1fr_90px] gap-2 items-center text-xs my-1.5" title={e.account}>
                     <span className="truncate">{e.account}</span>
                     <span className="h-2.5 bg-[var(--anc-soft)] rounded-full overflow-hidden">
                       <span className="block h-full bg-[var(--anc-green-2)] rounded-full" style={{ width: `${Math.max(2, (e.amount / maxExpense) * 100)}%` }} />
@@ -506,6 +617,13 @@ export default function DashboardPage() {
                   </div>
                 ))}
                 {charts.expenseBreakdown.length === 0 && <p className="text-sm text-[var(--anc-muted)]">Is period koi kharcha nahi</p>}
+                {charts.expenseBreakdown.length > 0 && (
+                  <div className="grid grid-cols-[110px_1fr_90px] gap-2 items-center text-xs mt-2 pt-2 border-t border-[var(--anc-line)] font-bold">
+                    <span>Total (top 5)</span>
+                    <span />
+                    <span className="text-right anc-num">{fmt(expenseBreakdownTotal)}</span>
+                  </div>
+                )}
               </>
             )}
           </Card>

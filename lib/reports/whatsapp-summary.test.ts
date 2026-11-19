@@ -5,7 +5,7 @@ import type { DailySummaryResponse } from "./daily-summary";
 
 function baseSummary(): DailySummaryResponse {
   return {
-    meta: { todayISO: "2026-11-18", latestPostedDateISO: "2026-11-18", period: "THIS_MONTH", periodLabel: "This Month", periodFromISO: "2026-11-01", periodToISO: "2026-11-30", comparisonLabel: null, generatedAt: "2026-11-18T00:00:00.000Z" },
+    meta: { period: "THIS_MONTH", periodLabel: "This Month", periodFromISO: "2026-11-01", periodToISO: "2026-11-30", rangeLabel: "1 Nov 2026 - 30 Nov 2026", comparisonLabel: null, generatedAt: "2026-11-18T00:00:00.000Z" },
     today: {
       biltyCount: 7, biltyBookingAmount: 412000, challanCount: 4, challanDispatchedCount: 3, billCount: 2, billAmount: 46500,
       showroomPhonchVehicleCount: 5, showroomPhonchDeliveryCharges: 6000, privatePhonchVehicleCount: 2, privatePhonchRent: 17000,
@@ -15,9 +15,9 @@ function baseSummary(): DailySummaryResponse {
     },
     profit: { totalIncome: 3963581, totalExpense: 3232810, profit: 730771, incomeDeltaPct: -53.8, expenseDeltaPct: -56.1, profitDeltaPct: -39.6, bookingIncome: 3612000, carrierRent: 2683500, grossMargin: 928500, grossMarginPct: 25.7, otherIncome: 351581 },
     wasooli: [
-      { partyId: "p1", name: "Jaecco Hyderabad", phone: null, amount: 127500, days: 48 },
-      { partyId: "p2", name: "Nawab Broker", phone: null, amount: 105000, days: 41 },
-      { partyId: "p3", name: "NKB", phone: null, amount: 98000, days: 35 },
+      { partyId: "p1", name: "Jaecco Hyderabad", phone: null, amount: 127500, days: 48, oldestDocLabel: "CN 6571" },
+      { partyId: "p2", name: "Nawab Broker", phone: null, amount: 105000, days: 41, oldestDocLabel: "CN 6580" },
+      { partyId: "p3", name: "NKB", phone: null, amount: 98000, days: 35, oldestDocLabel: "Bill 4399" },
     ],
     wasooliTotal: 330500,
     denaHai: [],
@@ -58,7 +58,7 @@ test("buildWhatsAppSummaryText - no wasooli, no alerts omits those lines cleanly
 
 test("buildWhatsAppSummaryText - only shows top 3 of a longer wasooli list", () => {
   const summary = baseSummary();
-  summary.wasooli!.push({ partyId: "p4", name: "Fourth Party", phone: null, amount: 1000, days: 32 });
+  summary.wasooli!.push({ partyId: "p4", name: "Fourth Party", phone: null, amount: 1000, days: 32, oldestDocLabel: null });
   const text = buildWhatsAppSummaryText(summary);
   assert.doesNotMatch(text, /Fourth Party/);
 });

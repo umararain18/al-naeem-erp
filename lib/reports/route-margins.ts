@@ -36,11 +36,19 @@ export type RouteChallanInput = {
 
 export type RouteMarginRow = {
   route: string; // "<from> -> <to>"
-  biltyCount: number;
+  biltyCount: number; // dispatched (challan-linked) bilties only - these are what booking/carrierRent/margin below are built from
   booking: number;
   carrierRent: number;
   margin: number; // profit Rs = booking - carrierRent
   marginPct: number; // margin / booking * 100, 0 when booking is 0
+  // Bilties on this route not yet linked to ANY Challan - their
+  // carrier rent is genuinely unknown (not yet dispatched), so they
+  // are EXCLUDED from booking/carrierRent/margin above entirely
+  // rather than silently counted as 100% margin (the exact reported
+  // bug: a route whose bilties are mostly still undispatched showed
+  // margin == booking). Surfaced here instead, never dropped.
+  pendingBiltyCount: number;
+  pendingBooking: number;
 };
 
 function routeKey(from: string, to: string): string {
@@ -67,16 +75,25 @@ export function computeRouteMargins(bilties: RouteBiltyInput[], challans: RouteC
 
   for (const b of bilties) {
     const key = routeKey(b.fromLocation, b.toLocation);
-    const row = rows.get(key) ?? { route: key, biltyCount: 0, booking: 0, carrierRent: 0, margin: 0, marginPct: 0 };
+    const row = rows.get(key) ?? { route: key, biltyCount: 0, booking: 0, carrierRent: 0, margin: 0, marginPct: 0, pendingBiltyCount: 0, pendingBooking: 0 };
+
+    if (!b.challanId) {
+      // Not yet dispatched - no Challan to allocate a share of Carrier
+      // Rent from, so its real margin is unknown. Tracked separately,
+      // never folded into booking/margin above.
+      row.pendingBiltyCount += 1;
+      row.pendingBooking += b.total;
+      rows.set(key, row);
+      continue;
+    }
+
     row.biltyCount += 1;
     row.booking += b.total;
 
-    if (b.challanId) {
-      const challanRent = rentByChallanId.get(b.challanId) ?? 0;
-      const challanBooking = bookingByChallanId.get(b.challanId) ?? 0;
-      const share = challanBooking > 0 ? b.total / challanBooking : 0;
-      row.carrierRent += challanRent * share;
-    }
+    const challanRent = rentByChallanId.get(b.challanId) ?? 0;
+    const challanBooking = bookingByChallanId.get(b.challanId) ?? 0;
+    const share = challanBooking > 0 ? b.total / challanBooking : 0;
+    row.carrierRent += challanRent * share;
 
     rows.set(key, row);
   }

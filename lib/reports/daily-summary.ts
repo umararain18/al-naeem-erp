@@ -4,10 +4,11 @@ import { getReceivablePayable, ageingBucketForDays, AGEING_BUCKET_LABELS, type P
 import { getTopTransportersByCarrierRent } from "@/lib/dashboard-analytics";
 import { getLatestOpenTrip, getTripProfitReport } from "@/lib/carrier-trip";
 import { getUnearnedRevenueAccountId } from "@/lib/gross-accounts";
-import { getPartyDocumentStates } from "@/lib/payment-allocation";
+import { getPartyDocumentStates, getOpeningBalanceBreakdown, type AllocationTargetType } from "@/lib/payment-allocation";
+import { derivePrivatePhonchVehicleAmounts } from "@/lib/dashboard-analytics";
 import { computePartyFifoPreview, checkPartyReconciliation, type PartyFifoPreview } from "@/lib/party-payment-fifo";
 import { getBusinessSettings } from "@/lib/business-settings";
-import { resolveDateRange, safePercentChange as rawPercentChange, toISODate, type DatePreset } from "@/lib/date-range";
+import { resolveDateRange, safePercentChange as rawPercentChange, type DatePreset } from "@/lib/date-range";
 import { computeRouteMargins, detectEmptyReturnCities, type RouteBiltyInput, type RouteChallanInput } from "./route-margins";
 import { applyDailySummaryPermissions, type DailySummaryPermissions } from "./daily-summary-permissions";
 
@@ -57,23 +58,24 @@ export type DrilldownKey =
 // show" - a genuinely different, non-sensitive state from `null`.
 export interface DailySummaryResponse {
   meta: {
-    // The date "Aaj ka khulasa" actually reflects - defaults to
-    // latestPostedDateISO (see below), NOT the server's own clock
-    // date, unless the caller passed an explicit `date` param (the
-    // date picker / "Kal"/"Aaj" quick buttons).
-    todayISO: string;
-    // The most recent date ANY JournalEntry was posted for, server-
-    // wide - always computed, regardless of what `date` was
-    // requested, so the "Aakhri posted din" quick button always has
-    // a real target even when the picker is showing some other date.
-    latestPostedDateISO: string | null;
+    // ONE global period selector drives every card below, including
+    // Khulasa (see this module's own header comment) - there is no
+    // longer a separate "today" date independent of it.
     period: DatePreset;
     periodLabel: string;
     periodFromISO: string | null;
     periodToISO: string | null;
+    // Exact human display range - "18 Nov 2026" (single day) or
+    // "1 Sep 2026 - 27 Sep 2026" (multi-day) - reused verbatim by the
+    // Khulasa header and the WhatsApp summary, never re-derived.
+    rangeLabel: string;
     comparisonLabel: string | null;
     generatedAt: string;
   };
+  // "Khulasa" - totals for the WHOLE selected period (not literally
+  // "today" any more, see this module's own header comment); the key
+  // is kept as `today` since it's already load-bearing in tests/
+  // permissions/WhatsApp summary and renaming it is purely cosmetic.
   today: {
     // bilty.view
     biltyCount: number | null;
@@ -112,7 +114,10 @@ export interface DailySummaryResponse {
     otherIncome: number;
   } | null;
   // reports.view
-  wasooli: { partyId: string | null; name: string; phone: string | null; amount: number; days: number }[] | null;
+  // oldestDocLabel: "CN 6571" / "PP 7013" / "Bill 4399" / "Bilty 1820" /
+  // "Opening Balance", or null when this party has no resolvable
+  // FIFO document at all (falls back to lastActivityDate for `days`).
+  wasooli: { partyId: string | null; name: string; phone: string | null; amount: number; days: number; oldestDocLabel: string | null }[] | null;
   wasooliTotal: number | null;
   denaHai: { partyId: string; name: string; amount: number; oldestDocNo: string | null; oldestDocDays: number | null }[] | null;
   denaHaiTotal: number | null;
@@ -160,8 +165,16 @@ export interface DailySummaryResponse {
 }
 
 export interface GetDailySummaryParams {
-  date?: string | null; // YYYY-MM-DD, defaults to server-local today - "Aaj ka khulasa" is ALWAYS this date, never period-filtered
-  period?: string | null; // DatePreset for everything else (Profit, Top Parties, Routes, charts) - defaults to THIS_MONTH
+  // ONE global period selector, resolved by lib/date-range.ts's own
+  // resolveDateRange() - drives EVERY card (Khulasa included; see
+  // this module's own header comment). The caller (app/api/reports/
+  // daily-summary/route.ts) defaults `preset` to "YESTERDAY" when the
+  // client sends none - this function itself defers that default to
+  // resolveDateRange's own ("THIS_MONTH" when nothing at all is
+  // supplied), never duplicating it.
+  preset?: string | null;
+  from?: string | null; // CUSTOM only
+  to?: string | null; // CUSTOM only
   // Required - the caller (app/api/reports/daily-summary/route.ts)
   // must compute this from the REAL requesting user's own
   // hasPermission() checks. Every section/field this permission set
@@ -171,12 +184,34 @@ export interface GetDailySummaryParams {
   permissions: DailySummaryPermissions;
 }
 
-function startOfDay(d: Date): Date {
-  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+// Pre-ERP fallback for an opening balance's display age when even
+// getOpeningBalanceBreakdown's own earliestDate can't be resolved
+// (should not normally happen) - this ERP's own go-live date, never
+// the FIFO sentinel (2000-01-01, see OPENING_BALANCE_SENTINEL_DATE in
+// lib/account-opening-balance.ts) which is correct for ALLOCATION
+// ORDER but wildly wrong as a human-facing age ("9818 din").
+const ERP_START_DATE = new Date(2026, 9, 1);
+
+// "<Type> <No>" for a party's oldest open document, or the literal
+// "Opening Balance" (no number) for the OPENING_BALANCE virtual
+// target - matches the short codes this business already recognizes
+// from its own documents, never invented ones.
+const DOC_TYPE_LABELS: Partial<Record<AllocationTargetType, string>> = {
+  CHALLAN: "CN",
+  PRIVATE_PHONCH_PAYABLE: "PP",
+  PRIVATE_PHONCH_RECOVERY: "PP",
+  BILL: "Bill",
+  BILTY: "Bilty",
+  BILTY_PAID: "Bilty",
+  PHONCH_RECOVERY: "Phonch",
+};
+
+function formatDocLabel(targetSourceType: AllocationTargetType, documentNo: string): string {
+  if (targetSourceType === "OPENING_BALANCE") return "Opening Balance";
+  const prefix = DOC_TYPE_LABELS[targetSourceType];
+  return prefix ? `${prefix} ${documentNo}` : documentNo;
 }
-function endOfDayExclusive(d: Date): Date {
-  return new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1);
-}
+
 function daysBetween(a: Date, b: Date): number {
   return Math.floor((b.getTime() - a.getTime()) / 86400000);
 }
@@ -288,7 +323,7 @@ function round2(value: number): number {
 // back to its own last-activity date so its balance is never dropped
 // from the bucket totals.
 interface PartyOpenDocs {
-  oldestDocNo: string | null;
+  oldestDocLabel: string | null; // "CN 6571" / "Opening Balance" / etc, see formatDocLabel
   oldestDocDate: Date | null;
   documents: { date: Date; remaining: number }[];
 }
@@ -299,14 +334,31 @@ async function computePartyOpenDocuments(accountIds: string[], direction: "RECEI
     accountIds.map(async (accountId) => {
       const docs = await getPartyDocumentStates(prisma, accountId, direction, { onlyWithRemainingBalance: true });
       if (docs.length === 0) {
-        result.set(accountId, { oldestDocNo: null, oldestDocDate: null, documents: [] });
+        result.set(accountId, { oldestDocLabel: null, oldestDocDate: null, documents: [] });
         return;
       }
+
+      // OPENING_BALANCE's own documentDate is the FIFO sentinel
+      // (2000-01-01) - correct for allocation ORDER (it must clear
+      // before every real document), wrong for a human-facing age
+      // ("9818 din", the exact reported bug). Swapped here, for
+      // DISPLAY only, for the real earliest contributing line's date
+      // (getOpeningBalanceBreakdown's own earliestDate) - the FIFO
+      // sort below still runs on the original sentinel-dated copy, so
+      // allocation order is completely unaffected.
       const sorted = [...docs].sort((a, b) => a.documentDate.getTime() - b.documentDate.getTime());
+      const withDisplayDates = await Promise.all(
+        sorted.map(async (d) => {
+          if (d.targetSourceType !== "OPENING_BALANCE") return { ...d, displayDate: d.documentDate };
+          const breakdown = await getOpeningBalanceBreakdown(prisma, d.targetSourceId);
+          return { ...d, displayDate: breakdown?.earliestDate ?? ERP_START_DATE };
+        })
+      );
+
       result.set(accountId, {
-        oldestDocNo: sorted[0].documentNo,
-        oldestDocDate: sorted[0].documentDate,
-        documents: sorted.map((d) => ({ date: d.documentDate, remaining: d.remainingAllocatable })),
+        oldestDocLabel: formatDocLabel(withDisplayDates[0].targetSourceType, withDisplayDates[0].documentNo),
+        oldestDocDate: withDisplayDates[0].displayDate,
+        documents: withDisplayDates.map((d) => ({ date: d.displayDate, remaining: d.remainingAllocatable })),
       });
     })
   );
@@ -601,8 +653,14 @@ async function computeCharts(periodWhere: DateFilter) {
   };
 }
 
-async function computeTodaySection(todayStart: Date, todayEnd: Date) {
-  const dateRange = { gte: todayStart, lt: todayEnd };
+// "Khulasa" totals for the WHOLE selected period (see this module's
+// own header comment - the global period selector drives this too,
+// not a separate single day any more). `periodToExclusive` null means
+// an open-ended range (should not happen for the 5 presets the
+// Dashboard's own selector offers, which always resolve a concrete
+// end) - cash balances then fall back to "right now" (no upper bound).
+async function computePeriodActivitySection(periodFrom: Date | null, periodToExclusive: Date | null) {
+  const dateRange = { gte: periodFrom ?? undefined, lt: periodToExclusive ?? undefined };
 
   const [bilties, challans, bills, phonches, privatePhonches, cashBankAccounts] = await Promise.all([
     prisma.bilty.findMany({
@@ -623,7 +681,7 @@ async function computeTodaySection(todayStart: Date, todayEnd: Date) {
     }),
     prisma.privatePhonch.findMany({
       where: { isDeleted: false, date: dateRange },
-      select: { id: true, phonchNo: true, transporterParty: { select: { partyName: true } }, vehicles: { select: { totalRent: true } } },
+      select: { id: true, phonchNo: true, transporterParty: { select: { partyName: true } }, vehicles: { select: { totalRent: true, deliveryCharges: true, carrierPayable: true } } },
     }),
     prisma.account.findMany({
       where: { isActive: true, OR: [{ category: "CASH" }, { category: "BANK" }] },
@@ -644,11 +702,22 @@ async function computeTodaySection(todayStart: Date, todayEnd: Date) {
   const showroomPhonchVehicleCount = showroomPhonchRows.reduce((s, p) => s + p.vehicleCount, 0);
   const showroomPhonchDeliveryCharges = showroomPhonchRows.reduce((s, p) => s + p.amount, 0);
 
+  // A vehicle's real gross charge is `totalRent`, EXCEPT a fully-paid
+  // vehicle (totalRent = 0, see schema's own PrivatePhonchVehicle
+  // comment) whose charge is instead recovered via deliveryCharges -
+  // reusing derivePrivatePhonchVehicleAmounts's own documented formula
+  // (lib/dashboard-analytics.ts), never a second rule. Without this, a
+  // fully-paid vehicle showed "Rs 0" on this tile despite real charges
+  // (the exact reported bug).
   const privatePhonchRows = privatePhonches.map((p) => ({
     id: p.id,
     label: `${p.phonchNo} - ${p.transporterParty?.partyName ?? "-"}`,
     vehicleCount: p.vehicles.length,
-    amount: p.vehicles.reduce((s, v) => s + Number(v.totalRent), 0),
+    amount: p.vehicles.reduce((s, v) => {
+      const totalRent = Number(v.totalRent);
+      const derived = derivePrivatePhonchVehicleAmounts({ totalRent, deliveryCharges: Number(v.deliveryCharges), carrierPayable: Number(v.carrierPayable) });
+      return s + totalRent + derived.deliveryRecovery;
+    }, 0),
   }));
   const privatePhonchVehicleCount = privatePhonchRows.reduce((s, p) => s + p.vehicleCount, 0);
   const privatePhonchRent = privatePhonchRows.reduce((s, p) => s + p.amount, 0);
@@ -656,21 +725,21 @@ async function computeTodaySection(todayStart: Date, todayEnd: Date) {
   const challanRows = challans.map((c) => ({ id: c.id, label: `${c.challanNo} - ${c.transporterParty?.partyName ?? "Own Carrier"}`, vehicleCount: c.bilties.length, amount: Number(c.carrierRent) }));
   const challanDispatchedCount = challans.filter((c) => c.status === "IN_TRANSIT" || c.status === "DELIVERED").length;
 
-  // Cash In/Out today - the Main (Cash/Bank) account's OWN side of
-  // every JournalLine posted today, exactly Cash Book's own Debit=In/
-  // Credit=Out convention (app/api/cash-book/route.ts) - never derived
-  // from a counter line.
+  // Cash In/Out for the WHOLE selected period - the Main (Cash/Bank)
+  // account's OWN side of every JournalLine posted in that range,
+  // exactly Cash Book's own Debit=In/Credit=Out convention (app/api/
+  // cash-book/route.ts) - never derived from a counter line.
   const cashBankIds = cashBankAccounts.map((a) => a.id);
-  const todayCashLines = cashBankIds.length
+  const periodCashLines = cashBankIds.length
     ? await prisma.journalLine.findMany({
         where: { accountId: { in: cashBankIds }, journalEntry: { entryDate: dateRange, isDeleted: false } },
         select: { accountId: true, debit: true, credit: true, description: true, sourceType: true },
       })
     : [];
-  const cashIn = todayCashLines.reduce((s, l) => s + Number(l.debit), 0);
-  const cashOut = todayCashLines.reduce((s, l) => s + Number(l.credit), 0);
+  const cashIn = periodCashLines.reduce((s, l) => s + Number(l.debit), 0);
+  const cashOut = periodCashLines.reduce((s, l) => s + Number(l.credit), 0);
 
-  function groupCashRows(lines: typeof todayCashLines, side: "debit" | "credit") {
+  function groupCashRows(lines: typeof periodCashLines, side: "debit" | "credit") {
     const byLabel = new Map<string, { entries: number; amount: number }>();
     for (const l of lines) {
       const amount = Number(l[side]);
@@ -684,17 +753,21 @@ async function computeTodaySection(todayStart: Date, todayEnd: Date) {
     return [...byLabel.entries()].map(([label, v]) => ({ label, entries: v.entries, amount: v.amount })).sort((a, b) => b.amount - a.amount);
   }
 
-  // Current balance per Cash/Bank account - all-time sum of debit -
-  // credit on that account's own JournalLines, no date filter (this is
-  // "right now", not a period total).
-  const allTimeCashLines = cashBankIds.length
+  // CLOSING balance per Cash/Bank account AS OF the selected period's
+  // own end date (per the user's own correction: a historical period
+  // like "Yesterday" must show the balance as it stood then, not
+  // "right now" which would include every later transaction too) -
+  // sum of debit - credit on every JournalLine dated before
+  // periodToExclusive, no lower bound (a balance is always a running
+  // total from the account's own start, never period-scoped itself).
+  const closingCashLines = cashBankIds.length
     ? await prisma.journalLine.groupBy({
         by: ["accountId"],
-        where: { accountId: { in: cashBankIds }, journalEntry: { isDeleted: false } },
+        where: { accountId: { in: cashBankIds }, journalEntry: { isDeleted: false, entryDate: periodToExclusive ? { lt: periodToExclusive } : undefined } },
         _sum: { debit: true, credit: true },
       })
     : [];
-  const balanceByAccountId = new Map(allTimeCashLines.map((l) => [l.accountId, Number(l._sum.debit || 0) - Number(l._sum.credit || 0)]));
+  const balanceByAccountId = new Map(closingCashLines.map((l) => [l.accountId, Number(l._sum.debit || 0) - Number(l._sum.credit || 0)]));
   const cashByAccount = cashBankAccounts.map((a) => ({ accountId: a.id, accountName: a.accountName, balance: balanceByAccountId.get(a.id) ?? 0 }));
   const totalCash = cashByAccount.reduce((s, a) => s + a.balance, 0);
 
@@ -721,39 +794,24 @@ async function computeTodaySection(todayStart: Date, todayEnd: Date) {
     billRows: billRowsRaw,
     showroomPhonchRows,
     privatePhonchRows,
-    cashInRows: groupCashRows(todayCashLines, "debit"),
-    cashOutRows: groupCashRows(todayCashLines, "credit"),
+    cashInRows: groupCashRows(periodCashLines, "debit"),
+    cashOutRows: groupCashRows(periodCashLines, "credit"),
   };
-}
-
-// The most recent date ANY non-deleted JournalEntry was posted for -
-// "Aaj ka khulasa"'s own default (per the user's own correction: the
-// day's data is usually posted the NEXT day, so "today" is often
-// empty and misleading as a default) and the "Aakhri posted din"
-// quick button's target.
-async function getLatestPostedDate(): Promise<Date | null> {
-  const latest = await prisma.journalEntry.findFirst({
-    where: { isDeleted: false },
-    orderBy: { entryDate: "desc" },
-    select: { entryDate: true },
-  });
-  return latest?.entryDate ?? null;
 }
 
 export async function getDailySummary(params: GetDailySummaryParams): Promise<DailySummaryResponse> {
   const now = new Date();
-  const latestPostedDate = await getLatestPostedDate();
-  const today = params.date ? new Date(`${params.date}T00:00:00`) : startOfDay(latestPostedDate ?? now);
-  const todayStart = startOfDay(today);
-  const todayEnd = endOfDayExclusive(today);
-
-  const periodPreset = (params.period || "THIS_MONTH") as DatePreset;
-  const range = resolveDateRange({ preset: periodPreset }, now);
+  // ONE global period selector (lib/date-range.ts's own resolveDateRange)
+  // drives EVERY card below, Khulasa included - see this module's own
+  // header comment. The route layer defaults `preset` to "YESTERDAY"
+  // before calling this; resolveDateRange's own bare-nothing-supplied
+  // default (THIS_MONTH) is never relied on here.
+  const range = resolveDateRange({ preset: params.preset, from: params.from, to: params.to }, now);
   const periodWhere = { gte: range.from ?? undefined, lt: range.to ?? undefined };
   const comparisonWhere = { gte: range.comparisonFrom ?? undefined, lt: range.comparisonTo ?? undefined };
 
   const [
-    todaySection,
+    periodActivitySection,
     profitSection,
     receivablePayable,
     alertsResult,
@@ -764,14 +822,14 @@ export async function getDailySummary(params: GetDailySummaryParams): Promise<Da
     chartsRaw,
     businessSettings,
   ] = await Promise.all([
-    computeTodaySection(todayStart, todayEnd),
+    computePeriodActivitySection(range.from, range.to),
     computeProfitSection(periodWhere, comparisonWhere),
     getReceivablePayable(),
     computeAlerts(periodWhere),
     computeTopParties(periodWhere),
     computeRoutesAndOwnCarrier(periodWhere),
     computeOwnCarriers(),
-    computeMarketing(today, periodWhere),
+    computeMarketing(now, periodWhere),
     computeCharts(periodWhere),
     getBusinessSettings(prisma),
   ]);
@@ -793,7 +851,14 @@ export async function getDailySummary(params: GetDailySummaryParams): Promise<Da
     .map((r) => {
       const docState = receivableDocsByAccount.get(r.accountId);
       const oldestDate = docState?.oldestDocDate ?? r.lastActivityDate;
-      return { partyId: r.partyId, name: r.partyName, phone: r.phone, amount: r.balance, days: oldestDate ? daysBetween(oldestDate, today) : Infinity };
+      return {
+        partyId: r.partyId,
+        name: r.partyName,
+        phone: r.phone,
+        amount: r.balance,
+        days: oldestDate ? daysBetween(oldestDate, now) : Infinity,
+        oldestDocLabel: docState?.oldestDocLabel ?? null,
+      };
     })
     .sort((a, b) => b.amount - a.amount);
 
@@ -805,13 +870,19 @@ export async function getDailySummary(params: GetDailySummaryParams): Promise<Da
         partyId: p.partyId!,
         name: p.partyName,
         amount: p.balance,
-        oldestDocNo: docState?.oldestDocNo ?? null,
-        oldestDocDays: oldestDate ? daysBetween(oldestDate, today) : null,
+        oldestDocNo: docState?.oldestDocLabel ?? null,
+        oldestDocDays: oldestDate ? daysBetween(oldestDate, now) : null,
       };
     })
     .sort((a, b) => b.amount - a.amount);
 
-  const ageingBuckets = bucketAgeingByDocument(receivablePayable.receivable, receivableDocsByAccount, today);
+  const ageingBuckets = bucketAgeingByDocument(receivablePayable.receivable, receivableDocsByAccount, now);
+
+  // "Aaj"/"aaj" ONLY when the selected period is literally TODAY, "Is
+  // period"/"is period" otherwise - the user's own correction (never
+  // say "aaj" for a period that may span many days).
+  const periodPrefix = range.preset === "TODAY" ? "Aaj" : "Is period";
+  const periodSuffix = range.preset === "TODAY" ? "aaj" : "is period";
 
   const drilldowns: Record<DrilldownKey, DrilldownDataset> = {
     cust: {
@@ -869,46 +940,46 @@ export async function getDailySummary(params: GetDailySummaryParams): Promise<Da
       rows: drillRows(chartsRaw.incomeBreakdownFull, (e) => ({ name: e.account, link: null, count: e.entries, amount: e.amount })),
     },
     tb: {
-      title: "Aaj ki bilties",
-      subtitle: toISODate(today),
+      title: `${periodPrefix} ki bilties`,
+      subtitle: range.rangeLabel,
       columns: ["Bilty / Customer", "Gaariyan", "Booking Rs"],
-      rows: drillRows(todaySection.biltyRows, (b) => ({ name: b.label, link: `/bilty/${b.id}`, count: 1, amount: b.amount })),
+      rows: drillRows(periodActivitySection.biltyRows, (b) => ({ name: b.label, link: `/bilty/${b.id}`, count: 1, amount: b.amount })),
     },
     tc: {
-      title: "Aaj ke challan",
-      subtitle: toISODate(today),
+      title: `${periodPrefix} ke challan`,
+      subtitle: range.rangeLabel,
       columns: ["Challan / Transporter", "Gaariyan", "Rent Rs"],
-      rows: drillRows(todaySection.challanRows, (c) => ({ name: c.label, link: `/challan/${c.id}`, count: c.vehicleCount, amount: c.amount })),
+      rows: drillRows(periodActivitySection.challanRows, (c) => ({ name: c.label, link: `/challan/${c.id}`, count: c.vehicleCount, amount: c.amount })),
     },
     tbill: {
-      title: "Aaj ke bill",
-      subtitle: toISODate(today),
+      title: `${periodPrefix} ke bill`,
+      subtitle: range.rangeLabel,
       columns: ["Bill / Client", "Gaariyan", "Rs"],
-      rows: drillRows(todaySection.billRows, (b) => ({ name: b.label, link: `/bill/${b.id}`, count: 1, amount: b.amount })),
+      rows: drillRows(periodActivitySection.billRows, (b) => ({ name: b.label, link: `/bill/${b.id}`, count: 1, amount: b.amount })),
     },
     tsr: {
-      title: "Showroom Phonch - aaj",
-      subtitle: toISODate(today),
+      title: `Showroom Phonch - ${periodSuffix}`,
+      subtitle: range.rangeLabel,
       columns: ["Phonch / Transporter", "Gaariyan", "Rs"],
-      rows: drillRows(todaySection.showroomPhonchRows, (p) => ({ name: p.label, link: `/phonch/${p.id}`, count: p.vehicleCount, amount: p.amount })),
+      rows: drillRows(periodActivitySection.showroomPhonchRows, (p) => ({ name: p.label, link: `/phonch/${p.id}`, count: p.vehicleCount, amount: p.amount })),
     },
     tpp: {
-      title: "Private Phonch - aaj",
-      subtitle: toISODate(today),
+      title: `Private Phonch - ${periodSuffix}`,
+      subtitle: range.rangeLabel,
       columns: ["Phonch / Clearing Agent", "Gaariyan", "Rs"],
-      rows: drillRows(todaySection.privatePhonchRows, (p) => ({ name: p.label, link: `/private-phonch/${p.id}`, count: p.vehicleCount, amount: p.amount })),
+      rows: drillRows(periodActivitySection.privatePhonchRows, (p) => ({ name: p.label, link: `/private-phonch/${p.id}`, count: p.vehicleCount, amount: p.amount })),
     },
     tin: {
-      title: "Paise aaye - aaj",
+      title: `Paise aaye - ${periodSuffix}`,
       subtitle: "Cash + Bank",
       columns: ["Kis se", "Entries", "Rs"],
-      rows: drillRows(todaySection.cashInRows, (r) => ({ name: r.label, link: null, count: r.entries, amount: r.amount })),
+      rows: drillRows(periodActivitySection.cashInRows, (r) => ({ name: r.label, link: null, count: r.entries, amount: r.amount })),
     },
     tout: {
-      title: "Paise gaye - aaj",
+      title: `Paise gaye - ${periodSuffix}`,
       subtitle: "Cash + Bank",
       columns: ["Kis ko", "Entries", "Rs"],
-      rows: drillRows(todaySection.cashOutRows, (r) => ({ name: r.label, link: null, count: r.entries, amount: r.amount })),
+      rows: drillRows(periodActivitySection.cashOutRows, (r) => ({ name: r.label, link: null, count: r.entries, amount: r.amount })),
     },
     loss: {
       title: "Nuqsan wale challan",
@@ -926,16 +997,15 @@ export async function getDailySummary(params: GetDailySummaryParams): Promise<Da
 
   const full: DailySummaryResponse = {
     meta: {
-      todayISO: toISODate(today),
-      latestPostedDateISO: latestPostedDate ? toISODate(latestPostedDate) : null,
       period: range.preset,
       periodLabel: range.label,
       periodFromISO: range.fromISO,
       periodToISO: range.toISO,
+      rangeLabel: range.rangeLabel,
       comparisonLabel: range.comparisonRangeLabel,
       generatedAt: now.toISOString(),
     },
-    today: todaySection.summary,
+    today: periodActivitySection.summary,
     profit: profitSection,
     wasooli: wasooliRows.slice(0, 10),
     wasooliTotal: receivablePayable.totalReceivable,

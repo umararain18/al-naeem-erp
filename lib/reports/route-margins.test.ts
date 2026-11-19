@@ -24,19 +24,26 @@ test("computeRouteMargins - one challan's rent splits proportionally across 2 ro
   assert.equal(multan.carrierRent, 1000); // 25% share
 });
 
-test("computeRouteMargins - a Bilty with no Challan link yet contributes booking with zero carrier rent", () => {
+test("computeRouteMargins - a Bilty with no Challan link is excluded from margin, tracked as pending", () => {
   const bilties: RouteBiltyInput[] = [{ biltyId: "b1", challanId: null, fromLocation: "Karachi", toLocation: "Lahore", total: 5000 }];
   const rows = computeRouteMargins(bilties, []);
+  assert.equal(rows[0].biltyCount, 0);
+  assert.equal(rows[0].booking, 0);
   assert.equal(rows[0].carrierRent, 0);
-  assert.equal(rows[0].margin, 5000);
+  assert.equal(rows[0].margin, 0);
+  assert.equal(rows[0].pendingBiltyCount, 1);
+  assert.equal(rows[0].pendingBooking, 5000);
 });
 
 test("computeRouteMargins - sorted by margin descending", () => {
   const bilties: RouteBiltyInput[] = [
-    { biltyId: "b1", challanId: null, fromLocation: "A", toLocation: "B", total: 1000 },
-    { biltyId: "b2", challanId: null, fromLocation: "C", toLocation: "D", total: 5000 },
+    { biltyId: "b1", challanId: "c1", fromLocation: "A", toLocation: "B", total: 1000 },
+    { biltyId: "b2", challanId: "c2", fromLocation: "C", toLocation: "D", total: 5000 },
   ];
-  const rows = computeRouteMargins(bilties, []);
+  const rows = computeRouteMargins(bilties, [
+    { challanId: "c1", carrierRent: 0 },
+    { challanId: "c2", carrierRent: 0 },
+  ]);
   assert.equal(rows[0].route, "C -> D");
   assert.equal(rows[1].route, "A -> B");
 });
