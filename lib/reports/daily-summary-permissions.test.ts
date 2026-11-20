@@ -33,11 +33,11 @@ function fullSummary(): DailySummaryResponse {
       receivableAgeing: [{ bucket: "1-30 Days", amount: 707016 }],
     },
     drilldowns: {
-      cust: { title: "Top Customers", subtitle: "", columns: ["Customer", "Bilties", "Rs"], rows: [] },
-      tb: { title: "Aaj ki bilties", subtitle: "", columns: ["Bilty", "Gaariyan", "Rs"], rows: [] },
-      tc: { title: "Aaj ke challan", subtitle: "", columns: ["Challan", "Gaariyan", "Rs"], rows: [] },
-      loss: { title: "Nuqsan", subtitle: "", columns: ["Challan", "Gaariyan", "Rs"], rows: [] },
-      routes: { title: "Routes", subtitle: "", columns: ["Route", "Bilties", "Rs"], rows: [] },
+      cust: { title: "Top Customers", subtitle: "", columns: ["Customer", "Bilties", "Rs"], sortBy: "count", rows: [] },
+      tb: { title: "Aaj ki bilties", subtitle: "", columns: ["Bilty", "Gaariyan", "Rs"], sortBy: "amount", rows: [] },
+      tc: { title: "Aaj ke challan", subtitle: "", columns: ["Challan", "Gaariyan", "Rs"], sortBy: "amount", rows: [] },
+      loss: { title: "Nuqsan", subtitle: "", columns: ["Challan", "Gaariyan", "Rs"], sortBy: "amount", rows: [] },
+      routes: { title: "Routes", subtitle: "", columns: ["Route", "Bilties", "Rs"], sortBy: "amount", rows: [] },
     },
     ownerWhatsapp: "03001234567",
   };

@@ -315,12 +315,19 @@ export default function AppSidebar({ user }: { user: User | null }) {
           content surface that should flip with the viewer's theme). */}
       <aside
         className={`
-          anc-theme fixed inset-y-0 left-0 z-50 bg-[var(--anc-green)] text-white transition-all duration-300 flex flex-col
-          lg:sticky lg:top-0 lg:h-screen lg:z-auto
+          anc-theme fixed inset-y-0 left-0 bg-[var(--anc-green)] text-white transition-all duration-300 flex flex-col
+          lg:sticky lg:top-0 lg:h-screen
           ${collapsed ? "w-[64px]" : "w-[240px]"}
           ${mobileOpen ? "translate-x-0" : "-translate-x-full lg:translate-x-0"}
         `}
-        style={{ fontFamily: "var(--anc-font)" }}
+        // An explicit z-index (never "auto", never Tailwind's lg:z-auto
+        // override) at every breakpoint, kept well below the Drill-
+        // down drawer's z-[200] - a sticky-positioned element with
+        // z-index:auto can still out-paint a later, differently-
+        // stacked fixed descendant in some browsers; pinning this
+        // removes that ambiguity (the reported "overlay covers
+        // sidebar" bug).
+        style={{ zIndex: 40, fontFamily: "var(--anc-font)" }}
       >
         {/* Brand - collapsed state keeps a small logo mark (instead of
             nothing at all) so the sidebar never loses its identity. */}

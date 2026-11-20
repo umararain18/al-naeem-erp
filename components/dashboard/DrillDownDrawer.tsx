@@ -49,14 +49,25 @@ export default function DrillDownDrawer({ dataset, onClose }: { dataset: Drilldo
     return () => window.removeEventListener("keydown", handleKey);
   }, [dataset, onClose]);
 
+  // Ranked by whichever field the dataset itself says is its own
+  // criterion (sortBy) - NOT always "amount": Top Customers/Clearing
+  // Agents/Transporters are ranked by COUNT per their own subtitle
+  // ("zyada bilties/gaariyan/challan"), while Wasooli/Dena/Routes/
+  // Kharcha/Income are ranked by Rs ("zyada raqam upar"). Rank is
+  // reassigned here to match the ACTUAL rendered order - the
+  // server's own `rank` reflects ITS OWN sort, which can differ once
+  // filtered/re-sorted client-side.
+  const sortKey = dataset?.sortBy ?? "amount";
   const filteredRows = useMemo(() => {
     if (!dataset) return [];
     const q = search.trim().toLowerCase();
     const rows = q ? dataset.rows.filter((r) => r.name.toLowerCase().includes(q)) : dataset.rows;
-    return [...rows].sort((a, b) => b.amount - a.amount || b.count - a.count);
-  }, [dataset, search]);
+    const otherKey = sortKey === "amount" ? "count" : "amount";
+    const sorted = [...rows].sort((a, b) => b[sortKey] - a[sortKey] || b[otherKey] - a[otherKey]);
+    return sorted.map((r, i) => ({ ...r, rank: i + 1 }));
+  }, [dataset, search, sortKey]);
 
-  const maxAmount = useMemo(() => Math.max(1, ...filteredRows.map((r) => Math.abs(r.amount))), [filteredRows]);
+  const maxValue = useMemo(() => Math.max(1, ...filteredRows.map((r) => Math.abs(r[sortKey]))), [filteredRows, sortKey]);
   const totals = useMemo(
     () => filteredRows.reduce((acc, r) => ({ count: acc.count + r.count, amount: acc.amount + r.amount }), { count: 0, amount: 0 }),
     [filteredRows]
@@ -65,7 +76,7 @@ export default function DrillDownDrawer({ dataset, onClose }: { dataset: Drilldo
   if (!dataset) return null;
 
   return (
-    <div className="anc-theme fixed inset-0 z-[100]" style={{ fontFamily: "var(--anc-font)" }}>
+    <div className="anc-theme fixed inset-0 z-[200]" style={{ fontFamily: "var(--anc-font)" }}>
       <div className="absolute inset-0 bg-black/40" onClick={onClose} />
       <div className="absolute right-0 top-0 bottom-0 w-full max-w-[640px] bg-[var(--anc-card)] text-[var(--anc-ink)] border-l-4 border-[var(--anc-crimson)] flex flex-col shadow-xl">
         <header className="flex items-start justify-between gap-3 px-5 py-4 border-b border-[var(--anc-line)]">
@@ -118,7 +129,7 @@ export default function DrillDownDrawer({ dataset, onClose }: { dataset: Drilldo
                       row.name
                     )}
                     <span className="block h-1 bg-[var(--anc-soft)] rounded-full mt-1 overflow-hidden">
-                      <span className="block h-full bg-[var(--anc-green-2)]" style={{ width: `${Math.round((Math.abs(row.amount) / maxAmount) * 100)}%` }} />
+                      <span className="block h-full bg-[var(--anc-green-2)]" style={{ width: `${Math.round((Math.abs(row[sortKey]) / maxValue) * 100)}%` }} />
                     </span>
                   </td>
                   <td className="py-2 text-right anc-num">{row.count.toLocaleString("en-US")}</td>

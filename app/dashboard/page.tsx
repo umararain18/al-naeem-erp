@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import type { DailySummaryResponse, DrilldownKey } from "@/lib/reports/daily-summary";
 import DrillDownDrawer from "@/components/dashboard/DrillDownDrawer";
@@ -17,6 +17,15 @@ function fmtShort(n: number): string {
   if (abs >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (abs >= 1_000) return `${Math.round(n / 1000)}k`;
   return String(Math.round(n));
+}
+
+// Display-only: strips leading zeros from a purely-numeric trip
+// number ("057" -> "57") so every Trip label on this card reads
+// consistently - never touches the stored tripNo string itself
+// (free-text, user-typed; some historical trips were entered with a
+// leading zero, others weren't).
+function formatTripNo(tripNo: string): string {
+  return /^\d+$/.test(tripNo) ? String(parseInt(tripNo, 10)) : tripNo;
 }
 
 function localISODate(d: Date): string {
@@ -151,11 +160,31 @@ export default function DashboardPage() {
   const [customDraft, setCustomDraft] = useState<{ from: string; to: string }>({ from: "", to: "" });
   const [drilldownKey, setDrilldownKey] = useState<DrilldownKey | null>(null);
   const [fifoMismatchCount, setFifoMismatchCount] = useState<number | null>(null);
+  const [moreOpen, setMoreOpen] = useState(false);
+  const moreMenuRef = useRef<HTMLDivElement>(null);
+
+  // Compact "More" actions menu (item 6: the full button row no longer
+  // fits one line at 1366px) - closes on an outside click, same as any
+  // ordinary dropdown.
+  useEffect(() => {
+    if (!moreOpen) return;
+    function handleClick(e: MouseEvent) {
+      if (moreMenuRef.current && !moreMenuRef.current.contains(e.target as Node)) setMoreOpen(false);
+    }
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [moreOpen]);
 
   // Restore the last-used period choice on mount (localStorage is
-  // per-browser, read only client-side).
+  // per-browser, read only client-side) - including the Custom date
+  // inputs themselves, which otherwise stayed blank after a reload
+  // even though the fetch below already used the restored from/to.
   useEffect(() => {
-    setPeriodChoice(loadStoredPeriod());
+    const stored = loadStoredPeriod();
+    setPeriodChoice(stored);
+    if (stored.preset === "CUSTOM" && stored.from && stored.to) {
+      setCustomDraft({ from: stored.from, to: stored.to });
+    }
   }, []);
 
   useEffect(() => {
@@ -292,16 +321,34 @@ export default function DashboardPage() {
                 />
               </>
             )}
-            <Link href="/bilty" className="rounded-lg bg-[var(--anc-blue)] text-white px-3 py-2 text-sm font-semibold">
+            <Link href="/bilty" className="rounded-lg bg-[var(--anc-blue)] text-white px-3 py-2 text-sm font-semibold whitespace-nowrap">
               + New Bilty
             </Link>
-            <Link href="/challan" className="rounded-lg border border-[var(--anc-line)] bg-[var(--anc-card)] px-3 py-2 text-sm font-semibold hover:bg-[var(--anc-soft)]">
-              + Challan
-            </Link>
-            <Link href="/daily-posting" className="rounded-lg border border-[var(--anc-line)] bg-[var(--anc-card)] px-3 py-2 text-sm font-semibold hover:bg-[var(--anc-soft)]">
-              Daily Posting
-            </Link>
-            <WhatsAppSummaryButton summary={summary} />
+            {/* Grouped into a compact menu so the whole row still fits
+                one line at 1366px (item 6) - everything that isn't the
+                period selector or the single most-used action. */}
+            <div className="relative" ref={moreMenuRef}>
+              <button
+                type="button"
+                onClick={() => setMoreOpen((v) => !v)}
+                className="rounded-lg border border-[var(--anc-line)] bg-[var(--anc-card)] px-3 py-2 text-sm font-semibold hover:bg-[var(--anc-soft)] whitespace-nowrap"
+              >
+                More ▾
+              </button>
+              {moreOpen && (
+                <div className="absolute right-0 top-full mt-1 w-48 rounded-lg border border-[var(--anc-line)] bg-[var(--anc-card)] shadow-lg z-20 flex flex-col p-1.5 gap-1">
+                  <Link href="/challan" onClick={() => setMoreOpen(false)} className="rounded-md px-3 py-2 text-sm font-semibold hover:bg-[var(--anc-soft)]">
+                    + Challan
+                  </Link>
+                  <Link href="/daily-posting" onClick={() => setMoreOpen(false)} className="rounded-md px-3 py-2 text-sm font-semibold hover:bg-[var(--anc-soft)]">
+                    Daily Posting
+                  </Link>
+                  <div className="px-1">
+                    <WhatsAppSummaryButton summary={summary} />
+                  </div>
+                </div>
+              )}
+            </div>
           </div>
         </div>
 
@@ -347,9 +394,9 @@ export default function DashboardPage() {
                   <b className="anc-num">{fmt(acc.balance)}</b>
                 </div>
               ))}
-              <div className="flex-1 min-w-[150px] rounded-lg px-3 py-2 flex justify-between items-center text-sm bg-[var(--anc-green)] text-white">
-                <span>Kul Cash + Bank (closing)</span>
-                <b className="anc-num">{today.totalCash !== null ? fmt(today.totalCash) : "—"}</b>
+              <div className="flex-1 min-w-[180px] rounded-lg px-3 py-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-0.5 text-sm bg-[var(--anc-green)] text-white">
+                <span className="whitespace-nowrap">Kul Cash + Bank (closing)</span>
+                <b className="anc-num whitespace-nowrap">{today.totalCash !== null ? fmt(today.totalCash) : "—"}</b>
               </div>
             </div>
           )}
@@ -494,29 +541,29 @@ export default function DashboardPage() {
         <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
           <Card title="Behtareen routes" subtitle="profit se sorted" onTitleClick={() => setDrilldownKey("routes")} className="md:col-span-2">
             <div className="overflow-x-auto">
-              <table className="w-full text-sm">
+              <table className="w-full text-sm border-separate border-spacing-0">
                 <thead>
                   <tr className="text-left text-[10px] uppercase text-[var(--anc-muted)]">
-                    <th className="py-1">Route</th>
-                    <th className="py-1 text-right">Bilties</th>
-                    <th className="py-1 text-right">Booking</th>
-                    <th className="py-1 text-right">Carrier Rent</th>
-                    <th className="py-1 text-right">Profit</th>
-                    <th className="py-1 text-right">Margin %</th>
+                    <th className="py-1 pr-3">Route</th>
+                    <th className="py-1 px-3 text-right">Bilties</th>
+                    <th className="py-1 px-3 text-right">Booking</th>
+                    <th className="py-1 px-3 text-right">Carrier Rent</th>
+                    <th className="py-1 px-3 text-right">Profit</th>
+                    <th className="py-1 pl-3 text-right">Margin %</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[var(--anc-line)]">
                   {routes.map((r) => (
                     <tr key={r.route}>
-                      <td className="py-1.5 max-w-[160px] truncate" title={r.route}>{r.route}</td>
-                      <td className="py-1.5 text-right anc-num">{r.biltyCount}</td>
-                      <td className="py-1.5 text-right anc-num">{fmt(r.booking)}</td>
-                      <td className="py-1.5 text-right anc-num">{fmt(r.carrierRent)}</td>
-                      <td className={`py-1.5 text-right anc-num ${r.margin >= 0 ? "text-[var(--anc-good)]" : "text-[var(--anc-bad)]"}`}>{fmt(r.margin)}</td>
-                      <td className="py-1.5 text-right anc-num">
+                      <td className="py-1.5 pr-3 max-w-[160px] truncate" title={r.route}>{r.route}</td>
+                      <td className="py-1.5 px-3 text-right anc-num">{r.biltyCount}</td>
+                      <td className="py-1.5 px-3 text-right anc-num">{fmt(r.booking)}</td>
+                      <td className="py-1.5 px-3 text-right anc-num">{fmt(r.carrierRent)}</td>
+                      <td className={`py-1.5 px-3 text-right anc-num ${r.margin >= 0 ? "text-[var(--anc-good)]" : "text-[var(--anc-bad)]"}`}>{fmt(r.margin)}</td>
+                      <td className="py-1.5 pl-3 text-right anc-num">
                         {r.biltyCount > 0 ? `${r.marginPct.toFixed(1)}%` : "—"}
                         {r.pendingBiltyCount > 0 && (
-                          <span className="block text-[10px] text-[var(--anc-warn)]" title={`${r.pendingBiltyCount} bilty abhi challan par nahi - rent pending`}>
+                          <span className="block text-[10px] text-[var(--anc-warn)] whitespace-nowrap" title={`${r.pendingBiltyCount} bilty abhi challan par nahi - rent pending`}>
                             {r.pendingBiltyCount} rent pending
                           </span>
                         )}
@@ -540,7 +587,7 @@ export default function DashboardPage() {
               <div key={oc.carrierId} className="mb-3">
                 {oc.activeTrip ? (
                   <div className="rounded-lg p-3 bg-[var(--anc-soft)] shadow-[inset_3px_0_0_var(--anc-blue)] mb-2.5">
-                    <div className="text-xs font-bold">Trip {oc.activeTrip.tripNo} - Chalti</div>
+                    <div className="text-xs font-bold">Trip {formatTripNo(oc.activeTrip.tripNo)} - Chalti</div>
                     <div className="text-[11px] text-[var(--anc-muted)]">{oc.activeTrip.route ?? "-"} · {oc.activeTrip.daysRunning} din se</div>
                     <div className="text-[11px] text-[var(--anc-muted)] anc-num">Kharcha ab tak {fmt(oc.activeTrip.expenseSoFar)}</div>
                   </div>
@@ -557,7 +604,7 @@ export default function DashboardPage() {
                   <tbody className="divide-y divide-[var(--anc-line)]">
                     {oc.recentTrips.map((t) => (
                       <tr key={t.tripId}>
-                        <td className="py-1">Trip {t.tripNo}</td>
+                        <td className="py-1">Trip {formatTripNo(t.tripNo)}</td>
                         <td className={`py-1 text-right anc-num ${t.profit >= 0 ? "text-[var(--anc-good)]" : "text-[var(--anc-bad)]"}`}>{t.profit >= 0 ? fmt(t.profit) : `- ${fmt(Math.abs(t.profit))}`}</td>
                       </tr>
                     ))}
@@ -579,7 +626,7 @@ export default function DashboardPage() {
 
         {/* 7. CHARTS */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-5">
-          <Card title="Income vs Kharcha" subtitle="6 mahine">
+          <Card title="Income vs Kharcha" subtitle={charts !== null ? `${charts.incomeExpense6mo.length} mahine` : undefined}>
             {charts === null ? (
               <NoAccessNote />
             ) : (
@@ -616,7 +663,11 @@ export default function DashboardPage() {
             )}
           </Card>
 
-          <Card title="Kharcha kahan gaya" subtitle={summary.meta.periodLabel} onTitleClick={charts !== null ? () => setDrilldownKey("exp") : undefined}>
+          <Card
+            title="Kharcha kahan gaya"
+            subtitle={profit !== null ? `Kul Kharcha ${fmt(profit.totalExpense)}` : summary.meta.periodLabel}
+            onTitleClick={charts !== null ? () => setDrilldownKey("exp") : undefined}
+          >
             {charts === null ? (
               <NoAccessNote />
             ) : (
@@ -631,11 +682,18 @@ export default function DashboardPage() {
                   </div>
                 ))}
                 {charts.expenseBreakdown.length === 0 && <p className="text-sm text-[var(--anc-muted)]">Is period koi kharcha nahi</p>}
+                {charts.expenseBreakdown.length > 0 && profit !== null && profit.totalExpense - expenseBreakdownTotal > 0.009 && (
+                  <div className="grid grid-cols-[110px_1fr_90px] gap-2 items-center text-xs my-1.5 text-[var(--anc-muted)]" title="Baaqi sab expense accounts">
+                    <span className="truncate italic">Baaqi</span>
+                    <span />
+                    <span className="text-right anc-num">{fmt(profit.totalExpense - expenseBreakdownTotal)}</span>
+                  </div>
+                )}
                 {charts.expenseBreakdown.length > 0 && (
                   <div className="grid grid-cols-[110px_1fr_90px] gap-2 items-center text-xs mt-2 pt-2 border-t border-[var(--anc-line)] font-bold">
-                    <span>Total (top 5)</span>
+                    <span>Kul Kharcha</span>
                     <span />
-                    <span className="text-right anc-num">{fmt(expenseBreakdownTotal)}</span>
+                    <span className="text-right anc-num">{fmt(profit !== null ? profit.totalExpense : expenseBreakdownTotal)}</span>
                   </div>
                 )}
               </>

@@ -4,7 +4,7 @@ import { getReceivablePayable, ageingBucketForDays, AGEING_BUCKET_LABELS, type P
 import { getTopTransportersByCarrierRent } from "@/lib/dashboard-analytics";
 import { getLatestOpenTrip, getTripProfitReport } from "@/lib/carrier-trip";
 import { getUnearnedRevenueAccountId } from "@/lib/gross-accounts";
-import { getPartyDocumentStates, getOpeningBalanceBreakdown, type AllocationTargetType } from "@/lib/payment-allocation";
+import { getPartyDocumentStates, type AllocationTargetType } from "@/lib/payment-allocation";
 import { derivePrivatePhonchVehicleAmounts } from "@/lib/dashboard-analytics";
 import { computePartyFifoPreview, checkPartyReconciliation, type PartyFifoPreview } from "@/lib/party-payment-fifo";
 import { getBusinessSettings } from "@/lib/business-settings";
@@ -42,7 +42,13 @@ export interface DrilldownRow {
 export interface DrilldownDataset {
   title: string;
   subtitle: string;
-  columns: [string, string, string]; // [name column label, count column label, amount column label]
+  columns: [string, string, string]; // [name column label, count column label, amount Rs column label]
+  // Which field is this dataset's own ranking criterion - the drawer
+  // sorts, numbers (rank 1..N) and bars BY THIS FIELD, never always
+  // "amount": a few drills (Top Customers/Clearing Agents/Transporters)
+  // are explicitly ranked by COUNT ("zyada bilties/gaariyan/challan"
+  // per their own subtitle), not by Rs.
+  sortBy: "amount" | "count";
   rows: DrilldownRow[];
 }
 
@@ -190,16 +196,18 @@ export interface GetDailySummaryParams {
   permissions: DailySummaryPermissions;
 }
 
-// Pre-ERP fallback for an opening balance's display age when even
-// getOpeningBalanceBreakdown's own earliestDate can't be resolved
-// (should not normally happen) - this ERP's own go-live date, never
-// the FIFO sentinel (2000-01-01, see OPENING_BALANCE_SENTINEL_DATE in
-// lib/account-opening-balance.ts) which is correct for ALLOCATION
-// ORDER but wildly wrong as a human-facing age ("9818 din").
+// An Opening Balance's display age is ALWAYS this ERP's own go-live
+// date - never the party's own OPENING_BALANCE entry date (which is
+// its real-world creation date, often long before this ERP existed,
+// and not a meaningful "age" either) and never the FIFO sentinel
+// (2000-01-01, see OPENING_BALANCE_SENTINEL_DATE in lib/account-
+// opening-balance.ts, correct for ALLOCATION ORDER but wildly wrong
+// as a human-facing age - the reported "9818 din" bug). Every pre-ERP
+// balance is, by definition, exactly this old as of go-live.
 const ERP_START_DATE = new Date(2026, 9, 1);
 
 // "<Type> <No>" for a party's oldest open document, or the literal
-// "Opening Balance" (no number) for the OPENING_BALANCE virtual
+// "Opening (pre-ERP)" (no number) for the OPENING_BALANCE virtual
 // target - matches the short codes this business already recognizes
 // from its own documents, never invented ones.
 const DOC_TYPE_LABELS: Partial<Record<AllocationTargetType, string>> = {
@@ -213,7 +221,7 @@ const DOC_TYPE_LABELS: Partial<Record<AllocationTargetType, string>> = {
 };
 
 function formatDocLabel(targetSourceType: AllocationTargetType, documentNo: string): string {
-  if (targetSourceType === "OPENING_BALANCE") return "Opening Balance";
+  if (targetSourceType === "OPENING_BALANCE") return "Opening (pre-ERP)";
   const prefix = DOC_TYPE_LABELS[targetSourceType];
   return prefix ? `${prefix} ${documentNo}` : documentNo;
 }
@@ -306,6 +314,11 @@ async function computeProfitSection(periodWhere: DateFilter, comparisonWhere: Da
     grossMargin,
     grossMarginPct: current.bookingIncome > 0 ? Math.round((grossMargin / current.bookingIncome) * 1000) / 10 : 0,
     otherIncome: current.income - current.bookingIncome,
+    // Whether the COMPARISON period itself has any posted activity at
+    // all - used by getDailySummary to hide the whole comparison
+    // (label + deltas) rather than showing a "0% change" or a label
+    // next to a comparison that's genuinely empty.
+    comparisonHasData: previous.income !== 0 || previous.expense !== 0,
   };
 }
 
@@ -348,18 +361,16 @@ async function computePartyOpenDocuments(accountIds: string[], direction: "RECEI
       // (2000-01-01) - correct for allocation ORDER (it must clear
       // before every real document), wrong for a human-facing age
       // ("9818 din", the exact reported bug). Swapped here, for
-      // DISPLAY only, for the real earliest contributing line's date
-      // (getOpeningBalanceBreakdown's own earliestDate) - the FIFO
-      // sort below still runs on the original sentinel-dated copy, so
-      // allocation order is completely unaffected.
+      // DISPLAY only, for this ERP's own go-live date (ERP_START_DATE)
+      // - never the party's own OPENING_BALANCE entry date either (see
+      // ERP_START_DATE's own doc comment) - the FIFO sort below still
+      // runs on the original sentinel-dated copy, so allocation order
+      // is completely unaffected.
       const sorted = [...docs].sort((a, b) => a.documentDate.getTime() - b.documentDate.getTime());
-      const withDisplayDates = await Promise.all(
-        sorted.map(async (d) => {
-          if (d.targetSourceType !== "OPENING_BALANCE") return { ...d, displayDate: d.documentDate };
-          const breakdown = await getOpeningBalanceBreakdown(prisma, d.targetSourceId);
-          return { ...d, displayDate: breakdown?.earliestDate ?? ERP_START_DATE };
-        })
-      );
+      const withDisplayDates = sorted.map((d) => ({
+        ...d,
+        displayDate: d.targetSourceType === "OPENING_BALANCE" ? ERP_START_DATE : d.documentDate,
+      }));
 
       result.set(accountId, {
         oldestDocLabel: formatDocLabel(withDisplayDates[0].targetSourceType, withDisplayDates[0].documentNo),
@@ -941,111 +952,143 @@ export async function getDailySummary(params: GetDailySummaryParams): Promise<Da
       title: "Top Customers",
       subtitle: "Sab se zyada bilties banwayin - top se lowest",
       columns: ["Customer", "Bilties", "Booking Rs"],
+      sortBy: "count",
       rows: drillRows(topPartiesRaw.customers, (c) => ({ name: c.name, link: `/parties/${c.partyId}/ledger`, count: c.count, amount: c.amount })),
     },
     ca: {
       title: "Top Clearing Agents",
       subtitle: "Private Phonch par gaariyan - top se lowest",
       columns: ["Clearing Agent", "Gaariyan", "Kiraya Rs"],
+      sortBy: "count",
       rows: drillRows(topPartiesRaw.clearingAgents, (c) => ({ name: c.name, link: `/parties/${c.partyId}/ledger`, count: c.count, amount: c.amount })),
     },
     sr: {
       title: "Top Transporters - Showroom Phonch",
       subtitle: "Showroom Phonch par gaariyan - top se lowest",
       columns: ["Transporter", "Gaariyan", "Charges Rs"],
+      sortBy: "count",
       rows: drillRows(topPartiesRaw.showroomTransporters, (c) => ({ name: c.name, link: `/parties/${c.partyId}/ledger`, count: c.count, amount: c.amount })),
     },
     ch: {
       title: "Top Transporters - Challan",
       subtitle: "Hamari gaariyan load kin - top se lowest",
       columns: ["Transporter", "Challan", "Carrier Rent Rs"],
+      sortBy: "count",
       rows: drillRows(topPartiesRaw.challanTransporters, (c) => ({ name: c.name, link: `/parties/${c.partyId}/ledger`, count: c.count, amount: c.amount })),
     },
     rec: {
       title: "Receivable - Wasooli",
       subtitle: "Sab parties - zyada raqam upar",
-      columns: ["Party", "Baaqi Rs", "Din"],
-      rows: drillRows(wasooliRows, (r) => ({ name: r.name, link: r.partyId ? `/parties/${r.partyId}/ledger` : null, count: Math.round(r.amount), amount: r.days === Infinity ? 0 : r.days })),
+      columns: ["Party", "Din", "Baaqi Rs"],
+      sortBy: "amount",
+      rows: drillRows(wasooliRows, (r) => ({ name: r.name, link: r.partyId ? `/parties/${r.partyId}/ledger` : null, count: r.days === Infinity ? 0 : r.days, amount: r.amount })),
     },
     pay: {
       title: "Payable - Dena hai",
       subtitle: "Sab carriers / transporters - zyada raqam upar",
-      columns: ["Party", "Dena Rs", "Din"],
-      rows: drillRows(denaHaiRows, (r) => ({ name: r.name, link: `/parties/${r.partyId}/ledger`, count: Math.round(r.amount), amount: r.oldestDocDays ?? 0 })),
+      columns: ["Party", "Din", "Dena Rs"],
+      sortBy: "amount",
+      rows: drillRows(denaHaiRows, (r) => ({ name: r.name, link: `/parties/${r.partyId}/ledger`, count: r.oldestDocDays ?? 0, amount: r.amount })),
     },
     routes: {
       title: "Routes",
       subtitle: "Gross margin - top se lowest",
       columns: ["Route", "Bilties", "Margin Rs"],
+      sortBy: "amount",
       rows: drillRows(routesRaw.routes, (r) => ({ name: r.route, link: null, count: r.biltyCount, amount: r.margin })),
     },
     exp: {
       title: "Kharcha",
       subtitle: "Period - zyada se kam",
       columns: ["Account", "Entries", "Rs"],
+      sortBy: "amount",
       rows: drillRows(chartsRaw.expenseBreakdownFull, (e) => ({ name: e.account, link: null, count: e.entries, amount: e.amount })),
     },
     inc: {
       title: "Income",
       subtitle: "Period - har income account",
       columns: ["Account", "Entries", "Rs"],
+      sortBy: "amount",
       rows: drillRows(chartsRaw.incomeBreakdownFull, (e) => ({ name: e.account, link: null, count: e.entries, amount: e.amount })),
     },
     tb: {
       title: `${periodPrefix} ki bilties`,
       subtitle: range.rangeLabel,
       columns: ["Bilty / Customer", "Gaariyan", "Booking Rs"],
+      sortBy: "amount",
       rows: drillRows(periodActivitySection.biltyRows, (b) => ({ name: b.label, link: `/bilty/${b.id}`, count: 1, amount: b.amount })),
     },
     tc: {
       title: `${periodPrefix} ke challan`,
       subtitle: range.rangeLabel,
       columns: ["Challan / Transporter", "Gaariyan", "Rent Rs"],
+      sortBy: "amount",
       rows: drillRows(periodActivitySection.challanRows, (c) => ({ name: c.label, link: `/challan/${c.id}`, count: c.vehicleCount, amount: c.amount })),
     },
     tbill: {
       title: `${periodPrefix} ke bill`,
       subtitle: range.rangeLabel,
       columns: ["Bill / Client", "Gaariyan", "Rs"],
+      sortBy: "amount",
       rows: drillRows(periodActivitySection.billRows, (b) => ({ name: b.label, link: `/bill/${b.id}`, count: 1, amount: b.amount })),
     },
     tsr: {
       title: `Showroom Phonch - ${periodSuffix}`,
       subtitle: range.rangeLabel,
       columns: ["Phonch / Transporter", "Gaariyan", "Rs"],
+      sortBy: "amount",
       rows: drillRows(periodActivitySection.showroomPhonchRows, (p) => ({ name: p.label, link: `/phonch/${p.id}`, count: p.vehicleCount, amount: p.amount })),
     },
     tpp: {
       title: `Private Phonch - ${periodSuffix}`,
       subtitle: range.rangeLabel,
       columns: ["Phonch / Clearing Agent", "Gaariyan", "Rs"],
+      sortBy: "amount",
       rows: drillRows(periodActivitySection.privatePhonchRows, (p) => ({ name: p.label, link: `/private-phonch/${p.id}`, count: p.vehicleCount, amount: p.amount })),
     },
     tin: {
       title: `Paise aaye - ${periodSuffix}`,
       subtitle: "Cash + Bank",
       columns: ["Kis se", "Entries", "Rs"],
+      sortBy: "amount",
       rows: drillRows(periodActivitySection.cashInRows, (r) => ({ name: r.label, link: null, count: r.entries, amount: r.amount })),
     },
     tout: {
       title: `Paise gaye - ${periodSuffix}`,
       subtitle: "Cash + Bank",
       columns: ["Kis ko", "Entries", "Rs"],
+      sortBy: "amount",
       rows: drillRows(periodActivitySection.cashOutRows, (r) => ({ name: r.label, link: null, count: r.entries, amount: r.amount })),
     },
     loss: {
       title: "Nuqsan wale challan",
       subtitle: "Carrier rent booking se zyada",
       columns: ["Challan", "Gaariyan", "Nuqsan Rs"],
+      sortBy: "amount",
       rows: drillRows(alertsResult.lossChallanRows, (c) => ({ name: c.label, link: `/challan/${c.id}`, count: c.biltyCount, amount: c.loss })),
     },
     settle: {
       title: "Settlement baaqi",
       subtitle: "Delivered, settlement pending",
       columns: ["Challan", "Gaariyan", "Rent Rs"],
+      sortBy: "amount",
       rows: drillRows(alertsResult.settlementPendingRows, (c) => ({ name: c.label, link: `/challan/${c.id}`, count: c.biltyCount, amount: c.carrierRent })),
     },
   };
+
+  // Hide the comparison entirely (label + every delta %) when it's
+  // genuinely meaningless: no comparison period at all (ALL_TIME/open
+  // CUSTOM), the comparison period starts before this ERP's own go-
+  // live date (2026-10-01 - there is no real posted data before that
+  // to compare against), or that period simply has zero posted
+  // activity either way.
+  const comparisonInvalid =
+    !range.comparisonFrom || range.comparisonFrom < ERP_START_DATE || !profitSection.comparisonHasData;
+  const { comparisonHasData: _comparisonHasData, ...profitWithoutInternalFlag } = profitSection;
+  void _comparisonHasData;
+  const profitForResponse = comparisonInvalid
+    ? { ...profitWithoutInternalFlag, incomeDeltaPct: null, expenseDeltaPct: null, profitDeltaPct: null }
+    : profitWithoutInternalFlag;
 
   const full: DailySummaryResponse = {
     meta: {
@@ -1054,11 +1097,11 @@ export async function getDailySummary(params: GetDailySummaryParams): Promise<Da
       periodFromISO: range.fromISO,
       periodToISO: range.toISO,
       rangeLabel: range.rangeLabel,
-      comparisonLabel: range.comparisonRangeLabel,
+      comparisonLabel: comparisonInvalid ? null : range.comparisonRangeLabel,
       generatedAt: now.toISOString(),
     },
     today: periodActivitySection.summary,
-    profit: profitSection,
+    profit: profitForResponse,
     wasooli: wasooliRows.slice(0, 10),
     wasooliTotal: receivablePayable.totalReceivable,
     denaHai: denaHaiRows.slice(0, 10),
