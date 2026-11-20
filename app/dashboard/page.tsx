@@ -317,7 +317,21 @@ export default function DashboardPage() {
             <Tile label="Bilty bani" locked={today.biltyCount === null} value={today.biltyCount !== null ? String(today.biltyCount) : undefined} sub={today.biltyBookingAmount !== null ? `Booking ${fmt(today.biltyBookingAmount)}` : undefined} onClick={today.biltyCount !== null ? () => setDrilldownKey("tb") : undefined} />
             <Tile label="Challan bane" locked={today.challanCount === null} value={today.challanCount !== null ? String(today.challanCount) : undefined} sub={today.challanDispatchedCount !== null ? `${today.challanDispatchedCount} dispatch` : undefined} onClick={today.challanCount !== null ? () => setDrilldownKey("tc") : undefined} />
             <Tile label="Bill bane" locked={today.billCount === null} value={today.billCount !== null ? String(today.billCount) : undefined} sub={today.billAmount !== null ? fmt(today.billAmount) : undefined} onClick={today.billCount !== null ? () => setDrilldownKey("tbill") : undefined} />
-            <Tile label="Showroom Phonch gaariyan" locked={today.showroomPhonchVehicleCount === null} value={today.showroomPhonchVehicleCount !== null ? String(today.showroomPhonchVehicleCount) : undefined} sub={today.showroomPhonchDeliveryCharges !== null ? fmt(today.showroomPhonchDeliveryCharges) : undefined} onClick={today.showroomPhonchVehicleCount !== null ? () => setDrilldownKey("tsr") : undefined} />
+            <Tile
+              label="Showroom Phonch gaariyan"
+              locked={today.showroomPhonchVehicleCount === null}
+              value={today.showroomPhonchVehicleCount !== null ? String(today.showroomPhonchVehicleCount) : undefined}
+              sub={
+                today.showroomPhonchDeliveryCharges !== null
+                  ? `${fmt(today.showroomPhonchDeliveryCharges)}${
+                      today.showroomPhonchCollected !== null && today.showroomPhonchOutstanding !== null
+                        ? ` · ${fmt(today.showroomPhonchCollected)} wasool, ${fmt(today.showroomPhonchOutstanding)} baaqi`
+                        : ""
+                    }`
+                  : undefined
+              }
+              onClick={today.showroomPhonchVehicleCount !== null ? () => setDrilldownKey("tsr") : undefined}
+            />
             <Tile label="Private Phonch gaariyan" locked={today.privatePhonchVehicleCount === null} value={today.privatePhonchVehicleCount !== null ? String(today.privatePhonchVehicleCount) : undefined} sub={today.privatePhonchRent !== null ? fmt(today.privatePhonchRent) : undefined} onClick={today.privatePhonchVehicleCount !== null ? () => setDrilldownKey("tpp") : undefined} />
             <Tile label="Paise aaye (In)" locked={today.cashIn === null} value={today.cashIn !== null ? fmt(today.cashIn) : undefined} sub={`Cash + Bank, ${periodPrefix.toLowerCase()}`} tone="in" onClick={today.cashIn !== null ? () => setDrilldownKey("tin") : undefined} />
             <Tile label="Paise gaye (Out)" locked={today.cashOut === null} value={today.cashOut !== null ? fmt(today.cashOut) : undefined} sub={`Cash + Bank, ${periodPrefix.toLowerCase()}`} tone="out" onClick={today.cashOut !== null ? () => setDrilldownKey("tout") : undefined} />

@@ -57,6 +57,8 @@ export function applyDailySummaryPermissions(full: DailySummaryResponse, permiss
       billAmount: permissions.bill ? full.today.billAmount : null,
       showroomPhonchVehicleCount: permissions.phonch ? full.today.showroomPhonchVehicleCount : null,
       showroomPhonchDeliveryCharges: permissions.phonch ? full.today.showroomPhonchDeliveryCharges : null,
+      showroomPhonchCollected: permissions.phonch ? full.today.showroomPhonchCollected : null,
+      showroomPhonchOutstanding: permissions.phonch ? full.today.showroomPhonchOutstanding : null,
       privatePhonchVehicleCount: permissions.privatePhonch ? full.today.privatePhonchVehicleCount : null,
       privatePhonchRent: permissions.privatePhonch ? full.today.privatePhonchRent : null,
       cashIn: permissions.reports ? full.today.cashIn : null,

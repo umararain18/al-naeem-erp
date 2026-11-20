@@ -89,6 +89,12 @@ export interface DailySummaryResponse {
     // phonch.view
     showroomPhonchVehicleCount: number | null;
     showroomPhonchDeliveryCharges: number | null;
+    // Collected vs outstanding, batched from the SAME Daily Posting
+    // lines getPhonchPaymentState() itself reads per-record (never a
+    // second formula) - null only alongside the rest of this gated
+    // section, never because a figure is genuinely zero.
+    showroomPhonchCollected: number | null;
+    showroomPhonchOutstanding: number | null;
     // privatePhonch.view
     privatePhonchVehicleCount: number | null;
     privatePhonchRent: number | null;
@@ -677,7 +683,7 @@ async function computePeriodActivitySection(periodFrom: Date | null, periodToExc
     }),
     prisma.phonch.findMany({
       where: { isDeleted: false, date: dateRange },
-      select: { id: true, phonchNo: true, transporterParty: { select: { partyName: true } }, vehicles: { select: { deliveryCharges: true } } },
+      select: { id: true, phonchNo: true, transporterParty: { select: { partyName: true, account: { select: { id: true } } } }, vehicles: { select: { deliveryCharges: true } } },
     }),
     prisma.privatePhonch.findMany({
       where: { isDeleted: false, date: dateRange },
@@ -693,6 +699,9 @@ async function computePeriodActivitySection(periodFrom: Date | null, periodToExc
   const billRowsRaw = bills.map((b) => ({ id: b.id, label: `${b.billNo} - ${b.clientName}`, amount: b.items.reduce((s, i) => s + Number(i.rent) + Number(i.delivery) + Number(i.otherExpense), 0) }));
   const billAmount = billRowsRaw.reduce((s, b) => s + b.amount, 0);
 
+  // ALL vehicles that arrived this period, paid or unpaid - the Phonch
+  // query above has no payment-status filter at all, so every vehicle
+  // on every Phonch in range is already counted here.
   const showroomPhonchRows = phonches.map((p) => ({
     id: p.id,
     label: `${p.phonchNo} - ${p.transporterParty?.partyName ?? "-"}`,
@@ -702,13 +711,54 @@ async function computePeriodActivitySection(periodFrom: Date | null, periodToExc
   const showroomPhonchVehicleCount = showroomPhonchRows.reduce((s, p) => s + p.vehicleCount, 0);
   const showroomPhonchDeliveryCharges = showroomPhonchRows.reduce((s, p) => s + p.amount, 0);
 
+  // Collected ("wasool") vs outstanding ("baaqi") - batched re-
+  // application of getPhonchPaymentState()'s own documented CREDIT-
+  // minus-DEBIT-on-the-transporter's-own-account formula (lib/phonch-
+  // accounting.ts) across every Showroom Phonch in range in ONE
+  // JournalLine query, never a per-record loop (same pattern as
+  // lib/dashboard-analytics.ts's own getBillSummary). The accountId
+  // match guards against a bundled Daily Posting entry's Cash/Bank
+  // line sharing this same sourceType/sourceId tag.
+  const showroomAccountIdByPhonchId = new Map(phonches.map((p) => [p.id, p.transporterParty?.account?.id ?? null]));
+  const showroomPhonchIds = phonches.map((p) => p.id);
+  const showroomReceiptLines = showroomPhonchIds.length
+    ? await prisma.journalLine.findMany({
+        where: { sourceType: "PHONCH", sourceId: { in: showroomPhonchIds }, journalEntry: { referenceType: "DAILY_POSTING", isDeleted: false } },
+        select: { sourceId: true, accountId: true, debit: true, credit: true },
+      })
+    : [];
+  const showroomReceivedByPhonchId = new Map<string, number>();
+  for (const l of showroomReceiptLines) {
+    if (!l.sourceId || showroomAccountIdByPhonchId.get(l.sourceId) !== l.accountId) continue;
+    showroomReceivedByPhonchId.set(l.sourceId, (showroomReceivedByPhonchId.get(l.sourceId) ?? 0) + Number(l.credit) - Number(l.debit));
+  }
+  const showroomPhonchCollected = showroomPhonchRows.reduce(
+    (s, p) => s + Math.max(0, Math.min(showroomReceivedByPhonchId.get(p.id) ?? 0, p.amount)),
+    0
+  );
+  const showroomPhonchOutstanding = Math.max(0, round2(showroomPhonchDeliveryCharges - showroomPhonchCollected));
+
   // A vehicle's real gross charge is `totalRent`, EXCEPT a fully-paid
   // vehicle (totalRent = 0, see schema's own PrivatePhonchVehicle
   // comment) whose charge is instead recovered via deliveryCharges -
   // reusing derivePrivatePhonchVehicleAmounts's own documented formula
   // (lib/dashboard-analytics.ts), never a second rule. Without this, a
   // fully-paid vehicle showed "Rs 0" on this tile despite real charges
-  // (the exact reported bug).
+  // (the exact reported bug). ALL vehicles this period are already
+  // included (the query above has no payment-status filter).
+  //
+  // Deliberately NO "wasool/baaqi" collected-vs-outstanding split
+  // here, unlike Showroom Phonch above: for a NORMAL (totalRent > 0)
+  // vehicle, `totalRent` nets into Carrier/Clearing-Agent PAYABLE (see
+  // lib/private-phonch-accounting.ts's own getPrivatePhonchPaymentState
+  // doc comment) - money ANC OWES, not a tracked receivable - so there
+  // is no single "amount ANC has collected" figure this system
+  // records against it. Only the fully-paid-vehicle Delivery Recovery
+  // slice is a genuine receivable (getPrivatePhonchDeliveryRecoveryState),
+  // and splitting just that slice while leaving the dominant totalRent
+  // portion unsplit would be a misleading, partial number - so this is
+  // left as a single total rather than inventing a split the
+  // accounting model doesn't actually support end-to-end.
   const privatePhonchRows = privatePhonches.map((p) => ({
     id: p.id,
     label: `${p.phonchNo} - ${p.transporterParty?.partyName ?? "-"}`,
@@ -781,6 +831,8 @@ async function computePeriodActivitySection(periodFrom: Date | null, periodToExc
       billAmount,
       showroomPhonchVehicleCount,
       showroomPhonchDeliveryCharges,
+      showroomPhonchCollected,
+      showroomPhonchOutstanding,
       privatePhonchVehicleCount,
       privatePhonchRent,
       cashIn,

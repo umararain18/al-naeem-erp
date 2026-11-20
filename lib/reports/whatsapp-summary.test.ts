@@ -8,7 +8,7 @@ function baseSummary(): DailySummaryResponse {
     meta: { period: "THIS_MONTH", periodLabel: "This Month", periodFromISO: "2026-11-01", periodToISO: "2026-11-30", rangeLabel: "1 Nov 2026 - 30 Nov 2026", comparisonLabel: null, generatedAt: "2026-11-18T00:00:00.000Z" },
     today: {
       biltyCount: 7, biltyBookingAmount: 412000, challanCount: 4, challanDispatchedCount: 3, billCount: 2, billAmount: 46500,
-      showroomPhonchVehicleCount: 5, showroomPhonchDeliveryCharges: 6000, privatePhonchVehicleCount: 2, privatePhonchRent: 17000,
+      showroomPhonchVehicleCount: 5, showroomPhonchDeliveryCharges: 6000, showroomPhonchCollected: 4000, showroomPhonchOutstanding: 2000, privatePhonchVehicleCount: 2, privatePhonchRent: 17000,
       cashIn: 186500, cashOut: 142360, netCash: 44140,
       cashByAccount: [{ accountId: "a1", accountName: "Office Cash", balance: 83410 }, { accountId: "a2", accountName: "Umar Bank", balance: 1193607 }],
       totalCash: 1277017,
